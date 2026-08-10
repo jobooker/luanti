@@ -34,6 +34,8 @@
 #include "nodemetadata.h"
 #include "particles.h"
 #include "porting.h"
+#include <fstream>
+#include <sstream>
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
@@ -475,6 +477,38 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 }
 
 
+// claude_settings_patch: poll <path_user>/claude_settings_patch.conf (~1 Hz)
+// and apply its key = value lines through g_settings — the same route the
+// in-game settings GUI uses, so live-appliable settings (view range, shadows,
+// bloom, undersampling, ...) take effect without a client restart. External
+// tooling overwrites the file; identical content is not re-applied.
+static void pollSettingsPatch(f32 dtime)
+{
+	static f32 timer = 0.0f;
+	static std::string last_applied;
+	timer += dtime;
+	if (timer < 1.0f)
+		return;
+	timer = 0.0f;
+	std::ifstream f(porting::path_user + "/claude_settings_patch.conf");
+	if (!f.good())
+		return;
+	std::string content((std::istreambuf_iterator<char>(f)),
+			std::istreambuf_iterator<char>());
+	if (content.empty() || content == last_applied)
+		return;
+	last_applied = content;
+	Settings patch;
+	std::istringstream is(content);
+	if (!patch.parseConfigLines(is))
+		return;
+	for (const std::string &name : patch.getNames()) {
+		g_settings->set(name, patch.get(name));
+		actionstream << "[claude_settings_patch] " << name << " = "
+				<< patch.get(name) << std::endl;
+	}
+}
+
 void Game::run()
 {
 	ZoneScoped;
@@ -526,6 +560,8 @@ void Game::run()
 		framemarker.start();
 
 		g_fontengine->handleReload();
+
+		pollSettingsPatch(dtime);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {
