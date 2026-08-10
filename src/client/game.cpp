@@ -482,7 +482,7 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 // in-game settings GUI uses, so live-appliable settings (view range, shadows,
 // bloom, undersampling, ...) take effect without a client restart. External
 // tooling overwrites the file; identical content is not re-applied.
-static void pollSettingsPatch(f32 dtime)
+static void pollSettingsPatch(f32 dtime, Client *client)
 {
 	static f32 timer = 0.0f;
 	static std::string last_applied;
@@ -503,6 +503,14 @@ static void pollSettingsPatch(f32 dtime)
 	if (!patch.parseConfigLines(is))
 		return;
 	for (const std::string &name : patch.getNames()) {
+		// Pseudo-key: any value change triggers a screenshot (same call as
+		// the F12 keybind), saved to the usual screenshots directory.
+		if (name == "claude_screenshot") {
+			client->makeScreenshot();
+			actionstream << "[claude_settings_patch] screenshot taken"
+					<< std::endl;
+			continue;
+		}
 		g_settings->set(name, patch.get(name));
 		actionstream << "[claude_settings_patch] " << name << " = "
 				<< patch.get(name) << std::endl;
@@ -561,7 +569,7 @@ void Game::run()
 
 		g_fontengine->handleReload();
 
-		pollSettingsPatch(dtime);
+		pollSettingsPatch(dtime, client);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {
