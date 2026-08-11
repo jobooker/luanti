@@ -287,6 +287,16 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 		pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_EXPOSURE_1, TEXTURE_EXPOSURE_2);
 	}
 
+	// BINARY SEARCH SWITCH (claude_bypass=1): return vanilla's tail and add
+	// none of our steps, so `effect` renders straight to the screen exactly as
+	// upstream does. This separates "our chain broke core-profile
+	// post-processing" from "Luanti's own post-processing does not work on a
+	// core profile at all" — which nothing else can distinguish, since with
+	// enable_post_processing=false the whole chain is absent.
+	if (g_settings->exists("claude_bypass")
+			&& g_settings->getFloat("claude_bypass", 0.0f, 1.0f) > 0.5f)
+		return effect;
+
 	// claude traced-mode chain: the final merge now lands in a texture;
 	// a half-res path-traced sample accumulates into a persistent
 	// ping-pong history; a present step picks accum (traced modes) or

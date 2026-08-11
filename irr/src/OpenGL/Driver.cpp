@@ -1086,18 +1086,39 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 		if (primitiveCount > 400) big++;
 		if (f == 0) toZero++; else toFbo++;
 		if (primitiveCount > 400 && f != 0) bigToFbo++;
+		// TEMPORARY: draw ORDER into the scene target. If big (terrain) draws
+		// come before small (sky) draws, the sky is painting over the world.
+		{
+			static int seq = 0;
+			if (f == 1 && seq < 24) {
+				seq++;
+				char b[128];
+				snprintf(b, sizeof(b), "[claude_seq] #%d prims=%u", seq, primitiveCount);
+				os::Printer::log(b, ELL_ERROR);
+			}
+		}
+		static int perFbo[16] = {0};
+		if (primitiveCount > 400 && f >= 0 && f < 16)
+			perFbo[f]++;
 		if (total == 3000 && dbg == 0) {
 			dbg = 1;
-			char b[192];
+			char b[256];
 			snprintf(b, sizeof(b),
-				"[claude_hist] draws=%d big(>400prim)=%d toFbo0=%d toOtherFbo=%d bigToOtherFbo=%d",
-				total, big, toZero, toFbo, bigToFbo);
+				"[claude_hist] big draws per fbo: "
+				"0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d 8=%d 9=%d 10=%d 11=%d",
+				perFbo[0], perFbo[1], perFbo[2], perFbo[3], perFbo[4], perFbo[5],
+				perFbo[6], perFbo[7], perFbo[8], perFbo[9], perFbo[10], perFbo[11]);
 			os::Printer::log(b, ELL_ERROR);
 		}
 	}
 	if (dbgOn) {
 		while (GL.GetError() != GL_NO_ERROR) {}
 	}
+	// TEMPORARY EXPERIMENT: if terrain is discarded by the depth test,
+	// disabling it makes the world appear (wrongly sorted, but visible).
+	if (Version.Spec == OpenGLSpec::Core)
+		GL.Disable(GL_BLEND);       // EXPERIMENT: alpha=0 would hide opaque terrain
+		GL.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	beginDraw(vTypeDesc, reinterpret_cast<uintptr_t>(vertices));
 	if (dbgOn) {
 		GLenum e = GL.GetError();
