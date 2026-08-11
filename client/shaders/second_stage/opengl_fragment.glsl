@@ -269,6 +269,13 @@ vec4 ghostView(vec2 uv)
 
 uniform vec3 volumeLightCol; // active light source color (sun/moon/none)
 
+// The engine's dayNightRatio never drops below ~0.175 — a baked-in
+// ambient floor. Remap it to a true 0..1 so traced midnight is dark.
+float pathDayLin()
+{
+	return clamp((dayNightRatio - 0.18) / 0.82, 0.0, 1.0);
+}
+
 // Dark-material floor: MTG foliage textures average near-black, which in
 // a pure multiply renderer eats all incident light ("low albedo is the
 // work" — John's diagnosis, confirmed by the mode-4 A/B). Lift only very
@@ -289,8 +296,11 @@ vec3 pathSkyRadiance(vec3 rd)
 	float cosSun = max(dot(rd, volumeSunDir), 0.0);
 	// gradient scales with daylight; disk/halo + scatter carry the
 	// active light source's color (warm sun by day, cool moon by night)
-	vec3 c = sky * clamp(dayNightRatio, 0.0, 1.0);
-	c += volumeLightCol * (pow(cosSun, 48.0) * 7.0 + pow(cosSun, 8.0) * 0.4);
+	vec3 c = sky * pathDayLin();
+	// crisp disc (sun face by day, full moon by night) + glow + halo
+	float disc = smoothstep(0.9993, 0.9997, cosSun);
+	c += volumeLightCol * (disc * 40.0
+			+ pow(cosSun, 48.0) * 3.0 + pow(cosSun, 8.0) * 0.4);
 	c += volumeLightCol * 0.18; // light scattered across the sky dome
 	return c;
 }
