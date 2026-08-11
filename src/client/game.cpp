@@ -1019,6 +1019,43 @@ static void claudeUpdateAccum(Client *client)
 	g_claude_volume.cur_tany = std::tan(cam->getFovY() * 0.5f);
 }
 
+// claude_stats: when enabled, write rolling frame statistics to
+// <path_user>/claude_stats.json once per second so external tooling can
+// measure performance without reading the debug overlay off a screenshot.
+static void claudeWriteStats(f32 dtime)
+{
+	if (!g_settings->exists("claude_stats")
+			|| g_settings->getFloat("claude_stats", 0.0f, 1.0f) < 0.5f)
+		return;
+	static f32 window = 0.0f;
+	static u32 frames = 0;
+	static f32 worst = 0.0f;
+	static f32 best = 1e9f;
+	static f32 total = 0.0f;
+	window += dtime;
+	frames++;
+	total += dtime;
+	worst = std::max(worst, dtime);
+	best = std::min(best, dtime);
+	if (window < 1.0f)
+		return;
+	std::ostringstream os;
+	os << "{\"fps\": " << (frames / std::max(window, 1e-3f))
+			<< ", \"frame_ms_avg\": " << (total / frames * 1000.0f)
+			<< ", \"frame_ms_worst\": " << (worst * 1000.0f)
+			<< ", \"frame_ms_best\": " << (best * 1000.0f)
+			<< ", \"frames\": " << frames
+			<< ", \"volume_valid\": " << (g_claude_volume.valid ? 1 : 0)
+			<< ", \"emitters\": " << g_claude_volume.emitter_count
+			<< ", \"accum_alpha\": " << g_claude_volume.accum_alpha
+			<< ", \"still_frames\": " << g_claude_volume.still_frames
+			<< "}\n";
+	std::ofstream f(porting::path_user + "/claude_stats.json",
+			std::ios::trunc);
+	f << os.str();
+	window = 0.0f; frames = 0; worst = 0.0f; best = 1e9f; total = 0.0f;
+}
+
 static void pollSettingsPatch(f32 dtime, Client *client)
 {
 	static f32 timer = 0.0f;
@@ -1147,6 +1184,7 @@ void Game::run()
 
 		pollSettingsPatch(dtime, client);
 		claudeUpdateAccum(client);
+		claudeWriteStats(dtime);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {
