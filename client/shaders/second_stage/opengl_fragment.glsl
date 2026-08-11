@@ -35,6 +35,35 @@ uniform vec3 volumeCamPos;   // camera in volume-local node units
 uniform vec3 volumeCamFwd;   // unit look direction
 uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
 uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
+uniform vec3 volumeSunDir;   // unit direction toward the sun
+
+// Shadow ray: second DDA march from a hit point toward the sun. Starts in
+// the empty cell the primary ray hit from (caller nudges the origin out
+// along the face normal) and tests only after the first step, so the
+// surface never shadows itself. Leaving the volume = reached open sky.
+float volumeShadow(vec3 ro)
+{
+	const float S = 128.0;
+	vec3 rd = volumeSunDir;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	for (int i = 0; i < 192; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return 1.0;
+		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
+			return 0.45;
+	}
+	return 1.0;
+}
 
 // claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
 // through the 128^3 occupancy snapshot. Voxel i spans [i, i+1) in cell
@@ -55,13 +84,24 @@ vec4 ghostView(vec2 uv)
 	int axis = -1; // axis of the last step = hit-face normal; -1 = ray origin cell
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
-			if (texture3D(claudeVolume, (cell + 0.5) / S).r > 0.5) {
+			// rgb = node average color; a: 0 air, ~0.5 water, 1 solid
+			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+			if (s.a > 0.25) {
 				float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 						: (axis == 0 ? 0.8 : 0.62);
-				if (axis < 0)
+				float shade = 1.0;
+				if (axis < 0) {
 					face = 0.9;
+				} else {
+					// nudge off the hit face, then trace toward the sun
+					vec3 n = vec3(0.0);
+					if (axis == 0) n.x = -stepDir.x;
+					else if (axis == 1) n.y = -stepDir.y;
+					else n.z = -stepDir.z;
+					shade = volumeShadow(ro + rd * t + n * 0.01);
+				}
 				float fog = exp(-t * 0.015);
-				return vec4(vec3(face * fog), 1.0);
+				return vec4(s.rgb * face * shade * fog, 1.0);
 			}
 		} else if (i > 0) {
 			break; // left the volume

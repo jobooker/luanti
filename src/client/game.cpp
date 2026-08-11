@@ -31,6 +31,7 @@
 #include "minimap.h"
 #include "network/networkexceptions.h"
 #include "nodedef.h"         // Needed for determining pointing to nodes
+#include "node_visuals.h"    // claude_volume: per-nodetype minimap_color
 #include "nodemetadata.h"
 #include "particles.h"
 #include "porting.h"
@@ -135,6 +136,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_up_pixel{"volumeCamUp"};
+	CachedPixelShaderSetting<float, 3> m_volume_sun_dir_pixel{"volumeSunDir"};
 	float m_volume_debug;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
@@ -327,6 +329,14 @@ public:
 				m_volume_cam_fwd_pixel.set(fwd, services);
 				m_volume_cam_right_pixel.set(right, services);
 				m_volume_cam_up_pixel.set(up, services);
+				// Shadow rays march toward the real sky sun (directions are
+				// offset-independent, so world axes = volume axes); fixed
+				// high-noon-ish fallback when the sun is down or sky unset.
+				v3f sun(0.35f, 0.75f, 0.5f);
+				if (m_sky && m_sky->getSunVisible())
+					sun = m_sky->getSunDirection();
+				sun.normalize();
+				m_volume_sun_dir_pixel.set(sun, services);
 			}
 		}
 
@@ -611,7 +621,11 @@ static void claudeVolumeSnapshot(Client *client)
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
 	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
 	Map &map = client->getEnv().getMap();
-	std::vector<u8> occ(S * S * S);
+	const NodeDefManager *ndef = client->getNodeDefManager();
+	// RGBA per cell: rgb = the node type's average color (same one the
+	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
+	// reflection rays can recognize it), 255 solid.
+	std::vector<u8> occ(S * S * S * 4);
 	u32 solid = 0;
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
@@ -619,10 +633,17 @@ static void claudeVolumeSnapshot(Client *client)
 	for (s16 x = 0; x < S; x++, i++) {
 		MapNode n = map.getNode(origin + v3s16(x, y, z));
 		content_t c = n.getContent();
-		if (c != CONTENT_AIR && c != CONTENT_IGNORE) {
-			occ[i] = 255;
-			solid++;
-		}
+		if (c == CONTENT_AIR || c == CONTENT_IGNORE)
+			continue;
+		const ContentFeatures &f = ndef->get(c);
+		video::SColor col(255, 180, 180, 180);
+		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
+			col = f.visuals->minimap_color;
+		occ[i * 4 + 0] = col.getRed();
+		occ[i * 4 + 1] = col.getGreen();
+		occ[i * 4 + 2] = col.getBlue();
+		occ[i * 4 + 3] = f.isLiquid() ? 128 : 255;
+		solid++;
 	}
 	if (!g_claude_volume.tex)
 		glGenTextures(1, &g_claude_volume.tex);
@@ -633,9 +654,7 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	// GL_LUMINANCE8: the GL 2.1-era single-channel format; replicates
-	// into .rgb on sample, so the shader's .r read works unchanged.
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, S, S, S, 0, GL_LUMINANCE,
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, S, S, S, 0, GL_RGBA,
 			GL_UNSIGNED_BYTE, occ.data());
 	glActiveTexture(GL_TEXTURE0);
 	g_claude_volume.origin = origin;
