@@ -148,8 +148,31 @@ vec3 microRot(vec3 sc, float r)
 	return vec3(15.0 - sc.z, sc.y, sc.x);
 }
 
+// A face pressed against another solid block must NOT stay carved, or
+// every pair of neighbours leaves a trench between them. Fill the rind
+// on interface faces so walls read as continuous stone and only exposed
+// faces keep their relief. nbNeg/nbPos: 1 where that neighbour is solid.
+bool microSolid(float slot, vec3 sc, float rot, vec3 nbNeg, vec3 nbPos)
+{
+	if (microOcc(slot, microRot(sc, rot)))
+		return true;
+	const float RIND = 2.0;
+	// Fill ONLY where every face whose rind this sub-voxel lies in is an
+	// interface. If it also lies in an EXPOSED face's rind, leave it
+	// carved — otherwise each block grows an uncarved border strip on its
+	// visible face and the wall reads as framed tiles.
+	bool exposed = false, iface = false;
+	if (sc.x < RIND) { if (nbNeg.x > 0.5) iface = true; else exposed = true; }
+	if (sc.x > 15.0 - RIND) { if (nbPos.x > 0.5) iface = true; else exposed = true; }
+	if (sc.y < RIND) { if (nbNeg.y > 0.5) iface = true; else exposed = true; }
+	if (sc.y > 15.0 - RIND) { if (nbPos.y > 0.5) iface = true; else exposed = true; }
+	if (sc.z < RIND) { if (nbNeg.z > 0.5) iface = true; else exposed = true; }
+	if (sc.z > 15.0 - RIND) { if (nbPos.z > 0.5) iface = true; else exposed = true; }
+	return iface && !exposed;
+}
+
 bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
-		out vec3 hitLocal, out vec3 hitNormal)
+		vec3 nbNeg, vec3 nbPos, out vec3 hitLocal, out vec3 hitNormal)
 {
 	vec3 p = clamp(lo, 0.0, 0.99999) * 16.0;
 	vec3 cell = floor(p);
@@ -161,7 +184,7 @@ bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
 	for (int i = 0; i < 26; i++) {
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
 			return false;                      // left the cell: real gap
-		if (microOcc(slot, microRot(cell, rot))) {
+		if (microSolid(slot, cell, rot, nbNeg, nbPos)) {
 			hitLocal = (p + rd * t) / 16.0;
 			hitNormal = vec3(0.0);
 			if (axis == 0) hitNormal.x = -stepDir.x;
@@ -182,6 +205,19 @@ bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
 }
 
 // visibility toward the (jittered) light direction: 1 lit, 0 blocked
+void microNeighbours(vec3 cell, out vec3 nbNeg, out vec3 nbPos)
+{
+	const float S = 128.0;
+	nbNeg = vec3(
+		texture3D(claudeVolume, (cell + vec3(-0.5, 0.5, 0.5)) / S).a > 0.9 ? 1.0 : 0.0,
+		texture3D(claudeVolume, (cell + vec3(0.5, -0.5, 0.5)) / S).a > 0.9 ? 1.0 : 0.0,
+		texture3D(claudeVolume, (cell + vec3(0.5, 0.5, -0.5)) / S).a > 0.9 ? 1.0 : 0.0);
+	nbPos = vec3(
+		texture3D(claudeVolume, (cell + vec3(1.5, 0.5, 0.5)) / S).a > 0.9 ? 1.0 : 0.0,
+		texture3D(claudeVolume, (cell + vec3(0.5, 1.5, 0.5)) / S).a > 0.9 ? 1.0 : 0.0,
+		texture3D(claudeVolume, (cell + vec3(0.5, 0.5, 1.5)) / S).a > 0.9 ? 1.0 : 0.0);
+}
+
 float lightVis(vec3 ro, vec3 sd)
 {
 	const float S = 128.0;
@@ -216,15 +252,17 @@ float lightVis(vec3 ro, vec3 sd)
 			continue;
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && tcur < 12.0) {
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && tcur < 20.0) {
 			// micro material: shadow only if the sub-grid is actually hit
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			vec3 lentry = ro + sd * tcur - cell;
 			float rot1 = floor(fract(sin(dot(cell + volumeOrigin,
 					vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
+			vec3 nbN1, nbP1;
+			microNeighbours(cell, nbN1, nbP1);
 			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
-					floor(mslot + 0.5), rot1, mh, mn))
+					floor(mslot + 0.5), rot1, nbN1, nbP1, mh, mn))
 				return 0.0;
 			continue;
 		}
@@ -491,7 +529,7 @@ void main(void)
 			// micro-geometry cell: march the material's sub-voxel grid
 			bool microMiss = false;
 			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && microStrength > 0.0
-					&& t < 18.0) {
+					&& t < 32.0) {
 				vec3 nn0 = vec3(0.0);
 				if (axis == 0) nn0.x = -stepDir.x;
 				else if (axis == 1) nn0.y = -stepDir.y;
@@ -500,8 +538,10 @@ void main(void)
 				vec3 hl, hn;
 				float rot0 = floor(fract(sin(dot(cell + volumeOrigin,
 						vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
+				vec3 nbN0, nbP0;
+				microNeighbours(cell, nbN0, nbP0);
 				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
-						rd, floor(mid0 + 0.5), rot0, hl, hn)) {
+						rd, floor(mid0 + 0.5), rot0, nbN0, nbP0, hl, hn)) {
 					vec3 hp2 = cell + hl + hn * 0.01;
 					vec3 alb = pathAlbedo(s.rgb);
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
