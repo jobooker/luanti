@@ -1072,13 +1072,28 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 {
 	auto &vTypeDesc = getVertexTypeDescription(vType);
 	// TEMPORARY: narrow which GL call is invalid on core.
+	// TEMPORARY: terrain meshes have high primitive counts — log where the
+	// BIG draws actually land, and with what depth state.
+	// TEMPORARY: histogram of every 3D draw — how many, how big, into which
+	// framebuffer. Answers whether terrain is drawn at all under PP.
 	static int dbg = 0;
-	static GLint lastFbo = -99;
 	bool dbgOn = false;
-	if (Version.Spec == OpenGLSpec::Core && dbg < 14) {
+	if (Version.Spec == OpenGLSpec::Core) {
+		static int total = 0, big = 0, toZero = 0, toFbo = 0, bigToFbo = 0;
 		GLint f = 0;
 		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &f);
-		if (f != lastFbo) { lastFbo = f; dbgOn = true; dbg++; }
+		total++;
+		if (primitiveCount > 400) big++;
+		if (f == 0) toZero++; else toFbo++;
+		if (primitiveCount > 400 && f != 0) bigToFbo++;
+		if (total == 3000 && dbg == 0) {
+			dbg = 1;
+			char b[192];
+			snprintf(b, sizeof(b),
+				"[claude_hist] draws=%d big(>400prim)=%d toFbo0=%d toOtherFbo=%d bigToOtherFbo=%d",
+				total, big, toZero, toFbo, bigToFbo);
+			os::Printer::log(b, ELL_ERROR);
+		}
 	}
 	if (dbgOn) {
 		while (GL.GetError() != GL_NO_ERROR) {}
@@ -1102,10 +1117,9 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 		while (GL.GetError() != GL_NO_ERROR) {}
 		char b[192];
 		snprintf(b, sizeof(b),
-			"[claude_gl] err=0x%04x fbo=%d vp=%dx%d depthObj=%d depthType=0x%04x "
-			"depthTest=%d depthFunc=0x%04x depthMask=%d",
-			(unsigned)e, (int)fbo, (int)vp[2], (int)vp[3],
-			(int)dObj, (unsigned)dType, (int)dTest, (unsigned)dFunc, (int)dMask);
+			"[claude_gl] BIG prims=%u fbo=%d depthObj=%d depthTest=%d depthMask=%d cull=%d",
+			primitiveCount, (int)fbo, (int)dObj, (int)dTest, (int)dMask,
+			(int)(GL.IsEnabled(GL_CULL_FACE) ? 1 : 0));
 		os::Printer::log(b, ELL_ERROR);
 	}
 	GLenum indexSize = 0;
@@ -1840,8 +1854,32 @@ bool COpenGL3DriverBase::setRenderTargetEx(IRenderTarget *target, u16 clearFlag,
 	if (target) {
 		COpenGL3RenderTarget *renderTarget = static_cast<COpenGL3RenderTarget *>(target);
 
+		{
+			static int n = 0;
+			if (n < 10) {
+				n++;
+				GLint before = 0;
+				GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &before);
+				char b[160];
+				snprintf(b, sizeof(b), "[claude_rt] setRT bufferID=%u glBound(before)=%d",
+					(unsigned)renderTarget->getBufferID(), (int)before);
+				os::Printer::log(b, ELL_ERROR);
+			}
+		}
 		CacheHandler->setFBO(renderTarget->getBufferID());
 		renderTarget->update();
+		{
+			static int n2 = 0;
+			if (n2 < 10) {
+				n2++;
+				GLint after = 0;
+				GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &after);
+				char b[160];
+				snprintf(b, sizeof(b), "[claude_rt] setRT bufferID=%u glBound(after)=%d",
+					(unsigned)renderTarget->getBufferID(), (int)after);
+				os::Printer::log(b, ELL_ERROR);
+			}
+		}
 
 		destRenderTargetSize = renderTarget->getSize();
 

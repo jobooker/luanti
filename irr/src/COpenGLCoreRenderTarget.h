@@ -112,6 +112,22 @@ public:
 			RequestTextureUpdate = true;
 		}
 
+		// TEMPORARY diagnostic: why does the 3D scene target get no depth?
+		{
+			static int n = 0;
+			if (n < 8) {
+				n++;
+				char b[192];
+				snprintf(b, sizeof(b),
+					"[claude_rt] setTextures nTex=%u depthPtr=%p same=%d fmt=%d isDepth=%d",
+					numTextures, (void *)depthStencil,
+					(int)(DepthStencil == depthStencil),
+					depthStencil ? (int)depthStencil->getColorFormat() : -1,
+					depthStencil ? (int)IImage::isDepthFormat(depthStencil->getColorFormat()) : -1);
+				os::Printer::log(b, ELL_ERROR);
+			}
+		}
+
 		// Set depth and stencil attachments.
 		if (DepthStencil != depthStencil) {
 			if (DepthStencil) {
