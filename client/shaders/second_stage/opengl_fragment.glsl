@@ -20,6 +20,8 @@ uniform vec2 texelSize0;
 uniform ExposureParams exposureParams;
 uniform lowp float bloomIntensity;
 uniform lowp float saturation;
+uniform lowp float dayNightRatio;
+uniform lowp float goldenHourStrength;
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -144,6 +146,16 @@ void main(void)
 #endif
 
 		color.rgb = applySaturation(color.rgb, saturation);
+
+		// Golden hour: warm the whole frame through dawn/dusk transitions,
+		// keyed to the engine's day-night ratio. Zero at full day and full
+		// night; golden_hour_strength setting scales it (0 disables).
+		if (goldenHourStrength > 0.0) {
+			float g = smoothstep(0.30, 0.60, dayNightRatio)
+				* (1.0 - smoothstep(0.85, 0.97, dayNightRatio));
+			vec3 warm = vec3(1.12, 1.03, 0.88);
+			color.rgb *= mix(vec3(1.0), warm, g * goldenHourStrength);
+		}
 	}
 
 #ifdef ENABLE_DITHERING
