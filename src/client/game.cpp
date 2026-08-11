@@ -934,7 +934,23 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 						+ (t2 & 0xFF) * 0.11f) / 255.0f;
 				h[y][x] = l;
 			}
-		const int CARVE = 5; // max sub-voxels removed from a face
+		// Normalise so the tile's brightest texels sit FLUSH with the cell
+		// boundary and only darker ones recede. Without this, a mid-tone
+		// tile carves every face inward and the block reads as a small
+		// stone floating inside an invisible 1 m shell.
+		if (have) {
+			float hmax = 0.0f, hmin = 1.0f;
+			for (int y = 0; y < 16; y++)
+				for (int x = 0; x < 16; x++) {
+					hmax = std::max(hmax, h[y][x]);
+					hmin = std::min(hmin, h[y][x]);
+				}
+			float span = std::max(hmax - hmin, 0.05f);
+			for (int y = 0; y < 16; y++)
+				for (int x = 0; x < 16; x++)
+					h[y][x] = std::clamp((h[y][x] - hmin) / span, 0.0f, 1.0f);
+		}
+		const int CARVE = 3; // max sub-voxels removed from a face
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
@@ -952,6 +968,16 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			if (15 - z < dPZ) solid = false;
 			int dNZ = (int)((1.0f - h[15 - y][15 - x]) * CARVE + 0.5f);
 			if (z < dNZ) solid = false;
+			// Real chamfer: cobblestone-style tiles are bright at their
+			// borders, so the six-face carve leaves an uncarved rim and
+			// every cell reads as a framed tile. Remove the 12 cube edges
+			// (one sub-voxel deep) so blocks meet as chamfered solids.
+			int ex = (x == 0 || x == 15) ? 1 : 0;
+			int ey = (y == 0 || y == 15) ? 1 : 0;
+			int ez = (z == 0 || z == 15) ? 1 : 0;
+			if (ex + ey + ez >= 2)
+				solid = false;
+
 			int ax2 = (mid % 16) * 16 + x;
 			int ay2 = (mid / 16) * 16 + y;
 			g_claude_volume.micro[(z * 256 + ay2) * 256 + ax2] = solid ? 255 : 0;

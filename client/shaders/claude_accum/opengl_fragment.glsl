@@ -136,7 +136,19 @@ bool microOcc(float slot, vec3 sc)
 	return texture3D(claudeMicro, uv3).r > 0.5;
 }
 
-bool microDDA(vec3 lo, vec3 rd, float slot, out vec3 hitLocal, out vec3 hitNormal)
+// Per-cell rotation: four yaw orientations chosen by a position hash, so
+// neighbouring blocks never share a pattern (the tell that made cells
+// read as a repeating frame).
+vec3 microRot(vec3 sc, float r)
+{
+	if (r < 1.0) return sc;
+	if (r < 2.0) return vec3(sc.z, sc.y, 15.0 - sc.x);
+	if (r < 3.0) return vec3(15.0 - sc.x, sc.y, 15.0 - sc.z);
+	return vec3(15.0 - sc.z, sc.y, sc.x);
+}
+
+bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
+		out vec3 hitLocal, out vec3 hitNormal)
 {
 	vec3 p = clamp(lo, 0.0, 0.99999) * 16.0;
 	vec3 cell = floor(p);
@@ -148,7 +160,7 @@ bool microDDA(vec3 lo, vec3 rd, float slot, out vec3 hitLocal, out vec3 hitNorma
 	for (int i = 0; i < 48; i++) {
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
 			return false;                      // left the cell: real gap
-		if (microOcc(slot, cell)) {
+		if (microOcc(slot, microRot(cell, rot))) {
 			hitLocal = (p + rd * t) / 16.0;
 			hitNormal = vec3(0.0);
 			if (axis == 0) hitNormal.x = -stepDir.x;
@@ -208,8 +220,10 @@ float lightVis(vec3 ro, vec3 sd)
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			vec3 lentry = ro + sd * tcur - cell;
+			float rot1 = floor(fract(sin(dot(cell, vec3(41.3, 289.1, 77.7)))
+					* 21311.7) * 4.0);
 			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
-					floor(mslot + 0.5), mh, mn))
+					floor(mslot + 0.5), rot1, mh, mn))
 				return 0.0;
 			continue;
 		}
@@ -481,8 +495,10 @@ void main(void)
 				else nn0.z = -stepDir.z;
 				float mid0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 				vec3 hl, hn;
+				float rot0 = floor(fract(sin(dot(cell, vec3(41.3, 289.1, 77.7)))
+						* 21311.7) * 4.0);
 				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
-						rd, floor(mid0 + 0.5), hl, hn)) {
+						rd, floor(mid0 + 0.5), rot0, hl, hn)) {
 					vec3 hp2 = cell + hl + hn * 0.01;
 					vec3 alb = pathAlbedo(s.rgb);
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
