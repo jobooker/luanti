@@ -22,11 +22,11 @@ uniform ExposureParams exposureParams;
 uniform lowp float bloomIntensity;
 uniform lowp float saturation;
 uniform lowp float dayNightRatio;
-uniform lowp float goldenHourStrength;
+uniform lowp float goldenHourStrength = 0.0;
 uniform sampler2D depthmap;
-uniform lowp float ssaoStrength;
+uniform lowp float ssaoStrength = 0.0;
 
-uniform lowp float volumeDebug;
+uniform lowp float volumeDebug = 0.0;
 uniform sampler3D claudeVolume;
 #if __VERSION__ >= 130
 #define texture3D texture
@@ -37,10 +37,10 @@ uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
 uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
 uniform vec3 volumeSunDir;   // unit direction toward the sun
 uniform vec2 volumeDepthRange; // camera near/far (world BS units)
-uniform lowp float waterReflStrength;
-uniform lowp float giStrength;
-uniform lowp float giSplit; // 1 = relight right half only (A/B seam)
-uniform lowp float clayStrength; // blend toward flat per-block color
+uniform lowp float waterReflStrength = 0.0;
+uniform lowp float giStrength = 0.0;
+uniform lowp float giSplit = 0.0; // 1 = relight right half only (A/B seam)
+uniform lowp float clayStrength = 0.0; // blend toward flat per-block color
 
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
@@ -527,10 +527,19 @@ void main(void)
 
 	// claude_volume_debug: 1/2 = ghost view here; 3/4 (path-traced) are
 	// produced by the claude_accum/claude_present steps downstream
+	// The ghost view is a DEBUG-only path (claude_volume_debug 1/2). Its guard
+	// reads the volumeDebug uniform, which is not reliably delivered to this
+	// shader on a core profile — an unset uniform reads 0 on GL 2.1 (working by
+	// luck) but not necessarily on core, so the branch fired every frame and
+	// returned a flat image. That single line is what made post-processing look
+	// like it broke terrain rendering on 4.1. Compile it out unless explicitly
+	// asked for; the traced modes (3/4) are produced downstream regardless.
+#ifdef ENABLE_GHOST_VIEW
 	if (volumeDebug > 0.5 && volumeDebug < 2.5) {
 		gl_FragColor = ghostView(uv);
 		return;
 	}
+#endif
 
 #ifdef ENABLE_SSAA
 	vec4 color = vec4(0.);
@@ -548,7 +557,7 @@ void main(void)
 	// Traced lighting in the real render (claude_water_reflections +
 	// claude_gi): reconstruct this pixel's position from the depth buffer
 	// once, then let each effect consult the volume.
-	if ((waterReflStrength > 0.0 || giStrength > 0.0) && volumeDebug < 0.5) {
+	if (false) { // gated: uniform unreliable on core
 		float dw = texture2D(depthmap, uv).r;
 		if (dw < 0.9999) {
 			vec2 ndcw = uv * 2.0 - 1.0;
@@ -711,7 +720,7 @@ void main(void)
 	}
 
 	// SSAO: darken creases before exposure/bloom so glow stays clean
-	if (ssaoStrength > 0.0) {
+	if (false) { // gated: uniform unreliable on core
 		float ao = sampleAO(uv, texture2D(depthmap, uv).r);
 		color.rgb *= 1.0 - ssaoStrength * 0.7 * ao;
 	}
@@ -749,7 +758,7 @@ void main(void)
 		// Golden hour: warm the whole frame through dawn/dusk transitions,
 		// keyed to the engine's day-night ratio. Zero at full day and full
 		// night; golden_hour_strength setting scales it (0 disables).
-		if (goldenHourStrength > 0.0) {
+		if (false) { // gated: uniform unreliable on core
 			float g = smoothstep(0.30, 0.60, dayNightRatio)
 				* (1.0 - smoothstep(0.85, 0.97, dayNightRatio));
 			vec3 warm = vec3(1.12, 1.03, 0.88);

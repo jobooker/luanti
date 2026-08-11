@@ -165,24 +165,24 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_ssao_strength;
 	CachedPixelShaderSetting<float> m_bump_strength_pixel{"bumpStrength"};
 	float m_bump_strength;
-	CachedPixelShaderSetting<SamplerLayer_t> m_volume_sampler_pixel{"claudeVolume"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_volume_sampler_pixel{"claudeVolume"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
-	CachedPixelShaderSetting<SamplerLayer_t> m_micro_sampler_pixel{"claudeMicro"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_micro_sampler_pixel{"claudeMicro"};
 	CachedPixelShaderSetting<float, 3> m_volume_origin_pixel{"volumeOrigin"};
-	CachedPixelShaderSetting<float> m_texture_amount_pixel{"textureAmount"};
-	CachedPixelShaderSetting<float> m_bevel_pixel{"bevelStrength"};
-	CachedPixelShaderSetting<float> m_relief_pixel{"reliefStrength"};
-	CachedPixelShaderSetting<float> m_parallax_pixel{"parallaxStrength"};
-	CachedPixelShaderSetting<float> m_jitter_pixel{"jitterStrength"};
-	CachedPixelShaderSetting<float> m_micro_pixel{"microStrength"};
-	CachedPixelShaderSetting<float> m_skybounce_pixel{"skyBounce"};
-	CachedPixelShaderSetting<float> m_sunangle_pixel{"sunAngle"};
-	CachedPixelShaderSetting<float> m_nightsky_pixel{"nightSkyGain"};
+	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
+	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_parallax_pixel{"parallaxStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_jitter_pixel{"jitterStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_micro_pixel{"microStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_skybounce_pixel{"skyBounce"};
+	CachedPixelShaderSetting<float, 1, false> m_sunangle_pixel{"sunAngle"};
+	CachedPixelShaderSetting<float, 1, false> m_nightsky_pixel{"nightSkyGain"};
 	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
-	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
+	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
@@ -217,7 +217,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3>
 		m_moon_position_pixel{"moonPositionScreen"};
 	CachedPixelShaderSetting<float> m_moon_brightness_pixel{"moonBrightness"};
-	CachedPixelShaderSetting<float>
+	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
 	static constexpr std::array<const char*, 19> SETTING_CALLBACKS = {
