@@ -354,6 +354,15 @@ float lightVis(vec3 ro, vec3 sd)
 }
 
 // radiance arriving from direction rd: sky on genuine exit, sun-lit
+// Forward declaration: emitterLight is defined further down (it needs
+// emitterVis, which needs microDDA), but bounceRay must reach it so that
+// TORCHLIGHT BOUNCES. Without this a bounce ray only ever relayed sun and
+// sky, so a torch lit exactly what it could see directly and nothing else —
+// no warm spill onto adjacent walls, no glow around a corner. That is most
+// of why a lit cabin interior still read as flat.
+vec3 emitterLight(vec3 hp, vec3 n);
+vec3 emitterLightOne(vec3 hp, vec3 n);
+
 // one-bounce on hit, darkness otherwise (sd = jittered light direction)
 vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 {
@@ -428,6 +437,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				float ndlm = max(dot(mn, sd), 0.0);
 				if (ndlm > 0.0)
 					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
+				litm += emitterLightOne(hpm, mn);  // torchlight bounces
 				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
@@ -456,6 +466,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			float ndl = max(dot(n, sd), 0.0);
 			if (ndl > 0.0)
 				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+			lit += emitterLightOne(hp, n);       // torchlight bounces
 			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}
@@ -496,7 +507,11 @@ vec4 getEmitter(int i)
 
 // visibility toward a nearby emitter: DDA capped just short of it, so
 // the emitter itself doesn't occlude its own light
-float emitterVis(vec3 ro, vec3 ld, float maxT)
+// allowMicro: primary hits march the sub-grid so a torch shadows honestly
+// through carved stone. BOUNCE rays pass 0 — indirect light is low-frequency
+// and cube-accurate occlusion is indistinguishable there, while the nested
+// DDA per emitter ray is not: it cost 54 -> 14 fps.
+float emitterVis(vec3 ro, vec3 ld, float maxT, float allowMicro)
 {
 	const float S = 128.0;
 	vec3 cell = floor(ro);
@@ -522,7 +537,7 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 		// respected the sub-voxels while emitterVis did not, so a torch cast a
 		// hard 1 m shadow onto surfaces the carve actually leaves open — the
 		// boundary shadow that grew with distance from the lamp.
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0) {
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && allowMicro > 0.5 && t < 20.0) {
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			float rotE = fract(sin(dot(cell + volumeOrigin,
@@ -543,6 +558,36 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 // Next-event estimation: aimed contribution from the nearest emitters.
 // The fix for John's lopsided torch pools — light no longer waits for a
 // random ambient ray to stumble into the torch.
+// Stochastic NEE for BOUNCE rays: sample ONE emitter and weight by the count,
+// rather than all eight each with its own visibility ray. Temporal
+// accumulation averages the choice back out, so the converged image matches
+// the full sum at an eighth of the cost — the full emitterLight() stays on
+// primary hits, where single-sample noise would be most visible.
+// Measured: bouncing torchlight with the full loop cost 54 -> 14 fps.
+vec3 emitterLightOne(vec3 hp, vec3 n)
+{
+	if (claudeEmitterCount < 0.5)
+		return vec3(0.0);
+	// re-pick every frame so accumulation sees all emitters over time
+	float r = fract(sin(dot(hp, vec3(12.9898, 78.233, 37.719))
+			+ animationTimer * 7.31) * 43758.5453);
+	int pick = int(min(floor(r * claudeEmitterCount), claudeEmitterCount - 1.0));
+	vec4 em = getEmitter(pick);
+	vec3 L = em.xyz - hp;
+	float d2 = dot(L, L);
+	if (d2 > 625.0)
+		return vec3(0.0);
+	float dist = max(sqrt(d2), 0.8);
+	vec3 ld = L / dist;
+	float ndl = max(dot(n, ld), 0.0);
+	if (ndl <= 0.0)
+		return vec3(0.0);
+	float vis = emitterVis(hp, ld, dist - 0.9, 0.0);
+	return vec3(1.0, 0.72, 0.42)
+			* (em.w * em.w * 10.0 * ndl * vis / max(d2, 1.0))
+			* claudeEmitterCount;
+}
+
 vec3 emitterLight(vec3 hp, vec3 n)
 {
 	vec3 acc = vec3(0.0);
@@ -559,7 +604,7 @@ vec3 emitterLight(vec3 hp, vec3 n)
 		float ndl = max(dot(n, ld), 0.0);
 		if (ndl <= 0.0)
 			continue;
-		float vis = emitterVis(hp, ld, dist - 0.9);
+		float vis = emitterVis(hp, ld, dist - 0.9, 1.0);
 		acc += vec3(1.0, 0.72, 0.42)
 				* (em.w * em.w * 10.0 * ndl * vis / max(d2, 1.0));
 	}
