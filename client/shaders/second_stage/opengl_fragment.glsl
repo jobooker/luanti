@@ -447,7 +447,11 @@ void main(void)
 						abs(nrm.y) < 0.9 ? vec3(0.0, 1.0, 0.0)
 								: vec3(1.0, 0.0, 0.0)));
 				vec3 t2 = cross(nrm, t1);
-				vec3 ro3 = p + nrm * 0.05;
+				// 0.6-cell bias: depth-reconstructed positions carry
+				// view-dependent noise; a small offset leaves ray origins
+				// flickering in/out of the surface cell (shadow acne
+				// crawling as the camera moves). Stay above the noise.
+				vec3 ro3 = p + nrm * 0.6;
 				vec3 d1 = normalize(nrm * 0.8 + t1 * 0.6);
 				vec3 d2 = normalize(nrm * 0.8 - t1 * 0.6);
 				vec3 d3 = normalize(nrm * 0.8 + t2 * 0.6);
