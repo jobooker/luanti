@@ -294,8 +294,17 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	static const u8 TEXTURE_ACCUM_1 = 30;
 	static const u8 TEXTURE_ACCUM_2 = 31;
 	static const u8 TEXTURE_MERGED = 32;
-	buffer->setTexture(TEXTURE_ACCUM_1, scale * 0.5f, "claude_accum_1", color_format);
-	buffer->setTexture(TEXTURE_ACCUM_2, scale * 0.5f, "claude_accum_2", color_format);
+	// Trace resolution, relative to the render target. 0.5 was chosen on a
+	// retina laptop, where a 2x backing store downsampled the result and gave
+	// free supersampling; on a plain 1080p external monitor the same 0.5 is
+	// simply half the pixels you look at, and the scene reads soft while the
+	// full-res UI over it stays crisp. Read at pipeline construction, so a
+	// change needs a client restart.
+	float trace_scale = 0.5f;
+	if (g_settings->exists("claude_trace_scale"))
+		trace_scale = rangelim(g_settings->getFloat("claude_trace_scale"), 0.25f, 1.0f);
+	buffer->setTexture(TEXTURE_ACCUM_1, scale * trace_scale, "claude_accum_1", color_format);
+	buffer->setTexture(TEXTURE_ACCUM_2, scale * trace_scale, "claude_accum_2", color_format);
 	buffer->setTexture(TEXTURE_MERGED, scale, "claude_merged", color_format);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
@@ -309,7 +318,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// edge-aware spatial denoise on the display path only — history
 	// accumulates raw, so the filter never compounds
 	static const u8 TEXTURE_DENOISED = 33;
-	buffer->setTexture(TEXTURE_DENOISED, scale * 0.5f, "claude_denoised", color_format);
+	buffer->setTexture(TEXTURE_DENOISED, scale * trace_scale, "claude_denoised", color_format);
 	shader_id = client->getShaderSource()->getShaderRaw("claude_denoise");
 	PostProcessingStep *denoise = pipeline->addStep<PostProcessingStep>(shader_id,
 			std::vector<u8> { TEXTURE_ACCUM_2 });
