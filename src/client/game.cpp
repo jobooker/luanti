@@ -81,6 +81,7 @@ struct ClaudeVolume
 	v3s16 origin; // node coords of voxel (0,0,0)
 	bool valid = false;
 	u64 last_snap_ms = 0;
+	u64 content_hash = 0;
 	// temporal accumulation state (updated once per frame)
 	v3f prev_cam_pos;
 	v3f prev_cam_dir;
@@ -740,6 +741,8 @@ static void claudeVolumeSnapshot(Client *client)
 	std::vector<u8> occ(S * S * S * 4);
 	std::vector<u8> coarse(32 * 32 * 32, 0);
 	u32 solid = 0;
+	u64 hash = 14695981039346656037ULL ^ (u64)origin.X
+			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
 	for (s16 y = 0; y < S; y++)
@@ -752,6 +755,14 @@ static void claudeVolumeSnapshot(Client *client)
 		video::SColor col(255, 180, 180, 180);
 		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
 			col = f.visuals->minimap_color;
+		// emissive nodes: mostly-transparent textures (torches) average
+		// to near-black, making their glow black x bright = invisible.
+		// Force a warm emitter color.
+		if (f.light_source > 0) {
+			col.setRed(255);
+			col.setGreen(std::max((u32)col.getGreen(), 200u));
+			col.setBlue(std::max((u32)col.getBlue(), 120u));
+		}
 		occ[i * 4 + 0] = col.getRed();
 		occ[i * 4 + 1] = col.getGreen();
 		occ[i * 4 + 2] = col.getBlue();
@@ -768,8 +779,16 @@ static void claudeVolumeSnapshot(Client *client)
 			acls = 130;
 		occ[i * 4 + 3] = acls;
 		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
+		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
 		solid++;
 	}
+	// world unchanged since the last snapshot: skip the upload and — key
+	// for image stability — do NOT disturb the converged accumulation
+	if (g_claude_volume.valid && hash == g_claude_volume.content_hash) {
+		g_claude_volume.last_snap_ms = porting::getTimeMs();
+		return;
+	}
+	g_claude_volume.content_hash = hash;
 	if (!g_claude_volume.tex)
 		glGenTextures(1, &g_claude_volume.tex);
 	glActiveTexture(GL_TEXTURE4);

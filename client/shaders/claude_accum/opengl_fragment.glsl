@@ -77,7 +77,8 @@ vec3 pathAlbedo(vec3 raw)
 	float lum = dot(a, vec3(0.2126, 0.7152, 0.0722));
 	if (lum < 0.16)
 		a *= 0.16 / max(lum, 0.02);
-	return a;
+	// additive floor: multiplicative lift can't rescue pure black
+	return max(a, vec3(0.04));
 }
 
 vec3 pathSkyRadiance(vec3 rd)
@@ -357,9 +358,11 @@ void main(void)
 		float tExp = min(length(W - (prevCamPos + 0.5)), 200.0);
 		bool skyMatch = tHit >= 199.5 && tPrev >= 190.0;
 		if (skyMatch || abs(tPrev - tExp) < 1.5) {
-			// clamp history's drift from the current sample: bounds the
-			// compounding resample error that melts edges into mush
-			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.3), vec3(0.3));
+			// clamp history's drift while moving (bounds resample mush) —
+			// but NOT when deeply converged: yanking settled history
+			// toward each frame's noise was itself a pulse source
+			float band = accumAlpha < 0.1 ? 4.0 : 0.3;
+			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-band), vec3(band));
 			a = accumAlpha;
 		} else {
 			// depth mismatch = aliased edge flipping under subpixel
