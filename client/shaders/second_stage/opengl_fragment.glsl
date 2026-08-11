@@ -452,16 +452,17 @@ void main(void)
 				// relight collapses to pure ambient after dusk.
 				float dayL = clamp((dayNightRatio - 0.3) / 0.4, 0.0, 1.0);
 				float ndl = max(dot(nrm, volumeSunDir), 0.0);
-				float direct = ndl > 0.02
-						? ndl * volumeShadow(ro3) : 0.0;
-				vec3 relight = m * mix(1.0, 0.55, dayL)
-						+ vec3(direct * 0.65 * dayL);
-				// Compress toward 1: the raster image already encodes
-				// occlusion (light propagation + shadow maps), so a raw
-				// multiply double-counts darkness and crushes canopy
-				// interiors to black. pow < 1 keeps the light/dark
-				// ordering (the depth cue) while lifting the floor.
-				relight = pow(clamp(relight, 0.0, 1.6), vec3(0.55));
+				// volumeShadow's 0.45 floor suits the ghost view, but
+				// for relighting it makes shadows read ~18% dimmer than
+				// sun — imperceptible. Remap: shadowed = 12% of direct.
+				float shraw = ndl > 0.02 ? volumeShadow(ro3) : 0.0;
+				float direct = ndl * (shraw > 0.9 ? 1.0 : 0.12);
+				vec3 relight = m * mix(1.0, 0.45, dayL)
+						+ vec3(direct * 0.8 * dayL);
+				// Mild compression: the raster already encodes occlusion,
+				// so a raw multiply crushes interiors — but too much
+				// compression (0.55 tried) flattens the whole effect.
+				relight = pow(clamp(relight, 0.0, 1.6), vec3(0.7));
 				color.rgb *= mix(vec3(1.0), relight, giStrength);
 			}
 		}
