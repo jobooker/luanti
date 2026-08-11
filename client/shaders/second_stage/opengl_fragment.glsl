@@ -40,6 +40,7 @@ uniform vec2 volumeDepthRange; // camera near/far (world BS units)
 uniform lowp float waterReflStrength;
 uniform lowp float giStrength;
 uniform lowp float giSplit; // 1 = relight right half only (A/B seam)
+uniform lowp float clayStrength; // blend toward flat per-block color
 
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
@@ -391,6 +392,24 @@ void main(void)
 			bool inVol = all(greaterThanEqual(wcell, vec3(0.0)))
 					&& all(lessThan(wcell, vec3(128.0)));
 			bool isWater = false;
+
+			// Clay mode: blend the textured surface toward its flat
+			// per-block color, the ghost-view/Teardown look — geometry
+			// and traced lighting carry the depth instead of texture
+			// noise. Sample slightly inside the surface along the view
+			// ray so side faces pick their own block, not the air cell.
+			if (inVol && clayStrength > 0.0
+					&& (giSplit < 0.5 || uv.x > 0.5)) {
+				vec3 ccell = floor(p + normalize(vdir) * 0.1
+						- vec3(0.0, 0.02, 0.0));
+				if (all(greaterThanEqual(ccell, vec3(0.0)))
+						&& all(lessThan(ccell, vec3(128.0)))) {
+					vec4 cv = texture3D(claudeVolume, (ccell + 0.5) / 128.0);
+					if (cv.a > 0.25)
+						color.rgb = mix(color.rgb,
+								pow(cv.rgb, vec3(2.2)), clayStrength);
+				}
+			}
 
 			// Water reflections: if this pixel is a tagged water cell,
 			// reflect the view ray about +Y and march it.

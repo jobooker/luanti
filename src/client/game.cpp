@@ -141,10 +141,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
 	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
+	CachedPixelShaderSetting<float> m_clay_pixel{"clayStrength"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
 	float m_gi_split;
+	float m_clay;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -155,7 +157,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 8> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 9> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -164,6 +166,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_water_reflections",
 		"claude_gi",
 		"claude_gi_split",
+		"claude_clay",
 	};
 
 	static float readGoldenHourStrength()
@@ -217,6 +220,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_gi_split", 0.0f, 1.0f);
 	}
 
+	static float readClay()
+	{
+		if (!g_settings->exists("claude_clay"))
+			return 0.0f;
+		// blend surfaces toward flat per-block color (ghost/Teardown look)
+		return g_settings->getFloat("claude_clay", 0.0f, 1.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -236,6 +247,8 @@ public:
 			m_gi_strength = readGiStrength();
 		if (name == "claude_gi_split")
 			m_gi_split = readGiSplit();
+		if (name == "claude_clay")
+			m_clay = readClay();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -260,6 +273,7 @@ public:
 		m_water_reflections = readWaterReflections();
 		m_gi_strength = readGiStrength();
 		m_gi_split = readGiSplit();
+		m_clay = readClay();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -356,7 +370,9 @@ public:
 			float gi = g_claude_volume.valid ? m_gi_strength : 0.0f;
 			m_gi_strength_pixel.set(&gi, services);
 			m_gi_split_pixel.set(&m_gi_split, services);
-			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f) {
+			float clay = g_claude_volume.valid ? m_clay : 0.0f;
+			m_clay_pixel.set(&clay, services);
+			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
 				Camera *camera = m_client->getCamera();
@@ -741,7 +757,8 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 				|| g_settings->getFloat("claude_volume_follow", 0.0f, 1.0f) > 0.0f;
 		bool consumer_on = setting_on("claude_volume_debug")
 				|| setting_on("claude_water_reflections")
-				|| setting_on("claude_gi");
+				|| setting_on("claude_gi")
+				|| setting_on("claude_clay");
 		if (follow && !g_claude_volume.valid && consumer_on) {
 			claudeVolumeSnapshot(client);
 		} else if (follow && g_claude_volume.valid) {
