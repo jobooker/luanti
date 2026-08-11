@@ -15,6 +15,8 @@ uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
 uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
+uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
+uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -396,6 +398,27 @@ void main(void)
 				hp += tj - n * dot(tj, n); // jitter within the face plane
 				vec3 albedo = volumeDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
+				// In-face hit position: the grid hands us exact UVs and,
+				// unlike triangle meshes, an EXACT constant tangent frame
+				// (the other two axes). Everything below rides on that.
+				vec3 hploc = ro + rd * t - cell;
+				vec2 fuv; vec3 udir, vdir;
+				if (axis == 0) { fuv = vec2(hploc.z, 1.0 - hploc.y);
+					udir = vec3(0.0, 0.0, 1.0); vdir = vec3(0.0, -1.0, 0.0); }
+				else if (axis == 1) { fuv = vec2(hploc.x, hploc.z);
+					udir = vec3(1.0, 0.0, 0.0); vdir = vec3(0.0, 0.0, 1.0); }
+				else { fuv = vec2(hploc.x, 1.0 - hploc.y);
+					udir = vec3(1.0, 0.0, 0.0); vdir = vec3(0.0, -1.0, 0.0); }
+				fuv = clamp(fuv, 0.001, 0.999);
+				// Analytic bevel: near a cell edge, tilt the normal toward
+				// the neighbouring face so cubes read as chamfered blocks
+				// (Teardown's rounded look) — no art, no height map.
+				if (bevelStrength > 0.0) {
+					vec2 e = (fuv - 0.5) * 2.0;             // -1..1
+					vec2 k = sign(e) * smoothstep(0.55, 1.0, abs(e));
+					n = normalize(n + (udir * k.x + vdir * k.y)
+							* bevelStrength);
+				}
 				// textured albedo: the DDA hit's position on the face IS
 				// its UV — the grid's free gift. Blend by the dial so
 				// texture can never fully bury the lighting.
@@ -403,15 +426,20 @@ void main(void)
 					float mid = texture3D(claudeMaterials,
 							(cell + 0.5) / S).r * 255.0;
 					if (mid > 0.5) {
-						vec3 hpl = ro + rd * t - cell;
-						vec2 uv2;
-						if (axis == 0) uv2 = vec2(hpl.z, 1.0 - hpl.y);
-						else if (axis == 1) uv2 = vec2(hpl.x, hpl.z);
-						else uv2 = vec2(hpl.x, 1.0 - hpl.y);
-						uv2 = clamp(uv2, 0.03, 0.97);
+						vec2 uv2 = clamp(fuv, 0.03, 0.97);
 						float slot = floor(mid + 0.5);
 						vec2 auv = (vec2(mod(slot, 16.0),
 								floor(slot / 16.0)) + uv2) / 16.0;
+						// micro relief: slope of the detail map perturbs
+						// the normal (texel-scale surface roughness)
+						if (reliefStrength > 0.0) {
+							float st = 1.0 / 256.0;
+							float l0 = dot(texture2D(claudeAtlas, auv).rgb, vec3(0.33));
+							float lu = dot(texture2D(claudeAtlas, auv + vec2(st, 0.0)).rgb, vec3(0.33));
+							float lv = dot(texture2D(claudeAtlas, auv + vec2(0.0, st)).rgb, vec3(0.33));
+							n = normalize(n - (udir * (lu - l0) + vdir * (lv - l0))
+									* reliefStrength * 22.0);
+						}
 						// atlas stores DETAIL/2 (texel / tile average):
 						// multiply the cell's own (palette-tinted) color,
 						// so texture adds variation without changing a
