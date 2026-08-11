@@ -19,6 +19,7 @@ uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
 uniform lowp float parallaxStrength; // march INTO the height field (0..1)
 uniform lowp float jitterStrength;   // per-block colour variation (Teardown)
+uniform lowp float microStrength;    // real micro-geometry depth (0..1)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -81,6 +82,7 @@ float cellTransmit(float a)
 	if (a > 0.50 && a < 0.53) return 0.55;  // leaves
 	if (a > 0.55 && a < 0.60) return 0.92;  // glass
 	if (a > 0.63 && a < 0.66) return 1.0;   // torch nub: too thin to shade
+	if (a > 0.97 && a < 0.99) return 0.0;   // micro material: solid enough
 	return 0.0;                              // opaque
 }
 
@@ -255,6 +257,47 @@ float atlasHeight(vec2 uv)
 	return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
 }
 
+// Micro-geometry: march the tile's height field INSIDE a cell. Unlike
+// parallax mapping this can miss entirely — the ray then continues on
+// through the cell, so gaps are real, silhouettes are real, and shadow
+// rays see the same shape. Height comes from the atlas alpha.
+// Micro-geometry wants BLOCKY height: nearest sample, quantised to a few
+// levels, so each texel is a flat-topped stone column. (Bilinear height
+// is right for relief maps and wrong here — it melts stones into dunes.)
+float atlasHeightBlocky(vec2 uv)
+{
+	float h = texture2D(claudeAtlas, uv).a;
+	return floor(h * 4.0 + 0.5) / 4.0;
+}
+
+bool microMarch(vec3 cell, vec3 entry, vec3 rd, vec3 nrm, float slot,
+		float depthScale, out vec3 hitLocal, out vec3 hitNormal)
+{
+	for (int i = 1; i <= 12; i++) {
+		vec3 pk = entry + rd * (float(i) * 0.085);
+		if (any(lessThan(pk, vec3(-0.001))) || any(greaterThan(pk, vec3(1.001))))
+			return false;                       // left the cell: real gap
+		float depth = dot(pk - entry, -nrm);
+		vec2 uvk;
+		if (abs(nrm.x) > 0.5) uvk = vec2(pk.z, 1.0 - pk.y);
+		else if (abs(nrm.y) > 0.5) uvk = vec2(pk.x, pk.z);
+		else uvk = vec2(pk.x, 1.0 - pk.y);
+		uvk = clamp(uvk, 0.07, 0.93);
+		vec2 auvk = (vec2(mod(slot, 16.0), floor(slot / 16.0)) + uvk) / 16.0;
+		float h = atlasHeightBlocky(auvk);
+		if (depth >= depthScale * (1.0 - h)) {
+			hitLocal = pk;
+			// flat column top: axis-aligned normal, so stones read as
+			// real cubic geometry rather than smooth relief
+			hitNormal = nrm;
+			return true;
+		}
+	}
+	hitLocal = entry;
+	hitNormal = nrm;
+	return true;
+}
+
 vec4 getEmitter(int i)
 {
 	if (i == 0) return claudeEmitter0;
@@ -410,6 +453,36 @@ void main(void)
 					break;
 				}
 				continue;
+			}
+			// micro-geometry cell: carve the cell with the height field
+			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && microStrength > 0.0) {
+				vec3 nn0 = vec3(0.0);
+				if (axis == 0) nn0.x = -stepDir.x;
+				else if (axis == 1) nn0.y = -stepDir.y;
+				else nn0.z = -stepDir.z;
+				float mid0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
+				vec3 hl, hn;
+				if (mid0 > 0.5 && microMarch(cell, ro + rd * t - cell, rd, nn0,
+						floor(mid0 + 0.5), microStrength * 0.4, hl, hn)) {
+					vec3 hp2 = cell + hl + hn * 0.01;
+					vec3 alb = pathAlbedo(s.rgb);
+					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
+							* 43758.5453);
+					alb *= 1.0 + (jh - 0.5) * 2.0 * jitterStrength;
+					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * 0.07);
+					float ndl2 = max(dot(hn, sd2), 0.0);
+					vec3 dir2 = ndl2 > 0.0
+							? vec3(ndl2 * lightVis(hp2, sd2)) * volumeLightCol
+							: vec3(0.0);
+					vec3 sp2 = normalize(rnd * 2.0 - 1.0);
+					vec3 ad2 = normalize(hn + sp2);
+					if (dot(ad2, hn) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, hn) * hn);
+					vec3 amb2 = bounceRay(hp2, ad2, sd2) * 1.15;
+					fresh = alb * (dir2 + amb2 + emitterLight(hp2, hn));
+					done = true;
+					break;
+				}
+				// no stone along this ray inside the cell: pass through
 			}
 			if (s.a > 0.25 && axis >= 0) {
 				// emissive primary hit: self-lit, no rays needed

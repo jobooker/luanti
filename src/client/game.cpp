@@ -169,7 +169,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float> m_parallax_pixel{"parallaxStrength"};
 	CachedPixelShaderSetting<float> m_jitter_pixel{"jitterStrength"};
-	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter;
+	CachedPixelShaderSetting<float> m_micro_pixel{"microStrength"};
+	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
 	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -208,7 +209,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 14> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 15> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -223,6 +224,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_relief",
 		"claude_parallax",
 		"claude_jitter",
+		"claude_micro",
 	};
 
 	static float readGoldenHourStrength()
@@ -314,6 +316,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_jitter", 0.0f, 1.0f);
 	}
 
+	static float readMicro()
+	{
+		if (!g_settings->exists("claude_micro"))
+			return 0.0f;
+		return g_settings->getFloat("claude_micro", 0.0f, 1.0f);
+	}
+
 	static float readClay()
 	{
 		if (!g_settings->exists("claude_clay"))
@@ -353,6 +362,8 @@ public:
 			m_parallax = readParallax();
 		if (name == "claude_jitter")
 			m_jitter = readJitter();
+		if (name == "claude_micro")
+			m_micro = readMicro();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -383,6 +394,7 @@ public:
 		m_relief = readRelief();
 		m_parallax = readParallax();
 		m_jitter = readJitter();
+		m_micro = readMicro();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -507,6 +519,7 @@ public:
 				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
 				m_jitter_pixel.set(&m_jitter, services);
+				m_micro_pixel.set(&m_micro, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
 						- v3f(g_claude_volume.origin.X,
@@ -981,6 +994,14 @@ static void claudeVolumeSnapshot(Client *client)
 			continue;
 
 		u8 acls = 255;
+		// Micro-geometry prototype: cobblestone gets class 250 — the
+		// tracer carves its cell with the tile's height field, so grooves
+		// become real gaps rather than painted ones.
+		{
+			const std::string &nn = ndef->get(c).name;
+			if (nn.find("cobble") != std::string::npos)
+				acls = 250;
+		}
 		// Small emitters (torches) are thin sticks inside their cell.
 		// Class 165 renders them as a sub-voxel nub instead of a full
 		// glowing cube that looks like it replaced a block.
