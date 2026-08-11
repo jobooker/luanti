@@ -94,6 +94,8 @@ struct ClaudeVolume
 	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
 	u32 material_tex = 0;
 	u32 atlas_tex = 0;
+	u32 micro_tex = 0;          // 256x256x16: 16x16 materials of 16^3 grids
+	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
 	bool atlas_dirty = false;
@@ -164,6 +166,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_micro_sampler_pixel{"claudeMicro"};
 	CachedPixelShaderSetting<float> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float> m_relief_pixel{"reliefStrength"};
@@ -514,6 +517,8 @@ public:
 				m_materials_sampler_pixel.set(&mlayer, services);
 				SamplerLayer_t alayer = 7;
 				m_atlas_sampler_pixel.set(&alayer, services);
+				SamplerLayer_t mlayer2 = 8;
+				m_micro_sampler_pixel.set(&mlayer2, services);
 				m_texture_amount_pixel.set(&m_texture_amount, services);
 				m_bevel_pixel.set(&m_bevel, services);
 				m_relief_pixel.set(&m_relief, services);
@@ -904,6 +909,54 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			for (int px = 0; px < 16; px++)
 				dst[(ay + py) * 256 + ax + px] = 0xFF808080u;
 	}
+	// Bake this material's 16^3 sub-voxel grid: start solid, then carve
+	// each of the six faces by that face's height field. Real 3D shape —
+	// the same data structure as the world, one scale down.
+	if (g_claude_volume.micro.empty())
+		g_claude_volume.micro.assign(256 * 256 * 16, 0);
+	{
+		float h[16][16];
+		u32 buf2[16 * 16];
+		bool have = false;
+		if (!tname.empty()) {
+			video::IImage *img2 = client->tsrc()->claudeGetImage(tname);
+			if (img2) {
+				img2->copyToScaling(buf2, 16, 16, video::ECF_A8R8G8B8);
+				img2->drop();
+				have = true;
+			}
+		}
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++) {
+				if (!have) { h[y][x] = 1.0f; continue; }
+				u32 t2 = buf2[y * 16 + x];
+				float l = (((t2 >> 16) & 0xFF) * 0.30f + ((t2 >> 8) & 0xFF) * 0.59f
+						+ (t2 & 0xFF) * 0.11f) / 255.0f;
+				h[y][x] = l;
+			}
+		const int CARVE = 5; // max sub-voxels removed from a face
+		for (int z = 0; z < 16; z++)
+		for (int y = 0; y < 16; y++)
+		for (int x = 0; x < 16; x++) {
+			bool solid = true;
+			// +Y / -Y faces use (x,z); +X/-X use (z,y); +Z/-Z use (x,y)
+			int dTop = (int)((1.0f - h[z][x]) * CARVE + 0.5f);
+			if (15 - y < dTop) solid = false;
+			int dBot = (int)((1.0f - h[15 - z][x]) * CARVE + 0.5f);
+			if (y < dBot) solid = false;
+			int dPX = (int)((1.0f - h[15 - y][z]) * CARVE + 0.5f);
+			if (15 - x < dPX) solid = false;
+			int dNX = (int)((1.0f - h[15 - y][15 - z]) * CARVE + 0.5f);
+			if (x < dNX) solid = false;
+			int dPZ = (int)((1.0f - h[15 - y][x]) * CARVE + 0.5f);
+			if (15 - z < dPZ) solid = false;
+			int dNZ = (int)((1.0f - h[15 - y][15 - x]) * CARVE + 0.5f);
+			if (z < dNZ) solid = false;
+			int ax2 = (mid % 16) * 16 + x;
+			int ay2 = (mid / 16) * 16 + y;
+			g_claude_volume.micro[(z * 256 + ay2) * 256 + ax2] = solid ? 255 : 0;
+		}
+	}
 	(void)fallback;
 	g_claude_volume.atlas_dirty = true;
 }
@@ -997,11 +1050,11 @@ static void claudeVolumeSnapshot(Client *client)
 		// Micro-geometry prototype: cobblestone gets class 250 — the
 		// tracer carves its cell with the tile's height field, so grooves
 		// become real gaps rather than painted ones.
-		{
-			const std::string &nn = ndef->get(c).name;
-			if (nn.find("cobble") != std::string::npos)
-				acls = 250;
-		}
+		// Micro-geometry for every carved solid: the 16^3 grids are baked
+		// from each tile, so this is the whole world in sub-voxels.
+		if (!f.isLiquid() && f.light_source == 0
+				&& f.drawtype == NDT_NORMAL)
+			acls = 250;
 		// Small emitters (torches) are thin sticks inside their cell.
 		// Class 165 renders them as a sub-voxel nub instead of a full
 		// glowing cube that looks like it replaced a block.
@@ -1106,6 +1159,17 @@ static void claudeVolumeSnapshot(Client *client)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_BGRA,
 				GL_UNSIGNED_BYTE, g_claude_volume.atlas.data());
+		if (!g_claude_volume.micro_tex)
+			glGenTextures(1, &g_claude_volume.micro_tex);
+		glActiveTexture(GL_TEXTURE8);
+		glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+		glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 256, 256, 16, 0,
+				GL_LUMINANCE, GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
 		g_claude_volume.atlas_dirty = false;
 	}
 	glActiveTexture(GL_TEXTURE0);

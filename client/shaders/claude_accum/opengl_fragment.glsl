@@ -14,6 +14,7 @@ uniform sampler3D claudeVolume;
 uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
 uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
+uniform sampler3D claudeMicro;     // 256x256x16: per-material 16^3 grids
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
@@ -123,22 +124,67 @@ vec3 pathSkyRadiance(vec3 rd)
 	return c;
 }
 
+// Nested DDA: the SAME traversal as the world, one scale down. Each
+// material owns a 16^3 occupancy grid; a ray entering a cell marches it
+// in local coordinates. Misses fall through, so gaps are real, and the
+// light rays use this too, so stones shadow each other honestly.
+bool microOcc(float slot, vec3 sc)
+{
+	vec2 mo = vec2(mod(slot, 16.0), floor(slot / 16.0)) * 16.0;
+	vec3 uv3 = vec3((mo.x + sc.x + 0.5) / 256.0,
+			(mo.y + sc.y + 0.5) / 256.0, (sc.z + 0.5) / 16.0);
+	return texture3D(claudeMicro, uv3).r > 0.5;
+}
+
+bool microDDA(vec3 lo, vec3 rd, float slot, out vec3 hitLocal, out vec3 hitNormal)
+{
+	vec3 p = clamp(lo, 0.0, 0.99999) * 16.0;
+	vec3 cell = floor(p);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - p) + stepDir * 0.5 + 0.5) * invRd;
+	int axis = -1;
+	float t = 0.0;
+	for (int i = 0; i < 48; i++) {
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
+			return false;                      // left the cell: real gap
+		if (microOcc(slot, cell)) {
+			hitLocal = (p + rd * t) / 16.0;
+			hitNormal = vec3(0.0);
+			if (axis == 0) hitNormal.x = -stepDir.x;
+			else if (axis == 1) hitNormal.y = -stepDir.y;
+			else if (axis == 2) hitNormal.z = -stepDir.z;
+			else hitNormal = -rd;
+			return true;
+		}
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+	}
+	return false;
+}
+
 // visibility toward the (jittered) light direction: 1 lit, 0 blocked
 float lightVis(vec3 ro, vec3 sd)
 {
 	const float S = 128.0;
 	float vis = 1.0;
+	float tcur = 0.0;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(sd);
 	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
 	for (int i = 0; i < 208; i++) {
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
-			sideDist.x += invRd.x; cell.x += stepDir.x;
+			tcur = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x;
 		} else if (sideDist.y < sideDist.z) {
-			sideDist.y += invRd.y; cell.y += stepDir.y;
+			tcur = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y;
 		} else {
-			sideDist.z += invRd.z; cell.z += stepDir.z;
+			tcur = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return vis;
@@ -157,6 +203,16 @@ float lightVis(vec3 ro, vec3 sd)
 			continue;
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0) {
+			// micro material: shadow only if the sub-grid is actually hit
+			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
+			vec3 mh, mn;
+			vec3 lentry = ro + sd * tcur - cell;
+			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
+					floor(mslot + 0.5), mh, mn))
+				return 0.0;
+			continue;
+		}
 		if (a > 0.25) {
 			float tr = cellTransmit(a);
 			if (tr <= 0.0)
@@ -261,43 +317,6 @@ float atlasHeight(vec2 uv)
 // parallax mapping this can miss entirely — the ray then continues on
 // through the cell, so gaps are real, silhouettes are real, and shadow
 // rays see the same shape. Height comes from the atlas alpha.
-// Micro-geometry wants BLOCKY height: nearest sample, quantised to a few
-// levels, so each texel is a flat-topped stone column. (Bilinear height
-// is right for relief maps and wrong here — it melts stones into dunes.)
-float atlasHeightBlocky(vec2 uv)
-{
-	float h = texture2D(claudeAtlas, uv).a;
-	return floor(h * 4.0 + 0.5) / 4.0;
-}
-
-bool microMarch(vec3 cell, vec3 entry, vec3 rd, vec3 nrm, float slot,
-		float depthScale, out vec3 hitLocal, out vec3 hitNormal)
-{
-	for (int i = 1; i <= 12; i++) {
-		vec3 pk = entry + rd * (float(i) * 0.085);
-		if (any(lessThan(pk, vec3(-0.001))) || any(greaterThan(pk, vec3(1.001))))
-			return false;                       // left the cell: real gap
-		float depth = dot(pk - entry, -nrm);
-		vec2 uvk;
-		if (abs(nrm.x) > 0.5) uvk = vec2(pk.z, 1.0 - pk.y);
-		else if (abs(nrm.y) > 0.5) uvk = vec2(pk.x, pk.z);
-		else uvk = vec2(pk.x, 1.0 - pk.y);
-		uvk = clamp(uvk, 0.07, 0.93);
-		vec2 auvk = (vec2(mod(slot, 16.0), floor(slot / 16.0)) + uvk) / 16.0;
-		float h = atlasHeightBlocky(auvk);
-		if (depth >= depthScale * (1.0 - h)) {
-			hitLocal = pk;
-			// flat column top: axis-aligned normal, so stones read as
-			// real cubic geometry rather than smooth relief
-			hitNormal = nrm;
-			return true;
-		}
-	}
-	hitLocal = entry;
-	hitNormal = nrm;
-	return true;
-}
-
 vec4 getEmitter(int i)
 {
 	if (i == 0) return claudeEmitter0;
@@ -462,8 +481,8 @@ void main(void)
 				else nn0.z = -stepDir.z;
 				float mid0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 				vec3 hl, hn;
-				if (mid0 > 0.5 && microMarch(cell, ro + rd * t - cell, rd, nn0,
-						floor(mid0 + 0.5), microStrength * 0.4, hl, hn)) {
+				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
+						rd, floor(mid0 + 0.5), hl, hn)) {
 					vec3 hp2 = cell + hl + hn * 0.01;
 					vec3 alb = pathAlbedo(s.rgb);
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
