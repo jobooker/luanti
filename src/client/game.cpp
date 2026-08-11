@@ -2892,7 +2892,11 @@ void Game::toggleFullViewRange()
 void Game::checkZoomEnabled()
 {
 	LocalPlayer *player = client->getEnv().getLocalPlayer();
-	if (player->getZoomFOV() < 0.001f || player->getFov().fov > 0.0f)
+	// Only an ABSOLUTE server FOV override actually blocks zoom; a multiplier
+	// scales it (see Camera::update). Testing spec.fov > 0.0f for both is why
+	// this nagged forever after a single sprint under Mineclonia.
+	PlayerFovSpec spec = player->getFov();
+	if (player->getZoomFOV() < 0.001f || (spec.fov > 0.0f && !spec.is_multiplier))
 		m_game_ui->showTranslatedStatusText("Zoom currently disabled by game or mod");
 }
 

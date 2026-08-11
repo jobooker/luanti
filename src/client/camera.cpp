@@ -465,7 +465,22 @@ void Camera::update(LocalPlayer* player, f32 frametime, f32 tool_reload_ratio)
 	 * If not, check for zoom and set to zoom FOV.
 	 * Otherwise, default to m_cache_fov.
 	 */
-	if (m_fov_transition_active) {
+	PlayerFovSpec fov_spec = player->getFov();
+	bool zooming = player->getPlayerControl().zoom && player->getZoomFOV() > 0.001f;
+	// A server-sent MULTIPLIER must not outrank zoom — it scales it. Only an
+	// ABSOLUTE override does. Upstream tested spec.fov > 0.0f for both, and
+	// Mineclonia's playerphysics sets a multiplier on sprint and then never
+	// clears it (it settles at a neutral 1.0), so one sprint permanently
+	// killed zoom for the rest of the session.
+	bool absolute_override = m_server_sent_fov && !fov_spec.is_multiplier;
+
+	if (zooming && !absolute_override) {
+		// Settle any in-flight transition first, so releasing zoom lands on
+		// the finished value instead of resuming a stale delta.
+		m_fov_transition_active = false;
+		m_curr_fov_degrees = player->getZoomFOV()
+				* (m_server_sent_fov ? fov_spec.fov : 1.0f);
+	} else if (m_fov_transition_active) {
 		// Smooth FOV transition
 		// Dynamically calculate FOV delta based on frametimes
 		f32 delta = (frametime / m_transition_time) * m_fov_diff;
