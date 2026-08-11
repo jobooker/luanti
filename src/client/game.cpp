@@ -39,6 +39,8 @@
 #include <sstream>
 #include <array>
 #include <algorithm>
+#include <unordered_map>
+#include <cstring>
 // claude_volume uploads its 3D texture through the platform GL directly:
 // the mac client runs Irrlicht's legacy "opengl" driver (GL 2.1 context,
 // GLSL 120), where the mt_opengl loader isn't initialized.
@@ -87,6 +89,13 @@ struct ClaudeVolume
 	// nearest emissive cells (volume cell coords + intensity), for NEE
 	float emitters[8][4] = {};
 	int emitter_count = 0;
+	// textured-albedo path: per-cell material id volume (unit 6) + a
+	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
+	u32 material_tex = 0;
+	u32 atlas_tex = 0;
+	std::unordered_map<content_t, u8> palette;
+	std::vector<u8> atlas; // BGRA
+	bool atlas_dirty = false;
 	// temporal accumulation state (updated once per frame)
 	v3f prev_cam_pos;
 	v3f prev_cam_dir;
@@ -152,6 +161,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_bump_strength;
 	CachedPixelShaderSetting<SamplerLayer_t> m_volume_sampler_pixel{"claudeVolume"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
+	CachedPixelShaderSetting<float> m_texture_amount_pixel{"textureAmount"};
+	float m_texture_amount;
 	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -190,7 +203,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 9> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 10> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -200,6 +213,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_gi",
 		"claude_gi_split",
 		"claude_clay",
+		"claude_texture",
 	};
 
 	static float readGoldenHourStrength()
@@ -255,6 +269,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_gi_split", 0.0f, 1.0f);
 	}
 
+	static float readTextureAmount()
+	{
+		if (!g_settings->exists("claude_texture"))
+			return 0.0f;
+		// 0 = pure clay, 1 = full tile texture (the flatness-guard dial)
+		return g_settings->getFloat("claude_texture", 0.0f, 1.0f);
+	}
+
 	static float readClay()
 	{
 		if (!g_settings->exists("claude_clay"))
@@ -284,6 +306,8 @@ public:
 			m_gi_split = readGiSplit();
 		if (name == "claude_clay")
 			m_clay = readClay();
+		if (name == "claude_texture")
+			m_texture_amount = readTextureAmount();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -309,6 +333,7 @@ public:
 		m_gi_strength = readGiStrength();
 		m_gi_split = readGiSplit();
 		m_clay = readClay();
+		m_texture_amount = readTextureAmount();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -424,6 +449,11 @@ public:
 				m_volume_sampler_pixel.set(&layer, services);
 				SamplerLayer_t clayer = 5;
 				m_coarse_sampler_pixel.set(&clayer, services);
+				SamplerLayer_t mlayer = 6;
+				m_materials_sampler_pixel.set(&mlayer, services);
+				SamplerLayer_t alayer = 7;
+				m_atlas_sampler_pixel.set(&alayer, services);
+				m_texture_amount_pixel.set(&m_texture_amount, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
 						- v3f(g_claude_volume.origin.X,
@@ -734,6 +764,37 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 // in-game settings GUI uses, so live-appliable settings (view range, shadows,
 // bloom, undersampling, ...) take effect without a client restart. External
 // tooling overwrites the file; identical content is not re-applied.
+// Blit one node type's top tile (16px, scaled) into the material atlas.
+static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
+		video::SColor fallback)
+{
+	if (g_claude_volume.atlas.empty())
+		g_claude_volume.atlas.assign(256 * 256 * 4, 0);
+	u32 *dst = (u32 *)g_claude_volume.atlas.data();
+	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
+	bool ok = false;
+	const std::string &tname = f.tiledef[0].name;
+	if (!tname.empty()) {
+		video::IImage *img = client->tsrc()->claudeGetImage(tname);
+		if (img) {
+			u32 buf[16 * 16];
+			img->copyToScaling(buf, 16, 16, video::ECF_A8R8G8B8);
+			for (int py = 0; py < 16; py++)
+				memcpy(&dst[(ay + py) * 256 + ax], &buf[py * 16], 16 * 4);
+			img->drop();
+			ok = true;
+		}
+	}
+	if (!ok) {
+		u32 argb = 0xFF000000u | ((u32)fallback.getRed() << 16)
+				| ((u32)fallback.getGreen() << 8) | (u32)fallback.getBlue();
+		for (int py = 0; py < 16; py++)
+			for (int px = 0; px < 16; px++)
+				dst[(ay + py) * 256 + ax + px] = argb;
+	}
+	g_claude_volume.atlas_dirty = true;
+}
+
 // claude_volume_snapshot: walk the client's loaded map ±SIZE/2 nodes around
 // the camera into a solid/air occupancy grid and upload it as a GL_R8 3D
 // texture on unit 4. One-shot: the volume does not follow the camera
@@ -758,6 +819,7 @@ static void claudeVolumeSnapshot(Client *client)
 	u64 hash = 14695981039346656037ULL ^ (u64)origin.X
 			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
 	std::vector<std::array<float, 4>> emitters;
+	std::vector<u8> mids(S * S * S, 0);
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
 	for (s16 y = 0; y < S; y++)
@@ -803,6 +865,16 @@ static void claudeVolumeSnapshot(Client *client)
 		occ[i * 4 + 3] = acls;
 		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
+		// material id (0 = untextured); palette + atlas grow on first sight
+		auto pit = g_claude_volume.palette.find(c);
+		if (pit != g_claude_volume.palette.end()) {
+			mids[i] = pit->second;
+		} else if (g_claude_volume.palette.size() < 254) {
+			u8 mid = (u8)(g_claude_volume.palette.size() + 1);
+			g_claude_volume.palette[c] = mid;
+			claudeAtlasAdd(client, mid, f, col);
+			mids[i] = mid;
+		}
 		solid++;
 	}
 	// world unchanged since the last snapshot: skip the upload and — key
@@ -835,6 +907,32 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 32, 32, 32, 0,
 			GL_LUMINANCE, GL_UNSIGNED_BYTE, coarse.data());
+	// material-id volume on unit 6
+	if (!g_claude_volume.material_tex)
+		glGenTextures(1, &g_claude_volume.material_tex);
+	glActiveTexture(GL_TEXTURE6);
+	glBindTexture(GL_TEXTURE_3D, g_claude_volume.material_tex);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, S, S, S, 0,
+			GL_LUMINANCE, GL_UNSIGNED_BYTE, mids.data());
+	// tile atlas on unit 7 (uploaded only when the palette grew)
+	if (g_claude_volume.atlas_dirty) {
+		if (!g_claude_volume.atlas_tex)
+			glGenTextures(1, &g_claude_volume.atlas_tex);
+		glActiveTexture(GL_TEXTURE7);
+		glBindTexture(GL_TEXTURE_2D, g_claude_volume.atlas_tex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_BGRA,
+				GL_UNSIGNED_BYTE, g_claude_volume.atlas.data());
+		g_claude_volume.atlas_dirty = false;
+	}
 	glActiveTexture(GL_TEXTURE0);
 	// nearest-8 emitters to the camera (= volume center) for NEE
 	std::sort(emitters.begin(), emitters.end(),

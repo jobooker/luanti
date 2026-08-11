@@ -120,6 +120,12 @@ public:
 
 	void setImageCaching(bool enabled);
 
+	video::IImage *claudeGetImage(const std::string &name) override
+	{
+		std::set<std::string> tmp;
+		return getOrGenerateImage(name, tmp);
+	}
+
 private:
 	// Gets or generates an image for a texture string
 	// Caller needs to drop the returned image

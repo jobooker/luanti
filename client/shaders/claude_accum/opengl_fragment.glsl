@@ -12,6 +12,9 @@ uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
 uniform sampler3D claudeVolume;
 uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
+uniform sampler3D claudeMaterials; // per-cell material id (x255)
+uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
+uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -367,6 +370,28 @@ void main(void)
 				hp += tj - n * dot(tj, n); // jitter within the face plane
 				vec3 albedo = volumeDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
+				// textured albedo: the DDA hit's position on the face IS
+				// its UV — the grid's free gift. Blend by the dial so
+				// texture can never fully bury the lighting.
+				if (textureAmount > 0.0 && volumeDebug < 3.5) {
+					float mid = texture3D(claudeMaterials,
+							(cell + 0.5) / S).r * 255.0;
+					if (mid > 0.5) {
+						vec3 hpl = ro + rd * t - cell;
+						vec2 uv2;
+						if (axis == 0) uv2 = vec2(hpl.z, 1.0 - hpl.y);
+						else if (axis == 1) uv2 = vec2(hpl.x, hpl.z);
+						else uv2 = vec2(hpl.x, 1.0 - hpl.y);
+						uv2 = clamp(uv2, 0.03, 0.97);
+						float slot = floor(mid + 0.5);
+						vec2 auv = (vec2(mod(slot, 16.0),
+								floor(slot / 16.0)) + uv2) / 16.0;
+						vec3 tc = texture2D(claudeAtlas, auv).rgb;
+						albedo = mix(albedo,
+								max(pow(tc, vec3(2.2)), vec3(0.02)),
+								textureAmount);
+					}
+				}
 
 				// direct light: jittered within the solar/lunar disc
 				// so the average converges to soft penumbras
