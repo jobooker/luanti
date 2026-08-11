@@ -138,7 +138,7 @@ float volumeSunVis(vec3 ro)
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
-	for (int i = 0; i < 64; i++) {
+	for (int i = 0; i < 144; i++) {
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
 			sideDist.x += invRd.x; cell.x += stepDir.x;
 		} else if (sideDist.y < sideDist.z) {
@@ -151,13 +151,15 @@ float volumeSunVis(vec3 ro)
 		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
 			return 0.0;
 	}
-	return 1.0;
+	// unresolved after 144 cells: assume blocked, not lit — a timeout
+	// credited as sunlight is how caves end up glowing
+	return 0.0;
 }
 
 vec3 giTrace(vec3 ro, vec3 rd)
 {
 	const float S = 128.0;
-	const int STEPS = 20;
+	const int STEPS = 96;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
@@ -172,8 +174,12 @@ vec3 giTrace(vec3 ro, vec3 rd)
 		} else {
 			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
 		}
-		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
-			break;
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S)))) {
+			// left through the bottom = deep underground, not sky
+			if (cell.y < 0.0)
+				return vec3(0.01);
+			return giSky(rd);
+		}
 		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
 		if (s.a > 0.25) {
 			// Real forest bounce comes almost entirely from SUNLIT
@@ -192,7 +198,9 @@ vec3 giTrace(vec3 ro, vec3 rd)
 					* clamp(dayNightRatio, 0.06, 1.0);
 		}
 	}
-	return giSky(rd);
+	// ran out of steps while still enclosed: darkness, NOT sky — the
+	// timeout-pays-skylight shortcut is why caves glowed
+	return vec3(0.02);
 }
 
 // claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
@@ -431,18 +439,31 @@ void main(void)
 			// 4 cone rays; modulate against the open-sky baseline so
 			// unoccluded ground is unchanged, overhangs darken, and lit
 			// colored surfaces bleed onto neighbors.
-			vec3 pdx = dFdx(p);
-			vec3 pdy = dFdy(p);
-			// Skip depth-discontinuity pixels (foliage edges and
-			// silhouettes): their derivative normals are noise, and GI
-			// there turns dappled canopies into flat mush.
-			if (inVol && giStrength > 0.0 && !isWater
-					&& length(pdx) + length(pdy) < 2.0
-					&& (giSplit < 0.5 || uv.x > 0.5)) {
-				vec3 nrm = normalize(cross(pdy, pdx));
-				vec3 vn2 = normalize(vdir);
-				if (dot(nrm, vn2) > 0.0)
-					nrm = -nrm;
+			// Voxel-exact geometry: the surface cell is just inside the
+			// point along the view ray, and the normal is whichever face
+			// of that cell the point sits on. No screen-space derivatives
+			// (their 2px garbage fringe at every silhouette was the
+			// 'flittering artifacts'), and entity pixels skip naturally
+			// because their containing cell is air.
+			vec3 vn2 = normalize(vdir);
+			vec3 scell = floor(p + vn2 * 0.08);
+			bool onSurface = false;
+			vec3 nrm = vec3(0.0, 1.0, 0.0);
+			if (inVol && giStrength > 0.0 && !isWater) {
+				vec4 sv = texture3D(claudeVolume, (scell + 0.5) / 128.0);
+				if (sv.a > 0.25) {
+					onSurface = true;
+					vec3 q = p - (scell + 0.5);
+					vec3 aq = abs(q);
+					if (aq.x > aq.y && aq.x > aq.z)
+						nrm = vec3(sign(q.x), 0.0, 0.0);
+					else if (aq.y > aq.z)
+						nrm = vec3(0.0, sign(q.y), 0.0);
+					else
+						nrm = vec3(0.0, 0.0, sign(q.z));
+				}
+			}
+			if (onSurface && (giSplit < 0.5 || uv.x > 0.5)) {
 				vec3 t1 = normalize(cross(nrm,
 						abs(nrm.y) < 0.9 ? vec3(0.0, 1.0, 0.0)
 								: vec3(1.0, 0.0, 0.0)));
@@ -487,6 +508,21 @@ void main(void)
 				// compression (0.55 tried) flattens the whole effect.
 				relight = pow(clamp(relight, 0.0, 1.6), vec3(0.7));
 				color.rgb *= mix(vec3(1.0), relight, giStrength);
+
+				// PURE TRACED MODE (clay >= 0.95): discard the raster
+				// lighting entirely — pixel = block albedo x traced
+				// light (hemisphere ambient + traced sun), the ghost's
+				// math in the live game. No blend, no compression: what
+				// the rays actually see. Unlit interiors go black until
+				// Phase 3 emissives — that's real tracing being honest.
+				if (clayStrength > 0.95) {
+					vec4 cv = texture3D(claudeVolume,
+							(scell + 0.5) / 128.0);
+					vec3 albedo = pow(cv.rgb, vec3(2.2));
+					vec3 sunCol = vec3(1.06, 0.96, 0.82);
+					color.rgb = albedo * (gi * 0.26
+							+ vec3(direct) * sunCol * dayL);
+				}
 			}
 		}
 	}
