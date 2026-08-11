@@ -139,8 +139,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3> m_volume_sun_dir_pixel{"volumeSunDir"};
 	CachedPixelShaderSetting<float, 2> m_volume_depth_range_pixel{"volumeDepthRange"};
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
+	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
 	float m_volume_debug;
 	float m_water_reflections;
+	float m_gi_strength;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -151,13 +153,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 6> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 7> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
 		"bump_strength",
 		"claude_volume_debug",
 		"claude_water_reflections",
+		"claude_gi",
 	};
 
 	static float readGoldenHourStrength()
@@ -196,6 +199,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_water_reflections", 0.0f, 1.0f);
 	}
 
+	static float readGiStrength()
+	{
+		if (!g_settings->exists("claude_gi"))
+			return 0.0f;
+		return g_settings->getFloat("claude_gi", 0.0f, 1.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -211,6 +221,8 @@ public:
 			m_volume_debug = readVolumeDebug();
 		if (name == "claude_water_reflections")
 			m_water_reflections = readWaterReflections();
+		if (name == "claude_gi")
+			m_gi_strength = readGiStrength();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -233,6 +245,7 @@ public:
 		m_bump_strength = readBumpStrength();
 		m_volume_debug = readVolumeDebug();
 		m_water_reflections = readWaterReflections();
+		m_gi_strength = readGiStrength();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -326,7 +339,9 @@ public:
 			m_volume_debug_pixel.set(&dbg, services);
 			float refl = g_claude_volume.valid ? m_water_reflections : 0.0f;
 			m_water_refl_pixel.set(&refl, services);
-			if (dbg > 0.0f || refl > 0.0f) {
+			float gi = g_claude_volume.valid ? m_gi_strength : 0.0f;
+			m_gi_strength_pixel.set(&gi, services);
+			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
 				Camera *camera = m_client->getCamera();
@@ -710,7 +725,8 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 		bool follow = !g_settings->exists("claude_volume_follow")
 				|| g_settings->getFloat("claude_volume_follow", 0.0f, 1.0f) > 0.0f;
 		bool consumer_on = setting_on("claude_volume_debug")
-				|| setting_on("claude_water_reflections");
+				|| setting_on("claude_water_reflections")
+				|| setting_on("claude_gi");
 		if (follow && !g_claude_volume.valid && consumer_on) {
 			claudeVolumeSnapshot(client);
 		} else if (follow && g_claude_volume.valid) {

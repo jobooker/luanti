@@ -38,6 +38,7 @@ uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
 uniform vec3 volumeSunDir;   // unit direction toward the sun
 uniform vec2 volumeDepthRange; // camera near/far (world BS units)
 uniform lowp float waterReflStrength;
+uniform lowp float giStrength;
 
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
@@ -98,12 +99,53 @@ vec3 volumeReflect(vec3 ro, vec3 rd)
 			else if (axis == 1) n.y = -stepDir.y;
 			else n.z = -stepDir.z;
 			float shade = volumeShadow(ro + rd * t + n * 0.01);
-			return s.rgb * face * shade;
+			// volume colors are full-bright; light the mirrored world
+			// like the real one or night water reflects a daylit phantom
+			return s.rgb * face * shade * clamp(dayNightRatio, 0.06, 1.0);
 		}
 	}
 	float up = clamp(rd.y, 0.0, 1.0);
 	vec3 sky = mix(vec3(0.70, 0.78, 0.86), vec3(0.28, 0.48, 0.80), up);
-	return sky * clamp(dayNightRatio, 0.1, 1.0);
+	return sky * clamp(dayNightRatio, 0.06, 1.0);
+}
+
+// Phase 2 v0 hemisphere GI. Light arriving from one direction: a short
+// cone-ray march — sky light if it escapes, distance-weighted bounce
+// color if it hits. Deliberately short range (20 cells): GI is about
+// nearby geometry, and short rays keep the per-pixel cost bounded.
+vec3 giSky(vec3 rd)
+{
+	float up = clamp(rd.y, 0.0, 1.0);
+	return mix(vec3(0.70, 0.78, 0.86), vec3(0.28, 0.48, 0.80), up)
+			* clamp(dayNightRatio, 0.06, 1.0);
+}
+
+vec3 giTrace(vec3 ro, vec3 rd)
+{
+	const float S = 128.0;
+	const int STEPS = 20;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	for (int i = 0; i < STEPS; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			break;
+		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (s.a > 0.25) {
+			float fall = 1.0 - t / float(STEPS);
+			return s.rgb * 0.55 * fall * clamp(dayNightRatio, 0.06, 1.0);
+		}
+	}
+	return giSky(rd);
 }
 
 // claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
@@ -286,11 +328,10 @@ void main(void)
 	// translate to linear colorspace (approximate)
 	color.rgb = pow(color.rgb, vec3(2.2));
 
-	// Traced water reflections (claude_water_reflections): reconstruct this
-	// pixel's position from the depth buffer; if it lands in a cell the
-	// volume tagged as water, reflect the view ray about +Y and march it.
-	// The first raster pixels partly colored by traced light.
-	if (waterReflStrength > 0.0 && volumeDebug < 0.5) {
+	// Traced lighting in the real render (claude_water_reflections +
+	// claude_gi): reconstruct this pixel's position from the depth buffer
+	// once, then let each effect consult the volume.
+	if ((waterReflStrength > 0.0 || giStrength > 0.0) && volumeDebug < 0.5) {
 		float dw = texture2D(depthmap, uv).r;
 		if (dw < 0.9999) {
 			vec2 ndcw = uv * 2.0 - 1.0;
@@ -301,10 +342,16 @@ void main(void)
 			// BS = 10: eye depth is in world units, the volume in nodes
 			vec3 p = volumeCamPos + 0.5 + vdir * (ez / 10.0);
 			vec3 wcell = floor(p - vec3(0.0, 0.05, 0.0));
-			if (all(greaterThanEqual(wcell, vec3(0.0)))
-					&& all(lessThan(wcell, vec3(128.0)))) {
+			bool inVol = all(greaterThanEqual(wcell, vec3(0.0)))
+					&& all(lessThan(wcell, vec3(128.0)));
+			bool isWater = false;
+
+			// Water reflections: if this pixel is a tagged water cell,
+			// reflect the view ray about +Y and march it.
+			if (inVol && waterReflStrength > 0.0) {
 				vec4 wv = texture3D(claudeVolume, (wcell + 0.5) / 128.0);
 				if (wv.a > 0.25 && wv.a < 0.75) {
+					isWater = true;
 					vec3 vn = normalize(vdir);
 					vec3 rdir = reflect(vn, vec3(0.0, 1.0, 0.0));
 					vec3 ro2 = vec3(p.x, wcell.y + 1.001, p.z);
@@ -313,6 +360,37 @@ void main(void)
 					float k = waterReflStrength * (0.25 + 0.55 * fres);
 					color.rgb = mix(color.rgb, pow(refl, vec3(2.2)), k);
 				}
+			}
+
+			// Hemisphere GI: normal from screen-space depth gradients,
+			// 4 cone rays; modulate against the open-sky baseline so
+			// unoccluded ground is unchanged, overhangs darken, and lit
+			// colored surfaces bleed onto neighbors.
+			if (inVol && giStrength > 0.0 && !isWater) {
+				vec3 nrm = normalize(cross(dFdy(p), dFdx(p)));
+				vec3 vn2 = normalize(vdir);
+				if (dot(nrm, vn2) > 0.0)
+					nrm = -nrm;
+				vec3 t1 = normalize(cross(nrm,
+						abs(nrm.y) < 0.9 ? vec3(0.0, 1.0, 0.0)
+								: vec3(1.0, 0.0, 0.0)));
+				vec3 t2 = cross(nrm, t1);
+				vec3 ro3 = p + nrm * 0.05;
+				vec3 d1 = normalize(nrm * 0.8 + t1 * 0.6);
+				vec3 d2 = normalize(nrm * 0.8 - t1 * 0.6);
+				vec3 d3 = normalize(nrm * 0.8 + t2 * 0.6);
+				vec3 d4 = normalize(nrm * 0.8 - t2 * 0.6);
+				// 5th ray biased toward the sky: vertical walls otherwise
+				// fire only sideways and miss open sky overhead, making
+				// roofless trenches/courtyards as dark as caves
+				vec3 d5 = normalize(nrm * 0.35 + vec3(0.0, 1.0, 0.0));
+				vec3 gi = giTrace(ro3, d1) + giTrace(ro3, d2)
+						+ giTrace(ro3, d3) + giTrace(ro3, d4)
+						+ giTrace(ro3, d5);
+				vec3 base = giSky(d1) + giSky(d2) + giSky(d3) + giSky(d4)
+						+ giSky(d5);
+				vec3 m = gi / max(base, vec3(1e-3));
+				color.rgb *= mix(vec3(1.0), clamp(m, 0.0, 1.5), giStrength);
 			}
 		}
 	}
