@@ -137,6 +137,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_up_pixel{"volumeCamUp"};
 	CachedPixelShaderSetting<float, 3> m_volume_sun_dir_pixel{"volumeSunDir"};
+	CachedPixelShaderSetting<float, 3> m_volume_light_col_pixel{"volumeLightCol"};
 	CachedPixelShaderSetting<float, 2> m_volume_depth_range_pixel{"volumeDepthRange"};
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
@@ -195,8 +196,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_volume_debug"))
 			return 0.0f;
 		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
-		// 3 = pure path-traced view (zero ambient, all light via rays)
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 3.0f);
+		// 3 = pure path-traced view (zero ambient, all light via rays),
+		// 4 = mode 3 with neutral albedo (lighting-only diagnostic)
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 4.0f);
 	}
 
 	static float readWaterReflections()
@@ -392,15 +394,25 @@ public:
 				m_volume_cam_fwd_pixel.set(fwd, services);
 				m_volume_cam_right_pixel.set(right, services);
 				m_volume_cam_up_pixel.set(up, services);
-				// Shadow rays march toward the real sky sun (directions are
-				// offset-independent, so world axes = volume axes); low
-				// morning-sun fallback when the sun is down or sky unset,
-				// so stand-in shadows read long and obvious.
+				// Traced light source: the sun when it's up (warm, ramped
+				// by day-night ratio), else the moon (cool, dim, a real
+				// light source so traced nights aren't pitch black), else
+				// no light at all. Directions are offset-independent.
 				v3f sun(0.55f, 0.40f, 0.35f);
-				if (m_sky && m_sky->getSunVisible())
+				v3f lcol(0.0f, 0.0f, 0.0f);
+				if (m_sky && m_sky->getSunVisible()) {
 					sun = m_sky->getSunDirection();
+					float ramp = std::min(dnr, 1.0f);
+					lcol = v3f(1.0f * ramp, 0.95f * ramp, 0.82f * ramp);
+				} else if (m_sky && m_sky->getMoonVisible()) {
+					sun = m_sky->getMoonDirection();
+					lcol = v3f(0.10f, 0.13f, 0.22f);
+				} else if (!m_sky) {
+					lcol = v3f(1.0f, 0.95f, 0.82f);
+				}
 				sun.normalize();
 				m_volume_sun_dir_pixel.set(sun, services);
+				m_volume_light_col_pixel.set(lcol, services);
 				// near/far for reconstructing eye depth from the depth
 				// buffer (world BS units; shader divides by BS for nodes)
 				auto cn = camera->getCameraNode();

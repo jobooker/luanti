@@ -267,15 +267,32 @@ vec4 ghostView(vec2 uv)
 // Blocks are exploited for geometry (exact DDA hits, exact face normals),
 // never for lighting.
 
+uniform vec3 volumeLightCol; // active light source color (sun/moon/none)
+
+// Dark-material floor: MTG foliage textures average near-black, which in
+// a pure multiply renderer eats all incident light ("low albedo is the
+// work" — John's diagnosis, confirmed by the mode-4 A/B). Lift only very
+// dark albedos, preserving hue.
+vec3 pathAlbedo(vec3 raw)
+{
+	vec3 a = pow(raw, vec3(2.2));
+	float lum = dot(a, vec3(0.2126, 0.7152, 0.0722));
+	if (lum < 0.16)
+		a *= 0.16 / max(lum, 0.02);
+	return a;
+}
+
 vec3 pathSkyRadiance(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
 	vec3 sky = mix(vec3(0.55, 0.66, 0.82), vec3(0.22, 0.42, 0.78), up);
 	float cosSun = max(dot(rd, volumeSunDir), 0.0);
-	// tight disk + faint halo, not a fog blob
-	sky += vec3(1.0, 0.92, 0.72)
-			* (pow(cosSun, 48.0) * 6.0 + pow(cosSun, 8.0) * 0.35);
-	return sky * clamp(dayNightRatio, 0.0, 1.0); // night = genuinely dark
+	// gradient scales with daylight; disk/halo + scatter carry the
+	// active light source's color (warm sun by day, cool moon by night)
+	vec3 c = sky * clamp(dayNightRatio, 0.0, 1.0);
+	c += volumeLightCol * (pow(cosSun, 48.0) * 7.0 + pow(cosSun, 8.0) * 0.4);
+	c += volumeLightCol * 0.18; // light scattered across the sky dome
+	return c;
 }
 
 // Radiance arriving at ro from direction rd: sky if the ray truly exits,
@@ -312,11 +329,10 @@ vec3 pathRay(vec3 ro, vec3 rd)
 			if (ndl <= 0.0)
 				return vec3(0.0); // faces away from sun: radiates nothing
 			float sv = volumeSunVis(ro + rd * t + n * 0.01);
-			// albedo x incident sun, attenuated by distance falloff
+			// albedo x incident light, attenuated by distance falloff
 			float fall = 1.0 - t / 160.0;
-			return pow(s.rgb, vec3(2.2)) * ndl * sv * fall
-					* vec3(1.0, 0.93, 0.76)
-					* clamp(dayNightRatio, 0.0, 1.0);
+			return pathAlbedo(s.rgb) * ndl * sv * fall
+					* volumeLightCol * 1.4;
 		}
 	}
 	return vec3(0.0); // unresolved while enclosed: darkness
@@ -343,14 +359,17 @@ vec4 pathView(vec2 uv)
 				else if (axis == 1) n.y = -stepDir.y;
 				else n.z = -stepDir.z;
 				vec3 hp = ro + rd * t + n * 0.01;
-				vec3 albedo = pow(s.rgb, vec3(2.2));
-				// direct sun: the only hard light source
+				// mode 4: lighting-only — neutral albedo shows pure
+				// transport, isolating material darkness from light bugs
+				vec3 albedo = volumeDebug > 3.5
+						? vec3(0.55) : pathAlbedo(s.rgb);
+				// direct light: sun by day, moon by night (color and
+				// intensity arrive via volumeLightCol)
 				float ndl = max(dot(n, volumeSunDir), 0.0);
 				vec3 direct = vec3(0.0);
 				if (ndl > 0.0)
 					direct = vec3(ndl * volumeSunVis(hp))
-							* vec3(1.0, 0.95, 0.82)
-							* clamp(dayNightRatio, 0.0, 1.0);
+							* volumeLightCol;
 				// sky + bounce: five hemisphere rays, cosine-biased
 				vec3 t1 = normalize(cross(n,
 						abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0)
@@ -368,9 +387,9 @@ vec4 pathView(vec2 uv)
 				if (s.a < 0.75 && n.y > 0.5) {
 					vec3 rr = reflect(rd, vec3(0.0, 1.0, 0.0));
 					vec3 refl = pathRay(hp, rr);
-					refl += vec3(1.0, 0.9, 0.7)
+					refl += volumeLightCol
 							* pow(max(dot(rr, volumeSunDir), 0.0), 64.0)
-							* 2.0 * clamp(dayNightRatio, 0.0, 1.0);
+							* 2.5;
 					c = mix(c, refl, 0.65);
 				}
 				return vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
