@@ -955,6 +955,22 @@ static void claudeVolumeSnapshot(Client *client)
 			continue;
 
 		u8 acls = 255;
+		// Small emitters (torches) are thin sticks inside their cell.
+		// Class 165 renders them as a sub-voxel nub instead of a full
+		// glowing cube that looks like it replaced a block.
+		if (f.light_source > 0 && (f.drawtype == NDT_TORCHLIKE
+				|| f.drawtype == NDT_PLANTLIKE
+				|| f.drawtype == NDT_FIRELIKE)) {
+			emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
+					(float)z + 0.5f,
+					std::min<int>(f.light_source, 14) / 14.0f});
+			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
+			occ[i * 4 + 3] = 165;
+			coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
+			hash = hash * 1099511628211ULL + (u64)i * 7919 + 165;
+			solid++;
+			continue;
+		}
 		if (f.light_source > 0) {
 			// emissive beats liquid: lava must GLOW, not mirror
 			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;

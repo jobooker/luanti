@@ -78,6 +78,7 @@ float cellTransmit(float a)
 {
 	if (a > 0.50 && a < 0.53) return 0.55;  // leaves
 	if (a > 0.55 && a < 0.60) return 0.92;  // glass
+	if (a > 0.63 && a < 0.66) return 1.0;   // torch nub: too thin to shade
 	return 0.0;                              // opaque
 }
 
@@ -392,6 +393,20 @@ void main(void)
 			// them, since transmitting eye rays makes canopies seethe.
 			if (s.a > 0.55 && s.a < 0.60) {
 				viewTint *= vec3(0.86, 0.93, 0.90);
+				continue;
+			}
+			// torch nub: analytic sphere inside the cell — sub-voxel
+			// shape with no occupancy bitmask
+			if (s.a > 0.63 && s.a < 0.66) {
+				vec3 ctr = cell + 0.5;
+				vec3 oc = ro - ctr;
+				float bq = dot(oc, rd);
+				float cq = dot(oc, oc) - 0.20 * 0.20;
+				if (bq * bq - cq > 0.0) {
+					fresh = pathAlbedo(s.rgb) * 4.0;
+					done = true;
+					break;
+				}
 				continue;
 			}
 			if (s.a > 0.25 && axis >= 0) {
