@@ -267,6 +267,12 @@ void main(void)
 			// compounding resample error that melts edges into mush
 			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.3), vec3(0.3));
 			a = accumAlpha;
+		} else {
+			// depth mismatch = aliased edge flipping under subpixel
+			// jitter. Rejecting outright makes edges shimmer forever;
+			// tightly-clamped history lets them settle into stable AA.
+			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.12), vec3(0.12));
+			a = max(accumAlpha, 0.3);
 		}
 	}
 

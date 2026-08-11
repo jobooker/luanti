@@ -35,7 +35,7 @@ void main(void)
 	vec2 P9 = vec2(0.896, 0.412);
 	vec2 P10 = vec2(-0.322, -0.933);
 	vec2 P11 = vec2(-0.792, -0.598);
-	float R = 3.5;
+	float R = 2.0;
 	for (int i = 0; i < 12; i++) {
 		vec2 o;
 		if (i == 0) o = P0; else if (i == 1) o = P1;
@@ -45,7 +45,8 @@ void main(void)
 		else if (i == 8) o = P8; else if (i == 9) o = P9;
 		else if (i == 10) o = P10; else o = P11;
 		vec4 s = texture2D(src, uv + o * R * texelSize0);
-		float w = exp(-abs(s.a - t0) * 50.0);
+		// gaussian spatial falloff (box blur reads as fuzz) x depth edge
+		float w = exp(-2.0 * dot(o, o)) * exp(-abs(s.a - t0) * 80.0);
 		sum += s.rgb * w;
 		wsum += w;
 	}
