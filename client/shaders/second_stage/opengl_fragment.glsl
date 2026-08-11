@@ -127,6 +127,32 @@ vec3 giSky(vec3 rd)
 	return sky * clamp(dayNightRatio, 0.06, 1.0);
 }
 
+// Short sun-visibility probe used from GI-ray hit points (64 cells is
+// plenty for canopy scale; cheaper than the full shadow march).
+float volumeSunVis(vec3 ro)
+{
+	const float S = 128.0;
+	vec3 rd = volumeSunDir;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	for (int i = 0; i < 64; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return 1.0;
+		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
+			return 0.0;
+	}
+	return 1.0;
+}
+
 vec3 giTrace(vec3 ro, vec3 rd)
 {
 	const float S = 128.0;
@@ -136,20 +162,33 @@ vec3 giTrace(vec3 ro, vec3 rd)
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
 	float t = 0.0;
+	int axis = -1;
 	for (int i = 0; i < STEPS; i++) {
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
-			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x;
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
 		} else if (sideDist.y < sideDist.z) {
-			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y;
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
 		} else {
-			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			break;
 		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
 		if (s.a > 0.25) {
+			// Real forest bounce comes almost entirely from SUNLIT
+			// surfaces — pools of sun on the floor re-radiating onto
+			// trunks. Probe the hit point's sun visibility: lit hits
+			// radiate warm and strong, shadowed hits barely leak.
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			float sunlit = axis < 0 ? 0.0
+					: volumeSunVis(ro + rd * t + n * 0.01);
 			float fall = 1.0 - t / float(STEPS);
-			return s.rgb * 0.55 * fall * clamp(dayNightRatio, 0.06, 1.0);
+			vec3 warm = mix(vec3(1.0), vec3(1.05, 0.93, 0.78), sunlit);
+			return s.rgb * warm * (0.18 + 1.1 * sunlit) * fall
+					* clamp(dayNightRatio, 0.06, 1.0);
 		}
 	}
 	return giSky(rd);
