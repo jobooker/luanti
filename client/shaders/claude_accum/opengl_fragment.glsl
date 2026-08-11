@@ -236,6 +236,22 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 	return vec3(0.0);
 }
 
+// Bilinear height from the atlas alpha. The atlas is NEAREST-filtered
+// (colour wants crisp pixels), so interpolate by hand: without this the
+// height is constant inside each texel and relief reads as stairs.
+float atlasHeight(vec2 uv)
+{
+	vec2 tc = uv * 256.0 - 0.5;
+	vec2 f = fract(tc);
+	vec2 b = (floor(tc) + 0.5) / 256.0;
+	float st = 1.0 / 256.0;
+	float h00 = texture2D(claudeAtlas, b).a;
+	float h10 = texture2D(claudeAtlas, b + vec2(st, 0.0)).a;
+	float h01 = texture2D(claudeAtlas, b + vec2(0.0, st)).a;
+	float h11 = texture2D(claudeAtlas, b + vec2(st, st)).a;
+	return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
 vec4 getEmitter(int i)
 {
 	if (i == 0) return claudeEmitter0;
@@ -430,7 +446,7 @@ void main(void)
 					float mid = texture3D(claudeMaterials,
 							(cell + 0.5) / S).r * 255.0;
 					if (mid > 0.5) {
-						vec2 uv2 = clamp(fuv, 0.03, 0.97);
+						vec2 uv2 = clamp(fuv, 0.07, 0.93);
 						float slot = floor(mid + 0.5);
 						vec2 auv = (vec2(mod(slot, 16.0),
 								floor(slot / 16.0)) + uv2) / 16.0;
@@ -442,26 +458,17 @@ void main(void)
 							// darken the grooves. The groove shadow is what
 							// actually reads as depth on bark and stone —
 							// directional shading alone is the weak cue.
-							// 16px height fields staircase badly (one texel
-							// is 6 cm on a metre block), so sample a blurred
-							// height: 4-tap average per probe turns cliffs
-							// into undulation. Relief wants smooth data;
-							// colour still samples crisp/nearest.
+							// Symmetric central differences on the
+							// bilinear height: consistent slopes, no
+							// directional bias, smooth inside texels.
 							float st = 1.0 / 256.0;
-							float h0 = 0.25 * (texture2D(claudeAtlas, auv + vec2(-st, 0.0)).a
-									+ texture2D(claudeAtlas, auv + vec2(st, 0.0)).a
-									+ texture2D(claudeAtlas, auv + vec2(0.0, -st)).a
-									+ texture2D(claudeAtlas, auv + vec2(0.0, st)).a);
-							float hu = 0.25 * (texture2D(claudeAtlas, auv + vec2(0.0, 0.0)).a
-									+ texture2D(claudeAtlas, auv + vec2(2.0 * st, 0.0)).a
-									+ texture2D(claudeAtlas, auv + vec2(st, -st)).a
-									+ texture2D(claudeAtlas, auv + vec2(st, st)).a);
-							float hv = 0.25 * (texture2D(claudeAtlas, auv + vec2(0.0, 0.0)).a
-									+ texture2D(claudeAtlas, auv + vec2(0.0, 2.0 * st)).a
-									+ texture2D(claudeAtlas, auv + vec2(-st, st)).a
-									+ texture2D(claudeAtlas, auv + vec2(st, st)).a);
-							n = normalize(n - (udir * (hu - h0) + vdir * (hv - h0))
-									* reliefStrength * 16.0);
+							float h0 = atlasHeight(auv);
+							float hx = atlasHeight(auv + vec2(st, 0.0))
+									- atlasHeight(auv - vec2(st, 0.0));
+							float hy = atlasHeight(auv + vec2(0.0, st))
+									- atlasHeight(auv - vec2(0.0, st));
+							n = normalize(n - (udir * hx + vdir * hy)
+									* reliefStrength * 9.0);
 							albedo *= 1.0 - reliefStrength * 0.55
 									* clamp(0.55 - h0, 0.0, 0.55) / 0.55;
 						}
