@@ -59,7 +59,10 @@ float cellHash(vec3 c)
 
 bool leafPass(float a, vec3 cell)
 {
-	return a > 0.45 && a < 0.56 && cellHash(cell) < 0.45;
+	// PARKED (2026-08-11): light-ray dapple shimmers at current
+	// accumulation depth; revisit with textures + deeper history.
+	// Re-arm by restoring: a > 0.45 && a < 0.56 && cellHash(cell) < 0.45
+	return false;
 }
 
 float pathDayLin()
