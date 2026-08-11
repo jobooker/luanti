@@ -33,6 +33,29 @@ void main(void)
 	if (d < 0.9999) {
 		float ez = 2.0 * zn * zf / (zf + zn - (2.0 * d - 1.0) * (zf - zn));
 		guide = min(ez / 10.0, 200.0); // BS = 10
+	} else {
+		// Empty raster depth means this pixel is SKY. Luanti already draws a
+		// proper one there — sun, clouds, stars, and Mineclonia's phase-correct
+		// moon sprite (mcl_moon, 8 phases seeded from the world seed). We were
+		// discarding all of it and substituting an analytic disc, which drew
+		// the moon as a blue SUN, because at night volumeSunDir and
+		// volumeLightCol literally are the moon's and the disc reused the sun's
+		// 40x multiplier.
+		//
+		// The analytic sky stays where it belongs: bounce rays need a function
+		// they can evaluate in any direction, so the WORLD is lit by our model
+		// while the VISIBLE sky is the game's own.
+		//
+		// Empty raster depth is NOT proof of sky, though — it also happens
+		// wherever raster geometry has not been meshed or is beyond its draw
+		// range, and the tracer sees further than the mesh does. Taking raster
+		// there punched sky-coloured holes straight through traced terrain.
+		// Require the TRACED ray to have escaped as well (alpha carries
+		// tHit/200, so a miss sits at the far end).
+		if (texture2D(accum, uv).a > 0.97) {
+			gl_FragColor = vec4(texture2D(merged, uv).rgb, 1.0);
+			return;
+		}
 	}
 
 	// 4 nearest half-res texels, bilinear x depth-agreement weights
