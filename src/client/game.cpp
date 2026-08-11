@@ -181,7 +181,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_volume_debug"))
 			return 0.0f;
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 1.0f);
+		// 1 = ghost view with shadow rays, 2 = ghost view without (A/B)
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 2.0f);
 	}
 
 public:
@@ -307,8 +308,7 @@ public:
 		// trace never involves camera-offset space. Right/up are pre-scaled
 		// by tan(fov/2) so the shader builds rays with two multiply-adds.
 		{
-			float dbg = (m_volume_debug > 0.0f && g_claude_volume.valid)
-					? 1.0f : 0.0f;
+			float dbg = g_claude_volume.valid ? m_volume_debug : 0.0f;
 			m_volume_debug_pixel.set(&dbg, services);
 			if (dbg > 0.0f) {
 				SamplerLayer_t layer = 4;
@@ -330,9 +330,10 @@ public:
 				m_volume_cam_right_pixel.set(right, services);
 				m_volume_cam_up_pixel.set(up, services);
 				// Shadow rays march toward the real sky sun (directions are
-				// offset-independent, so world axes = volume axes); fixed
-				// high-noon-ish fallback when the sun is down or sky unset.
-				v3f sun(0.35f, 0.75f, 0.5f);
+				// offset-independent, so world axes = volume axes); low
+				// morning-sun fallback when the sun is down or sky unset,
+				// so stand-in shadows read long and obvious.
+				v3f sun(0.55f, 0.40f, 0.35f);
 				if (m_sky && m_sky->getSunVisible())
 					sun = m_sky->getSunDirection();
 				sun.normalize();

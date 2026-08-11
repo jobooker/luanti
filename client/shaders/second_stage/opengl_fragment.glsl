@@ -92,15 +92,18 @@ vec4 ghostView(vec2 uv)
 				float shade = 1.0;
 				if (axis < 0) {
 					face = 0.9;
-				} else {
+				} else if (volumeDebug < 1.5) {
 					// nudge off the hit face, then trace toward the sun
+					// (claude_volume_debug = 2 skips this: A/B compare)
 					vec3 n = vec3(0.0);
 					if (axis == 0) n.x = -stepDir.x;
 					else if (axis == 1) n.y = -stepDir.y;
 					else n.z = -stepDir.z;
 					shade = volumeShadow(ro + rd * t + n * 0.01);
 				}
-				float fog = exp(-t * 0.015);
+				// gentle: colors+shadows carry depth now; the old 0.015
+				// clay-ghost fog crushed everything past ~70 cells
+				float fog = exp(-t * 0.004);
 				return vec4(s.rgb * face * shade * fog, 1.0);
 			}
 		} else if (i > 0) {
