@@ -36,6 +36,7 @@
 #include "porting.h"
 #include <fstream>
 #include <sstream>
+#include <mt_opengl.h>
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
@@ -60,6 +61,21 @@
 #endif
 
 typedef s32 SamplerLayer_t;
+
+// claude_volume: one-shot 128^3 occupancy snapshot of the map around the
+// camera, held as a raw GL_R8 3D texture bound to texture unit 4 — outside
+// Irrlicht's material system, which only manages units 0-3, so nothing else
+// touches the binding. Written by claudeVolumeSnapshot() (triggered through
+// claude_settings_patch.conf), read each frame by the uniform setter below
+// and marched in the second_stage shader when claude_volume_debug is set.
+struct ClaudeVolume
+{
+	static constexpr int SIZE = 128;
+	u32 tex = 0; // GL texture name (GLuint)
+	v3s16 origin; // node coords of voxel (0,0,0)
+	bool valid = false;
+};
+static ClaudeVolume g_claude_volume;
 
 
 class GameGlobalShaderUniformSetter : public IShaderUniformSetter
@@ -109,6 +125,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_ssao_strength;
 	CachedPixelShaderSetting<float> m_bump_strength_pixel{"bumpStrength"};
 	float m_bump_strength;
+	CachedPixelShaderSetting<SamplerLayer_t> m_volume_sampler_pixel{"claudeVolume"};
+	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
+	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
+	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
+	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
+	CachedPixelShaderSetting<float, 3> m_volume_cam_up_pixel{"volumeCamUp"};
+	float m_volume_debug;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -119,11 +142,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 4> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 5> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
 		"bump_strength",
+		"claude_volume_debug",
 	};
 
 	static float readGoldenHourStrength()
@@ -147,6 +171,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("bump_strength", 0.0f, 2.0f);
 	}
 
+	static float readVolumeDebug()
+	{
+		if (!g_settings->exists("claude_volume_debug"))
+			return 0.0f;
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 1.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -158,6 +189,8 @@ public:
 			m_ssao_strength = readSsaoStrength();
 		if (name == "bump_strength")
 			m_bump_strength = readBumpStrength();
+		if (name == "claude_volume_debug")
+			m_volume_debug = readVolumeDebug();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -178,6 +211,7 @@ public:
 		m_golden_hour_strength = readGoldenHourStrength();
 		m_ssao_strength = readSsaoStrength();
 		m_bump_strength = readBumpStrength();
+		m_volume_debug = readVolumeDebug();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -260,6 +294,37 @@ public:
 		m_golden_hour_pixel.set(&m_golden_hour_strength, services);
 		m_ssao_strength_pixel.set(&m_ssao_strength, services);
 		m_bump_strength_pixel.set(&m_bump_strength, services);
+
+		// claude_volume ghost view: hand the shader a ray-generation basis
+		// in volume-local node units. Camera position is absolute world
+		// coords / BS minus the volume origin — computed CPU-side so the
+		// trace never involves camera-offset space. Right/up are pre-scaled
+		// by tan(fov/2) so the shader builds rays with two multiply-adds.
+		{
+			float dbg = (m_volume_debug > 0.0f && g_claude_volume.valid)
+					? 1.0f : 0.0f;
+			m_volume_debug_pixel.set(&dbg, services);
+			if (dbg > 0.0f) {
+				SamplerLayer_t layer = 4;
+				m_volume_sampler_pixel.set(&layer, services);
+				Camera *camera = m_client->getCamera();
+				v3f local = camera->getPosition() / BS
+						- v3f(g_claude_volume.origin.X,
+							g_claude_volume.origin.Y,
+							g_claude_volume.origin.Z);
+				m_volume_cam_pos_pixel.set(local, services);
+				v3f fwd = camera->getDirection();
+				fwd.normalize();
+				v3f right = v3f(0.f, 1.f, 0.f).crossProduct(fwd);
+				right.normalize();
+				v3f up = fwd.crossProduct(right);
+				right *= std::tan(camera->getFovX() * 0.5f);
+				up *= std::tan(camera->getFovY() * 0.5f);
+				m_volume_cam_fwd_pixel.set(fwd, services);
+				m_volume_cam_right_pixel.set(right, services);
+				m_volume_cam_up_pixel.set(up, services);
+			}
+		}
 
 		if (m_volumetric_light_enabled) {
 			// Map directional light to screen space
@@ -528,6 +593,53 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 // in-game settings GUI uses, so live-appliable settings (view range, shadows,
 // bloom, undersampling, ...) take effect without a client restart. External
 // tooling overwrites the file; identical content is not re-applied.
+// claude_volume_snapshot: walk the client's loaded map ±SIZE/2 nodes around
+// the camera into a solid/air occupancy grid and upload it as a GL_R8 3D
+// texture on unit 4. One-shot: the volume does not follow the camera
+// afterwards (streaming updates are a later patch). Unloaded map (IGNORE)
+// reads as air, so rays pass through it and miss. Runs on the main thread
+// with the GL context current; the ~2 MB walk causes a brief hitch, which
+// is acceptable for a manually-triggered debug snapshot.
+static void claudeVolumeSnapshot(Client *client)
+{
+	constexpr int S = ClaudeVolume::SIZE;
+	u64 t0 = porting::getTimeMs();
+	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
+	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
+	Map &map = client->getEnv().getMap();
+	std::vector<u8> occ(S * S * S);
+	u32 solid = 0;
+	size_t i = 0;
+	for (s16 z = 0; z < S; z++)
+	for (s16 y = 0; y < S; y++)
+	for (s16 x = 0; x < S; x++, i++) {
+		MapNode n = map.getNode(origin + v3s16(x, y, z));
+		content_t c = n.getContent();
+		if (c != CONTENT_AIR && c != CONTENT_IGNORE) {
+			occ[i] = 255;
+			solid++;
+		}
+	}
+	if (!g_claude_volume.tex)
+		GL.GenTextures(1, &g_claude_volume.tex);
+	GL.ActiveTexture(GL.TEXTURE4);
+	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.R8, S, S, S, 0, GL.RED,
+			GL.UNSIGNED_BYTE, occ.data());
+	GL.ActiveTexture(GL.TEXTURE0);
+	g_claude_volume.origin = origin;
+	g_claude_volume.valid = true;
+	actionstream << "[claude_volume] snapshot origin=(" << origin.X << ","
+			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
+			<< (S * S * S) << " in " << (porting::getTimeMs() - t0)
+			<< " ms" << std::endl;
+}
+
 static void pollSettingsPatch(f32 dtime, Client *client)
 {
 	static f32 timer = 0.0f;
@@ -555,6 +667,12 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 			client->makeScreenshot();
 			actionstream << "[claude_settings_patch] screenshot taken"
 					<< std::endl;
+			continue;
+		}
+		// Pseudo-key: any value change re-snapshots the volume around the
+		// current camera position.
+		if (name == "claude_volume_snapshot") {
+			claudeVolumeSnapshot(client);
 			continue;
 		}
 		g_settings->set(name, patch.get(name));

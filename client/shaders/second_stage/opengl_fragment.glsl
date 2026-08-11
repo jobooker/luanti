@@ -26,6 +26,54 @@ uniform lowp float goldenHourStrength;
 uniform sampler2D depthmap;
 uniform lowp float ssaoStrength;
 
+uniform lowp float volumeDebug;
+uniform sampler3D claudeVolume;
+uniform vec3 volumeCamPos;   // camera in volume-local node units
+uniform vec3 volumeCamFwd;   // unit look direction
+uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
+uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
+
+// claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
+// through the 128^3 occupancy snapshot. Voxel i spans [i, i+1) in cell
+// space; node centers sit at integer volume-local coords, hence the +0.5
+// shift on the ray origin. Shading: face brightness by hit axis (sun-from-
+// above convention) times distance fog — geometry only, no lighting.
+vec4 ghostView(vec2 uv)
+{
+	const float S = 128.0;
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec3 rd = normalize(volumeCamFwd + ndc.x * volumeCamRight + ndc.y * volumeCamUp);
+	vec3 ro = volumeCamPos + 0.5;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	int axis = -1; // axis of the last step = hit-face normal; -1 = ray origin cell
+	for (int i = 0; i < 384; i++) {
+		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
+			if (texture(claudeVolume, (cell + 0.5) / S).r > 0.5) {
+				float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
+						: (axis == 0 ? 0.8 : 0.62);
+				if (axis < 0)
+					face = 0.9;
+				float fog = exp(-t * 0.015);
+				return vec4(vec3(face * fog), 1.0);
+			}
+		} else if (i > 0) {
+			break; // left the volume
+		}
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+	}
+	return vec4(0.0, 0.0, 0.04, 1.0); // miss: near-black, blue tint = "sky"
+}
+
 // Cheap single-pass SSAO from the depth buffer alone: spiral taps around
 // each pixel; nearer samples within a depth window count as occluders.
 // Thresholds scale with (1 - depth) to roughly compensate for the
@@ -131,6 +179,13 @@ vec3 screen_space_dither(highp vec2 frag_coord) {
 void main(void)
 {
 	vec2 uv = varTexCoord.st;
+
+	// claude_volume_debug: replace the frame with the traced ghost view
+	if (volumeDebug > 0.5) {
+		gl_FragColor = ghostView(uv);
+		return;
+	}
+
 #ifdef ENABLE_SSAA
 	vec4 color = vec4(0.);
 	for (float dx = 1.; dx < SSAA_SCALE; dx += 2.)
