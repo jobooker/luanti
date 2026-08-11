@@ -15,6 +15,7 @@ uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
 uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
 uniform sampler3D claudeMicro;     // 256x256x16: per-material 16^3 grids
+uniform vec3 volumeOrigin;         // volume cell (0,0,0) in world nodes
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
@@ -157,7 +158,7 @@ bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
 	vec3 sideDist = (stepDir * (cell - p) + stepDir * 0.5 + 0.5) * invRd;
 	int axis = -1;
 	float t = 0.0;
-	for (int i = 0; i < 48; i++) {
+	for (int i = 0; i < 26; i++) {
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
 			return false;                      // left the cell: real gap
 		if (microOcc(slot, microRot(cell, rot))) {
@@ -215,13 +216,13 @@ float lightVis(vec3 ro, vec3 sd)
 			continue;
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0) {
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && tcur < 12.0) {
 			// micro material: shadow only if the sub-grid is actually hit
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			vec3 lentry = ro + sd * tcur - cell;
-			float rot1 = floor(fract(sin(dot(cell, vec3(41.3, 289.1, 77.7)))
-					* 21311.7) * 4.0);
+			float rot1 = floor(fract(sin(dot(cell + volumeOrigin,
+					vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
 			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
 					floor(mslot + 0.5), rot1, mh, mn))
 				return 0.0;
@@ -487,16 +488,18 @@ void main(void)
 				}
 				continue;
 			}
-			// micro-geometry cell: carve the cell with the height field
-			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && microStrength > 0.0) {
+			// micro-geometry cell: march the material's sub-voxel grid
+			bool microMiss = false;
+			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && microStrength > 0.0
+					&& t < 18.0) {
 				vec3 nn0 = vec3(0.0);
 				if (axis == 0) nn0.x = -stepDir.x;
 				else if (axis == 1) nn0.y = -stepDir.y;
 				else nn0.z = -stepDir.z;
 				float mid0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 				vec3 hl, hn;
-				float rot0 = floor(fract(sin(dot(cell, vec3(41.3, 289.1, 77.7)))
-						* 21311.7) * 4.0);
+				float rot0 = floor(fract(sin(dot(cell + volumeOrigin,
+						vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
 				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
 						rd, floor(mid0 + 0.5), rot0, hl, hn)) {
 					vec3 hp2 = cell + hl + hn * 0.01;
@@ -517,9 +520,12 @@ void main(void)
 					done = true;
 					break;
 				}
-				// no stone along this ray inside the cell: pass through
+				// no stone along this ray: the cell is a real gap here, so
+				// it must NOT fall through to the solid-cube branch —
+				// that fall-through was keeping silhouettes cubic.
+				microMiss = true;
 			}
-			if (s.a > 0.25 && axis >= 0) {
+			if (!microMiss && s.a > 0.25 && axis >= 0) {
 				// emissive primary hit: self-lit, no rays needed
 				if (s.a > 0.6 && s.a < 0.97) {
 					float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);

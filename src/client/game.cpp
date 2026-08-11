@@ -167,6 +167,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_micro_sampler_pixel{"claudeMicro"};
+	CachedPixelShaderSetting<float, 3> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float> m_relief_pixel{"reliefStrength"};
@@ -519,6 +520,10 @@ public:
 				m_atlas_sampler_pixel.set(&alayer, services);
 				SamplerLayer_t mlayer2 = 8;
 				m_micro_sampler_pixel.set(&mlayer2, services);
+				v3f vorg((float)g_claude_volume.origin.X,
+						(float)g_claude_volume.origin.Y,
+						(float)g_claude_volume.origin.Z);
+				m_volume_origin_pixel.set(vorg, services);
 				m_texture_amount_pixel.set(&m_texture_amount, services);
 				m_bevel_pixel.set(&m_bevel, services);
 				m_relief_pixel.set(&m_relief, services);
@@ -950,7 +955,7 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 				for (int x = 0; x < 16; x++)
 					h[y][x] = std::clamp((h[y][x] - hmin) / span, 0.0f, 1.0f);
 		}
-		const int CARVE = 3; // max sub-voxels removed from a face
+		const int CARVE = 2; // max sub-voxels removed from a face
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
