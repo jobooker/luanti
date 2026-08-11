@@ -36,6 +36,8 @@ uniform vec3 volumeCamFwd;   // unit look direction
 uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
 uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
 uniform vec3 volumeSunDir;   // unit direction toward the sun
+uniform vec2 volumeDepthRange; // camera near/far (world BS units)
+uniform lowp float waterReflStrength;
 
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
@@ -63,6 +65,45 @@ float volumeShadow(vec3 ro)
 			return 0.45;
 	}
 	return 1.0;
+}
+
+// Reflection march: DDA from just above a water surface, returning the
+// shaded hit color (face + traced sun shadow) or a day-scaled sky
+// gradient on miss. Advances before sampling so the origin cell is skipped.
+vec3 volumeReflect(vec3 ro, vec3 rd)
+{
+	const float S = 128.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	int axis = -1;
+	for (int i = 0; i < 256; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			break;
+		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (s.a > 0.25) {
+			float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
+					: (axis == 0 ? 0.8 : 0.62);
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			float shade = volumeShadow(ro + rd * t + n * 0.01);
+			return s.rgb * face * shade;
+		}
+	}
+	float up = clamp(rd.y, 0.0, 1.0);
+	vec3 sky = mix(vec3(0.70, 0.78, 0.86), vec3(0.28, 0.48, 0.80), up);
+	return sky * clamp(dayNightRatio, 0.1, 1.0);
 }
 
 // claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
@@ -244,6 +285,37 @@ void main(void)
 
 	// translate to linear colorspace (approximate)
 	color.rgb = pow(color.rgb, vec3(2.2));
+
+	// Traced water reflections (claude_water_reflections): reconstruct this
+	// pixel's position from the depth buffer; if it lands in a cell the
+	// volume tagged as water, reflect the view ray about +Y and march it.
+	// The first raster pixels partly colored by traced light.
+	if (waterReflStrength > 0.0 && volumeDebug < 0.5) {
+		float dw = texture2D(depthmap, uv).r;
+		if (dw < 0.9999) {
+			vec2 ndcw = uv * 2.0 - 1.0;
+			vec3 vdir = volumeCamFwd + ndcw.x * volumeCamRight + ndcw.y * volumeCamUp;
+			float zn = volumeDepthRange.x;
+			float zf = volumeDepthRange.y;
+			float ez = 2.0 * zn * zf / (zf + zn - (2.0 * dw - 1.0) * (zf - zn));
+			// BS = 10: eye depth is in world units, the volume in nodes
+			vec3 p = volumeCamPos + 0.5 + vdir * (ez / 10.0);
+			vec3 wcell = floor(p - vec3(0.0, 0.05, 0.0));
+			if (all(greaterThanEqual(wcell, vec3(0.0)))
+					&& all(lessThan(wcell, vec3(128.0)))) {
+				vec4 wv = texture3D(claudeVolume, (wcell + 0.5) / 128.0);
+				if (wv.a > 0.25 && wv.a < 0.75) {
+					vec3 vn = normalize(vdir);
+					vec3 rdir = reflect(vn, vec3(0.0, 1.0, 0.0));
+					vec3 ro2 = vec3(p.x, wcell.y + 1.001, p.z);
+					vec3 refl = volumeReflect(ro2, rdir);
+					float fres = pow(1.0 - clamp(-vn.y, 0.0, 1.0), 2.0);
+					float k = waterReflStrength * (0.25 + 0.55 * fres);
+					color.rgb = mix(color.rgb, pow(refl, vec3(2.2)), k);
+				}
+			}
+		}
+	}
 
 	// SSAO: darken creases before exposure/bloom so glow stays clean
 	if (ssaoStrength > 0.0) {

@@ -137,7 +137,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_up_pixel{"volumeCamUp"};
 	CachedPixelShaderSetting<float, 3> m_volume_sun_dir_pixel{"volumeSunDir"};
+	CachedPixelShaderSetting<float, 2> m_volume_depth_range_pixel{"volumeDepthRange"};
+	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	float m_volume_debug;
+	float m_water_reflections;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -148,12 +151,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 5> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 6> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
 		"bump_strength",
 		"claude_volume_debug",
+		"claude_water_reflections",
 	};
 
 	static float readGoldenHourStrength()
@@ -185,6 +189,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_volume_debug", 0.0f, 2.0f);
 	}
 
+	static float readWaterReflections()
+	{
+		if (!g_settings->exists("claude_water_reflections"))
+			return 0.0f;
+		return g_settings->getFloat("claude_water_reflections", 0.0f, 1.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -198,6 +209,8 @@ public:
 			m_bump_strength = readBumpStrength();
 		if (name == "claude_volume_debug")
 			m_volume_debug = readVolumeDebug();
+		if (name == "claude_water_reflections")
+			m_water_reflections = readWaterReflections();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -219,6 +232,7 @@ public:
 		m_ssao_strength = readSsaoStrength();
 		m_bump_strength = readBumpStrength();
 		m_volume_debug = readVolumeDebug();
+		m_water_reflections = readWaterReflections();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -310,7 +324,9 @@ public:
 		{
 			float dbg = g_claude_volume.valid ? m_volume_debug : 0.0f;
 			m_volume_debug_pixel.set(&dbg, services);
-			if (dbg > 0.0f) {
+			float refl = g_claude_volume.valid ? m_water_reflections : 0.0f;
+			m_water_refl_pixel.set(&refl, services);
+			if (dbg > 0.0f || refl > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
 				Camera *camera = m_client->getCamera();
@@ -338,6 +354,11 @@ public:
 					sun = m_sky->getSunDirection();
 				sun.normalize();
 				m_volume_sun_dir_pixel.set(sun, services);
+				// near/far for reconstructing eye depth from the depth
+				// buffer (world BS units; shader divides by BS for nodes)
+				auto cn = camera->getCameraNode();
+				float range[2] = {cn->getNearValue(), cn->getFarValue()};
+				m_volume_depth_range_pixel.set(range, services);
 			}
 		}
 
@@ -674,6 +695,33 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 	if (timer < 1.0f)
 		return;
 	timer = 0.0f;
+
+	// claude_volume follow (Phase 0-lite streaming): whenever any volume
+	// consumer (ghost view or water reflections) is enabled, keep a volume
+	// alive around the camera — bootstrap one if none exists (e.g. right
+	// after a restart), and re-snapshot when the camera strays >24 nodes
+	// from the current center. The ~15 ms walk lands at most once per
+	// second. claude_volume_follow = 0 restores the frozen-bubble behavior.
+	{
+		auto setting_on = [](const char *name) {
+			return g_settings->exists(name)
+					&& g_settings->getFloat(name, 0.0f, 2.0f) > 0.0f;
+		};
+		bool follow = !g_settings->exists("claude_volume_follow")
+				|| g_settings->getFloat("claude_volume_follow", 0.0f, 1.0f) > 0.0f;
+		bool consumer_on = setting_on("claude_volume_debug")
+				|| setting_on("claude_water_reflections");
+		if (follow && !g_claude_volume.valid && consumer_on) {
+			claudeVolumeSnapshot(client);
+		} else if (follow && g_claude_volume.valid) {
+			constexpr s16 H = ClaudeVolume::SIZE / 2;
+			v3s16 center = g_claude_volume.origin + v3s16(H, H, H);
+			v3s16 d = floatToInt(client->getCamera()->getPosition(), BS) - center;
+			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24 || std::abs(d.Z) > 24)
+				claudeVolumeSnapshot(client);
+		}
+	}
+
 	std::ifstream f(porting::path_user + "/claude_settings_patch.conf");
 	if (!f.good())
 		return;
