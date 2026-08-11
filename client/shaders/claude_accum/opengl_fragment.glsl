@@ -15,6 +15,10 @@ uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
 uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles; .a = height
 #define MICRO_CARVE 2.0            // max sub-voxels a face may recede
+uniform lowp float skyBounce;      // how much sky a bounced-off surface relays
+uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
+uniform lowp float nightSkyGain;   // gain on the night dome
+#define SKY_BOUNCE skyBounce
 uniform vec3 volumeOrigin;         // volume cell (0,0,0) in world nodes
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
@@ -104,24 +108,61 @@ float pathDayLin()
 
 vec3 pathAlbedo(vec3 raw)
 {
-	vec3 a = pow(raw, vec3(2.2));
-	float lum = dot(a, vec3(0.2126, 0.7152, 0.0722));
-	if (lum < 0.16)
-		a *= 0.16 / max(lum, 0.02);
-	// additive floor: multiplicative lift can't rescue pure black
-	return max(a, vec3(0.04));
+	// NO luminance floor. Lifting dark albedo to 0.16 (and flooring it again
+	// at 0.04) was propping up the bounceRay bug where shaded surfaces
+	// returned black: everything was too dark, so materials were brightened
+	// to compensate. With sky bounce and emitters working, the prop only
+	// destroys contrast — dark stone could not be dark, and night became a
+	// grey wash. The tiny floor that remains is numerical, not aesthetic.
+	return max(pow(raw, vec3(2.2)), vec3(0.005));
 }
 
 vec3 pathSkyRadiance(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
-	vec3 sky = mix(vec3(0.55, 0.66, 0.82), vec3(0.22, 0.42, 0.78), up);
+	float day = pathDayLin();
+
+	// The horizon must WARM as the sun drops. Near the horizon a ray takes a
+	// long path through atmosphere, so blue scatters out and what survives is
+	// orange — the old two-colour lerp had fixed endpoints and so had no dawn
+	// and no dusk, only a blue sky dimmed toward black.
+	float low = smoothstep(0.35, -0.05, volumeSunDir.y);   // 0 high sun .. 1 set
+	vec3 zenith = mix(vec3(0.16, 0.34, 0.72), vec3(0.10, 0.15, 0.34), low);
+	vec3 horizon = mix(vec3(0.62, 0.74, 0.92), vec3(0.95, 0.50, 0.22), low);
+	// pow < 1 keeps the bright band tight to the horizon instead of a ramp
+	vec3 sky = mix(horizon, zenith, pow(up, 0.42));
+
 	float cosSun = max(dot(rd, volumeSunDir), 0.0);
-	vec3 c = sky * pathDayLin();
-	float disc = smoothstep(0.9993, 0.9997, cosSun);
-	c += volumeLightCol * (disc * 40.0
-			+ pow(cosSun, 48.0) * 3.0 + pow(cosSun, 8.0) * 0.4);
-	c += volumeLightCol * 0.18;
+	// Mie forward scattering — a broad warm halo that widens as the sun sets
+	float mie = pow(cosSun, mix(28.0, 6.0, low)) * mix(0.35, 1.5, low);
+
+	vec3 c = sky * day + volumeLightCol * mie;
+	c += volumeLightCol * smoothstep(0.9993, 0.9997, cosSun) * 40.0;
+
+	// NIGHT SKY. Previously the whole gradient was scaled by day, so at night
+	// the dome went to black and the only light left was a dim directional
+	// moon — night was dead outdoors while being washed out indoors. This is
+	// not a fake ambient term: it is the sky's own faint radiance (airglow,
+	// stars, scattered moonlight), and only rays that actually ESCAPE collect
+	// it, so it cannot leak into a sealed cave.
+	float night = 1.0 - day;
+	// Moonlight SCATTERS through the atmosphere exactly as sunlight does —
+	// it is sunlight bounced off a rock. That scattering is why a full-moon
+	// sky is deep blue instead of black, and on a clear night it dominates
+	// starlight completely. A constant night dome cannot tell a full moon
+	// from a new one; this one is driven by the moon actually being up.
+	float moonUp = clamp(volumeSunDir.y, 0.0, 1.0);
+	float moonAmt = dot(volumeLightCol, vec3(0.33)) * 12.0 * moonUp;
+	vec3 nightSky = mix(vec3(0.006, 0.010, 0.026),   // airglow, horizon
+			vec3(0.010, 0.016, 0.040), up);          // airglow, zenith
+	nightSky += mix(vec3(0.05, 0.08, 0.16), vec3(0.03, 0.06, 0.15), up)
+			* moonAmt;
+	// stars: sparse, only well above the horizon, and steady (no twinkle —
+	// it would fight temporal accumulation)
+	float st = fract(sin(dot(floor(rd * 220.0), vec3(12.9898, 78.233, 37.719)))
+			* 43758.5453);
+	nightSky += vec3(0.9, 0.92, 1.0) * step(0.9992, st) * smoothstep(0.05, 0.35, up) * 1.6;
+	c += nightSky * night * nightSkyGain;
 	return c;
 }
 
@@ -376,12 +417,12 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			if (ms > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0), rd,
 					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn)) {
 				float fallm = 1.0 - t / 160.0;
+				vec3 hpm = cell + mh + mn * 0.03125;
+				vec3 litm = pathSkyRadiance(mn) * lightVis(hpm, mn) * SKY_BOUNCE;
 				float ndlm = max(dot(mn, sd), 0.0);
-				if (ndlm <= 0.0)
-					return vec3(0.0);
-				float svm = lightVis(cell + mh + mn * 0.03125, sd);
-				return pathAlbedo(s.rgb) * ndlm * svm * fallm
-						* volumeLightCol * 1.4 * trans;
+				if (ndlm > 0.0)
+					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
+				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
 		}
@@ -397,12 +438,19 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			if (axis == 0) n.x = -stepDir.x;
 			else if (axis == 1) n.y = -stepDir.y;
 			else n.z = -stepDir.z;
+			// A surface lit only by SKY used to contribute nothing: this
+			// returned black whenever the hit faced away from the sun or was
+			// shadowed, so in shade, indoors, at dusk, or at night the whole
+			// hemisphere term collapsed to zero. That is the "sometimes the
+			// hemisphere light sucks" hole, and it is also a NOISE source —
+			// an estimator that returns 0 or a large value has far more
+			// variance than one that returns a smooth range.
+			vec3 hp = ro + rd * t + n * 0.01;
+			vec3 lit = pathSkyRadiance(n) * lightVis(hp, n) * SKY_BOUNCE;
 			float ndl = max(dot(n, sd), 0.0);
-			if (ndl <= 0.0)
-				return vec3(0.0);
-			float sv = lightVis(ro + rd * t + n * 0.01, sd);
-			return pathAlbedo(s.rgb) * ndl * sv * fall
-					* volumeLightCol * 1.4 * trans;
+			if (ndl > 0.0)
+				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}
 	return vec3(0.0);
@@ -625,10 +673,28 @@ void main(void)
 					// shouldn't be there".
 					vec3 hp2 = cell + hl + hn * 0.03125;
 					vec3 alb = pathAlbedo(s.rgb);
+					// Texture the SUB-VOXEL, not just the block. Carved
+					// surfaces previously took the cell's average colour and
+					// never touched the atlas, so the atlas drove the carve
+					// (via alpha) while contributing no detail to what the
+					// carve exposed — stones were the right shape and a flat
+					// colour. Pick the face from the hit normal and sample the
+					// same detail encoding the uncarved path uses.
+					if (textureAmount > 0.0) {
+						vec2 st = abs(hn.y) > 0.5
+								? vec2(hl.x, hn.y > 0.0 ? hl.z : 1.0 - hl.z)
+								: (abs(hn.x) > 0.5
+									? vec2(hn.x > 0.0 ? hl.z : 1.0 - hl.z, 1.0 - hl.y)
+									: vec2(hn.z > 0.0 ? 1.0 - hl.x : hl.x, 1.0 - hl.y));
+						vec2 mo0 = vec2(mod(mid0, 16.0), floor(mid0 / 16.0)) * 16.0;
+						vec2 auv0 = (mo0 + clamp(floor(st * 16.0), 0.0, 15.0) + 0.5) / 256.0;
+						vec3 det0 = texture2D(claudeAtlas, auv0).rgb * 2.0;
+						alb *= mix(vec3(1.0), det0, textureAmount);
+					}
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
 							* 43758.5453);
 					alb *= 1.0 + (jh - 0.5) * 2.0 * jitterStrength;
-					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * 0.07);
+					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 					float ndl2 = max(dot(hn, sd2), 0.0);
 					vec3 dir2 = ndl2 > 0.0
 							? vec3(ndl2 * lightVis(hp2, sd2)) * volumeLightCol
@@ -773,7 +839,7 @@ void main(void)
 
 				// direct light: jittered within the solar/lunar disc
 				// so the average converges to soft penumbras
-				vec3 sd = normalize(volumeSunDir + (rnd2 - 0.5) * 0.07);
+				vec3 sd = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 				float ndl = max(dot(n, sd), 0.0);
 				vec3 direct = vec3(0.0);
 				if (ndl > 0.0)

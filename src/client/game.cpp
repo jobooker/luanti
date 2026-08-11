@@ -104,6 +104,9 @@ struct ClaudeVolume
 	v3f prev_cam_dir;
 	v3s16 prev_origin;
 	float accum_alpha = 1.0f;
+	v3f prev_light_dir;          // last frame's sun/moon direction
+	v3f prev_light_col;          // last frame's sun/moon colour
+	int light_body = 0;          // 0 none, 1 sun, 2 moon (for stats)
 	float still_frames = 0.0f;
 	// last frame's ray-camera basis (volume-local), for reprojection:
 	// shader_* is what the shader sees (frame N-1); cur_* staged this frame
@@ -174,7 +177,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_parallax_pixel{"parallaxStrength"};
 	CachedPixelShaderSetting<float> m_jitter_pixel{"jitterStrength"};
 	CachedPixelShaderSetting<float> m_micro_pixel{"microStrength"};
+	CachedPixelShaderSetting<float> m_skybounce_pixel{"skyBounce"};
+	CachedPixelShaderSetting<float> m_sunangle_pixel{"sunAngle"};
+	CachedPixelShaderSetting<float> m_nightsky_pixel{"nightSkyGain"};
 	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
+	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
 	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -213,7 +220,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 15> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 19> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -229,6 +236,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_parallax",
 		"claude_jitter",
 		"claude_micro",
+		"claude_skybounce",
+		"claude_sun_angle",
+		"claude_night_sky",
+		"claude_moon_gain",
 	};
 
 	static float readGoldenHourStrength()
@@ -320,6 +331,38 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_jitter", 0.0f, 1.0f);
 	}
 
+	// Sun/moon angular DIAMETER in degrees. Both are ~0.53 deg in reality,
+	// and that half-degree is the whole reason shadow edges soften with
+	// distance from the caster. The old hardcoded jitter was ~4 deg — about
+	// eight times too wide, which smeared every shadow edge.
+	static float readSunAngle()
+	{
+		if (!g_settings->exists("claude_sun_angle"))
+			return 0.53f;
+		return g_settings->getFloat("claude_sun_angle", 0.0f, 20.0f);
+	}
+
+	static float readNightSky()
+	{
+		if (!g_settings->exists("claude_night_sky"))
+			return 1.0f;
+		return g_settings->getFloat("claude_night_sky", 0.0f, 20.0f);
+	}
+
+	static float readMoonGain()
+	{
+		if (!g_settings->exists("claude_moon_gain"))
+			return 1.0f;
+		return g_settings->getFloat("claude_moon_gain", 0.0f, 20.0f);
+	}
+
+	static float readSkyBounce()
+	{
+		if (!g_settings->exists("claude_skybounce"))
+			return 0.6f;
+		return g_settings->getFloat("claude_skybounce", 0.0f, 2.0f);
+	}
+
 	static float readMicro()
 	{
 		if (!g_settings->exists("claude_micro"))
@@ -368,6 +411,14 @@ public:
 			m_jitter = readJitter();
 		if (name == "claude_micro")
 			m_micro = readMicro();
+		if (name == "claude_skybounce")
+			m_skybounce = readSkyBounce();
+		if (name == "claude_sun_angle")
+			m_sunangle = readSunAngle();
+		if (name == "claude_night_sky")
+			m_nightsky = readNightSky();
+		if (name == "claude_moon_gain")
+			m_moongain = readMoonGain();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -399,6 +450,10 @@ public:
 		m_parallax = readParallax();
 		m_jitter = readJitter();
 		m_micro = readMicro();
+		m_skybounce = readSkyBounce();
+		m_sunangle = readSunAngle();
+		m_nightsky = readNightSky();
+		m_moongain = readMoonGain();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -530,6 +585,10 @@ public:
 				m_parallax_pixel.set(&m_parallax, services);
 				m_jitter_pixel.set(&m_jitter, services);
 				m_micro_pixel.set(&m_micro, services);
+				m_skybounce_pixel.set(&m_skybounce, services);
+				float sun_rad = m_sunangle * 0.0174532925f;
+				m_sunangle_pixel.set(&sun_rad, services);
+				m_nightsky_pixel.set(&m_nightsky, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
 						- v3f(g_claude_volume.origin.X,
@@ -552,17 +611,51 @@ public:
 				// no light at all. Directions are offset-independent.
 				v3f sun(0.55f, 0.40f, 0.35f);
 				v3f lcol(0.0f, 0.0f, 0.0f);
-				if (m_sky && m_sky->getSunVisible()) {
-					sun = m_sky->getSunDirection();
-					float ramp = std::min(dnr, 1.0f);
-					lcol = v3f(1.0f * ramp, 0.95f * ramp, 0.82f * ramp);
-				} else if (m_sky && m_sky->getMoonVisible()) {
-					sun = m_sky->getMoonDirection();
-					lcol = v3f(0.10f, 0.13f, 0.22f);
-				} else if (!m_sky) {
+				// Choose by which body is actually ABOVE THE HORIZON, never by
+				// the visible flags: Mineclonia leaves getSunVisible() true all
+				// night, so the moon branch never ran once. Nights were lit by
+				// a dim warm SUN pointing ~60 deg underground — every upward
+				// face had dot(n,l) <= 0 and got no direct light at all, and
+				// the moon-scattered sky term keyed off a negative Y so it was
+				// identically zero. The moon is exactly antipodal to the sun
+				// (sky.cpp differs only 90 vs 270), so whenever the sun is
+				// down, the moon is up.
+				if (m_sky) {
+					v3f sdir = m_sky->getSunDirection();
+					v3f mdir = m_sky->getMoonDirection();
+					if (m_sky->getSunVisible() && sdir.Y > 0.0f) {
+						sun = sdir;
+						float ramp = std::min(dnr, 1.0f);
+						lcol = v3f(1.0f * ramp, 0.95f * ramp, 0.82f * ramp);
+						g_claude_volume.light_body = 1;
+					} else if (m_sky->getMoonVisible() && mdir.Y > 0.0f) {
+						sun = mdir;
+						lcol = v3f(0.10f, 0.13f, 0.22f) * m_moongain;
+						g_claude_volume.light_body = 2;
+					} else {
+						g_claude_volume.light_body = 0;
+					}
+				} else {
 					lcol = v3f(1.0f, 0.95f, 0.82f);
+					g_claude_volume.light_body = 1;
 				}
 				sun.normalize();
+				// Temporal accumulation invalidated on CAMERA motion only, so
+				// standing still averaged dozens of frames while the SUN swept
+				// across the sky — it smeared into a streak. The sun disc is
+				// 0.53 deg wide and moves ~6 deg/s at time_speed 1440, so it
+				// smears eleven disc-widths a second; at the default speed it
+				// reads as haze rather than a streak, which is why it went
+				// unnoticed. Treat a moved sky as a moved camera.
+				if ((sun - g_claude_volume.prev_light_dir).getLength() > 1e-4f
+						|| (lcol - g_claude_volume.prev_light_col).getLength()
+								> 1e-4f) {
+					g_claude_volume.still_frames = 0.0f;
+					g_claude_volume.accum_alpha =
+							std::max(g_claude_volume.accum_alpha, 0.5f);
+				}
+				g_claude_volume.prev_light_dir = sun;
+				g_claude_volume.prev_light_col = lcol;
 				m_volume_sun_dir_pixel.set(sun, services);
 				m_volume_light_col_pixel.set(lcol, services);
 				// near/far for reconstructing eye depth from the depth
@@ -1376,6 +1469,11 @@ static void claudeWriteStats(f32 dtime)
 			<< ", \"volume_valid\": " << (g_claude_volume.valid ? 1 : 0)
 			<< ", \"emitters\": " << g_claude_volume.emitter_count
 			<< ", \"accum_alpha\": " << g_claude_volume.accum_alpha
+			<< ", \"light_body\": " << g_claude_volume.light_body
+			<< ", \"light_y\": " << g_claude_volume.prev_light_dir.Y
+			<< ", \"light_lum\": " << (g_claude_volume.prev_light_col.X
+					+ g_claude_volume.prev_light_col.Y
+					+ g_claude_volume.prev_light_col.Z) / 3.0f
 			<< ", \"still_frames\": " << g_claude_volume.still_frames
 			<< "}\n";
 	std::ofstream f(porting::path_user + "/claude_stats.json",
