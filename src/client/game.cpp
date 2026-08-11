@@ -771,7 +771,7 @@ static void claudeUpdateAccum(Client *client)
 	if (origin_changed || moved > 20.0f)
 		g_claude_volume.accum_alpha = 1.0f;
 	else if (moved > 0.05f || turned > 1e-4f)
-		g_claude_volume.accum_alpha = 0.35f;
+		g_claude_volume.accum_alpha = 0.5f; // less ghost-smear, bit more grain
 	else
 		g_claude_volume.accum_alpha = 0.06f;
 }

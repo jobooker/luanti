@@ -26,14 +26,20 @@ uniform lowp float accumAlpha;
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
-float hash12(vec2 p)
+// Interleaved gradient noise (Jimenez): spatially low-discrepancy, so
+// 1-spp error reads as fine film grain instead of TV static; animated
+// across frames by an R2-sequence offset.
+float ign(vec2 p)
 {
-	return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+	return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
-vec3 hash32(vec2 p, float t)
+vec3 noise3(vec2 px, float seed)
 {
-	return vec3(hash12(p + t), hash12(p + t + 17.17), hash12(p + t + 31.3));
+	vec2 o = fract(vec2(seed * 0.7548776662, seed * 0.5698402909)) * 64.0;
+	return vec3(ign(px + o),
+			ign(px + o + vec2(17.0, 59.0)),
+			ign(px + o + vec2(41.0, 23.0)));
 }
 
 float pathDayLin()
@@ -140,8 +146,9 @@ void main(void)
 		return;
 	}
 
-	vec3 rnd = hash32(gl_FragCoord.xy, fract(animationTimer * 7.31));
-	vec3 rnd2 = hash32(gl_FragCoord.yx + 5.7, fract(animationTimer * 3.71));
+	vec3 rnd = noise3(gl_FragCoord.xy, animationTimer * 100.0);
+	vec3 rnd2 = noise3(gl_FragCoord.xy + vec2(131.0, 71.0),
+			animationTimer * 100.0 + 37.7);
 
 	// subpixel jitter: free anti-aliasing through the average
 	vec2 juv = uv + (rnd.xy - 0.5) * texelSize0;
