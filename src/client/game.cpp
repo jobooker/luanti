@@ -88,7 +88,8 @@ struct ClaudeVolume
 	u64 content_hash = 0;
 	// nearest emissive cells (volume cell coords + intensity), for NEE
 	float emitters[8][4] = {};
-	int emitter_count = 0;
+	int emitter_count = 0;      // static (snapshot) emitters
+	int emitter_runtime = 0;    // static + held light this frame
 	// textured-albedo path: per-cell material id volume (unit 6) + a
 	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
 	u32 material_tex = 0;
@@ -442,7 +443,7 @@ public:
 			m_prev_tan_pixel.set(ptan, services);
 			for (int e = 0; e < 8; e++)
 				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
-			float ecount = (float)g_claude_volume.emitter_count;
+			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
@@ -881,9 +882,31 @@ static void claudeVolumeSnapshot(Client *client)
 		occ[i * 4 + 0] = col.getRed();
 		occ[i * 4 + 1] = col.getGreen();
 		occ[i * 4 + 2] = col.getBlue();
-		// alpha = occupancy class: 0 air, 100 water, 130 leaves
-		// (stochastic ray transmission -> dapple), 170..240 emissive
+		// Non-occluding decorations: grass tufts, flowers, rails, signs are
+		// quads inside a cell, not cubes — leaving them solid makes a
+		// flower cast a full block shadow. Emissive ones (torches) stay,
+		// since they are light sources.
+		if (f.light_source == 0
+				&& (f.drawtype == NDT_PLANTLIKE
+					|| f.drawtype == NDT_PLANTLIKE_ROOTED
+					|| f.drawtype == NDT_FIRELIKE
+					|| f.drawtype == NDT_SIGNLIKE
+					|| f.drawtype == NDT_RAILLIKE
+					|| f.drawtype == NDT_TORCHLIKE))
+			continue;
+
+		// alpha = occupancy class: 0 air, 100 water, 130 leaves (partial
+		// transmission), 145 glass (see-through), 170..240 emissive
 		// (170 + light_source*5, so shaders recover brightness), 255 solid
+		// Invisible light nodes (wielded_light's airlike emitters) should
+		// light the world without rendering as a glowing cube.
+		if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE) {
+			emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
+					(float)z + 0.5f,
+					std::min<int>(f.light_source, 14) / 14.0f});
+			continue;
+		}
+
 		u8 acls = 255;
 		if (f.light_source > 0) {
 			// emissive beats liquid: lava must GLOW, not mirror
@@ -900,6 +923,10 @@ static void claudeVolumeSnapshot(Client *client)
 		else if (f.drawtype == NDT_ALLFACES
 				|| f.drawtype == NDT_ALLFACES_OPTIONAL)
 			acls = 130;
+		else if (f.drawtype == NDT_GLASSLIKE
+				|| f.drawtype == NDT_GLASSLIKE_FRAMED
+				|| f.drawtype == NDT_GLASSLIKE_FRAMED_OPTIONAL)
+			acls = 145;
 		occ[i * 4 + 3] = acls;
 		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
@@ -1031,6 +1058,35 @@ static void claudeUpdateAccum(Client *client)
 		g_claude_volume.still_frames += 1.0f;
 		g_claude_volume.accum_alpha =
 				std::max(0.02f, 1.0f / (2.0f + g_claude_volume.still_frames));
+	}
+
+	// Held light: if the wielded item is a light-emitting node, place an
+	// emitter at the camera every frame. Real-time by construction — no
+	// server round trip, no snapshot lag, no light node in the world.
+	g_claude_volume.emitter_runtime = g_claude_volume.emitter_count;
+	if (g_claude_volume.valid) {
+		LocalPlayer *lp = client->getEnv().getLocalPlayer();
+		const NodeDefManager *ndef = client->getNodeDefManager();
+		if (lp && ndef) {
+			ItemStack sel, hand;
+			ItemStack wield = lp->getWieldedItem(&sel, &hand);
+			content_t cid = CONTENT_IGNORE;
+			if (!wield.name.empty() && ndef->getId(wield.name, cid)
+					&& cid != CONTENT_IGNORE) {
+				u8 ls = ndef->get(cid).light_source;
+				if (ls > 0) {
+					int slot = std::min(g_claude_volume.emitter_count, 7);
+					v3f lpos = p / BS - v3f(g_claude_volume.origin.X,
+							g_claude_volume.origin.Y, g_claude_volume.origin.Z);
+					g_claude_volume.emitters[slot][0] = lpos.X;
+					g_claude_volume.emitters[slot][1] = lpos.Y + 0.2f;
+					g_claude_volume.emitters[slot][2] = lpos.Z;
+					g_claude_volume.emitters[slot][3] =
+							std::min<int>(ls, 14) / 14.0f;
+					g_claude_volume.emitter_runtime = slot + 1;
+				}
+			}
+		}
 	}
 
 	// stage the ray-camera basis: what was current becomes the shader's

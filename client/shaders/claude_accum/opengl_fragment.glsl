@@ -69,6 +69,16 @@ float cellHash(vec3 c)
 			vec3(12.9898, 78.233, 37.719))) * 43758.5453);
 }
 
+// Deterministic transmittance per cell class: no coin flips, so no
+// shimmer (the stochastic version was parked for exactly that). Cross
+// three leaf cells and 0.55^3 of the light survives — real dappled shade.
+float cellTransmit(float a)
+{
+	if (a > 0.50 && a < 0.53) return 0.55;  // leaves
+	if (a > 0.55 && a < 0.60) return 0.92;  // glass
+	return 0.0;                              // opaque
+}
+
 bool leafPass(float a, vec3 cell)
 {
 	// PARKED (2026-08-11): light-ray dapple shimmers at current
@@ -110,6 +120,7 @@ vec3 pathSkyRadiance(vec3 rd)
 float lightVis(vec3 ro, vec3 sd)
 {
 	const float S = 128.0;
+	float vis = 1.0;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(sd);
 	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
@@ -123,7 +134,7 @@ float lightVis(vec3 ro, vec3 sd)
 			sideDist.z += invRd.z; cell.z += stepDir.z;
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
-			return 1.0;
+			return vis;
 		vec3 cc = floor(cell / 4.0);
 		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
 			// empty brick: leap to its far side in one step
@@ -139,10 +150,14 @@ float lightVis(vec3 ro, vec3 sd)
 			continue;
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
-		if (leafPass(a, cell))
-			continue;
-		if (a > 0.25)
-			return 0.0;
+		if (a > 0.25) {
+			float tr = cellTransmit(a);
+			if (tr <= 0.0)
+				return 0.0;
+			vis *= tr;
+			if (vis < 0.04)
+				return 0.0;
+		}
 	}
 	return 0.0;
 }
@@ -152,6 +167,7 @@ float lightVis(vec3 ro, vec3 sd)
 vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 {
 	const float S = 128.0;
+	float trans = 1.0;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
@@ -169,7 +185,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S)))) {
 			if (cell.y < 0.0)
 				return vec3(0.0);
-			return pathSkyRadiance(rd);
+			return pathSkyRadiance(rd) * trans;
 		}
 		vec3 cc = floor(cell / 4.0);
 		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
@@ -189,15 +205,19 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			continue;
 		}
 		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
-		if (leafPass(s.a, cell))
+		if (s.a > 0.25 && cellTransmit(s.a) > 0.0) {
+			trans *= cellTransmit(s.a);
+			if (trans < 0.04)
+				return vec3(0.0);
 			continue;
+		}
 		if (s.a > 0.25) {
 			float fall = 1.0 - t / 160.0;
 			// emissive hit: the surface IS a light — return its glow
 			// directly (this is how torches light nearby walls)
 			if (s.a > 0.6 && s.a < 0.97) {
 				float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
-				return pathAlbedo(s.rgb) * (0.4 + e * 2.0) * fall;
+				return pathAlbedo(s.rgb) * (0.4 + e * 2.0) * fall * trans;
 			}
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
@@ -208,7 +228,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				return vec3(0.0);
 			float sv = lightVis(ro + rd * t + n * 0.01, sd);
 			return pathAlbedo(s.rgb) * ndl * sv * fall
-					* volumeLightCol * 1.4;
+					* volumeLightCol * 1.4 * trans;
 		}
 	}
 	return vec3(0.0);
@@ -324,6 +344,7 @@ void main(void)
 	float t = 0.0;
 	int axis = -1;
 	vec3 fresh = vec3(0.0);
+	vec3 viewTint = vec3(1.0);
 	bool done = false;
 
 	for (int i = 0; i < 384; i++) {
@@ -348,8 +369,13 @@ void main(void)
 				continue;
 			}
 			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
-			// NOTE: no leafPass here — stochastic transmission is for
-			// LIGHT rays only; on eye rays it makes canopies seethe
+			// see through glass (windows!): tint and keep going. Leaves
+			// stay visible to eye rays — only LIGHT rays sieve through
+			// them, since transmitting eye rays makes canopies seethe.
+			if (s.a > 0.55 && s.a < 0.60) {
+				viewTint *= vec3(0.86, 0.93, 0.90);
+				continue;
+			}
 			if (s.a > 0.25 && axis >= 0) {
 				// emissive primary hit: self-lit, no rays needed
 				if (s.a > 0.6 && s.a < 0.97) {
@@ -443,6 +469,7 @@ void main(void)
 	}
 	if (!done)
 		fresh = vec3(0.0);
+	fresh *= viewTint;
 
 	// Reprojection: find where THIS pixel's world point was on last
 	// frame's screen, and only trust history whose stored hit distance
