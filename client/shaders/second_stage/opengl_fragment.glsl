@@ -116,8 +116,14 @@ vec3 volumeReflect(vec3 ro, vec3 rd)
 vec3 giSky(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
-	return mix(vec3(0.70, 0.78, 0.86), vec3(0.28, 0.48, 0.80), up)
-			* clamp(dayNightRatio, 0.06, 1.0);
+	vec3 sky = mix(vec3(0.70, 0.78, 0.86), vec3(0.28, 0.48, 0.80), up);
+	// Directional sun glow: escaping rays aligned with the sun carry
+	// direct warmth. Under canopy this makes block-level gaps into
+	// dappled bright pools instead of one uniform dimness — the depth
+	// cue dense tree cover was missing.
+	float sunAmt = pow(max(dot(rd, volumeSunDir), 0.0), 6.0);
+	sky += vec3(1.0, 0.9, 0.7) * sunAmt * 2.0;
+	return sky * clamp(dayNightRatio, 0.06, 1.0);
 }
 
 vec3 giTrace(vec3 ro, vec3 rd)
@@ -366,8 +372,14 @@ void main(void)
 			// 4 cone rays; modulate against the open-sky baseline so
 			// unoccluded ground is unchanged, overhangs darken, and lit
 			// colored surfaces bleed onto neighbors.
-			if (inVol && giStrength > 0.0 && !isWater) {
-				vec3 nrm = normalize(cross(dFdy(p), dFdx(p)));
+			vec3 pdx = dFdx(p);
+			vec3 pdy = dFdy(p);
+			// Skip depth-discontinuity pixels (foliage edges and
+			// silhouettes): their derivative normals are noise, and GI
+			// there turns dappled canopies into flat mush.
+			if (inVol && giStrength > 0.0 && !isWater
+					&& length(pdx) + length(pdy) < 2.0) {
+				vec3 nrm = normalize(cross(pdy, pdx));
 				vec3 vn2 = normalize(vdir);
 				if (dot(nrm, vn2) > 0.0)
 					nrm = -nrm;
