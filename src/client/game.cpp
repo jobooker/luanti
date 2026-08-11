@@ -80,6 +80,7 @@ struct ClaudeVolume
 	u32 coarse_tex = 0; // 32^3 any-solid brick map (unit 5): rays leap empty bricks
 	v3s16 origin; // node coords of voxel (0,0,0)
 	bool valid = false;
+	u64 last_snap_ms = 0;
 	// temporal accumulation state (updated once per frame)
 	v3f prev_cam_pos;
 	v3f prev_cam_dir;
@@ -795,6 +796,11 @@ static void claudeVolumeSnapshot(Client *client)
 	glActiveTexture(GL_TEXTURE0);
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
+	g_claude_volume.last_snap_ms = porting::getTimeMs();
+	// let the accumulator adapt to new world content within ~1s even
+	// when deeply converged (placed torches shouldn't fade in slowly)
+	if (g_claude_volume.still_frames > 10.0f)
+		g_claude_volume.still_frames = 10.0f;
 	actionstream << "[claude_volume] snapshot origin=(" << origin.X << ","
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
 			<< (S * S * S) << " in " << (porting::getTimeMs() - t0)
@@ -890,7 +896,11 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 			constexpr s16 H = ClaudeVolume::SIZE / 2;
 			v3s16 center = g_claude_volume.origin + v3s16(H, H, H);
 			v3s16 d = floatToInt(client->getCamera()->getPosition(), BS) - center;
-			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24 || std::abs(d.Z) > 24)
+			// re-snap on straying — or every 2 s while a consumer is on,
+			// so world edits (placed torches, dug holes) appear promptly
+			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24 || std::abs(d.Z) > 24
+					|| (consumer_on && porting::getTimeMs()
+							- g_claude_volume.last_snap_ms > 2000))
 				claudeVolumeSnapshot(client);
 		}
 	}
