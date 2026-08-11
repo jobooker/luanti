@@ -142,12 +142,8 @@ bool microOcc(float slot, vec3 sc)
 // read as a repeating frame).
 vec3 microRot(vec3 sc, float r)
 {
-	// Minecraft tiles are authored to tile seamlessly; rotating adjacent
-	// blocks guarantees their stone patterns mismatch at every boundary,
-	// which reads as seams across a wall (John). Identity keeps walls
-	// continuous. Variation must come from something that does not break
-	// tiling (per-block colour jitter, or world-space noise later).
-	return sc;
+	// Rotation stays: John prefers the variation, and the wall seam he
+	// saw was the baked chamfer, not the pattern mismatch.
 	if (r < 1.0) return sc;
 	if (r < 2.0) return vec3(sc.z, sc.y, 15.0 - sc.x);
 	if (r < 3.0) return vec3(15.0 - sc.x, sc.y, 15.0 - sc.z);

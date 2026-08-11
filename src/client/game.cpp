@@ -973,15 +973,11 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			if (15 - z < dPZ) solid = false;
 			int dNZ = (int)((1.0f - h[15 - y][15 - x]) * CARVE + 0.5f);
 			if (z < dNZ) solid = false;
-			// Real chamfer: cobblestone-style tiles are bright at their
-			// borders, so the six-face carve leaves an uncarved rim and
-			// every cell reads as a framed tile. Remove the 12 cube edges
-			// (one sub-voxel deep) so blocks meet as chamfered solids.
-			int ex = (x == 0 || x == 15) ? 1 : 0;
-			int ey = (y == 0 || y == 15) ? 1 : 0;
-			int ez = (z == 0 || z == 15) ? 1 : 0;
-			if (ex + ey + ez >= 2)
-				solid = false;
+			// NOTE: no baked chamfer. Carving the 12 cube edges put a
+			// perfectly straight groove at every block boundary — a
+			// machined line no stone crosses, which reads as a seam
+			// (John). Exposed-edge chamfering, if wanted, must happen at
+			// trace time where neighbours are known.
 
 			int ax2 = (mid % 16) * 16 + x;
 			int ay2 = (mid / 16) * 16 + y;
