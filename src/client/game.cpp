@@ -930,12 +930,12 @@ static void claudeVolumeSnapshot(Client *client)
 		// (170 + light_source*5, so shaders recover brightness), 255 solid
 		// Invisible light nodes (wielded_light's airlike emitters) should
 		// light the world without rendering as a glowing cube.
-		if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE) {
-			emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
-					(float)z + 0.5f,
-					std::min<int>(f.light_source, 14) / 14.0f});
+		// Invisible light nodes are wielded_light's raster-era workaround
+		// (a light node dropped in the world a beat behind the player).
+		// We now light the held item client-side every frame, so these
+		// only produce a duplicate, laggy second light — skip entirely.
+		if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
 			continue;
-		}
 
 		u8 acls = 255;
 		if (f.light_source > 0) {
