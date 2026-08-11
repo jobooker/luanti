@@ -118,6 +118,17 @@ void COpenGL3MaterialRenderer::init(s32 &outMaterialTypeNr,
 	for (size_t i = 0; i < EVA_COUNT; ++i)
 		GL.BindAttribLocation(Program, i, sBuiltInVertexAttributeNames[i]);
 
+	// GLSL 1.50 has no layout(location=...) for FRAGMENT outputs — that
+	// arrived in 3.30 — so a user-declared `out vec4 outFragColor` gets an
+	// arbitrary location unless it is bound explicitly here. If it lands
+	// anywhere but 0, writes miss GL_COLOR_ATTACHMENT0 and every render
+	// target comes back BLACK, while the default framebuffer still works.
+	// That is exactly the split seen on macOS core: post-processing off
+	// rendered the world, post-processing on rendered nothing.
+	// Harmless when the shader uses gl_FragColor or declares its own layout.
+	if (GL.BindFragDataLocation)
+		GL.BindFragDataLocation(Program, 0, "outFragColor");
+
 	if (!linkProgram())
 		return;
 

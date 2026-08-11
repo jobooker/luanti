@@ -1091,10 +1091,21 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 		GL.GetIntegerv(GL_CURRENT_PROGRAM, &prog);
 		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
 		GL.GetIntegerv(GL_VIEWPORT, vp);
+		GLint dObj = -1, dType = 0, dTest = 0, dMask = 0, dFunc = 0;
+		GL.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+				GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &dObj);
+		GL.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
+				GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &dType);
+		dTest = GL.IsEnabled(GL_DEPTH_TEST) ? 1 : 0;
+		GL.GetIntegerv(GL_DEPTH_FUNC, &dFunc);
+		GL.GetIntegerv(GL_DEPTH_WRITEMASK, &dMask);
+		while (GL.GetError() != GL_NO_ERROR) {}
 		char b[192];
 		snprintf(b, sizeof(b),
-			"[claude_gl] err=0x%04x vao=%d prog=%d fbo=%d vp=%dx%d",
-			(unsigned)e, (int)vao, (int)prog, (int)fbo, (int)vp[2], (int)vp[3]);
+			"[claude_gl] err=0x%04x fbo=%d vp=%dx%d depthObj=%d depthType=0x%04x "
+			"depthTest=%d depthFunc=0x%04x depthMask=%d",
+			(unsigned)e, (int)fbo, (int)vp[2], (int)vp[3],
+			(int)dObj, (unsigned)dType, (int)dTest, (unsigned)dFunc, (int)dMask);
 		os::Printer::log(b, ELL_ERROR);
 	}
 	GLenum indexSize = 0;
