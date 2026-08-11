@@ -138,7 +138,7 @@ float volumeSunVis(vec3 ro)
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
-	for (int i = 0; i < 144; i++) {
+	for (int i = 0; i < 208; i++) {
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
 			sideDist.x += invRd.x; cell.x += stepDir.x;
 		} else if (sideDist.y < sideDist.z) {
