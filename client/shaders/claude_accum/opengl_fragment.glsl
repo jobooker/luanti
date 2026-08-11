@@ -18,6 +18,7 @@ uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
 uniform lowp float parallaxStrength; // march INTO the height field (0..1)
+uniform lowp float jitterStrength;   // per-block colour variation (Teardown)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -430,6 +431,18 @@ void main(void)
 				hp += tj - n * dot(tj, n); // jitter within the face plane
 				vec3 albedo = volumeDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
+				// Per-block colour jitter: Teardown's answer to flatness
+				// without textures — a stone wall becomes a thousand
+				// slightly different stones. Hashed from cell position so
+				// it is stable in space and across frames.
+				if (jitterStrength > 0.0) {
+					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
+							* 43758.5453);
+					float jh2 = fract(sin(dot(cell, vec3(93.9898, 12.233, 57.719)))
+							* 24634.6345);
+					albedo *= 1.0 + (jh - 0.5) * 2.0 * jitterStrength;
+					albedo.rg *= 1.0 + (jh2 - 0.5) * 0.6 * jitterStrength;
+				}
 				// In-face hit position: the grid hands us exact UVs and,
 				// unlike triangle meshes, an EXACT constant tangent frame
 				// (the other two axes). Everything below rides on that.

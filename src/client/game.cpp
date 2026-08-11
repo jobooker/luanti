@@ -168,7 +168,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float> m_parallax_pixel{"parallaxStrength"};
-	float m_texture_amount, m_bevel, m_relief, m_parallax;
+	CachedPixelShaderSetting<float> m_jitter_pixel{"jitterStrength"};
+	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter;
 	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -207,7 +208,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 13> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 14> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -221,6 +222,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bevel",
 		"claude_relief",
 		"claude_parallax",
+		"claude_jitter",
 	};
 
 	static float readGoldenHourStrength()
@@ -305,6 +307,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_parallax", 0.0f, 1.0f);
 	}
 
+	static float readJitter()
+	{
+		if (!g_settings->exists("claude_jitter"))
+			return 0.10f;
+		return g_settings->getFloat("claude_jitter", 0.0f, 1.0f);
+	}
+
 	static float readClay()
 	{
 		if (!g_settings->exists("claude_clay"))
@@ -342,6 +351,8 @@ public:
 			m_relief = readRelief();
 		if (name == "claude_parallax")
 			m_parallax = readParallax();
+		if (name == "claude_jitter")
+			m_jitter = readJitter();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -371,6 +382,7 @@ public:
 		m_bevel = readBevel();
 		m_relief = readRelief();
 		m_parallax = readParallax();
+		m_jitter = readJitter();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -494,6 +506,7 @@ public:
 				m_bevel_pixel.set(&m_bevel, services);
 				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
+				m_jitter_pixel.set(&m_jitter, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
 						- v3f(g_claude_volume.origin.X,
