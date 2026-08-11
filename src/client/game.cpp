@@ -107,6 +107,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_golden_hour_strength;
 	CachedPixelShaderSetting<float> m_ssao_strength_pixel{"ssaoStrength"};
 	float m_ssao_strength;
+	CachedPixelShaderSetting<float> m_bump_strength_pixel{"bumpStrength"};
+	float m_bump_strength;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -117,10 +119,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 3> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 4> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
+		"bump_strength",
 	};
 
 	static float readGoldenHourStrength()
@@ -137,6 +140,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("ssao_strength", 0.0f, 2.0f);
 	}
 
+	static float readBumpStrength()
+	{
+		if (!g_settings->exists("bump_strength"))
+			return 0.8f;
+		return g_settings->getFloat("bump_strength", 0.0f, 2.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -146,6 +156,8 @@ public:
 			m_golden_hour_strength = readGoldenHourStrength();
 		if (name == "ssao_strength")
 			m_ssao_strength = readSsaoStrength();
+		if (name == "bump_strength")
+			m_bump_strength = readBumpStrength();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -165,6 +177,7 @@ public:
 		m_user_exposure_compensation = g_settings->getFloat("exposure_compensation", -1.0f, 1.0f);
 		m_golden_hour_strength = readGoldenHourStrength();
 		m_ssao_strength = readSsaoStrength();
+		m_bump_strength = readBumpStrength();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -246,6 +259,7 @@ public:
 		m_day_night_ratio_pixel.set(&dnr, services);
 		m_golden_hour_pixel.set(&m_golden_hour_strength, services);
 		m_ssao_strength_pixel.set(&m_ssao_strength, services);
+		m_bump_strength_pixel.set(&m_bump_strength, services);
 
 		if (m_volumetric_light_enabled) {
 			// Map directional light to screen space

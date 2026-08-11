@@ -41,6 +41,8 @@ uniform float crackTextureScale;
 #endif
 
 
+uniform lowp float bumpStrength;
+
 VARYING_ vec3 vNormal;
 // World position in the visible world (i.e. relative to the cameraOffset.)
 // This can be used for many shader effects without loss of precision.
@@ -472,6 +474,40 @@ void main(void)
 #ifdef ENABLE_DYNAMIC_SHADOWS
 	// Fragment normal, can differ from vNormal which is derived from vertex normals.
 	vec3 fNormal = vNormal;
+
+	// claude fork: texture-derived bump mapping. Neighboring texels'
+	// luminance acts as a micro height field; a cotangent frame built from
+	// screen-space derivatives maps its gradient into world space to perturb
+	// the normal, which is then relit against the sun direction. Per-pixel
+	// relief without asset normal maps. bumpStrength setting scales (0 off).
+#if !defined(USE_ARRAY_TEXTURE)
+	if (bumpStrength > 0.0) {
+		// v1 simplification: assume 16 px node textures (Mineclonia/MTG
+		// standard) — textureSize() is unavailable in this GLSL profile.
+		vec2 ts = vec2(1.0 / 16.0);
+		const vec3 LUMA = vec3(0.299, 0.587, 0.114);
+		float h0 = dot(texture2D(baseTexture, uv).rgb, LUMA);
+		float hx = dot(texture2D(baseTexture, uv + vec2(ts.x, 0.0)).rgb, LUMA);
+		float hy = dot(texture2D(baseTexture, uv + vec2(0.0, ts.y)).rgb, LUMA);
+		vec2 grad = vec2(hx - h0, hy - h0);
+		vec3 dp1 = dFdx(worldPosition);
+		vec3 dp2 = dFdy(worldPosition);
+		vec2 duv1 = dFdx(uv);
+		vec2 duv2 = dFdy(uv);
+		vec3 dp2perp = cross(dp2, fNormal);
+		vec3 dp1perp = cross(fNormal, dp1);
+		vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+		vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+		float invmax = inversesqrt(max(dot(T, T), dot(B, B)) + 1e-10);
+		vec3 bumped = normalize(fNormal
+				- bumpStrength * 4.0 * (T * invmax * grad.x + B * invmax * grad.y));
+		float flatDiff = max(dot(fNormal, -v_LightDirection), 0.0);
+		float bumpDiff = max(dot(bumped, -v_LightDirection), 0.0);
+		float relight = (bumpDiff + 0.35) / (flatDiff + 0.35);
+		col.rgb *= clamp(relight, 0.5, 1.6);
+		fNormal = bumped;
+	}
+#endif
 
 	if (f_shadow_strength > 0.0) {
 		float shadow_int = 0.0;
