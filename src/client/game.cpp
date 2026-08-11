@@ -565,15 +565,46 @@ public:
 			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
-				SamplerLayer_t layer = 4;
+				// REBIND EVERY FRAME. These 3D textures are bound with raw GL
+				// outside Irrlicht's material system, and they were only bound
+				// inside claudeVolumeSnapshot() — which runs every ~2 s, not
+				// per frame. Units 4-8 fall inside Irrlicht's managed range
+				// (MATERIAL_MAX_TEXTURES), and the GL3 cache handler resets
+				// those units between snapshots, so on a core profile every
+				// sampler read empty and every ray escaped to sky. The legacy
+				// 2.1 driver evidently left them alone, which is why this only
+				// ever showed on 4.1.
+				if (g_claude_volume.tex) {
+					glActiveTexture(GL_TEXTURE10);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
+				}
+				if (g_claude_volume.coarse_tex) {
+					glActiveTexture(GL_TEXTURE11);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
+				}
+				if (g_claude_volume.material_tex) {
+					glActiveTexture(GL_TEXTURE12);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.material_tex);
+				}
+				if (g_claude_volume.atlas_tex) {
+					glActiveTexture(GL_TEXTURE13);
+					glBindTexture(GL_TEXTURE_2D, g_claude_volume.atlas_tex);
+				}
+				if (g_claude_volume.micro_tex) {
+					glActiveTexture(GL_TEXTURE14);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
+				}
+				glActiveTexture(GL_TEXTURE0);
+
+				SamplerLayer_t layer = 10;
 				m_volume_sampler_pixel.set(&layer, services);
-				SamplerLayer_t clayer = 5;
+				SamplerLayer_t clayer = 11;
 				m_coarse_sampler_pixel.set(&clayer, services);
-				SamplerLayer_t mlayer = 6;
+				SamplerLayer_t mlayer = 12;
 				m_materials_sampler_pixel.set(&mlayer, services);
-				SamplerLayer_t alayer = 7;
+				SamplerLayer_t alayer = 13;
 				m_atlas_sampler_pixel.set(&alayer, services);
-				SamplerLayer_t mlayer2 = 8;
+				SamplerLayer_t mlayer2 = 14;
 				m_micro_sampler_pixel.set(&mlayer2, services);
 				v3f vorg((float)g_claude_volume.origin.X,
 						(float)g_claude_volume.origin.Y,
@@ -1283,7 +1314,7 @@ static void claudeVolumeSnapshot(Client *client)
 	g_claude_volume.content_hash = hash;
 	if (!g_claude_volume.tex)
 		glGenTextures(1, &g_claude_volume.tex);
-	glActiveTexture(GL_TEXTURE4);
+	glActiveTexture(GL_TEXTURE10);
 	glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1295,7 +1326,7 @@ static void claudeVolumeSnapshot(Client *client)
 	// coarse any-solid brick map on unit 5: empty-space leaping
 	if (!g_claude_volume.coarse_tex)
 		glGenTextures(1, &g_claude_volume.coarse_tex);
-	glActiveTexture(GL_TEXTURE5);
+	glActiveTexture(GL_TEXTURE11);
 	glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1308,7 +1339,7 @@ static void claudeVolumeSnapshot(Client *client)
 	// material-id volume on unit 6
 	if (!g_claude_volume.material_tex)
 		glGenTextures(1, &g_claude_volume.material_tex);
-	glActiveTexture(GL_TEXTURE6);
+	glActiveTexture(GL_TEXTURE12);
 	glBindTexture(GL_TEXTURE_3D, g_claude_volume.material_tex);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1322,7 +1353,7 @@ static void claudeVolumeSnapshot(Client *client)
 	if (g_claude_volume.atlas_dirty) {
 		if (!g_claude_volume.atlas_tex)
 			glGenTextures(1, &g_claude_volume.atlas_tex);
-		glActiveTexture(GL_TEXTURE7);
+		glActiveTexture(GL_TEXTURE13);
 		glBindTexture(GL_TEXTURE_2D, g_claude_volume.atlas_tex);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1332,7 +1363,7 @@ static void claudeVolumeSnapshot(Client *client)
 				GL_UNSIGNED_BYTE, g_claude_volume.atlas.data());
 		if (!g_claude_volume.micro_tex)
 			glGenTextures(1, &g_claude_volume.micro_tex);
-		glActiveTexture(GL_TEXTURE8);
+		glActiveTexture(GL_TEXTURE14);
 		glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
 		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
