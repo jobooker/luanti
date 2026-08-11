@@ -28,6 +28,9 @@ uniform lowp float ssaoStrength;
 
 uniform lowp float volumeDebug;
 uniform sampler3D claudeVolume;
+#if __VERSION__ >= 130
+#define texture3D texture
+#endif
 uniform vec3 volumeCamPos;   // camera in volume-local node units
 uniform vec3 volumeCamFwd;   // unit look direction
 uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
@@ -52,7 +55,7 @@ vec4 ghostView(vec2 uv)
 	int axis = -1; // axis of the last step = hit-face normal; -1 = ray origin cell
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
-			if (texture(claudeVolume, (cell + 0.5) / S).r > 0.5) {
+			if (texture3D(claudeVolume, (cell + 0.5) / S).r > 0.5) {
 				float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 						: (axis == 0 ? 0.8 : 0.62);
 				if (axis < 0)

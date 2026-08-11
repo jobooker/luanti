@@ -36,7 +36,11 @@
 #include "porting.h"
 #include <fstream>
 #include <sstream>
-#include <mt_opengl.h>
+// claude_volume uploads its 3D texture through the platform GL directly:
+// the mac client runs Irrlicht's legacy "opengl" driver (GL 2.1 context,
+// GLSL 120), where the mt_opengl loader isn't initialized.
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl.h>
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
@@ -621,17 +625,19 @@ static void claudeVolumeSnapshot(Client *client)
 		}
 	}
 	if (!g_claude_volume.tex)
-		GL.GenTextures(1, &g_claude_volume.tex);
-	GL.ActiveTexture(GL.TEXTURE4);
-	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.R8, S, S, S, 0, GL.RED,
-			GL.UNSIGNED_BYTE, occ.data());
-	GL.ActiveTexture(GL.TEXTURE0);
+		glGenTextures(1, &g_claude_volume.tex);
+	glActiveTexture(GL_TEXTURE4);
+	glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	// GL_LUMINANCE8: the GL 2.1-era single-channel format; replicates
+	// into .rgb on sample, so the shader's .r read works unchanged.
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, S, S, S, 0, GL_LUMINANCE,
+			GL_UNSIGNED_BYTE, occ.data());
+	glActiveTexture(GL_TEXTURE0);
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
 	actionstream << "[claude_volume] snapshot origin=(" << origin.X << ","
