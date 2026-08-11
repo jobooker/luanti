@@ -13,8 +13,12 @@ CENTROID_ VARYING_ mediump vec2 varTexCoord;
 void main(void)
 {
 	vec2 uv = varTexCoord.st;
-	if (volumeDebug > 2.5)
-		gl_FragColor = vec4(texture2D(accum, uv).rgb, 1.0);
-	else
+	if (volumeDebug > 2.5) {
+		// Teardown's filmic rolloff: highlights compress instead of clip
+		vec3 lin = pow(texture2D(accum, uv).rgb, vec3(2.2));
+		lin = vec3(1.0) - exp(-lin * 1.6);
+		gl_FragColor = vec4(pow(lin, vec3(1.0 / 2.2)), 1.0);
+	} else {
 		gl_FragColor = vec4(texture2D(merged, uv).rgb, 1.0);
+	}
 }

@@ -194,7 +194,12 @@ void main(void)
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
 				else n.z = -stepDir.z;
+				// origin jitter (Teardown: 'position jittering to hide
+				// voxel artifacts'): launching secondary rays from exact
+				// hit points quantizes occlusion into blocky staircases
 				vec3 hp = ro + rd * t + n * 0.01;
+				vec3 tj = (rnd2.zxy - 0.5) * 0.35;
+				hp += tj - n * dot(tj, n); // jitter within the face plane
 				vec3 albedo = volumeDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
 
