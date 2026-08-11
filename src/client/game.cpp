@@ -779,19 +779,45 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 		if (img) {
 			u32 buf[16 * 16];
 			img->copyToScaling(buf, 16, 16, video::ECF_A8R8G8B8);
-			for (int py = 0; py < 16; py++)
-				memcpy(&dst[(ay + py) * 256 + ax], &buf[py * 16], 16 * 4);
+			// Store DETAIL, not color: each texel divided by the tile's
+			// own average, encoded /2 in 0..255. The per-cell color (which
+			// already carries the biome palette tint) supplies the hue, so
+			// grayscale-plus-palette tiles (Mineclonia grass, leaves) work,
+			// and texture can add variation without shifting a face's
+			// average brightness — it cannot flatten the lighting.
+			double sum[3] = {0, 0, 0};
+			for (int k = 0; k < 256; k++) {
+				sum[0] += (buf[k] >> 16) & 0xFF;
+				sum[1] += (buf[k] >> 8) & 0xFF;
+				sum[2] += buf[k] & 0xFF;
+			}
+			double avg[3] = {std::max(sum[0] / 256.0, 1.0),
+					std::max(sum[1] / 256.0, 1.0),
+					std::max(sum[2] / 256.0, 1.0)};
+			for (int py = 0; py < 16; py++) {
+				for (int px = 0; px < 16; px++) {
+					u32 t = buf[py * 16 + px];
+					u32 c[3] = {(t >> 16) & 0xFFu, (t >> 8) & 0xFFu, t & 0xFFu};
+					u32 o = 0xFF000000u;
+					for (int ch = 0; ch < 3; ch++) {
+						double d = (double)c[ch] / avg[ch] * 0.5 * 255.0;
+						u32 v = (u32)std::clamp(d, 0.0, 255.0);
+						o |= v << (16 - ch * 8);
+					}
+					dst[(ay + py) * 256 + ax + px] = o;
+				}
+			}
 			img->drop();
 			ok = true;
 		}
 	}
 	if (!ok) {
-		u32 argb = 0xFF000000u | ((u32)fallback.getRed() << 16)
-				| ((u32)fallback.getGreen() << 8) | (u32)fallback.getBlue();
+		// neutral detail (0.5 encodes 1.0x): texture-free material
 		for (int py = 0; py < 16; py++)
 			for (int px = 0; px < 16; px++)
-				dst[(ay + py) * 256 + ax + px] = argb;
+				dst[(ay + py) * 256 + ax + px] = 0xFF808080u;
 	}
+	(void)fallback;
 	g_claude_volume.atlas_dirty = true;
 }
 
@@ -832,6 +858,18 @@ static void claudeVolumeSnapshot(Client *client)
 		video::SColor col(255, 180, 180, 180);
 		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
 			col = f.visuals->minimap_color;
+		// biome/palette tint (Mineclonia grass and leaves are grayscale
+		// tiles colored per-node through param2) — modulate the cell color
+		if (f.visuals) {
+			video::SColor tint(255, 255, 255, 255);
+			f.visuals->getColor(n.getParam2(), &tint);
+			if (tint.getRed() != 255 || tint.getGreen() != 255
+					|| tint.getBlue() != 255) {
+				col.setRed(col.getRed() * tint.getRed() / 255);
+				col.setGreen(col.getGreen() * tint.getGreen() / 255);
+				col.setBlue(col.getBlue() * tint.getBlue() / 255);
+			}
+		}
 		// emissive nodes: mostly-transparent textures (torches) average
 		// to near-black, making their glow black x bright = invisible.
 		// Force a warm emitter color.

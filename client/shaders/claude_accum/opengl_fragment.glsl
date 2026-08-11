@@ -386,10 +386,12 @@ void main(void)
 						float slot = floor(mid + 0.5);
 						vec2 auv = (vec2(mod(slot, 16.0),
 								floor(slot / 16.0)) + uv2) / 16.0;
-						vec3 tc = texture2D(claudeAtlas, auv).rgb;
-						albedo = mix(albedo,
-								max(pow(tc, vec3(2.2)), vec3(0.02)),
-								textureAmount);
+						// atlas stores DETAIL/2 (texel / tile average):
+						// multiply the cell's own (palette-tinted) color,
+						// so texture adds variation without changing a
+						// face's average brightness
+						vec3 det = texture2D(claudeAtlas, auv).rgb * 2.0;
+						albedo *= mix(vec3(1.0), det, textureAmount);
 					}
 				}
 
