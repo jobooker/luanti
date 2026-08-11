@@ -318,9 +318,9 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DENOISED });
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DENOISED, TEXTURE_DEPTH });
 	pipeline->addStep(present);
-	present->setBilinearFilter(1, true); // smooth upscale of half-res accum
+	// joint-bilateral upsample does its own tap weighting: keep NEAREST
 	present->setRenderSource(buffer);
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);

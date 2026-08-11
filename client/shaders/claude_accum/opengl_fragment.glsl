@@ -125,6 +125,13 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 		}
 		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
 		if (s.a > 0.25) {
+			float fall = 1.0 - t / 160.0;
+			// emissive hit: the surface IS a light — return its glow
+			// directly (this is how torches light nearby walls)
+			if (s.a > 0.6 && s.a < 0.97) {
+				float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
+				return pathAlbedo(s.rgb) * (1.0 + e * 6.0) * fall;
+			}
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
 			else if (axis == 1) n.y = -stepDir.y;
@@ -133,7 +140,6 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			if (ndl <= 0.0)
 				return vec3(0.0);
 			float sv = lightVis(ro + rd * t + n * 0.01, sd);
-			float fall = 1.0 - t / 160.0;
 			return pathAlbedo(s.rgb) * ndl * sv * fall
 					* volumeLightCol * 1.4;
 		}
@@ -190,6 +196,13 @@ void main(void)
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
 			if (s.a > 0.25 && axis >= 0) {
+				// emissive primary hit: self-lit, no rays needed
+				if (s.a > 0.6 && s.a < 0.97) {
+					float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
+					fresh = pathAlbedo(s.rgb) * (0.5 + e * 5.0);
+					done = true;
+					break;
+				}
 				vec3 n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
@@ -225,7 +238,8 @@ void main(void)
 				fresh = albedo * (direct + amb);
 
 				// mirror water: one traced reflection + jittered glint
-				if (s.a < 0.75 && n.y > 0.5) {
+				// (water = alpha band around 100/255)
+				if (s.a > 0.3 && s.a < 0.5 && n.y > 0.5) {
 					vec3 rr = reflect(rd, vec3(0.0, 1.0, 0.0));
 					vec3 refl = bounceRay(hp, rr, sd);
 					refl += volumeLightCol

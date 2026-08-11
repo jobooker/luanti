@@ -748,7 +748,14 @@ static void claudeVolumeSnapshot(Client *client)
 		occ[i * 4 + 0] = col.getRed();
 		occ[i * 4 + 1] = col.getGreen();
 		occ[i * 4 + 2] = col.getBlue();
-		occ[i * 4 + 3] = f.isLiquid() ? 128 : 255;
+		// alpha = occupancy class: 0 air, 100 water, 170..240 emissive
+		// (170 + light_source*5, so shaders recover brightness), 255 solid
+		u8 acls = 255;
+		if (f.isLiquid())
+			acls = 100;
+		else if (f.light_source > 0)
+			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;
+		occ[i * 4 + 3] = acls;
 		solid++;
 	}
 	if (!g_claude_volume.tex)
