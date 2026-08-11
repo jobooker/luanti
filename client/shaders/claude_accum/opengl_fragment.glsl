@@ -17,6 +17,7 @@ uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
+uniform lowp float parallaxStrength; // march INTO the height field (0..1)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -467,6 +468,30 @@ void main(void)
 								floor(slot / 16.0)) + uv2) / 16.0;
 						// micro relief: slope of the detail map perturbs
 						// the normal (texel-scale surface roughness)
+						// Parallax: step along the view ray inside the
+						// face until we drop below the height field. This
+						// is the cue relief can't give — features slide
+						// over each other as you move (real motion depth).
+						if (parallaxStrength > 0.0) {
+							vec3 V = -rd;
+							vec2 vt = vec2(dot(V, udir), dot(V, vdir));
+							float vz = max(abs(dot(V, n)), 0.15);
+							vec2 maxShift = vt / vz * parallaxStrength * 0.06;
+							float layer = 1.0;
+							vec2 cur = auv;
+							for (int pi = 0; pi < 8; pi++) {
+								float h = atlasHeight(cur);
+								if (h >= layer)
+									break;
+								layer -= 0.125;
+								cur -= maxShift * 0.125;
+							}
+							vec2 lo = (vec2(mod(slot, 16.0),
+									floor(slot / 16.0)) + 0.07) / 16.0;
+							vec2 hi = (vec2(mod(slot, 16.0),
+									floor(slot / 16.0)) + 0.93) / 16.0;
+							auv = clamp(cur, lo, hi);
+						}
 						if (reliefStrength > 0.0) {
 							// Height lives in the atlas alpha (texel
 							// luminance): tilt the normal by its slope AND
