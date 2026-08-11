@@ -79,6 +79,11 @@ struct ClaudeVolume
 	u32 tex = 0; // GL texture name (GLuint)
 	v3s16 origin; // node coords of voxel (0,0,0)
 	bool valid = false;
+	// temporal accumulation state (updated once per frame)
+	v3f prev_cam_pos;
+	v3f prev_cam_dir;
+	v3s16 prev_origin;
+	float accum_alpha = 1.0f;
 };
 static ClaudeVolume g_claude_volume;
 
@@ -143,6 +148,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
 	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
 	CachedPixelShaderSetting<float> m_clay_pixel{"clayStrength"};
+	CachedPixelShaderSetting<float> m_accum_alpha_pixel{"accumAlpha"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
@@ -375,6 +381,7 @@ public:
 			m_gi_split_pixel.set(&m_gi_split, services);
 			float clay = g_claude_volume.valid ? m_clay : 0.0f;
 			m_clay_pixel.set(&clay, services);
+			m_accum_alpha_pixel.set(&g_claude_volume.accum_alpha, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
@@ -746,6 +753,29 @@ static void claudeVolumeSnapshot(Client *client)
 			<< " ms" << std::endl;
 }
 
+// Once per frame: decide how strongly this frame's traced sample should
+// overwrite the accumulation history. Teleports and volume swaps trash
+// the history entirely; gentle drift blends fast; stillness accumulates
+// deep (the converged, soft-lit image).
+static void claudeUpdateAccum(Client *client)
+{
+	Camera *cam = client->getCamera();
+	v3f p = cam->getPosition();
+	v3f d = cam->getDirection();
+	float moved = p.getDistanceFrom(g_claude_volume.prev_cam_pos);
+	float turned = (d - g_claude_volume.prev_cam_dir).getLength();
+	bool origin_changed = g_claude_volume.origin != g_claude_volume.prev_origin;
+	g_claude_volume.prev_cam_pos = p;
+	g_claude_volume.prev_cam_dir = d;
+	g_claude_volume.prev_origin = g_claude_volume.origin;
+	if (origin_changed || moved > 20.0f)
+		g_claude_volume.accum_alpha = 1.0f;
+	else if (moved > 0.05f || turned > 1e-4f)
+		g_claude_volume.accum_alpha = 0.35f;
+	else
+		g_claude_volume.accum_alpha = 0.06f;
+}
+
 static void pollSettingsPatch(f32 dtime, Client *client)
 {
 	static f32 timer = 0.0f;
@@ -869,6 +899,7 @@ void Game::run()
 		g_fontengine->handleReload();
 
 		pollSettingsPatch(dtime, client);
+		claudeUpdateAccum(client);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {

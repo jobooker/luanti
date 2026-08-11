@@ -287,7 +287,35 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 		pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_EXPOSURE_1, TEXTURE_EXPOSURE_2);
 	}
 
-	return effect;
+	// claude traced-mode chain: the final merge now lands in a texture;
+	// a half-res path-traced sample accumulates into a persistent
+	// ping-pong history; a present step picks accum (traced modes) or
+	// the merged raster frame, and becomes the pipeline's returned tail.
+	static const u8 TEXTURE_ACCUM_1 = 30;
+	static const u8 TEXTURE_ACCUM_2 = 31;
+	static const u8 TEXTURE_MERGED = 32;
+	buffer->setTexture(TEXTURE_ACCUM_1, scale * 0.5f, "claude_accum_1", color_format);
+	buffer->setTexture(TEXTURE_ACCUM_2, scale * 0.5f, "claude_accum_2", color_format);
+	buffer->setTexture(TEXTURE_MERGED, scale, "claude_merged", color_format);
+
+	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
+
+	shader_id = client->getShaderSource()->getShaderRaw("claude_accum");
+	PostProcessingStep *accum = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_ACCUM_1 });
+	accum->setRenderSource(buffer);
+	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
+
+	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
+	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2 });
+	pipeline->addStep(present);
+	present->setBilinearFilter(1, true); // smooth upscale of half-res accum
+	present->setRenderSource(buffer);
+
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
+
+	return present;
 }
 
 void ResolveMSAAStep::run(PipelineContext &context)

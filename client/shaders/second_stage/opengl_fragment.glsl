@@ -525,12 +525,9 @@ void main(void)
 {
 	vec2 uv = varTexCoord.st;
 
-	// claude_volume_debug: 1/2 = ghost view, 3 = pure path-traced view
-	if (volumeDebug > 2.5) {
-		gl_FragColor = pathView(uv);
-		return;
-	}
-	if (volumeDebug > 0.5) {
+	// claude_volume_debug: 1/2 = ghost view here; 3/4 (path-traced) are
+	// produced by the claude_accum/claude_present steps downstream
+	if (volumeDebug > 0.5 && volumeDebug < 2.5) {
 		gl_FragColor = ghostView(uv);
 		return;
 	}
