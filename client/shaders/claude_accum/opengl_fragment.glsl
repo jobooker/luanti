@@ -29,6 +29,15 @@ uniform vec3 prevCamFwd;
 uniform vec3 prevCamRightU; // unit right/up (unscaled)
 uniform vec3 prevCamUpU;
 uniform vec2 prevCamTan;    // tan(fovX/2), tan(fovY/2)
+uniform vec4 claudeEmitter0; // xyz = cell-space center, w = intensity
+uniform vec4 claudeEmitter1;
+uniform vec4 claudeEmitter2;
+uniform vec4 claudeEmitter3;
+uniform vec4 claudeEmitter4;
+uniform vec4 claudeEmitter5;
+uniform vec4 claudeEmitter6;
+uniform vec4 claudeEmitter7;
+uniform lowp float claudeEmitterCount;
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -185,7 +194,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			// directly (this is how torches light nearby walls)
 			if (s.a > 0.6 && s.a < 0.97) {
 				float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
-				return pathAlbedo(s.rgb) * (1.0 + e * 6.0) * fall;
+				return pathAlbedo(s.rgb) * (0.4 + e * 2.0) * fall;
 			}
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
@@ -200,6 +209,73 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 		}
 	}
 	return vec3(0.0);
+}
+
+vec4 getEmitter(int i)
+{
+	if (i == 0) return claudeEmitter0;
+	if (i == 1) return claudeEmitter1;
+	if (i == 2) return claudeEmitter2;
+	if (i == 3) return claudeEmitter3;
+	if (i == 4) return claudeEmitter4;
+	if (i == 5) return claudeEmitter5;
+	if (i == 6) return claudeEmitter6;
+	return claudeEmitter7;
+}
+
+// visibility toward a nearby emitter: DDA capped just short of it, so
+// the emitter itself doesn't occlude its own light
+float emitterVis(vec3 ro, vec3 ld, float maxT)
+{
+	const float S = 128.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(ld);
+	vec3 invRd = 1.0 / max(abs(ld), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	for (int i = 0; i < 48; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (t >= maxT)
+			return 1.0;
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return 1.0;
+		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		if (a > 0.25 && !(a > 0.6 && a < 0.97))
+			return 0.0;
+	}
+	return 1.0;
+}
+
+// Next-event estimation: aimed contribution from the nearest emitters.
+// The fix for John's lopsided torch pools — light no longer waits for a
+// random ambient ray to stumble into the torch.
+vec3 emitterLight(vec3 hp, vec3 n)
+{
+	vec3 acc = vec3(0.0);
+	for (int i = 0; i < 8; i++) {
+		if (float(i) >= claudeEmitterCount)
+			break;
+		vec4 em = getEmitter(i);
+		vec3 L = em.xyz - hp;
+		float d2 = dot(L, L);
+		if (d2 > 625.0)
+			continue; // beyond 25 cells: negligible
+		float dist = max(sqrt(d2), 0.8);
+		vec3 ld = L / dist;
+		float ndl = max(dot(n, ld), 0.0);
+		if (ndl <= 0.0)
+			continue;
+		float vis = emitterVis(hp, ld, dist - 0.9);
+		acc += vec3(1.0, 0.72, 0.42)
+				* (em.w * em.w * 10.0 * ndl * vis / max(d2, 1.0));
+	}
+	return acc;
 }
 
 // Reproject a volume-local point into last frame's screen; returns
@@ -311,7 +387,7 @@ void main(void)
 					ad = normalize(ad - 2.0 * dot(ad, n) * n);
 				vec3 amb = bounceRay(hp, ad, sd) * 1.15;
 
-				fresh = albedo * (direct + amb);
+				fresh = albedo * (direct + amb + emitterLight(hp, n));
 
 				// mirror water: one traced reflection + jittered glint
 				// (water = alpha band around 100/255)

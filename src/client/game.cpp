@@ -37,6 +37,8 @@
 #include "porting.h"
 #include <fstream>
 #include <sstream>
+#include <array>
+#include <algorithm>
 // claude_volume uploads its 3D texture through the platform GL directly:
 // the mac client runs Irrlicht's legacy "opengl" driver (GL 2.1 context,
 // GLSL 120), where the mt_opengl loader isn't initialized.
@@ -82,6 +84,9 @@ struct ClaudeVolume
 	bool valid = false;
 	u64 last_snap_ms = 0;
 	u64 content_hash = 0;
+	// nearest emissive cells (volume cell coords + intensity), for NEE
+	float emitters[8][4] = {};
+	int emitter_count = 0;
 	// temporal accumulation state (updated once per frame)
 	v3f prev_cam_pos;
 	v3f prev_cam_dir;
@@ -165,6 +170,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3> m_prev_rightu_pixel{"prevCamRightU"};
 	CachedPixelShaderSetting<float, 3> m_prev_upu_pixel{"prevCamUpU"};
 	CachedPixelShaderSetting<float, 2> m_prev_tan_pixel{"prevCamTan"};
+	CachedPixelShaderSetting<float, 4> m_emitter_pixel[8] = {
+		{"claudeEmitter0"}, {"claudeEmitter1"}, {"claudeEmitter2"},
+		{"claudeEmitter3"}, {"claudeEmitter4"}, {"claudeEmitter5"},
+		{"claudeEmitter6"}, {"claudeEmitter7"}};
+	CachedPixelShaderSetting<float> m_emitter_count_pixel{"claudeEmitterCount"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
@@ -405,6 +415,10 @@ public:
 			float ptan[2] = {g_claude_volume.shader_prev_tanx,
 					g_claude_volume.shader_prev_tany};
 			m_prev_tan_pixel.set(ptan, services);
+			for (int e = 0; e < 8; e++)
+				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
+			float ecount = (float)g_claude_volume.emitter_count;
+			m_emitter_count_pixel.set(&ecount, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
@@ -743,6 +757,7 @@ static void claudeVolumeSnapshot(Client *client)
 	u32 solid = 0;
 	u64 hash = 14695981039346656037ULL ^ (u64)origin.X
 			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
+	std::vector<std::array<float, 4>> emitters;
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
 	for (s16 y = 0; y < S; y++)
@@ -770,10 +785,18 @@ static void claudeVolumeSnapshot(Client *client)
 		// (stochastic ray transmission -> dapple), 170..240 emissive
 		// (170 + light_source*5, so shaders recover brightness), 255 solid
 		u8 acls = 255;
-		if (f.isLiquid())
-			acls = 100;
-		else if (f.light_source > 0)
+		if (f.light_source > 0) {
+			// emissive beats liquid: lava must GLOW, not mirror
 			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;
+			// NEE list is for POINT lights only. Area emitters (lava
+			// lakes) are barn doors the random ambient ray can't miss —
+			// and they'd flood all 8 aimed slots with adjacent cells.
+			if (!f.isLiquid())
+				emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
+						(float)z + 0.5f,
+						std::min<int>(f.light_source, 14) / 14.0f});
+		} else if (f.isLiquid())
+			acls = 100;
 		else if (f.drawtype == NDT_ALLFACES
 				|| f.drawtype == NDT_ALLFACES_OPTIONAL)
 			acls = 130;
@@ -813,6 +836,21 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 32, 32, 32, 0,
 			GL_LUMINANCE, GL_UNSIGNED_BYTE, coarse.data());
 	glActiveTexture(GL_TEXTURE0);
+	// nearest-8 emitters to the camera (= volume center) for NEE
+	std::sort(emitters.begin(), emitters.end(),
+			[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
+				auto d2 = [](const std::array<float, 4> &e) {
+					float dx = e[0] - 64.f, dy = e[1] - 64.f, dz = e[2] - 64.f;
+					return dx * dx + dy * dy + dz * dz;
+				};
+				return d2(a) < d2(b);
+			});
+	g_claude_volume.emitter_count = std::min<size_t>(emitters.size(), 8);
+	for (int e = 0; e < 8; e++)
+		for (int k = 0; k < 4; k++)
+			g_claude_volume.emitters[e][k] =
+					e < g_claude_volume.emitter_count ? emitters[e][k] : 0.0f;
+
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
 	g_claude_volume.last_snap_ms = porting::getTimeMs();
