@@ -433,12 +433,19 @@ void main(void)
 						// micro relief: slope of the detail map perturbs
 						// the normal (texel-scale surface roughness)
 						if (reliefStrength > 0.0) {
+							// Height lives in the atlas alpha (texel
+							// luminance): tilt the normal by its slope AND
+							// darken the grooves. The groove shadow is what
+							// actually reads as depth on bark and stone —
+							// directional shading alone is the weak cue.
 							float st = 1.0 / 256.0;
-							float l0 = dot(texture2D(claudeAtlas, auv).rgb, vec3(0.33));
-							float lu = dot(texture2D(claudeAtlas, auv + vec2(st, 0.0)).rgb, vec3(0.33));
-							float lv = dot(texture2D(claudeAtlas, auv + vec2(0.0, st)).rgb, vec3(0.33));
-							n = normalize(n - (udir * (lu - l0) + vdir * (lv - l0))
-									* reliefStrength * 22.0);
+							float h0 = texture2D(claudeAtlas, auv).a;
+							float hu = texture2D(claudeAtlas, auv + vec2(st, 0.0)).a;
+							float hv = texture2D(claudeAtlas, auv + vec2(0.0, st)).a;
+							n = normalize(n - (udir * (hu - h0) + vdir * (hv - h0))
+									* reliefStrength * 26.0);
+							albedo *= 1.0 - reliefStrength * 0.55
+									* clamp(0.55 - h0, 0.0, 0.55) / 0.55;
 						}
 						// atlas stores DETAIL/2 (texel / tile average):
 						// multiply the cell's own (palette-tinted) color,

@@ -825,7 +825,11 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 				for (int px = 0; px < 16; px++) {
 					u32 t = buf[py * 16 + px];
 					u32 c[3] = {(t >> 16) & 0xFFu, (t >> 8) & 0xFFu, t & 0xFFu};
-					u32 o = 0xFF000000u;
+					// alpha carries HEIGHT (texel luminance): dark = deeper.
+					// Honest only for carved materials (bark, stone, brick,
+					// planks); painted patterns are excluded by class below.
+					u32 lum = (c[0] * 30 + c[1] * 59 + c[2] * 11) / 100;
+					u32 o = (std::min(lum, 255u) << 24);
 					for (int ch = 0; ch < 3; ch++) {
 						double d = (double)c[ch] / avg[ch] * 0.5 * 255.0;
 						u32 v = (u32)std::clamp(d, 0.0, 255.0);
