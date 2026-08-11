@@ -303,8 +303,20 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	float trace_scale = 0.5f;
 	if (g_settings->exists("claude_trace_scale"))
 		trace_scale = rangelim(g_settings->getFloat("claude_trace_scale"), 0.25f, 1.0f);
-	buffer->setTexture(TEXTURE_ACCUM_1, scale * trace_scale, "claude_accum_1", color_format);
-	buffer->setTexture(TEXTURE_ACCUM_2, scale * trace_scale, "claude_accum_2", color_format);
+	// The accumulation buffers hold HDR radiance (the sun disc alone is x40)
+	// and are written directly, never alpha-blended into — so they can always
+	// be float, whatever the raster path chose. Tying them to
+	// post_processing_texture_bits forced a choice between two bad options:
+	// leave it at 10 and clip every value above 1.0 into a NORMALISED buffer,
+	// or raise it to 16 and drag the whole raster pipeline onto a float target
+	// — which broke alpha blending for the sky's sun and moon quads on this
+	// legacy GL driver and drew them as opaque SQUARES.
+	video::ECOLOR_FORMAT accum_format = color_format;
+	if (driver->queryTextureFormat(video::ECF_A16B16G16R16F)
+			&& driver->queryFeature(video::EVDF_RENDER_TO_FLOAT_TEXTURE))
+		accum_format = video::ECF_A16B16G16R16F;
+	buffer->setTexture(TEXTURE_ACCUM_1, scale * trace_scale, "claude_accum_1", accum_format);
+	buffer->setTexture(TEXTURE_ACCUM_2, scale * trace_scale, "claude_accum_2", accum_format);
 	buffer->setTexture(TEXTURE_MERGED, scale, "claude_merged", color_format);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));

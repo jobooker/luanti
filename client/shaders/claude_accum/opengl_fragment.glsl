@@ -152,7 +152,13 @@ vec3 pathSkyRadiance(vec3 rd)
 	// starlight completely. A constant night dome cannot tell a full moon
 	// from a new one; this one is driven by the moon actually being up.
 	float moonUp = clamp(volumeSunDir.y, 0.0, 1.0);
-	float moonAmt = dot(volumeLightCol, vec3(0.33)) * 12.0 * moonUp;
+	// Kept deliberately WELL BELOW the moon's own directional light. At 12.0
+	// the scattered dome outshone the beam several times over, and ambient
+	// that strong erases shadows by definition — there was no moonshadow at
+	// all. Moonlight behaves like sunlight: the direct beam dominates and the
+	// sky fill is a fraction of it. Use claude_moon_gain for overall night
+	// brightness, not this.
+	float moonAmt = dot(volumeLightCol, vec3(0.33)) * 1.6 * moonUp;
 	vec3 nightSky = mix(vec3(0.006, 0.010, 0.026),   // airglow, horizon
 			vec3(0.010, 0.016, 0.040), up);          // airglow, zenith
 	nightSky += mix(vec3(0.05, 0.08, 0.16), vec3(0.03, 0.06, 0.15), up)
