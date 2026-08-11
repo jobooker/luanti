@@ -1,5 +1,6 @@
 #define rendered texture0
 #define bloom texture1
+#define depthmap texture3
 
 #ifdef GL_ES
 // Dithering requires sufficient floating-point precision
@@ -22,6 +23,32 @@ uniform lowp float bloomIntensity;
 uniform lowp float saturation;
 uniform lowp float dayNightRatio;
 uniform lowp float goldenHourStrength;
+uniform sampler2D depthmap;
+uniform lowp float ssaoStrength;
+
+// Cheap single-pass SSAO from the depth buffer alone: spiral taps around
+// each pixel; nearer samples within a depth window count as occluders.
+// Thresholds scale with (1 - depth) to roughly compensate for the
+// nonlinear depth distribution. Sky (depth ~1) is excluded.
+float sampleAO(vec2 uv, float d0)
+{
+	if (d0 >= 0.9999)
+		return 0.0;
+	float zscale = max(1.0 - d0, 1e-4);
+	float ao = 0.0;
+	const int N = 12;
+	for (int i = 0; i < N; i++) {
+		float a = float(i) * 2.39996; // golden angle spiral
+		float r = 12.0 * (float(i) + 0.5) / float(N);
+		vec2 offs = vec2(cos(a), sin(a)) * r * texelSize0;
+		float ds = texture2D(depthmap, uv + offs).r;
+		float diff = d0 - ds; // > 0: sample is closer -> potential occluder
+		float t1 = 0.0004 * zscale;
+		float t2 = 0.02 * zscale;
+		ao += smoothstep(t1 * 0.25, t1, diff) * (1.0 - smoothstep(t2 * 0.5, t2, diff));
+	}
+	return ao / float(N);
+}
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -116,6 +143,12 @@ void main(void)
 
 	// translate to linear colorspace (approximate)
 	color.rgb = pow(color.rgb, vec3(2.2));
+
+	// SSAO: darken creases before exposure/bloom so glow stays clean
+	if (ssaoStrength > 0.0) {
+		float ao = sampleAO(uv, texture2D(depthmap, uv).r);
+		color.rgb *= 1.0 - ssaoStrength * 0.7 * ao;
+	}
 
 #ifdef ENABLE_BLOOM_DEBUG
 	if (uv.x > 0.5 || uv.y > 0.5)
