@@ -1114,6 +1114,22 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 	g_claude_volume.atlas_dirty = true;
 }
 
+// GL_LUMINANCE was REMOVED in the OpenGL core profile, so these uploads
+// silently produced nothing there: the coarse brick map read zero everywhere,
+// every ray leapt past all geometry, and the traced world came out as pure
+// sky. GL_R8/GL_RED is the core replacement and exists from 3.0; the legacy
+// 2.1 driver has only LUMINANCE. Shaders read .r either way.
+static bool claudeUseR8()
+{
+	static int cached = -1;
+	if (cached < 0) {
+		const char *v = (const char *)glGetString(GL_VERSION);
+		int major = (v && v[0] >= '0' && v[0] <= '9') ? (v[0] - '0') : 2;
+		cached = (major >= 3) ? 1 : 0;
+	}
+	return cached == 1;
+}
+
 // claude_volume_snapshot: walk the client's loaded map ±SIZE/2 nodes around
 // the camera into a solid/air occupancy grid and upload it as a GL_R8 3D
 // texture on unit 4. One-shot: the volume does not follow the camera
@@ -1286,8 +1302,9 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 32, 32, 32, 0,
-			GL_LUMINANCE, GL_UNSIGNED_BYTE, coarse.data());
+	glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
+			32, 32, 32, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
+			GL_UNSIGNED_BYTE, coarse.data());
 	// material-id volume on unit 6
 	if (!g_claude_volume.material_tex)
 		glGenTextures(1, &g_claude_volume.material_tex);
@@ -1298,8 +1315,9 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, S, S, S, 0,
-			GL_LUMINANCE, GL_UNSIGNED_BYTE, mids.data());
+	glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
+			S, S, S, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
+			GL_UNSIGNED_BYTE, mids.data());
 	// tile atlas on unit 7 (uploaded only when the palette grew)
 	if (g_claude_volume.atlas_dirty) {
 		if (!g_claude_volume.atlas_tex)
@@ -1321,8 +1339,9 @@ static void claudeVolumeSnapshot(Client *client)
 		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-		glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 256, 256, 16, 0,
-				GL_LUMINANCE, GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
+		glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
+				256, 256, 16, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
+				GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
 		g_claude_volume.atlas_dirty = false;
 	}
 	glActiveTexture(GL_TEXTURE0);

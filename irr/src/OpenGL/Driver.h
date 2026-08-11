@@ -310,6 +310,18 @@ protected:
 	core::stringc VendorName;
 	SIrrlichtCreationParameters Params;
 	OpenGLVersion Version;
+	//! Core profile has no valid default VAO (object 0), so one must be
+	//! bound or every draw call fails. Compatibility profile and OpenGL ES
+	//! both tolerate its absence, which is why this driver never needed it
+	//! until macOS — where 3.2+ is core-only.
+	u32 CoreVAO = 0;
+	//! Scratch buffers used to stream client-side vertex/index data, which
+	//! core profile forbids passing directly.
+	u32 StreamVBO = 0;
+	u32 StreamIBO = 0;
+	uintptr_t streamVertices(const void *vertices, int vertexCount, const VertexType &vertexType);
+	const void *streamIndices(const void *indices, int indexCount, int indexSize);
+	void unstream();
 
 	//! bool to make all renderstates reset if set to true.
 	bool ResetRenderStates;

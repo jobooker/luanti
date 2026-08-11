@@ -33,8 +33,12 @@ OpenGLVersion COpenGL3Driver::getVersionFromOpenGL() const
 
 void COpenGL3Driver::initFeatures()
 {
-	if (Version.Spec != OpenGLSpec::Compat) {
-		throw std::runtime_error("OpenGL 3 driver requires Compatibility context");
+	// Core profile is now supported: genericDriverInit() binds a VAO, which
+	// is the only thing compatibility was actually providing (its default
+	// VAO object 0). macOS grants nothing above 2.1 except core, so this is
+	// what unblocks GL 4.1 there. See luanti#16041.
+	if (Version.Spec != OpenGLSpec::Compat && Version.Spec != OpenGLSpec::Core) {
+		throw std::runtime_error("OpenGL 3 driver requires Compat or Core context");
 	}
 	if (!isVersionAtLeast(3, 2)) {
 		throw std::runtime_error("OpenGL 3 driver requires OpenGL >= 3.2");

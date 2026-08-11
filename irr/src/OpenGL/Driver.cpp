@@ -273,6 +273,15 @@ bool COpenGL3DriverBase::genericDriverInit(const core::dimension2d<u32> &screenS
 		KHRDebugSupported = false;
 	}
 
+	// Core profile: bind a VAO before anything draws. Object 0 is not a
+	// valid VAO in core, so without this every draw call is an immediate
+	// GL_INVALID_OPERATION. One driver-wide VAO is enough — this driver
+	// sets attribute pointers per draw rather than caching them per mesh.
+	if (Version.Spec == OpenGLSpec::Core) {
+		GL.GenVertexArrays(1, &CoreVAO);
+		GL.BindVertexArray(CoreVAO);
+	}
+
 	initQuadsIndices();
 	initMaxJointTransforms();
 
@@ -974,18 +983,64 @@ void COpenGL3DriverBase::drawQuad(const VertexType &vertexType, const S3DVertex 
 	drawArrays(GL_TRIANGLE_FAN, vertexType, vertices, 4);
 }
 
+// Core profile forbids client-side vertex arrays entirely: beginDraw() hands
+// its `verticesBase` to glVertexAttribPointer, which is an offset when a VBO
+// is bound and a raw CPU pointer otherwise. In core the latter is illegal and
+// the draw is silently dropped — which is why on macOS the world rendered into
+// its framebuffer correctly (that path uses VBOs) while the fullscreen quad
+// that blits the result to screen drew nothing, leaving only the HUD.
+//
+// Stream the client data through a scratch buffer instead. Only used in core;
+// compatibility and ES keep the direct path.
+uintptr_t COpenGL3DriverBase::streamVertices(const void *vertices, int vertexCount,
+		const VertexType &vertexType)
+{
+	if (Version.Spec != OpenGLSpec::Core || !vertices)
+		return reinterpret_cast<uintptr_t>(vertices);
+	if (!StreamVBO)
+		GL.GenBuffers(1, &StreamVBO);
+	GL.BindBuffer(GL_ARRAY_BUFFER, StreamVBO);
+	GL.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)vertexCount * vertexType.VertexSize,
+			vertices, GL_STREAM_DRAW);
+	return 0;
+}
+
+const void *COpenGL3DriverBase::streamIndices(const void *indices, int indexCount,
+		int indexSize)
+{
+	if (Version.Spec != OpenGLSpec::Core || !indices)
+		return indices;
+	if (!StreamIBO)
+		GL.GenBuffers(1, &StreamIBO);
+	GL.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, StreamIBO);
+	GL.BufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)indexCount * indexSize,
+			indices, GL_STREAM_DRAW);
+	return nullptr;
+}
+
+void COpenGL3DriverBase::unstream()
+{
+	if (Version.Spec != OpenGLSpec::Core)
+		return;
+	GL.BindBuffer(GL_ARRAY_BUFFER, 0);
+	GL.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
 void COpenGL3DriverBase::drawArrays(GLenum primitiveType, const VertexType &vertexType, const void *vertices, int vertexCount)
 {
-	beginDraw(vertexType, reinterpret_cast<uintptr_t>(vertices));
+	beginDraw(vertexType, streamVertices(vertices, vertexCount, vertexType));
 	GL.DrawArrays(primitiveType, 0, vertexCount);
 	endDraw(vertexType);
+	unstream();
 }
 
 void COpenGL3DriverBase::drawElements(GLenum primitiveType, const VertexType &vertexType, const void *vertices, int vertexCount, const u16 *indices, int indexCount)
 {
-	beginDraw(vertexType, reinterpret_cast<uintptr_t>(vertices));
-	GL.DrawRangeElements(primitiveType, 0, vertexCount - 1, indexCount, GL_UNSIGNED_SHORT, indices);
+	beginDraw(vertexType, streamVertices(vertices, vertexCount, vertexType));
+	const void *idx = streamIndices(indices, indexCount, 2);
+	GL.DrawRangeElements(primitiveType, 0, vertexCount - 1, indexCount, GL_UNSIGNED_SHORT, idx);
 	endDraw(vertexType);
+	unstream();
 }
 
 void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList,

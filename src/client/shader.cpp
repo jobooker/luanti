@@ -711,6 +711,16 @@ void ShaderSource::generateShader(ShaderInfo &shaderinfo)
 		if (use_glsl3) {
 			shaders_header << "#define ATTRIBUTE_(n) layout(location = n) in\n"
 				"#define texture2D texture\n";
+		} else if (use_glsl15) {
+			// GLSL 1.50 has no layout(location=...) for attributes (that is
+			// 3.30+), but `attribute` and `texture2D` are ALREADY removed, so
+			// it cannot use the legacy spelling either. Falling through to the
+			// legacy branch emitted `attribute` under `#version 150`, which
+			// lenient drivers accept in a compatibility context and a strict
+			// CORE context rejects outright — the reason macOS could never run
+			// this driver. cf. luanti#16041.
+			shaders_header << "#define ATTRIBUTE_(n) in\n"
+				"#define texture2D texture\n";
 		} else {
 			shaders_header << "#define ATTRIBUTE_(n) attribute\n";
 		}
@@ -755,7 +765,12 @@ void ShaderSource::generateShader(ShaderInfo &shaderinfo)
 				"#define gl_FragColor outFragColor\n"
 				"layout(location = 0) out vec4 outFragColor;\n";
 		} else if (use_glsl15) {
-			fragment_header += "#define VARYING_ in\n";
+			// gl_FragColor is removed in 1.50 too; declare our own output.
+			// No layout(location=...) on outputs before 3.30, so it is a
+			// bare declaration.
+			fragment_header += "#define VARYING_ in\n"
+				"#define gl_FragColor outFragColor\n"
+				"out vec4 outFragColor;\n";
 		} else {
 			fragment_header += "#define VARYING_ varying\n";
 		}
