@@ -401,12 +401,13 @@ void main(void)
 					&& all(lessThan(wcell, vec3(128.0)));
 			bool isWater = false;
 
-			// Clay mode: blend the textured surface toward its flat
-			// per-block color, the ghost-view/Teardown look — geometry
-			// and traced lighting carry the depth instead of texture
-			// noise. Sample slightly inside the surface along the view
-			// ray so side faces pick their own block, not the air cell.
-			if (inVol && clayStrength > 0.0
+			// Clay mode (mid strengths only): blend the textured surface
+			// toward its flat per-block color. Pure mode (>= 0.95) paints
+			// albedo inside the lit branch instead — painting it here
+			// without guaranteed lighting made distant pixels (where
+			// depth-reconstruction noise misses the surface cell) render
+			// full-bright unlit: the 'lit cave' bug.
+			if (inVol && clayStrength > 0.0 && clayStrength < 0.95
 					&& (giSplit < 0.5 || uv.x > 0.5)) {
 				vec3 ccell = floor(p + normalize(vdir) * 0.1
 						- vec3(0.0, 0.02, 0.0));
@@ -446,7 +447,10 @@ void main(void)
 			// 'flittering artifacts'), and entity pixels skip naturally
 			// because their containing cell is air.
 			vec3 vn2 = normalize(vdir);
-			vec3 scell = floor(p + vn2 * 0.08);
+			// 0.3-node inward probe: depth reconstruction wobbles a few
+			// tenths of a node at range; a shallow probe misses the
+			// surface cell and drops pixels out of the lit path
+			vec3 scell = floor(p + vn2 * 0.3);
 			bool onSurface = false;
 			vec3 nrm = vec3(0.0, 1.0, 0.0);
 			if (inVol && giStrength > 0.0 && !isWater) {
@@ -516,9 +520,10 @@ void main(void)
 				// the rays actually see. Unlit interiors go black until
 				// Phase 3 emissives — that's real tracing being honest.
 				if (clayStrength > 0.95) {
-					vec4 cv = texture3D(claudeVolume,
-							(scell + 0.5) / 128.0);
-					vec3 albedo = pow(cv.rgb, vec3(2.2));
+					// albedo from the SAME cell the lighting used —
+					// keeps 'painted' and 'lit' inseparable
+					vec3 albedo = pow(texture3D(claudeVolume,
+							(scell + 0.5) / 128.0).rgb, vec3(2.2));
 					vec3 sunCol = vec3(1.06, 0.96, 0.82);
 					color.rgb = albedo * (gi * 0.26
 							+ vec3(direct) * sunCol * dayL);
