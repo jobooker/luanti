@@ -954,6 +954,18 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			for (int y = 0; y < 16; y++)
 				for (int x = 0; x < 16; x++)
 					h[y][x] = std::clamp((h[y][x] - hmin) / span, 0.0f, 1.0f);
+			// Border texels are dark in most tiles (mortar drawn at the
+			// edge), so every block carved a groove exactly at its
+			// boundary and the grooves lined up into a mortar LATTICE
+			// across whole walls. Lift each border texel to at least its
+			// inward neighbour so blocks meet flush; interior relief is
+			// untouched.
+			for (int i2 = 0; i2 < 16; i2++) {
+				h[0][i2] = std::max(h[0][i2], h[1][i2]);
+				h[15][i2] = std::max(h[15][i2], h[14][i2]);
+				h[i2][0] = std::max(h[i2][0], h[i2][1]);
+				h[i2][15] = std::max(h[i2][15], h[i2][14]);
+			}
 		}
 		const int CARVE = 2; // max sub-voxels removed from a face
 		for (int z = 0; z < 16; z++)
