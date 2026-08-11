@@ -1534,7 +1534,25 @@ void COpenGL3DriverBase::setTextureRenderStates(const SMaterial &material, bool 
 			states.MagFilter = magFilter;
 		}
 
-		if (material.UseMipMaps && tmpTexture->hasMipMaps()) {
+		// A texture with NO mip chain but a MIPMAP min filter is INCOMPLETE, and
+		// sampling it returns black. Verified standalone on macOS 4.1 core, where
+		// the driver even says so: "unit 0 ... is unloadable and bound to sampler
+		// type (Float) - using zero texture because texture unloadable". Compat
+		// drivers tolerate it, which is why this never showed on GL 2.1.
+		//
+		// Luanti's PostProcessingStep sets ETMINF_NEAREST_MIPMAP_NEAREST with
+		// UseMipMaps=false on render-target textures, so the guarded branch below
+		// should already avoid it — but the per-texture state cache can decide no
+		// update is needed and leave a stale mipmap filter in place. Force the
+		// safe value whenever the texture genuinely has no mip levels.
+		if (!tmpTexture->hasMipMaps()) {
+			GL.TexParameteri(tmpTextureType, GL_TEXTURE_MIN_FILTER,
+					(layer.MinFilter == ETMINF_NEAREST_MIPMAP_NEAREST
+						|| layer.MinFilter == ETMINF_NEAREST_MIPMAP_LINEAR)
+						? GL_NEAREST : GL_LINEAR);
+			states.MinFilter = layer.MinFilter;
+			states.MipMapStatus = false;
+		} else if (material.UseMipMaps && tmpTexture->hasMipMaps()) {
 			if (!states.IsCached || layer.MinFilter != states.MinFilter ||
 					!states.MipMapStatus) {
 				E_TEXTURE_MIN_FILTER minFilter = layer.MinFilter;
