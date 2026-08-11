@@ -13,8 +13,8 @@ uniform lowp float volumeDebug;
 uniform sampler3D claudeVolume;
 uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
-uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles
-uniform sampler3D claudeMicro;     // 256x256x16: per-material 16^3 grids
+uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles; .a = height
+#define MICRO_CARVE 2.0            // max sub-voxels a face may recede
 uniform vec3 volumeOrigin;         // volume cell (0,0,0) in world nodes
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
@@ -125,52 +125,75 @@ vec3 pathSkyRadiance(vec3 rd)
 	return c;
 }
 
-// Nested DDA: the SAME traversal as the world, one scale down. Each
-// material owns a 16^3 occupancy grid; a ray entering a cell marches it
-// in local coordinates. Misses fall through, so gaps are real, and the
-// light rays use this too, so stones shadow each other honestly.
-bool microOcc(float slot, vec3 sc)
+// Nested DDA: the SAME traversal as the world, one scale down. A ray
+// entering a cell marches a 16^3 sub-grid in local coordinates. Misses fall
+// through, so gaps are real, and the light rays use this too, so stones
+// shadow each other honestly. The sub-grid is not stored — it is carved on
+// demand, per face, by microSolid below.
+
+// How deep this face recedes at one texel, in sub-voxels (0..C). Nearest
+// sampling on purpose: 16x16 art maps 1:1 onto 16 sub-voxels, and the
+// carve is integer anyway. Bilinear here is what made the stones lumpy.
+float faceCarve(float slot, vec2 t, float C)
 {
 	vec2 mo = vec2(mod(slot, 16.0), floor(slot / 16.0)) * 16.0;
-	vec3 uv3 = vec3((mo.x + sc.x + 0.5) / 256.0,
-			(mo.y + sc.y + 0.5) / 256.0, (sc.z + 0.5) / 16.0);
-	return texture3D(claudeMicro, uv3).r > 0.5;
+	vec2 p = clamp(floor(t), 0.0, 15.0);
+	float h = texture2D(claudeAtlas, (mo + p + 0.5) / 256.0).a;
+	return floor((1.0 - h) * C + 0.5);
 }
 
-// Per-cell rotation: four yaw orientations chosen by a position hash, so
-// neighbouring blocks never share a pattern (the tell that made cells
-// read as a repeating frame).
-vec3 microRot(vec3 sc, float r)
+// The face mapping is ALIGNED — deliberately identical in every cell.
+//
+// This looks like a missed opportunity for variation, and three attempts at
+// variation are why it isn't. Per-cell rotation, mirroring, and a toroidal
+// offset were each tried; all three produce the same fatal artifact. The
+// carve depth at a shared edge is then whatever each block's own pattern
+// says, so one side sits flush while the other is cut 12.5 cm deep, and the
+// boundary becomes a CLIFF running the full metre. Grazing light turns every
+// cliff into a shadow line whose length grows with distance from the lamp —
+// a hard 1 m lattice, and worse than the repetition it was meant to hide.
+//
+// The rule: any per-cell change of mapping IS a discontinuity. Only a height
+// field continuous in world space carves seamlessly. Minecraft tiles are
+// drawn to tile at exactly 1 m, so the aligned mapping is already that — the
+// pattern repeats, but nothing steps at the seam. Variation has to come from
+// somewhere that isn't geometry (light, or a gentle albedo jitter).
+vec2 faceUV(vec2 t, float h, float horiz)
 {
-	// Rotation stays: John prefers the variation, and the wall seam he
-	// saw was the baked chamfer, not the pattern mismatch.
-	if (r < 1.0) return sc;
-	if (r < 2.0) return vec3(sc.z, sc.y, 15.0 - sc.x);
-	if (r < 3.0) return vec3(15.0 - sc.x, sc.y, 15.0 - sc.z);
-	return vec3(15.0 - sc.z, sc.y, sc.x);
+	return t;
 }
 
-// A face pressed against another solid block must NOT stay carved, or
-// every pair of neighbours leaves a trench between them. Fill the rind
-// on interface faces so walls read as continuous stone and only exposed
-// faces keep their relief. nbNeg/nbPos: 1 where that neighbour is solid.
+// Sub-voxel shape is carved AT TRACE TIME, per face, and ONLY on faces
+// that are actually exposed. The old path baked one 16^3 grid carved by
+// all six height maps at once, which failed twice over: a side face's
+// carve punched holes through the front face, and a face pressed against
+// a neighbour had to be re-filled with a 2-thick rind — a proud ridge at
+// every 1 m boundary that cast its own shadow line. That ridge WAS the
+// lattice John saw. Here an interface face is never carved at all, so
+// neighbours meet flush, and every visible face shows its own projection.
+// nbNeg/nbPos: 1 where that neighbour cell is solid.
 bool microSolid(float slot, vec3 sc, float rot, vec3 nbNeg, vec3 nbPos)
 {
-	if (microOcc(slot, microRot(sc, rot)))
-		return true;
-	const float RIND = 2.0;
-	// Fill ONLY where every face whose rind this sub-voxel lies in is an
-	// interface. If it also lies in an EXPOSED face's rind, leave it
-	// carved — otherwise each block grows an uncarved border strip on its
-	// visible face and the wall reads as framed tiles.
-	bool exposed = false, iface = false;
-	if (sc.x < RIND) { if (nbNeg.x > 0.5) iface = true; else exposed = true; }
-	if (sc.x > 15.0 - RIND) { if (nbPos.x > 0.5) iface = true; else exposed = true; }
-	if (sc.y < RIND) { if (nbNeg.y > 0.5) iface = true; else exposed = true; }
-	if (sc.y > 15.0 - RIND) { if (nbPos.y > 0.5) iface = true; else exposed = true; }
-	if (sc.z < RIND) { if (nbNeg.z > 0.5) iface = true; else exposed = true; }
-	if (sc.z > 15.0 - RIND) { if (nbPos.z > 0.5) iface = true; else exposed = true; }
-	return iface && !exposed;
+	float C = max(1.0, floor(MICRO_CARVE * microStrength + 0.5));
+	if (nbPos.y < 0.5 && sc.y > 15.0 - C
+			&& 15.0 - sc.y < faceCarve(slot, faceUV(vec2(sc.x, sc.z), rot, 1.0), C))
+		return false;
+	if (nbNeg.y < 0.5 && sc.y < C
+			&& sc.y < faceCarve(slot, faceUV(vec2(sc.x, 15.0 - sc.z), rot, 1.0), C))
+		return false;
+	if (nbPos.x < 0.5 && sc.x > 15.0 - C
+			&& 15.0 - sc.x < faceCarve(slot, faceUV(vec2(sc.z, 15.0 - sc.y), rot, 0.0), C))
+		return false;
+	if (nbNeg.x < 0.5 && sc.x < C
+			&& sc.x < faceCarve(slot, faceUV(vec2(15.0 - sc.z, 15.0 - sc.y), rot, 0.0), C))
+		return false;
+	if (nbPos.z < 0.5 && sc.z > 15.0 - C
+			&& 15.0 - sc.z < faceCarve(slot, faceUV(vec2(15.0 - sc.x, 15.0 - sc.y), rot, 0.0), C))
+		return false;
+	if (nbNeg.z < 0.5 && sc.z < C
+			&& sc.z < faceCarve(slot, faceUV(vec2(sc.x, 15.0 - sc.y), rot, 0.0), C))
+		return false;
+	return true;
 }
 
 bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
@@ -183,7 +206,10 @@ bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
 	vec3 sideDist = (stepDir * (cell - p) + stepDir * 0.5 + 0.5) * invRd;
 	int axis = -1;
 	float t = 0.0;
-	for (int i = 0; i < 26; i++) {
+	// 48, not 26: a diagonal march across a 16^3 grid needs up to 3*16 steps.
+	// At 26 a grazing ray quit mid-block and reported "no hit", which reads as
+	// a see-through eye ray or a missing shadow.
+	for (int i = 0; i < 48; i++) {
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
 			return false;                      // left the cell: real gap
 		if (microSolid(slot, cell, rot, nbNeg, nbPos)) {
@@ -259,8 +285,8 @@ float lightVis(vec3 ro, vec3 sd)
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			vec3 lentry = ro + sd * tcur - cell;
-			float rot1 = floor(fract(sin(dot(cell + volumeOrigin,
-					vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
+			float rot1 = fract(sin(dot(cell + volumeOrigin,
+					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbN1, nbP1;
 			microNeighbours(cell, nbN1, nbP1);
 			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
@@ -328,6 +354,36 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			if (trans < 0.04)
 				return vec3(0.0);
 			continue;
+		}
+		// Bounce rays must march the sub-grid too. Without this every GI and
+		// ambient ray saw 1 m CUBES while the eye saw carved stone: indirect
+		// light and occlusion were computed against the blocky world, so each
+		// recess was darkened by its neighbour's full cube right at the 1 m
+		// boundary. Ambient is most of the light here, so this dominated, and
+		// unlike the emitter path it showed under sunlight too.
+		// Range-gated hard at 6 m, unlike the eye and sun paths. A bounce ray's
+		// sub-voxel detail only matters where it shapes CONTACT occlusion —
+		// the near stone around a recess. Past a few metres the bounce is
+		// low-frequency fill and cube-vs-carved is invisible, while the cost
+		// is not: ungated at 20 m this cost 43 -> 17 fps on its own.
+		if (s.a > 0.97 && s.a < 0.99 && microStrength > 0.0 && t < 6.0) {
+			float ms = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
+			vec3 mh, mn;
+			float rb = fract(sin(dot(cell + volumeOrigin,
+					vec3(41.3, 289.1, 77.7))) * 21311.7);
+			vec3 nbNb, nbPb;
+			microNeighbours(cell, nbNb, nbPb);
+			if (ms > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0), rd,
+					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn)) {
+				float fallm = 1.0 - t / 160.0;
+				float ndlm = max(dot(mn, sd), 0.0);
+				if (ndlm <= 0.0)
+					return vec3(0.0);
+				float svm = lightVis(cell + mh + mn * 0.03125, sd);
+				return pathAlbedo(s.rgb) * ndlm * svm * fallm
+						* volumeLightCol * 1.4 * trans;
+			}
+			continue;   // carved away here: the ray really does pass through
 		}
 		if (s.a > 0.25) {
 			float fall = 1.0 - t / 160.0;
@@ -407,6 +463,23 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		// Emitters must march the sub-grid too. Testing only the 1 m cell made
+		// every carved block a solid CUBE to torch light: lightVis (sun/moon)
+		// respected the sub-voxels while emitterVis did not, so a torch cast a
+		// hard 1 m shadow onto surfaces the carve actually leaves open — the
+		// boundary shadow that grew with distance from the lamp.
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0) {
+			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
+			vec3 mh, mn;
+			float rotE = fract(sin(dot(cell + volumeOrigin,
+					vec3(41.3, 289.1, 77.7))) * 21311.7);
+			vec3 nbNe, nbPe;
+			microNeighbours(cell, nbNe, nbPe);
+			if (mslot > 0.5 && microDDA(clamp(ro + ld * t - cell, 0.0, 1.0), ld,
+					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn))
+				return 0.0;
+			continue;
+		}
 		if (a > 0.25 && !(a > 0.6 && a < 0.97))
 			return 0.0;
 	}
@@ -538,13 +611,19 @@ void main(void)
 				else nn0.z = -stepDir.z;
 				float mid0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 				vec3 hl, hn;
-				float rot0 = floor(fract(sin(dot(cell + volumeOrigin,
-						vec3(41.3, 289.1, 77.7))) * 21311.7) * 4.0);
+				float rot0 = fract(sin(dot(cell + volumeOrigin,
+						vec3(41.3, 289.1, 77.7))) * 21311.7);
 				vec3 nbN0, nbP0;
 				microNeighbours(cell, nbN0, nbP0);
 				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
 						rd, floor(mid0 + 0.5), rot0, nbN0, nbP0, hl, hn)) {
-					vec3 hp2 = cell + hl + hn * 0.01;
+					// Bias by HALF A SUB-VOXEL (1/32 node), not the 0.01 used
+					// for 1 m faces. A sub-voxel is 6.25 cm, so a 1 cm bias is
+					// 16% of one: a shadow ray leaving a carved stone at a
+					// grazing angle re-entered the very sub-voxel it left, and
+					// the surface shadowed itself — acne read as "shadows that
+					// shouldn't be there".
+					vec3 hp2 = cell + hl + hn * 0.03125;
 					vec3 alb = pathAlbedo(s.rgb);
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
 							* 43758.5453);

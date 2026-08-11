@@ -885,16 +885,37 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			for (int k = 0; k < 256; k++)
 				lvar += (lum[k] - lmean) * (lum[k] - lmean);
 			bool carved = std::sqrt(lvar / 256.0) > 14.0;
+			// HEIGHT field in alpha, normalised: the tile's BRIGHTEST texels
+			// sit flush with the cell boundary and only darker ones recede.
+			// Un-normalised, a mid-tone tile carved every face inward and the
+			// block read as a small stone floating inside an invisible shell.
+			float hgt[256];
+			if (carved) {
+				double hmin = 255.0, hmax = 0.0;
+				for (int k = 0; k < 256; k++) {
+					hmin = std::min(hmin, lum[k]);
+					hmax = std::max(hmax, lum[k]);
+				}
+				double span = std::max(hmax - hmin, 12.0);
+				for (int k = 0; k < 256; k++)
+					hgt[k] = (float)std::clamp((lum[k] - hmin) / span, 0.0, 1.0);
+				// NOTE: no border lift. Flattening the outer ring so blocks
+				// met flush AT the seam just traded a dark lattice for a
+				// bright one — the seam still knew where it was. The tile is
+				// left alone and the shader slides each cell's pattern by its
+				// own offset instead (faceUV), which moves the mortar off the
+				// boundary rather than papering over it.
+			} else {
+				// flat material: fully flush, no carve at all
+				for (int k = 0; k < 256; k++)
+					hgt[k] = 1.0f;
+			}
 			for (int py = 0; py < 16; py++) {
 				for (int px = 0; px < 16; px++) {
 					u32 t = buf[py * 16 + px];
 					u32 c[3] = {(t >> 16) & 0xFFu, (t >> 8) & 0xFFu, t & 0xFFu};
-					// alpha carries HEIGHT (texel luminance): dark = deeper.
-					// Honest only for carved materials (bark, stone, brick,
-					// planks); painted patterns are excluded by class below.
-					u32 lv = carved
-							? std::min((c[0] * 30 + c[1] * 59 + c[2] * 11) / 100, 255u)
-							: 128u; // flat material: neutral height, no relief
+					u32 lv = (u32)std::clamp(hgt[py * 16 + px] * 255.0f + 0.5f,
+							0.0f, 255.0f);
 					u32 o = (lv << 24);
 					for (int ch = 0; ch < 3; ch++) {
 						double d = (double)c[ch] / avg[ch] * 0.5 * 255.0;
