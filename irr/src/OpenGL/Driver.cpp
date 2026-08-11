@@ -634,6 +634,10 @@ void COpenGL3DriverBase::drawBuffers(const scene::IVertexBuffer *vb,
 	drawVertexPrimitiveList(vertices, vb->getCount(), indexList,
 		PrimitiveCount, vb->getType(), PrimitiveType, ib->getType());
 
+	// TEMPORARY core-profile diagnostic: macOS 4.1 has no KHR_debug, so the
+	// only way to see why map geometry vanishes is to ask directly. Logs the
+	// first few distinct errors then goes quiet.
+
 	if (hw_weights) {
 		GL.DisableVertexAttribArray(EVA_WEIGHTS);
 		GL.VertexAttrib4f(EVA_WEIGHTS, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -690,6 +694,25 @@ void COpenGL3DriverBase::drawVertexPrimitiveList(const void *vertices, u32 verte
 	CNullDriver::drawVertexPrimitiveList(vertices, vertexCount, indexList, primitiveCount, vType, pType, iType);
 
 	setRenderStates3DMode();
+
+	// The MAP arrives here. When a block has no hardware buffer, drawBuffers()
+	// hands down client pointers, which core profile rejects with
+	// GL_INVALID_OPERATION and silently draws nothing — the entire world
+	// vanishing while the sky (drawn without depth test) survived. Stream the
+	// client data through scratch buffers; this is the only place with the
+	// real vertexCount, so it must happen here rather than in drawGeneric.
+	// nullptr means a VBO is already bound, and stream*() passes that through.
+	if (Version.Spec == OpenGLSpec::Core && (vertices || indexList)) {
+		auto &vtd = getVertexTypeDescription(vType);
+		uintptr_t vbase = streamVertices(vertices, (int)vertexCount, vtd);
+		u32 idxCount = primitiveCount * 3 + 2;
+		const void *idx = streamIndices(indexList, (int)idxCount,
+				iType == EIT_32BIT ? 4 : 2);
+		drawGeneric(reinterpret_cast<const void *>(vbase), idx,
+				primitiveCount, vType, pType, iType);
+		unstream();
+		return;
+	}
 
 	drawGeneric(vertices, indexList, primitiveCount, vType, pType, iType);
 }
@@ -1048,7 +1071,32 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 		E_VERTEX_TYPE vType, scene::E_PRIMITIVE_TYPE pType, E_INDEX_TYPE iType)
 {
 	auto &vTypeDesc = getVertexTypeDescription(vType);
+	// TEMPORARY: narrow which GL call is invalid on core.
+	static int dbg = 0;
+	static GLint lastFbo = -99;
+	bool dbgOn = false;
+	if (Version.Spec == OpenGLSpec::Core && dbg < 14) {
+		GLint f = 0;
+		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &f);
+		if (f != lastFbo) { lastFbo = f; dbgOn = true; dbg++; }
+	}
+	if (dbgOn) {
+		while (GL.GetError() != GL_NO_ERROR) {}
+	}
 	beginDraw(vTypeDesc, reinterpret_cast<uintptr_t>(vertices));
+	if (dbgOn) {
+		GLenum e = GL.GetError();
+		GLint vao = 0, prog = 0, fbo = -1, vp[4] = {0,0,0,0};
+		GL.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+		GL.GetIntegerv(GL_CURRENT_PROGRAM, &prog);
+		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
+		GL.GetIntegerv(GL_VIEWPORT, vp);
+		char b[192];
+		snprintf(b, sizeof(b),
+			"[claude_gl] err=0x%04x vao=%d prog=%d fbo=%d vp=%dx%d",
+			(unsigned)e, (int)vao, (int)prog, (int)fbo, (int)vp[2], (int)vp[3]);
+		os::Printer::log(b, ELL_ERROR);
+	}
 	GLenum indexSize = 0;
 
 	switch (iType) {
