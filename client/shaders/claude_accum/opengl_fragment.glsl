@@ -422,7 +422,11 @@ void main(void)
 				// textured albedo: the DDA hit's position on the face IS
 				// its UV — the grid's free gift. Blend by the dial so
 				// texture can never fully bury the lighting.
-				if (textureAmount > 0.0 && volumeDebug < 3.5) {
+				// Surface relief is INDEPENDENT of color texture: John's
+				// ask — carved depth on clay-colored blocks. Both read the
+				// same atlas, one for height (alpha), one for color (rgb).
+				if ((textureAmount > 0.0 || reliefStrength > 0.0)
+						&& volumeDebug < 3.5) {
 					float mid = texture3D(claudeMaterials,
 							(cell + 0.5) / S).r * 255.0;
 					if (mid > 0.5) {
@@ -451,8 +455,10 @@ void main(void)
 						// multiply the cell's own (palette-tinted) color,
 						// so texture adds variation without changing a
 						// face's average brightness
-						vec3 det = texture2D(claudeAtlas, auv).rgb * 2.0;
-						albedo *= mix(vec3(1.0), det, textureAmount);
+						if (textureAmount > 0.0) {
+							vec3 det = texture2D(claudeAtlas, auv).rgb * 2.0;
+							albedo *= mix(vec3(1.0), det, textureAmount);
+						}
 					}
 				}
 
