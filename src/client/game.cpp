@@ -170,7 +170,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_micro_sampler_pixel{"claudeMicro"};
-	CachedPixelShaderSetting<float, 3> m_volume_origin_pixel{"volumeOrigin"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
@@ -183,24 +183,24 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
-	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
-	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
-	CachedPixelShaderSetting<float, 3> m_volume_cam_right_pixel{"volumeCamRight"};
-	CachedPixelShaderSetting<float, 3> m_volume_cam_up_pixel{"volumeCamUp"};
-	CachedPixelShaderSetting<float, 3> m_volume_sun_dir_pixel{"volumeSunDir"};
-	CachedPixelShaderSetting<float, 3> m_volume_light_col_pixel{"volumeLightCol"};
-	CachedPixelShaderSetting<float, 2> m_volume_depth_range_pixel{"volumeDepthRange"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_cam_right_pixel{"volumeCamRight"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_cam_up_pixel{"volumeCamUp"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_sun_dir_pixel{"volumeSunDir"};
+	CachedPixelShaderSetting<float, 3, false> m_volume_light_col_pixel{"volumeLightCol"};
+	CachedPixelShaderSetting<float, 2, false> m_volume_depth_range_pixel{"volumeDepthRange"};
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
 	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
 	CachedPixelShaderSetting<float> m_clay_pixel{"clayStrength"};
 	CachedPixelShaderSetting<float> m_accum_alpha_pixel{"accumAlpha"};
-	CachedPixelShaderSetting<float, 3> m_prev_pos_pixel{"prevCamPos"};
-	CachedPixelShaderSetting<float, 3> m_prev_fwd_pixel{"prevCamFwd"};
-	CachedPixelShaderSetting<float, 3> m_prev_rightu_pixel{"prevCamRightU"};
-	CachedPixelShaderSetting<float, 3> m_prev_upu_pixel{"prevCamUpU"};
-	CachedPixelShaderSetting<float, 2> m_prev_tan_pixel{"prevCamTan"};
-	CachedPixelShaderSetting<float, 4> m_emitter_pixel[8] = {
+	CachedPixelShaderSetting<float, 3, false> m_prev_pos_pixel{"prevCamPos"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_fwd_pixel{"prevCamFwd"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_rightu_pixel{"prevCamRightU"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_upu_pixel{"prevCamUpU"};
+	CachedPixelShaderSetting<float, 2, false> m_prev_tan_pixel{"prevCamTan"};
+	CachedPixelShaderSetting<float, 4, false> m_emitter_pixel[8] = {
 		{"claudeEmitter0"}, {"claudeEmitter1"}, {"claudeEmitter2"},
 		{"claudeEmitter3"}, {"claudeEmitter4"}, {"claudeEmitter5"},
 		{"claudeEmitter6"}, {"claudeEmitter7"}};
