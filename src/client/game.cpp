@@ -821,6 +821,21 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			double avg[3] = {std::max(sum[0] / 256.0, 1.0),
 					std::max(sum[1] / 256.0, 1.0),
 					std::max(sum[2] / 256.0, 1.0)};
+			// Height variance decides whether this material has real
+			// relief. Snow/smooth tiles vary only by dithering; treating
+			// that grain as geometry produced speckle and dark blotches.
+			double lmean = 0.0, lvar = 0.0;
+			double lum[256];
+			for (int k = 0; k < 256; k++) {
+				lum[k] = (((buf[k] >> 16) & 0xFF) * 0.30
+						+ ((buf[k] >> 8) & 0xFF) * 0.59
+						+ (buf[k] & 0xFF) * 0.11);
+				lmean += lum[k];
+			}
+			lmean /= 256.0;
+			for (int k = 0; k < 256; k++)
+				lvar += (lum[k] - lmean) * (lum[k] - lmean);
+			bool carved = std::sqrt(lvar / 256.0) > 14.0;
 			for (int py = 0; py < 16; py++) {
 				for (int px = 0; px < 16; px++) {
 					u32 t = buf[py * 16 + px];
@@ -828,8 +843,10 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 					// alpha carries HEIGHT (texel luminance): dark = deeper.
 					// Honest only for carved materials (bark, stone, brick,
 					// planks); painted patterns are excluded by class below.
-					u32 lum = (c[0] * 30 + c[1] * 59 + c[2] * 11) / 100;
-					u32 o = (std::min(lum, 255u) << 24);
+					u32 lv = carved
+							? std::min((c[0] * 30 + c[1] * 59 + c[2] * 11) / 100, 255u)
+							: 128u; // flat material: neutral height, no relief
+					u32 o = (lv << 24);
 					for (int ch = 0; ch < 3; ch++) {
 						double d = (double)c[ch] / avg[ch] * 0.5 * 255.0;
 						u32 v = (u32)std::clamp(d, 0.0, 255.0);
