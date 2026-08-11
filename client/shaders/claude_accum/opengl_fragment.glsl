@@ -11,6 +11,7 @@ uniform sampler2D history;
 uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
 uniform sampler3D claudeVolume;
+uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -45,6 +46,20 @@ vec3 noise3(vec2 px, float seed)
 	return vec3(ign(px + o),
 			ign(px + o + vec2(17.0, 59.0)),
 			ign(px + o + vec2(41.0, 23.0)));
+}
+
+// per-cell, per-frame coin flip for stochastic leaf transmission: rays
+// pass through leaf cells ~45% of the time; temporal accumulation
+// averages the flips into true dappled partial shadows
+float cellHash(vec3 c)
+{
+	return fract(sin(dot(c + fract(animationTimer * 13.7),
+			vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+bool leafPass(float a, vec3 cell)
+{
+	return a > 0.45 && a < 0.56 && cellHash(cell) < 0.45;
 }
 
 float pathDayLin()
@@ -93,7 +108,24 @@ float lightVis(vec3 ro, vec3 sd)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
-		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+			// empty brick: leap to its far side in one step
+			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
+					* max(abs(sd), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z) + 1e-3;
+			vec3 p2 = ro + sd * tj;
+			cell = floor(p2);
+			sideDist = tj + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
+		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		if (leafPass(a, cell))
+			continue;
+		if (a > 0.25)
 			return 0.0;
 	}
 	return 0.0;
@@ -123,7 +155,26 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				return vec3(0.0);
 			return pathSkyRadiance(rd);
 		}
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+					* max(abs(rd), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z);
+			if (tt.x <= tt.y && tt.x <= tt.z) axis = 0;
+			else if (tt.y <= tt.z) axis = 1;
+			else axis = 2;
+			t = tj;
+			vec3 p2 = ro + rd * (tj + 1e-3);
+			cell = floor(p2);
+			sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
 		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (leafPass(s.a, cell))
+			continue;
 		if (s.a > 0.25) {
 			float fall = 1.0 - t / 160.0;
 			// emissive hit: the surface IS a light — return its glow
@@ -194,7 +245,28 @@ void main(void)
 
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
+			vec3 cc = floor(cell / 4.0);
+			if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+				// empty brick: leap to its far side, keeping the crossing
+				// axis so a hit right after the jump gets a true normal
+				vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+				vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+						* max(abs(rd), vec3(1e-6));
+				vec3 tt = (bb - ro) / rdg;
+				float tj = min(min(tt.x, tt.y), tt.z);
+				if (tt.x <= tt.y && tt.x <= tt.z) axis = 0;
+				else if (tt.y <= tt.z) axis = 1;
+				else axis = 2;
+				t = tj;
+				vec3 p2 = ro + rd * (tj + 1e-3);
+				cell = floor(p2);
+				sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+						+ stepDir * 0.5 + 0.5) * invRd;
+				continue;
+			}
 			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+			// NOTE: no leafPass here — stochastic transmission is for
+			// LIGHT rays only; on eye rays it makes canopies seethe
 			if (s.a > 0.25 && axis >= 0) {
 				// emissive primary hit: self-lit, no rays needed
 				if (s.a > 0.6 && s.a < 0.97) {

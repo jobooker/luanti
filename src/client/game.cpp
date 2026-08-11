@@ -77,6 +77,7 @@ struct ClaudeVolume
 {
 	static constexpr int SIZE = 128;
 	u32 tex = 0; // GL texture name (GLuint)
+	u32 coarse_tex = 0; // 32^3 any-solid brick map (unit 5): rays leap empty bricks
 	v3s16 origin; // node coords of voxel (0,0,0)
 	bool valid = false;
 	// temporal accumulation state (updated once per frame)
@@ -142,6 +143,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_bump_strength_pixel{"bumpStrength"};
 	float m_bump_strength;
 	CachedPixelShaderSetting<SamplerLayer_t> m_volume_sampler_pixel{"claudeVolume"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
 	CachedPixelShaderSetting<float> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -403,6 +405,8 @@ public:
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
+				SamplerLayer_t clayer = 5;
+				m_coarse_sampler_pixel.set(&clayer, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
 						- v3f(g_claude_volume.origin.X,
@@ -732,6 +736,7 @@ static void claudeVolumeSnapshot(Client *client)
 	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
 	// reflection rays can recognize it), 255 solid.
 	std::vector<u8> occ(S * S * S * 4);
+	std::vector<u8> coarse(32 * 32 * 32, 0);
 	u32 solid = 0;
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
@@ -748,14 +753,19 @@ static void claudeVolumeSnapshot(Client *client)
 		occ[i * 4 + 0] = col.getRed();
 		occ[i * 4 + 1] = col.getGreen();
 		occ[i * 4 + 2] = col.getBlue();
-		// alpha = occupancy class: 0 air, 100 water, 170..240 emissive
+		// alpha = occupancy class: 0 air, 100 water, 130 leaves
+		// (stochastic ray transmission -> dapple), 170..240 emissive
 		// (170 + light_source*5, so shaders recover brightness), 255 solid
 		u8 acls = 255;
 		if (f.isLiquid())
 			acls = 100;
 		else if (f.light_source > 0)
 			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;
+		else if (f.drawtype == NDT_ALLFACES
+				|| f.drawtype == NDT_ALLFACES_OPTIONAL)
+			acls = 130;
 		occ[i * 4 + 3] = acls;
+		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 		solid++;
 	}
 	if (!g_claude_volume.tex)
@@ -769,6 +779,18 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, S, S, S, 0, GL_RGBA,
 			GL_UNSIGNED_BYTE, occ.data());
+	// coarse any-solid brick map on unit 5: empty-space leaping
+	if (!g_claude_volume.coarse_tex)
+		glGenTextures(1, &g_claude_volume.coarse_tex);
+	glActiveTexture(GL_TEXTURE5);
+	glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_LUMINANCE8, 32, 32, 32, 0,
+			GL_LUMINANCE, GL_UNSIGNED_BYTE, coarse.data());
 	glActiveTexture(GL_TEXTURE0);
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
@@ -802,7 +824,7 @@ static void claudeUpdateAccum(Client *client)
 	else if (moved > 0.05f || turned > 1e-4f)
 		g_claude_volume.accum_alpha = 0.5f;
 	else
-		g_claude_volume.accum_alpha = 0.12f;
+		g_claude_volume.accum_alpha = 0.05f; // deep still-convergence: calm light
 
 	// stage the ray-camera basis: what was current becomes the shader's
 	// previous frame
