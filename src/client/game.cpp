@@ -85,6 +85,7 @@ struct ClaudeVolume
 	v3f prev_cam_dir;
 	v3s16 prev_origin;
 	float accum_alpha = 1.0f;
+	float still_frames = 0.0f;
 	// last frame's ray-camera basis (volume-local), for reprojection:
 	// shader_* is what the shader sees (frame N-1); cur_* staged this frame
 	v3f shader_prev_pos, shader_prev_fwd, shader_prev_rightu, shader_prev_upu;
@@ -818,13 +819,20 @@ static void claudeUpdateAccum(Client *client)
 	// With reprojection the shader revalidates history per pixel; the CPU
 	// only forces a full reset when the coordinate space itself changes.
 	// Teardown-style shallow history in motion (spatial denoise carries
-	// the smoothing), deeper accumulation when still for beauty shots.
-	if (origin_changed || moved > 20.0f)
+	// the smoothing); when still, a TRUE running average (weight 1/N)
+	// so the image converges to actual stillness instead of the EMA's
+	// perpetual 5%-new-sample pulse.
+	if (origin_changed || moved > 20.0f) {
 		g_claude_volume.accum_alpha = 1.0f;
-	else if (moved > 0.05f || turned > 1e-4f)
+		g_claude_volume.still_frames = 0.0f;
+	} else if (moved > 0.05f || turned > 1e-4f) {
 		g_claude_volume.accum_alpha = 0.5f;
-	else
-		g_claude_volume.accum_alpha = 0.05f; // deep still-convergence: calm light
+		g_claude_volume.still_frames = 0.0f;
+	} else {
+		g_claude_volume.still_frames += 1.0f;
+		g_claude_volume.accum_alpha =
+				std::max(0.02f, 1.0f / (2.0f + g_claude_volume.still_frames));
+	}
 
 	// stage the ray-camera basis: what was current becomes the shader's
 	// previous frame
