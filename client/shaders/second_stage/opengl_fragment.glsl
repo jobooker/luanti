@@ -258,6 +258,138 @@ vec4 ghostView(vec2 uv)
 	return vec4(0.0, 0.0, 0.04, 1.0); // miss: near-black, blue tint = "sky"
 }
 
+// ============ PURE PATH VIEW (claude_volume_debug = 3) ============
+// 100% ray-traced illumination, zero ambient: every unit of brightness
+// arrives via an explicit ray path — direct sun (N.L x traced visibility),
+// sky dome (hemisphere rays paying ONLY on genuine sky exit), and one
+// bounce (hit surfaces re-radiate only what the sun actually gives them).
+// No face-brightness constants, no leak terms, no day-night floors.
+// Blocks are exploited for geometry (exact DDA hits, exact face normals),
+// never for lighting.
+
+vec3 pathSkyRadiance(vec3 rd)
+{
+	float up = clamp(rd.y, 0.0, 1.0);
+	vec3 sky = mix(vec3(0.55, 0.66, 0.82), vec3(0.22, 0.42, 0.78), up);
+	float cosSun = max(dot(rd, volumeSunDir), 0.0);
+	// tight disk + faint halo, not a fog blob
+	sky += vec3(1.0, 0.92, 0.72)
+			* (pow(cosSun, 48.0) * 6.0 + pow(cosSun, 8.0) * 0.35);
+	return sky * clamp(dayNightRatio, 0.0, 1.0); // night = genuinely dark
+}
+
+// Radiance arriving at ro from direction rd: sky if the ray truly exits,
+// sun-lit bounce if it hits a surface the sun reaches, darkness otherwise.
+vec3 pathRay(vec3 ro, vec3 rd)
+{
+	const float S = 128.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	int axis = -1;
+	for (int i = 0; i < 160; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S)))) {
+			if (cell.y < 0.0)
+				return vec3(0.0); // exited underground: no light there
+			return pathSkyRadiance(rd);
+		}
+		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (s.a > 0.25) {
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			float ndl = max(dot(n, volumeSunDir), 0.0);
+			if (ndl <= 0.0)
+				return vec3(0.0); // faces away from sun: radiates nothing
+			float sv = volumeSunVis(ro + rd * t + n * 0.01);
+			// albedo x incident sun, attenuated by distance falloff
+			float fall = 1.0 - t / 160.0;
+			return pow(s.rgb, vec3(2.2)) * ndl * sv * fall
+					* vec3(1.0, 0.93, 0.76)
+					* clamp(dayNightRatio, 0.0, 1.0);
+		}
+	}
+	return vec3(0.0); // unresolved while enclosed: darkness
+}
+
+vec4 pathView(vec2 uv)
+{
+	const float S = 128.0;
+	vec2 ndc = uv * 2.0 - 1.0;
+	vec3 rd = normalize(volumeCamFwd + ndc.x * volumeCamRight + ndc.y * volumeCamUp);
+	vec3 ro = volumeCamPos + 0.5;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	int axis = -1;
+	for (int i = 0; i < 384; i++) {
+		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
+			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+			if (s.a > 0.25 && axis >= 0) {
+				vec3 n = vec3(0.0);
+				if (axis == 0) n.x = -stepDir.x;
+				else if (axis == 1) n.y = -stepDir.y;
+				else n.z = -stepDir.z;
+				vec3 hp = ro + rd * t + n * 0.01;
+				vec3 albedo = pow(s.rgb, vec3(2.2));
+				// direct sun: the only hard light source
+				float ndl = max(dot(n, volumeSunDir), 0.0);
+				vec3 direct = vec3(0.0);
+				if (ndl > 0.0)
+					direct = vec3(ndl * volumeSunVis(hp))
+							* vec3(1.0, 0.95, 0.82)
+							* clamp(dayNightRatio, 0.0, 1.0);
+				// sky + bounce: five hemisphere rays, cosine-biased
+				vec3 t1 = normalize(cross(n,
+						abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0)
+								: vec3(1.0, 0.0, 0.0)));
+				vec3 t2 = cross(n, t1);
+				vec3 amb = pathRay(hp, n);
+				amb += pathRay(hp, normalize(n * 0.65 + t1 * 0.75));
+				amb += pathRay(hp, normalize(n * 0.65 - t1 * 0.75));
+				amb += pathRay(hp, normalize(n * 0.65 + t2 * 0.75));
+				amb += pathRay(hp, normalize(n * 0.65 - t2 * 0.75));
+				amb *= 0.2;
+				vec3 c = albedo * (direct + amb);
+				// water surfaces mirror: one traced reflection ray plus
+				// a specular sun glint — still 100% ray-earned light
+				if (s.a < 0.75 && n.y > 0.5) {
+					vec3 rr = reflect(rd, vec3(0.0, 1.0, 0.0));
+					vec3 refl = pathRay(hp, rr);
+					refl += vec3(1.0, 0.9, 0.7)
+							* pow(max(dot(rr, volumeSunDir), 0.0), 64.0)
+							* 2.0 * clamp(dayNightRatio, 0.0, 1.0);
+					c = mix(c, refl, 0.65);
+				}
+				return vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+			}
+		} else if (i > 0) {
+			// primary ray left the volume: show the sky itself
+			return vec4(pow(pathSkyRadiance(rd), vec3(1.0 / 2.2)), 1.0);
+		}
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+	}
+	return vec4(0.0, 0.0, 0.0, 1.0);
+}
+
 // Cheap single-pass SSAO from the depth buffer alone: spiral taps around
 // each pixel; nearer samples within a depth window count as occluders.
 // Thresholds scale with (1 - depth) to roughly compensate for the
@@ -364,7 +496,11 @@ void main(void)
 {
 	vec2 uv = varTexCoord.st;
 
-	// claude_volume_debug: replace the frame with the traced ghost view
+	// claude_volume_debug: 1/2 = ghost view, 3 = pure path-traced view
+	if (volumeDebug > 2.5) {
+		gl_FragColor = pathView(uv);
+		return;
+	}
 	if (volumeDebug > 0.5) {
 		gl_FragColor = ghostView(uv);
 		return;

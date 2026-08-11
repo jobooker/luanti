@@ -194,8 +194,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_volume_debug"))
 			return 0.0f;
-		// 1 = ghost view with shadow rays, 2 = ghost view without (A/B)
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 2.0f);
+		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
+		// 3 = pure path-traced view (zero ambient, all light via rays)
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 3.0f);
 	}
 
 	static float readWaterReflections()
