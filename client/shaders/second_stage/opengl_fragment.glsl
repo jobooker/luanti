@@ -572,16 +572,32 @@ void main(void)
 			// without guaranteed lighting made distant pixels (where
 			// depth-reconstruction noise misses the surface cell) render
 			// full-bright unlit: the 'lit cave' bug.
-			if (inVol && clayStrength > 0.0 && clayStrength < 0.95
+			if (inVol && clayStrength > 0.0
 					&& (giSplit < 0.5 || uv.x > 0.5)) {
 				vec3 ccell = floor(p + normalize(vdir) * 0.1
 						- vec3(0.0, 0.02, 0.0));
 				if (all(greaterThanEqual(ccell, vec3(0.0)))
 						&& all(lessThan(ccell, vec3(128.0)))) {
 					vec4 cv = texture3D(claudeVolume, (ccell + 0.5) / 128.0);
-					if (cv.a > 0.25)
-						color.rgb = mix(color.rgb,
-								pow(cv.rgb, vec3(2.2)), clayStrength);
+					if (cv.a > 0.25) {
+						if (clayStrength > 0.95) {
+							// stock-lighting comparison mode: keep the
+							// raster's light, swap texture for flat block
+							// color — light estimated as pixel luminance
+							// over known material luminance
+							vec3 alb = pathAlbedo(cv.rgb);
+							float pl = dot(color.rgb,
+									vec3(0.2126, 0.7152, 0.0722));
+							float al = dot(alb,
+									vec3(0.2126, 0.7152, 0.0722));
+							float lightEst = clamp(pl / max(al, 0.03),
+									0.0, 1.5);
+							color.rgb = alb * lightEst;
+						} else {
+							color.rgb = mix(color.rgb,
+									pow(cv.rgb, vec3(2.2)), clayStrength);
+						}
+					}
 				}
 			}
 
