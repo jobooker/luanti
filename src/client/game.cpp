@@ -84,6 +84,12 @@ struct ClaudeVolume
 	v3f prev_cam_dir;
 	v3s16 prev_origin;
 	float accum_alpha = 1.0f;
+	// last frame's ray-camera basis (volume-local), for reprojection:
+	// shader_* is what the shader sees (frame N-1); cur_* staged this frame
+	v3f shader_prev_pos, shader_prev_fwd, shader_prev_rightu, shader_prev_upu;
+	float shader_prev_tanx = 1.0f, shader_prev_tany = 1.0f;
+	v3f cur_pos, cur_fwd, cur_rightu, cur_upu;
+	float cur_tanx = 1.0f, cur_tany = 1.0f;
 };
 static ClaudeVolume g_claude_volume;
 
@@ -149,6 +155,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
 	CachedPixelShaderSetting<float> m_clay_pixel{"clayStrength"};
 	CachedPixelShaderSetting<float> m_accum_alpha_pixel{"accumAlpha"};
+	CachedPixelShaderSetting<float, 3> m_prev_pos_pixel{"prevCamPos"};
+	CachedPixelShaderSetting<float, 3> m_prev_fwd_pixel{"prevCamFwd"};
+	CachedPixelShaderSetting<float, 3> m_prev_rightu_pixel{"prevCamRightU"};
+	CachedPixelShaderSetting<float, 3> m_prev_upu_pixel{"prevCamUpU"};
+	CachedPixelShaderSetting<float, 2> m_prev_tan_pixel{"prevCamTan"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
@@ -382,6 +393,13 @@ public:
 			float clay = g_claude_volume.valid ? m_clay : 0.0f;
 			m_clay_pixel.set(&clay, services);
 			m_accum_alpha_pixel.set(&g_claude_volume.accum_alpha, services);
+			m_prev_pos_pixel.set(g_claude_volume.shader_prev_pos, services);
+			m_prev_fwd_pixel.set(g_claude_volume.shader_prev_fwd, services);
+			m_prev_rightu_pixel.set(g_claude_volume.shader_prev_rightu, services);
+			m_prev_upu_pixel.set(g_claude_volume.shader_prev_upu, services);
+			float ptan[2] = {g_claude_volume.shader_prev_tanx,
+					g_claude_volume.shader_prev_tany};
+			m_prev_tan_pixel.set(ptan, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
@@ -768,12 +786,39 @@ static void claudeUpdateAccum(Client *client)
 	g_claude_volume.prev_cam_pos = p;
 	g_claude_volume.prev_cam_dir = d;
 	g_claude_volume.prev_origin = g_claude_volume.origin;
+	// With reprojection the shader revalidates history per pixel; the CPU
+	// only forces a full reset when the coordinate space itself changes.
+	// Teardown-style shallow history in motion (spatial denoise carries
+	// the smoothing), deeper accumulation when still for beauty shots.
 	if (origin_changed || moved > 20.0f)
 		g_claude_volume.accum_alpha = 1.0f;
 	else if (moved > 0.05f || turned > 1e-4f)
-		g_claude_volume.accum_alpha = 0.5f; // less ghost-smear, bit more grain
+		g_claude_volume.accum_alpha = 0.5f;
 	else
-		g_claude_volume.accum_alpha = 0.06f;
+		g_claude_volume.accum_alpha = 0.12f;
+
+	// stage the ray-camera basis: what was current becomes the shader's
+	// previous frame
+	g_claude_volume.shader_prev_pos = g_claude_volume.cur_pos;
+	g_claude_volume.shader_prev_fwd = g_claude_volume.cur_fwd;
+	g_claude_volume.shader_prev_rightu = g_claude_volume.cur_rightu;
+	g_claude_volume.shader_prev_upu = g_claude_volume.cur_upu;
+	g_claude_volume.shader_prev_tanx = g_claude_volume.cur_tanx;
+	g_claude_volume.shader_prev_tany = g_claude_volume.cur_tany;
+
+	v3f fwd = d;
+	fwd.normalize();
+	v3f right = v3f(0.f, 1.f, 0.f).crossProduct(fwd);
+	right.normalize();
+	v3f up = fwd.crossProduct(right);
+	g_claude_volume.cur_pos = p / BS
+			- v3f(g_claude_volume.origin.X, g_claude_volume.origin.Y,
+					g_claude_volume.origin.Z);
+	g_claude_volume.cur_fwd = fwd;
+	g_claude_volume.cur_rightu = right;
+	g_claude_volume.cur_upu = up;
+	g_claude_volume.cur_tanx = std::tan(cam->getFovX() * 0.5f);
+	g_claude_volume.cur_tany = std::tan(cam->getFovY() * 0.5f);
 }
 
 static void pollSettingsPatch(f32 dtime, Client *client)

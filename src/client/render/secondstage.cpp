@@ -306,9 +306,19 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	accum->setRenderSource(buffer);
 	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
 
+	// edge-aware spatial denoise on the display path only — history
+	// accumulates raw, so the filter never compounds
+	static const u8 TEXTURE_DENOISED = 33;
+	buffer->setTexture(TEXTURE_DENOISED, scale * 0.5f, "claude_denoised", color_format);
+	shader_id = client->getShaderSource()->getShaderRaw("claude_denoise");
+	PostProcessingStep *denoise = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_ACCUM_2 });
+	denoise->setRenderSource(buffer);
+	denoise->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_DENOISED));
+
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2 });
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DENOISED });
 	pipeline->addStep(present);
 	present->setBilinearFilter(1, true); // smooth upscale of half-res accum
 	present->setRenderSource(buffer);

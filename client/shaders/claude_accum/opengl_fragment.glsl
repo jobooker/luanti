@@ -23,6 +23,11 @@ uniform vec3 volumeLightCol; // active light color (sun/moon/none)
 uniform lowp float dayNightRatio;
 uniform float animationTimer;
 uniform lowp float accumAlpha;
+uniform vec3 prevCamPos;    // last frame's camera, volume-local
+uniform vec3 prevCamFwd;
+uniform vec3 prevCamRightU; // unit right/up (unscaled)
+uniform vec3 prevCamUpU;
+uniform vec2 prevCamTan;    // tan(fovX/2), tan(fovY/2)
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -136,13 +141,28 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 	return vec3(0.0);
 }
 
+// Reproject a volume-local point into last frame's screen; returns
+// history uv, or marks invalid via w<0.5. Depth check happens at the
+// caller (needs the stored alpha).
+vec3 reprojectUv(vec3 W)
+{
+	vec3 rel = W - (prevCamPos + 0.5);
+	float z = dot(rel, prevCamFwd);
+	if (z < 0.1)
+		return vec3(0.0, 0.0, -1.0);
+	vec2 puv = vec2(dot(rel, prevCamRightU) / (z * prevCamTan.x),
+			dot(rel, prevCamUpU) / (z * prevCamTan.y)) * 0.5 + 0.5;
+	if (any(lessThan(puv, vec2(0.002))) || any(greaterThan(puv, vec2(0.998))))
+		return vec3(0.0, 0.0, -1.0);
+	return vec3(puv, 1.0);
+}
+
 void main(void)
 {
 	vec2 uv = varTexCoord.st;
-	vec3 prev = texture2D(history, uv).rgb;
 	if (volumeDebug < 2.5) {
 		// traced mode off: carry history through untouched
-		gl_FragColor = vec4(prev, 1.0);
+		gl_FragColor = texture2D(history, uv);
 		return;
 	}
 
@@ -226,7 +246,30 @@ void main(void)
 	if (!done)
 		fresh = vec3(0.0);
 
-	// accumulate in gamma space (RGBA8 history: better dark precision)
+	// Reprojection: find where THIS pixel's world point was on last
+	// frame's screen, and only trust history whose stored hit distance
+	// (alpha channel) agrees with the previous camera's view of it.
+	float tHit = done && axis >= 0 ? min(t, 199.0) : 200.0;
+	vec3 W = ro + rd * min(t, 400.0);
+	if (tHit >= 199.5)
+		W = ro + rd * 400.0; // sky: reproject by direction, far point
 	vec3 fresh_g = pow(max(fresh, vec3(0.0)), vec3(1.0 / 2.2));
-	gl_FragColor = vec4(mix(prev, fresh_g, accumAlpha), 1.0);
+	vec3 rp = reprojectUv(W);
+	float a = 1.0; // no valid history: fresh sample stands alone
+	vec3 prev = vec3(0.0);
+	if (rp.z > 0.5 && accumAlpha < 0.99) {
+		vec4 h = texture2D(history, rp.xy);
+		float tPrev = h.a * 200.0;
+		float tExp = min(length(W - (prevCamPos + 0.5)), 200.0);
+		bool skyMatch = tHit >= 199.5 && tPrev >= 190.0;
+		if (skyMatch || abs(tPrev - tExp) < 1.5) {
+			// clamp history's drift from the current sample: bounds the
+			// compounding resample error that melts edges into mush
+			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.3), vec3(0.3));
+			a = accumAlpha;
+		}
+	}
+
+	// accumulate in gamma space (RGBA8 history: better dark precision)
+	gl_FragColor = vec4(mix(prev, fresh_g, a), tHit / 200.0);
 }
