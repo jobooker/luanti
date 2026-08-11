@@ -39,6 +39,7 @@ uniform vec3 volumeSunDir;   // unit direction toward the sun
 uniform vec2 volumeDepthRange; // camera near/far (world BS units)
 uniform lowp float waterReflStrength;
 uniform lowp float giStrength;
+uniform lowp float giSplit; // 1 = relight right half only (A/B seam)
 
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
@@ -378,7 +379,8 @@ void main(void)
 			// silhouettes): their derivative normals are noise, and GI
 			// there turns dappled canopies into flat mush.
 			if (inVol && giStrength > 0.0 && !isWater
-					&& length(pdx) + length(pdy) < 2.0) {
+					&& length(pdx) + length(pdy) < 2.0
+					&& (giSplit < 0.5 || uv.x > 0.5)) {
 				vec3 nrm = normalize(cross(pdy, pdx));
 				vec3 vn2 = normalize(vdir);
 				if (dot(nrm, vn2) > 0.0)
@@ -401,8 +403,27 @@ void main(void)
 						+ giTrace(ro3, d5);
 				vec3 base = giSky(d1) + giSky(d2) + giSky(d3) + giSky(d4)
 						+ giSky(d5);
-				vec3 m = gi / max(base, vec3(1e-3));
-				color.rgb *= mix(vec3(1.0), clamp(m, 0.0, 1.5), giStrength);
+				vec3 m = clamp(gi / max(base, vec3(1e-3)), 0.0, 1.5);
+				// Directional sun: N.L diffuse + a traced shadow ray.
+				// Luanti's face lighting has no sun-angle term at all
+				// (every south face is as bright as every north face),
+				// which is why forests read flat. Sun-side trunks
+				// brighten, back sides fall dark, trunks cast traced
+				// shadows on the ground. Fades out toward night so the
+				// relight collapses to pure ambient after dusk.
+				float dayL = clamp((dayNightRatio - 0.3) / 0.4, 0.0, 1.0);
+				float ndl = max(dot(nrm, volumeSunDir), 0.0);
+				float direct = ndl > 0.02
+						? ndl * volumeShadow(ro3) : 0.0;
+				vec3 relight = m * mix(1.0, 0.55, dayL)
+						+ vec3(direct * 0.65 * dayL);
+				// Compress toward 1: the raster image already encodes
+				// occlusion (light propagation + shadow maps), so a raw
+				// multiply double-counts darkness and crushes canopy
+				// interiors to black. pow < 1 keeps the light/dark
+				// ordering (the depth cue) while lifting the floor.
+				relight = pow(clamp(relight, 0.0, 1.6), vec3(0.55));
+				color.rgb *= mix(vec3(1.0), relight, giStrength);
 			}
 		}
 	}

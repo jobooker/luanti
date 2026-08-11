@@ -140,9 +140,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 2> m_volume_depth_range_pixel{"volumeDepthRange"};
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
+	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
+	float m_gi_split;
 	bool m_volumetric_light_enabled;
 	CachedPixelShaderSetting<float, 3>
 		m_sun_position_pixel{"sunPositionScreen"};
@@ -153,7 +155,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 7> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 8> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -161,6 +163,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_volume_debug",
 		"claude_water_reflections",
 		"claude_gi",
+		"claude_gi_split",
 	};
 
 	static float readGoldenHourStrength()
@@ -206,6 +209,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_gi", 0.0f, 1.0f);
 	}
 
+	static float readGiSplit()
+	{
+		if (!g_settings->exists("claude_gi_split"))
+			return 0.0f;
+		// 1 = relight only the right half of the screen (A/B seam)
+		return g_settings->getFloat("claude_gi_split", 0.0f, 1.0f);
+	}
+
 public:
 	void onSettingsChange(const std::string &name)
 	{
@@ -223,6 +234,8 @@ public:
 			m_water_reflections = readWaterReflections();
 		if (name == "claude_gi")
 			m_gi_strength = readGiStrength();
+		if (name == "claude_gi_split")
+			m_gi_split = readGiSplit();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -246,6 +259,7 @@ public:
 		m_volume_debug = readVolumeDebug();
 		m_water_reflections = readWaterReflections();
 		m_gi_strength = readGiStrength();
+		m_gi_split = readGiSplit();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -341,6 +355,7 @@ public:
 			m_water_refl_pixel.set(&refl, services);
 			float gi = g_claude_volume.valid ? m_gi_strength : 0.0f;
 			m_gi_strength_pixel.set(&gi, services);
+			m_gi_split_pixel.set(&m_gi_split, services);
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f) {
 				SamplerLayer_t layer = 4;
 				m_volume_sampler_pixel.set(&layer, services);
