@@ -442,12 +442,26 @@ void main(void)
 							// darken the grooves. The groove shadow is what
 							// actually reads as depth on bark and stone —
 							// directional shading alone is the weak cue.
+							// 16px height fields staircase badly (one texel
+							// is 6 cm on a metre block), so sample a blurred
+							// height: 4-tap average per probe turns cliffs
+							// into undulation. Relief wants smooth data;
+							// colour still samples crisp/nearest.
 							float st = 1.0 / 256.0;
-							float h0 = texture2D(claudeAtlas, auv).a;
-							float hu = texture2D(claudeAtlas, auv + vec2(st, 0.0)).a;
-							float hv = texture2D(claudeAtlas, auv + vec2(0.0, st)).a;
+							float h0 = 0.25 * (texture2D(claudeAtlas, auv + vec2(-st, 0.0)).a
+									+ texture2D(claudeAtlas, auv + vec2(st, 0.0)).a
+									+ texture2D(claudeAtlas, auv + vec2(0.0, -st)).a
+									+ texture2D(claudeAtlas, auv + vec2(0.0, st)).a);
+							float hu = 0.25 * (texture2D(claudeAtlas, auv + vec2(0.0, 0.0)).a
+									+ texture2D(claudeAtlas, auv + vec2(2.0 * st, 0.0)).a
+									+ texture2D(claudeAtlas, auv + vec2(st, -st)).a
+									+ texture2D(claudeAtlas, auv + vec2(st, st)).a);
+							float hv = 0.25 * (texture2D(claudeAtlas, auv + vec2(0.0, 0.0)).a
+									+ texture2D(claudeAtlas, auv + vec2(0.0, 2.0 * st)).a
+									+ texture2D(claudeAtlas, auv + vec2(-st, st)).a
+									+ texture2D(claudeAtlas, auv + vec2(st, st)).a);
 							n = normalize(n - (udir * (hu - h0) + vdir * (hv - h0))
-									* reliefStrength * 26.0);
+									* reliefStrength * 16.0);
 							albedo *= 1.0 - reliefStrength * 0.55
 									* clamp(0.55 - h0, 0.0, 0.55) / 0.55;
 						}
