@@ -231,37 +231,64 @@ vec4 cascadeSample(float slab, vec3 c)
 			vec3((c.xy + 0.5) / 128.0, (slab * 128.0 + c.z + 0.5) / 640.0));
 }
 
-// visibility march in ONE cascade level's grid; foliage transmits
-float rungVis(float lv, vec3 corigin, float csz, vec3 pvol, vec3 sd)
+// visibility march CHAINED across cascade levels: march my own rung's
+// grid, and when the ray exits the box unblocked, continue one rung
+// coarser — a mountain 500m away shadows this valley cell through the
+// coarse rungs. v1 marched only the cell's own box, which silently
+// truncated all long-range terrain shadows (John: "are far off lods
+// not actually casting shadows?" — they weren't, past each box).
+float rungVis(float lv, vec3 corigin0, float csz0, vec3 pvol, vec3 sd)
 {
-	vec3 pc = (pvol - corigin) / csz + sd * 1.2;
-	if (any(lessThan(pc, vec3(0.0)))
-			|| any(greaterThanEqual(pc, vec3(128.0))))
-		return 1.0;
-	vec3 cell = floor(pc);
-	vec3 stepDir = sign(sd);
-	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
-	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
 	float vis = 1.0;
-	for (int i = 0; i < 64; i++) {
-		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
-			sideDist.x += invRd.x; cell.x += stepDir.x;
-		} else if (sideDist.y < sideDist.z) {
-			sideDist.y += invRd.y; cell.y += stepDir.y;
-		} else {
-			sideDist.z += invRd.z; cell.z += stepDir.z;
-		}
-		if (any(lessThan(cell, vec3(0.0)))
-				|| any(greaterThanEqual(cell, vec3(128.0))))
-			return vis;
-		vec4 s = cascadeSample(lv, cell);
-		if (s.a > 0.6 && s.a < 0.8) {
-			vis *= 0.7; // canopy: soft partial shadow
-			if (vis < 0.1)
+	vec3 pcur = pvol;
+	for (int L = 0; L < 5; L++) {
+		float flv = float(L);
+		if (flv < lv - 0.5)
+			continue;
+		float valid = L == 0 ? cascadeValid.x : L == 1 ? cascadeValid.y
+				: L == 2 ? cascadeValid.z : L == 3 ? cascadeValidB.x
+				: cascadeValidB.y;
+		if (valid < 0.5)
+			continue;
+		vec3 corigin = L == 0 ? cascade0Origin : L == 1 ? cascade1Origin
+				: L == 2 ? cascade2Origin : L == 3 ? cascade3Origin
+				: cascade4Origin;
+		float csz = exp2(flv + 1.0);
+		vec3 pc = (pcur - corigin) / csz + sd * 1.2;
+		if (any(lessThan(pc, vec3(0.0)))
+				|| any(greaterThanEqual(pc, vec3(128.0))))
+			continue; // outside this rung: try coarser
+		vec3 cell = floor(pc);
+		vec3 stepDir = sign(sd);
+		vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
+		vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5)
+				* invRd;
+		float tcur = 0.0;
+		for (int i = 0; i < 64; i++) {
+			if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+				tcur = sideDist.x;
+				sideDist.x += invRd.x; cell.x += stepDir.x;
+			} else if (sideDist.y < sideDist.z) {
+				tcur = sideDist.y;
+				sideDist.y += invRd.y; cell.y += stepDir.y;
+			} else {
+				tcur = sideDist.z;
+				sideDist.z += invRd.z; cell.z += stepDir.z;
+			}
+			if (any(lessThan(cell, vec3(0.0)))
+					|| any(greaterThanEqual(cell, vec3(128.0))))
+				break; // exited this rung's box: continue coarser
+			vec4 s = cascadeSample(flv, cell);
+			if (s.a > 0.6 && s.a < 0.8) {
+				vis *= 0.7; // canopy: soft partial shadow
+				if (vis < 0.1)
+					return 0.0;
+			} else if (s.a > 0.35) {
 				return 0.0;
-		} else if (s.a > 0.35) {
-			return 0.0;
+			}
 		}
+		// resume the next rung from where this march ended
+		pcur = corigin + (pc + sd * (tcur + 0.5)) * csz;
 	}
 	return vis;
 }
@@ -482,7 +509,13 @@ void main(void)
 	else { tu = vec3(1.0, 0.0, 0.0); tv = vec3(0.0, 1.0, 0.0); }
 	float du = (texel.x + 0.5) / NSUB - 0.5;
 	float dv = (texel.y + 0.5) / NSUB - 0.5;
-	vec3 ro = node + 0.5 + n * 0.51 + tu * du + tv * dv;
+	// standoff 0.51 -> 0.08: at sub-face resolution a half-meter
+	// standoff let corner texels see over wall lips — junctions GLOWED
+	// instead of darkening ("light leakage", John 2026-08-12). Contact
+	// occlusion needs the gather origin ON the surface, like the
+	// per-pixel bounce's 1cm origin always had.
+	vec3 ro = node + 0.5 + n * 0.58 + tu * du + tv * dv;
+	ro -= n * 0.50; // = surface + 0.08
 
 	vec3 inj = vec3(0.0);
 	for (int i = 0; i < 9; i++) {
