@@ -45,11 +45,30 @@ uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 uniform lowp float claudePyramid; // occupancy-pyramid leap climb dial
 uniform vec3 claudeOriginDelta;   // cells, non-zero only on the rebase frame
 uniform lowp float claudeCacheRemap; // 1 = shift across rebase, 0 = zero (pulse)
+uniform lowp float claudeSkyAz;
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
+
+// dawn/dusk azimuth: the warm horizon glow belongs to the SUN'S side
+// of the sky — without this, sunrise bathed west-facing backs in
+// east-glow ("back sides aren't very dark", John 2026-08-12)
+float dawnAz(vec3 rd)
+{
+	if (claudeSkyAz < 0.5)
+		return 1.0;
+	vec2 sh = vec2(volumeSunDir.x, volumeSunDir.z);
+	float sl = length(sh);
+	vec2 rh = vec2(rd.x, rd.z);
+	float rl = length(rh);
+	if (sl < 1e-4 || rl < 1e-4)
+		return 0.6;
+	float c = dot(rh / rl, sh / sl) * 0.5 + 0.5;
+	return 0.2 + 0.8 * c * c;
+}
+
 
 #define FTEX_W 4096.0
 #define FTEX_H 3072.0
@@ -109,7 +128,7 @@ vec3 cacheSky(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
 	float day = clamp((dayNightRatio - 0.18) / 0.82, 0.0, 1.0);
-	float low = smoothstep(0.35, -0.05, volumeSunDir.y);
+	float low = smoothstep(0.35, -0.05, volumeSunDir.y) * dawnAz(rd);
 	vec3 zenith = mix(vec3(0.16, 0.34, 0.72), vec3(0.10, 0.15, 0.34), low);
 	vec3 horizon = mix(vec3(0.62, 0.74, 0.92), vec3(0.95, 0.50, 0.22), low);
 	vec3 c = mix(horizon, zenith, pow(up, 0.42)) * day;

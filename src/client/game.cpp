@@ -270,6 +270,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_lod_dither_pixel{"claudeLodDither"};
 	float m_far_grain = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_far_grain_pixel{"claudeFarGrain"};
+	float m_far_fog = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_far_fog_pixel{"claudeFarFog"};
+	float m_sky_az = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_sky_az_pixel{"claudeSkyAz"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -312,7 +316,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 35> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 37> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -348,6 +352,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_light_ladder",
 		"claude_lod_dither",
 		"claude_far_grain",
+		"claude_far_fog",
+		"claude_sky_azimuth",
 	};
 
 	static float readGoldenHourStrength()
@@ -613,6 +619,22 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_far_grain", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = aerial-perspective haze on far terrain
+	static float readFarFog()
+	{
+		if (!g_settings->exists("claude_far_fog"))
+			return 1.0f;
+		return g_settings->getFloat("claude_far_fog", 0.0f, 1.0f);
+	}
+
+	// 1 (default) = dawn/dusk glow confined to the sun's side of the sky
+	static float readSkyAz()
+	{
+		if (!g_settings->exists("claude_sky_azimuth"))
+			return 1.0f;
+		return g_settings->getFloat("claude_sky_azimuth", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -702,6 +724,10 @@ public:
 			m_lod_dither = readLodDither();
 		if (name == "claude_far_grain")
 			m_far_grain = readFarGrain();
+		if (name == "claude_far_fog")
+			m_far_fog = readFarFog();
+		if (name == "claude_sky_azimuth")
+			m_sky_az = readSkyAz();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -753,6 +779,8 @@ public:
 		m_light_ladder = readLightLadder();
 		m_lod_dither = readLodDither();
 		m_far_grain = readFarGrain();
+		m_far_fog = readFarFog();
+		m_sky_az = readSkyAz();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -896,6 +924,8 @@ public:
 			m_light_ladder_pixel.set(&m_light_ladder, services);
 			m_lod_dither_pixel.set(&m_lod_dither, services);
 			m_far_grain_pixel.set(&m_far_grain, services);
+			m_far_fog_pixel.set(&m_far_fog, services);
+			m_sky_az_pixel.set(&m_sky_az, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which

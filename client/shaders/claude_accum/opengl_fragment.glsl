@@ -75,6 +75,10 @@ uniform lowp float claudeLodDither;
 // flat color per cell read as "shipping containers, not mountains"
 // (John, 2026-08-12); 1m + 4m world-anchored hash restores rock.
 uniform lowp float claudeFarGrain;
+// 1 = aerial-perspective haze on far terrain; 0 = pure tracing (John:
+// "zero in on just the ray tracing — volumetric stuff not yet")
+uniform lowp float claudeFarFog;
+uniform lowp float claudeSkyAz;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
@@ -115,6 +119,24 @@ uniform lowp float claudeEmitterCount;
 uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
+
+// dawn/dusk azimuth: the warm horizon glow belongs to the SUN'S side
+// of the sky — without this, sunrise bathed west-facing backs in
+// east-glow ("back sides aren't very dark", John 2026-08-12)
+float dawnAz(vec3 rd)
+{
+	if (claudeSkyAz < 0.5)
+		return 1.0;
+	vec2 sh = vec2(volumeSunDir.x, volumeSunDir.z);
+	float sl = length(sh);
+	vec2 rh = vec2(rd.x, rd.z);
+	float rl = length(rh);
+	if (sl < 1e-4 || rl < 1e-4)
+		return 0.6;
+	float c = dot(rh / rl, sh / sl) * 0.5 + 0.5;
+	return 0.2 + 0.8 * c * c;
+}
+
 
 // Interleaved gradient noise (Jimenez): spatially low-discrepancy, so
 // 1-spp error reads as fine film grain instead of TV static; animated
@@ -192,7 +214,7 @@ vec3 pathSkyRadiance(vec3 rd)
 	// long path through atmosphere, so blue scatters out and what survives is
 	// orange — the old two-colour lerp had fixed endpoints and so had no dawn
 	// and no dusk, only a blue sky dimmed toward black.
-	float low = smoothstep(0.35, -0.05, volumeSunDir.y);   // 0 high sun .. 1 set
+	float low = smoothstep(0.35, -0.05, volumeSunDir.y) * dawnAz(rd);   // 0 high sun .. 1 set
 	vec3 zenith = mix(vec3(0.16, 0.34, 0.72), vec3(0.10, 0.15, 0.34), low);
 	vec3 horizon = mix(vec3(0.62, 0.74, 0.92), vec3(0.95, 0.50, 0.22), low);
 	// pow < 1 keeps the bright band tight to the horizon instead of a ramp
@@ -244,7 +266,7 @@ vec3 pathSkyFog(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
 	float day = pathDayLin();
-	float low = smoothstep(0.35, -0.05, volumeSunDir.y);
+	float low = smoothstep(0.35, -0.05, volumeSunDir.y) * dawnAz(rd);
 	vec3 zenith = mix(vec3(0.16, 0.34, 0.72), vec3(0.10, 0.15, 0.34), low);
 	vec3 horizon = mix(vec3(0.62, 0.74, 0.92), vec3(0.95, 0.50, 0.22), low);
 	vec3 sky = mix(horizon, zenith, pow(up, 0.42));
@@ -666,8 +688,9 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 				if (s.a < 0.6)
 					c2 = mix(c2, pathSkyFog(reflect(rd,
 							vec3(0.0, 1.0, 0.0))), 0.6);
-				c2 = mix(c2, pathSkyFog(rd),
-						1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
+				if (claudeFarFog > 0.5)
+					c2 = mix(c2, pathSkyFog(rd),
+							1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
 				return vec4(c2, tw);
 			}
 			// sd is the caller's DISC-JITTERED sun: accumulation averages
@@ -734,8 +757,9 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			// Fog STARTS past the near seam (64 nodes) — fogging at the
 			// seam itself drew an abrupt haze line exactly where the
 			// resolution changes, doubling the visual discontinuity.
-			c = mix(c, pathSkyFog(rd),
-					1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
+			if (claudeFarFog > 0.5)
+				c = mix(c, pathSkyFog(rd),
+						1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
 			return vec4(c, tw);
 		}
 	}
