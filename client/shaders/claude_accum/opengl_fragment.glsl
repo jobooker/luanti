@@ -47,6 +47,12 @@ uniform lowp float claudeFaceDirect;
 // 1 (default) = bounce-vertex budget tiers (2-torch NEE, cell-exact
 // sun vis); 0 = full-quality shading at indirect hits (pre-tier look).
 uniform lowp float claudeTiers;
+// Russian-roulette the per-pixel bounce ray: each frame a pixel fires
+// it with probability 1/stride, weighted by stride (unbiased); the
+// temporal history averages the rest — the same machinery that eats
+// jittered shadow noise. Keeps per-pixel AO, trades convergence speed.
+// 1 (default) = every pixel every frame.
+uniform lowp float claudeBounceStride;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -810,6 +816,22 @@ vec3 emitterLightCheap(vec3 hp, vec3 n);
 // 0 clear (never met a carved cell), 1 rim-passed, 2 blocked in OWN
 // cell, 3 blocked crossing another carved cell, 4 blocked by full cube.
 float g_evisCause = 0.0;
+
+// Returns the bounce ray's Monte Carlo weight this frame: stride when
+// this pixel won the lottery, 0 when it sits out. Hash varies per
+// frame via animationTimer so every pixel integrates over time.
+float bounceLottery()
+{
+	if (claudeBounceStride < 1.5)
+		return 1.0;
+	// Tile-coherent selection (8x8 blocks win together): a random
+	// per-pixel lottery leaves ~every GPU warp with a winner, and the
+	// whole warp waits out its march — coherent tiles let warps skip.
+	float r = fract(sin(dot(floor(gl_FragCoord.xy / 8.0)
+			+ fract(animationTimer * 7.13) * 61.7,
+			vec2(419.23, 271.87))) * 34781.719);
+	return r * claudeBounceStride < 1.0 ? claudeBounceStride : 0.0;
+}
 
 // Coarse-rung sun visibility for INDIRECT consumers (bounce hits):
 // identical cell-exact A&W with pyramid leaps and far promotion, but no
@@ -1598,10 +1620,13 @@ void main(void)
 					if (dot(ad2, bnB) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, bnB) * bnB);
 					vec3 amb2 = vec3(0.0);
 					if (claudeCost < 2.5) {
-						if (claudeFaceDirect > 0.5 && radianceStrength > 0.0)
+						if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
 							amb2 = faceCache(cell, bnB) * radianceStrength * 1.15;
-						else
-							amb2 = bounceRay(bpos, ad2, sd2) * 1.15;
+						} else {
+							float bw2 = bounceLottery();
+							if (bw2 > 0.0)
+								amb2 = bounceRay(bpos, ad2, sd2) * 1.15 * bw2;
+						}
 					}
 					// origin biased ~1.5 sub-voxels off the surface: with
 					// uniform own-cell tracing, shadow features must stand
@@ -1836,10 +1861,13 @@ void main(void)
 				bool skipB = claudeCost > 2.5;
 				vec3 amb = vec3(0.0);
 				if (!skipB) {
-					if (claudeFaceDirect > 0.5 && radianceStrength > 0.0)
+					if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
 						amb = faceCache(cell, n) * radianceStrength * 1.15;
-					else
-						amb = bounceRay(hp, ad, sd) * 1.15;
+					} else {
+						float bw = bounceLottery();
+						if (bw > 0.0)
+							amb = bounceRay(hp, ad, sd) * 1.15 * bw;
+					}
 				}
 
 				// Specular rides the same visibility as diffuse — the

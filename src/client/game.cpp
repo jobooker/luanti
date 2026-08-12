@@ -248,6 +248,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_face_direct_pixel{"claudeFaceDirect"};
 	float m_tiers = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tiers_pixel{"claudeTiers"};
+	float m_bounce_stride = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bounce_stride_pixel{"claudeBounceStride"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -287,7 +289,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 28> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 29> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -316,6 +318,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_cost",
 		"claude_face_direct",
 		"claude_tiers",
+		"claude_bounce_stride",
 	};
 
 	static float readGoldenHourStrength()
@@ -523,6 +526,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_tiers", 0.0f, 1.0f);
 	}
 
+	// 1 = bounce ray every pixel every frame (default); N = Russian-
+	// roulette to 1/N of pixels, weighted N, history averages the rest.
+	static float readBounceStride()
+	{
+		if (!g_settings->exists("claude_bounce_stride"))
+			return 1.0f;
+		return g_settings->getFloat("claude_bounce_stride", 1.0f, 8.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -598,6 +610,8 @@ public:
 			m_face_direct = readFaceDirect();
 		if (name == "claude_tiers")
 			m_tiers = readTiers();
+		if (name == "claude_bounce_stride")
+			m_bounce_stride = readBounceStride();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -642,6 +656,7 @@ public:
 		m_cost = readCost();
 		m_face_direct = readFaceDirect();
 		m_tiers = readTiers();
+		m_bounce_stride = readBounceStride();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -769,6 +784,7 @@ public:
 			m_cost_pixel.set(&m_cost, services);
 			m_face_direct_pixel.set(&m_face_direct, services);
 			m_tiers_pixel.set(&m_tiers, services);
+			m_bounce_stride_pixel.set(&m_bounce_stride, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
