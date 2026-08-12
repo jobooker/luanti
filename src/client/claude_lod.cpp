@@ -91,62 +91,77 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 {
 	constexpr int N = 128; // cells per axis
 	const int CELL = cell_nodes;
-	const int SUBS = CELL / 4; // subcells (4 nodes) per cell per axis: 1 or 2
 	rgba.assign((size_t)N * N * N * 4, 0);
 	coarse.assign(32 * 32 * 32, 0);
+
+	// SCATTER, not gather: iterate the blocks we actually HAVE (a few
+	// thousand) and deposit their 4-node subcells into cells. Cost is
+	// independent of cell size, and a 32 m cell spanning 2x2x2 blocks —
+	// which breaks the one-block-per-cell gather — is handled for free.
+	// Accumulators are static and reused (u16 counts: max 32^3 = 32768
+	// nodes per cell fits; u32 color sums).
+	static std::vector<u16> occ_acc, water_acc;
+	static std::vector<u32> r_acc, g_acc, b_acc;
+	constexpr size_t NC = (size_t)N * N * N;
+	occ_acc.assign(NC, 0);
+	water_acc.assign(NC, 0);
+	r_acc.assign(NC, 0);
+	g_acc.assign(NC, 0);
+	b_acc.assign(NC, 0);
+
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if (g_summaries.empty())
+			return 0;
+		const int span = N * CELL;
+		for (const auto &kv : g_summaries) {
+			v3s16 bbase(kv.first.X * 16, kv.first.Y * 16, kv.first.Z * 16);
+			v3s16 rel = bbase - origin_nodes;
+			if (rel.X < 0 || rel.Y < 0 || rel.Z < 0
+					|| rel.X + 16 > span || rel.Y + 16 > span
+					|| rel.Z + 16 > span)
+				continue;
+			const BlockSummary &s = kv.second;
+			for (int sz = 0; sz < 4; sz++)
+			for (int sy = 0; sy < 4; sy++)
+			for (int sx = 0; sx < 4; sx++) {
+				int sub = sz * 16 + sy * 4 + sx;
+				u32 cnt = (u32)s.occ[sub] + s.water[sub];
+				if (cnt == 0)
+					continue;
+				size_t ci = (((size_t)(rel.Z + sz * 4) / CELL) * N
+						+ ((rel.Y + sy * 4) / CELL)) * N
+						+ ((rel.X + sx * 4) / CELL);
+				occ_acc[ci] += s.occ[sub];
+				water_acc[ci] += s.water[sub];
+				r_acc[ci] += s.rsum[sub];
+				g_acc[ci] += s.gsum[sub];
+				b_acc[ci] += s.bsum[sub];
+			}
+		}
+	}
+
+	// threshold pass: >= 50% occupancy => solid; water wins only when it
+	// outnumbers solid matter (a lake surface cell)
+	const u32 half = (u32)CELL * CELL * CELL / 2;
 	u32 solid_cells = 0;
-
-	std::lock_guard<std::mutex> lock(g_mutex);
-	if (g_summaries.empty())
-		return 0;
-
-	// A CELL-node cell at CELL-node alignment always lies inside ONE
-	// MapBlock (16 nodes) for CELL in {4, 8} — one map lookup plus a few
-	// array reads per cell.
-	const u32 half = (u32)(CELL * CELL * CELL) / 2; // 50% occupancy
 	size_t i = 0;
-	const BlockSummary *cached = nullptr;
-	v3s16 cached_pos(32767, 32767, 32767);
 	for (int cz = 0; cz < N; cz++)
 	for (int cy = 0; cy < N; cy++)
 	for (int cx = 0; cx < N; cx++, i++) {
-		v3s16 base = origin_nodes + v3s16(cx * CELL, cy * CELL, cz * CELL);
-		v3s16 bp(base.X >> 4, base.Y >> 4, base.Z >> 4);
-		if (bp != cached_pos) {
-			auto it = g_summaries.find(bp);
-			cached = it == g_summaries.end() ? nullptr : &it->second;
-			cached_pos = bp;
-		}
-		if (!cached)
-			continue; // never seen: air (the fog owns the data frontier)
-		int sx = (base.X & 15) / 4, sy = (base.Y & 15) / 4,
-			sz = (base.Z & 15) / 4;
-		u32 occ = 0, water = 0, r = 0, g = 0, b = 0;
-		for (int oz = 0; oz < SUBS; oz++)
-		for (int oy = 0; oy < SUBS; oy++)
-		for (int ox = 0; ox < SUBS; ox++) {
-			int sub = (sz + oz) * 16 + (sy + oy) * 4 + (sx + ox);
-			occ += cached->occ[sub];
-			water += cached->water[sub];
-			r += cached->rsum[sub];
-			g += cached->gsum[sub];
-			b += cached->bsum[sub];
-		}
-		u32 counted = occ + water;
+		u32 counted = (u32)occ_acc[i] + water_acc[i];
 		if (counted == 0)
 			continue;
-		// >= 50% of the cell's nodes occupied => solid; water wins only
-		// when it outnumbers solid matter (a lake surface cell)
 		u8 cls = 0;
-		if (occ >= half)
+		if (occ_acc[i] >= half)
 			cls = 255;
-		else if (water >= half && water > occ)
+		else if (water_acc[i] >= half && water_acc[i] > occ_acc[i])
 			cls = 100;
 		else
-			continue; // sparse: air at this resolution
-		rgba[i * 4 + 0] = (u8)(r / counted);
-		rgba[i * 4 + 1] = (u8)(g / counted);
-		rgba[i * 4 + 2] = (u8)(b / counted);
+			continue;
+		rgba[i * 4 + 0] = (u8)(r_acc[i] / counted);
+		rgba[i * 4 + 1] = (u8)(g_acc[i] / counted);
+		rgba[i * 4 + 2] = (u8)(b_acc[i] / counted);
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
 		coarse[((cz / 4) * 32 + (cy / 4)) * 32 + (cx / 4)] = 255;

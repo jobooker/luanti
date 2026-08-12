@@ -311,7 +311,10 @@ uniform sampler3D claudeCascadeCoarse; // 32x32x160 R8 any-solid bricks
 uniform vec3 cascade0Origin;  // 2 m level origin, volume-local nodes
 uniform vec3 cascade1Origin;  // 4 m
 uniform vec3 cascade2Origin;  // 8 m
-uniform vec3 cascadeValid;    // per-level 0/1
+uniform vec3 cascade3Origin;  // 16 m
+uniform vec3 cascade4Origin;  // 32 m
+uniform vec3 cascadeValid;    // levels 0-2, 0/1 each
+uniform vec3 cascadeValidB;   // levels 3-4 in .xy
 
 vec4 cascadeSample(float slab, vec3 c)
 {
@@ -319,19 +322,18 @@ vec4 cascadeSample(float slab, vec3 c)
 			vec3((c.xy + 0.5) / 128.0, (slab * 128.0 + c.z + 0.5) / 640.0));
 }
 
-// Binary sun occlusion marched in 8 m cells (the coarsest level ONLY:
-// an 8 m occluder test is indistinguishable from a 2 m one at terrain
-// distance, at a third the cost) — this is what lets a mountain 400
-// nodes west dim the camp at sunset. Start is biased 1.2 cells along
-// the ray — the launch point sits on (or exits near) real terrain whose
-// own coarse cell is >50% solid, and sampling it would self-shadow
+// Binary sun occlusion marched in ONE cascade level from a volume-local
+// point. Returns 1 lit, 0 blocked, -1 = left the box unblocked (caller
+// continues in a coarser level). Start is biased 1.2 cells along the
+// ray — the launch point sits on (or exits near) real terrain whose own
+// coarse cell is >50% solid, and sampling it would self-shadow
 // everything near any slope. The bias trades that for a slight light
-// leak at terrain-scale silhouettes, invisible at 8 m frequency.
-float farShadow(vec3 pvol, vec3 sd)
+// leak at terrain-scale silhouettes, invisible at this frequency.
+float farShadowL(float slab, vec3 corigin, float csz, vec3 pvol, vec3 sd)
 {
-	if (cascadeValid.z < 0.5)
-		return 1.0;
-	vec3 pc = (pvol - cascade2Origin) / 8.0 + sd * 1.2;
+	vec3 pc = (pvol - corigin) / csz + sd * 1.2;
+	if (any(lessThan(pc, vec3(0.0))) || any(greaterThanEqual(pc, vec3(128.0))))
+		return -1.0;
 	vec3 cell = floor(pc);
 	vec3 stepDir = sign(sd);
 	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
@@ -346,10 +348,10 @@ float farShadow(vec3 pvol, vec3 sd)
 		}
 		if (any(lessThan(cell, vec3(0.0)))
 				|| any(greaterThanEqual(cell, vec3(128.0))))
-			return 1.0;
+			return -1.0;
 		vec3 cc = floor(cell / 4.0);
 		if (texture3D(claudeCascadeCoarse, vec3((cc.xy + 0.5) / 32.0,
-				(2.0 * 32.0 + cc.z + 0.5) / 160.0)).r < 0.5) {
+				(slab * 32.0 + cc.z + 0.5) / 160.0)).r < 0.5) {
 			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
 			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
 					* max(abs(sd), vec3(1e-6));
@@ -361,8 +363,26 @@ float farShadow(vec3 pvol, vec3 sd)
 					+ stepDir * 0.5 + 0.5) * invRd;
 			continue;
 		}
-		if (cascadeSample(2.0, cell).a > 0.9)
+		if (cascadeSample(slab, cell).a > 0.9)
 			return 0.0;
+	}
+	return -1.0;
+}
+
+// 8 m to +/-512, then 32 m to +/-2048: a mountain a mile out still
+// blocks the sun. The 16 m level is skipped for shadows — at that range
+// the 32 m answer is identical and half the marching.
+float farShadow(vec3 pvol, vec3 sd)
+{
+	if (cascadeValid.z > 0.5) {
+		float v = farShadowL(2.0, cascade2Origin, 8.0, pvol, sd);
+		if (v >= 0.0)
+			return v;
+	}
+	if (cascadeValidB.y > 0.5) {
+		float v = farShadowL(4.0, cascade4Origin, 32.0, pvol, sd);
+		if (v >= 0.0)
+			return v;
 	}
 	return 1.0;
 }
@@ -441,8 +461,9 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			if (volumeDebug > 4.5)
 				c = tint * (0.4 + 0.6 * ndl);
 			// aerial perspective: the beauty term, and the concealer for
-			// the data frontier (unseen terrain fades into atmosphere)
-			c = mix(c, pathSkyRadiance(rd), 1.0 - exp(-tw / 900.0));
+			// the data frontier (unseen terrain fades into atmosphere).
+			// 1400-node scale keeps the 2 km ring visible through the haze
+			c = mix(c, pathSkyRadiance(rd), 1.0 - exp(-tw / 1400.0));
 			return vec4(c, tw);
 		}
 	}
@@ -473,6 +494,20 @@ vec4 farTrace(vec3 ro, vec3 rd, float t0)
 	if (cascadeValid.z > 0.5) {
 		r = farTraceL(2.0, cascade2Origin, 8.0,
 				vec3(0.9, 0.9, 0.15), ro, rd, tcur);
+		if (r.w > 0.0)
+			return r;
+		tcur = -r.w - 1.0;
+	}
+	if (cascadeValidB.x > 0.5) {
+		r = farTraceL(3.0, cascade3Origin, 16.0,
+				vec3(0.2, 0.85, 0.25), ro, rd, tcur);
+		if (r.w > 0.0)
+			return r;
+		tcur = -r.w - 1.0;
+	}
+	if (cascadeValidB.y > 0.5) {
+		r = farTraceL(4.0, cascade4Origin, 32.0,
+				vec3(0.2, 0.8, 0.9), ro, rd, tcur);
 		if (r.w > 0.0)
 			return r;
 	}

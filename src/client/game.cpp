@@ -124,10 +124,10 @@ struct ClaudeVolume
 	// as belt-and-braces over the FBO clear.
 	float radiance_frame = 0.0f;
 	int radiance_reset = 2;
-	// far cascades (claude_lod Phase 2): detail degrades in OCTAVES —
-	// 2 m to +/-128 m, 4 m to +/-256 m, 8 m to +/-512 m — so the eye
-	// never jumps more than one resolution doubling at a seam. Slabs
-	// 0/1/2 of the 5-slab textures (levels are data, not layout).
+	// far cascades (claude_lod Phase 2+3): detail degrades in OCTAVES —
+	// 2 m to +/-128, 4 m to +/-256, 8 m to +/-512, 16 m to +/-1024,
+	// 32 m to +/-2048 — so the eye never jumps more than one resolution
+	// doubling at a seam. Slabs 0..4 of the stacked textures.
 	u32 cascades_tex = 0;        // 128x128x640 RGBA8, unit 8
 	u32 cascades_coarse_tex = 0; // 32x32x160 R8, unit 9
 	struct CascLevel {
@@ -137,7 +137,7 @@ struct ClaudeVolume
 		u64 build_time = 0;
 		u32 solid = 0;
 		float ms = 0.0f;         // last build+upload cost (stats)
-	} casc[3];                   // [0]=2m [1]=4m [2]=8m
+	} casc[5];                   // [0]=2m [1]=4m [2]=8m [3]=16m [4]=32m
 };
 static ClaudeVolume g_claude_volume;
 
@@ -200,7 +200,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_cascade0_origin_pixel{"cascade0Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade1_origin_pixel{"cascade1Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade2_origin_pixel{"cascade2Origin"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade3_origin_pixel{"cascade3Origin"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade4_origin_pixel{"cascade4Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid_pixel{"cascadeValid"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
@@ -707,11 +710,12 @@ public:
 				// (cascade world origin minus volume world origin), so the
 				// shader converts a volume-local point to cascade cells
 				// with one subtract and a divide
-				CachedPixelShaderSetting<float, 3, false> *corg_pixels[3] = {
+				CachedPixelShaderSetting<float, 3, false> *corg_pixels[5] = {
 					&m_cascade0_origin_pixel, &m_cascade1_origin_pixel,
-					&m_cascade2_origin_pixel };
-				float cvalid[3];
-				for (int lv = 0; lv < 3; lv++) {
+					&m_cascade2_origin_pixel, &m_cascade3_origin_pixel,
+					&m_cascade4_origin_pixel };
+				float cvalid[5];
+				for (int lv = 0; lv < 5; lv++) {
 					v3f corg = v3f((float)(g_claude_volume.casc[lv].origin.X
 								- g_claude_volume.origin.X),
 							(float)(g_claude_volume.casc[lv].origin.Y
@@ -722,6 +726,8 @@ public:
 					cvalid[lv] = g_claude_volume.casc[lv].valid ? 1.0f : 0.0f;
 				}
 				m_cascade_valid_pixel.set(cvalid, services);
+				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};
+				m_cascade_valid2_pixel.set(cvalid2, services);
 			}
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				v3f vorg((float)g_claude_volume.origin.X,
@@ -1756,12 +1762,18 @@ static void claudeWriteStats(f32 dtime)
 			<< ", \"casc_valid\": [" << (g_claude_volume.casc[0].valid ? 1 : 0)
 			<< "," << (g_claude_volume.casc[1].valid ? 1 : 0)
 			<< "," << (g_claude_volume.casc[2].valid ? 1 : 0)
+			<< "," << (g_claude_volume.casc[3].valid ? 1 : 0)
+			<< "," << (g_claude_volume.casc[4].valid ? 1 : 0)
 			<< "], \"casc_solid\": [" << g_claude_volume.casc[0].solid
 			<< "," << g_claude_volume.casc[1].solid
 			<< "," << g_claude_volume.casc[2].solid
+			<< "," << g_claude_volume.casc[3].solid
+			<< "," << g_claude_volume.casc[4].solid
 			<< "], \"casc_ms\": [" << g_claude_volume.casc[0].ms
 			<< "," << g_claude_volume.casc[1].ms
 			<< "," << g_claude_volume.casc[2].ms
+			<< "," << g_claude_volume.casc[3].ms
+			<< "," << g_claude_volume.casc[4].ms
 			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
 			<< "}\n";
 	std::ofstream f(porting::path_user + "/claude_stats.json",
@@ -1779,12 +1791,12 @@ static void claudeCascadeUpdate(Client *client)
 	if (!g_settings->exists("claude_cascades")
 			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f)
 		return;
-	static const int CELL[3] = {2, 4, 8};
-	static const u64 CADENCE[3] = {8000, 6000, 4000};
+	static const int CELL[5] = {2, 4, 8, 16, 32};
+	static const u64 CADENCE[5] = {8000, 6000, 4000, 12000, 20000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
 	u64 ver = claude_lod::contentVersion();
 
-	for (int lv = 0; lv < 3; lv++) {
+	for (int lv = 0; lv < 5; lv++) {
 		auto &L = g_claude_volume.casc[lv];
 		const int half = 128 * CELL[lv] / 2;
 		const int stray = 16 * CELL[lv]; // 32 / 64 / 128 nodes
@@ -1803,9 +1815,10 @@ static void claudeCascadeUpdate(Client *client)
 			continue;
 		u64 t0 = porting::getTimeMs();
 		v3s16 origin = center - v3s16(half, half, half);
-		// snap to 32 nodes: one coarse brick at the finest level, and
-		// stable world-space cell identity across recenters everywhere
-		origin.X &= ~31; origin.Y &= ~31; origin.Z &= ~31;
+		// snap to one coarse brick (4 cells) so brick boundaries and
+		// world-space cell identity are stable across recenters
+		const s16 snap_mask = (s16)~(CELL[lv] * 4 - 1);
+		origin.X &= snap_mask; origin.Y &= snap_mask; origin.Z &= snap_mask;
 		static std::vector<u8> rgba, coarse;
 		u32 solid = lv == 0
 				? claude_lod::buildCascade2(client, origin, rgba, coarse)
