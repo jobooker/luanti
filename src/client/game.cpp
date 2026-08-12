@@ -42,17 +42,29 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
-// claude_volume uploads its 3D texture through the platform GL directly:
-// the mac client runs Irrlicht's legacy "opengl" driver (GL 2.1 context,
-// GLSL 120), where the mt_opengl loader isn't initialized.
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl.h>
-#include "client/render/pipeline.h"
-#ifndef GL_R32UI
-#define GL_R32UI 0x8236
+// claude_volume uploads its 3D textures through raw GL directly.
+// Cross-platform GL via the engine's own loader (irr/include/mt_opengl.h):
+// it supplies BOTH entry points and enums as members of the global `GL`,
+// and LoadAllProcedures() runs on both driver paths. The old
+// <OpenGL/gl.h> was Apple-only, and on Windows opengl32.dll exports just
+// GL 1.1 — ActiveTexture/TexImage3D/TexSubImage3D would have been null.
+#include <mt_opengl.h>
+// Legacy non-core fallback only (claudeUseR8() == false); mt_opengl omits
+// these because core profile removed them.
+#ifndef GL_LUMINANCE
+#define GL_LUMINANCE 0x1909
 #endif
-#ifndef GL_RED_INTEGER
-#define GL_RED_INTEGER 0x8D94
+#ifndef GL_LUMINANCE8
+#define GL_LUMINANCE8 0x8040
+#endif
+// mt_opengl keeps its scalar typedefs private, so declare the three we
+// use with their standard Khronos definitions.
+using GLint = int;
+using GLenum = unsigned int;
+using GLuint = unsigned int;
+#include "client/render/pipeline.h"
+#ifndef GL.RED_INTEGER
+#define GL.RED_INTEGER 0x8D94
 #endif // ClaudeGpuProf (per-pass GPU times)
 #include "profiler.h"
 #include "raycast.h"
@@ -80,7 +92,7 @@
 typedef s32 SamplerLayer_t;
 
 // claude_volume: one-shot 128^3 occupancy snapshot of the map around the
-// camera, held as a raw GL_R8 3D texture bound to texture unit 4 — outside
+// camera, held as a raw GL.R8 3D texture bound to texture unit 4 — outside
 // Irrlicht's material system, which only manages units 0-3, so nothing else
 // touches the binding. Written by claudeVolumeSnapshot() (triggered through
 // claude_settings_patch.conf), read each frame by the uniform setter below
@@ -1004,7 +1016,7 @@ public:
 			// is what validity requires.)
 			//
 			// Also: restore the active-texture unit the DRIVER'S CACHE
-			// believes is current, not a hard-coded GL_TEXTURE0 — a raw
+			// believes is current, not a hard-coded GL.TEXTURE0 — a raw
 			// restore to 0 desyncs COpenGLCoreCacheHandler's ActiveTexture
 			// mirror, after which cached setActiveTexture(X) calls are
 			// skipped as "already X" while GL really sits at 0, and
@@ -1012,44 +1024,44 @@ public:
 			// of frame-order-dependent corruption is exactly the
 			// works-once-never-again symptom.
 			{
-				GLint prev_active = GL_TEXTURE0;
-				glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+				GLint prev_active = GL.TEXTURE0;
+				GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active);
 				if (g_claude_volume.tex) {
-					glActiveTexture(GL_TEXTURE10);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
+					GL.ActiveTexture(GL.TEXTURE10);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
 				}
 				if (g_claude_volume.coarse_tex) {
-					glActiveTexture(GL_TEXTURE11);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
+					GL.ActiveTexture(GL.TEXTURE11);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.coarse_tex);
 				}
 				if (g_claude_volume.material_tex) {
-					glActiveTexture(GL_TEXTURE12);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.material_tex);
+					GL.ActiveTexture(GL.TEXTURE12);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.material_tex);
 				}
 				if (g_claude_volume.atlas_tex) {
-					glActiveTexture(GL_TEXTURE13);
-					glBindTexture(GL_TEXTURE_2D, g_claude_volume.atlas_tex);
+					GL.ActiveTexture(GL.TEXTURE13);
+					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.atlas_tex);
 				}
 				if (g_claude_volume.micro_tex) {
-					glActiveTexture(GL_TEXTURE14);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
+					GL.ActiveTexture(GL.TEXTURE14);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.micro_tex);
 				}
 				if (g_claude_volume.matparams_tex) {
-					glActiveTexture(GL_TEXTURE15);
-					glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
+					GL.ActiveTexture(GL.TEXTURE15);
+					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.matparams_tex);
 				}
 				if (g_claude_volume.subvox_tex) {
-					glActiveTexture(GL_TEXTURE7);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.subvox_tex);
+					GL.ActiveTexture(GL.TEXTURE7);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.subvox_tex);
 				}
 				if (g_claude_volume.cascades_tex) {
-					glActiveTexture(GL_TEXTURE8);
-					glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
-					glActiveTexture(GL_TEXTURE9);
-					glBindTexture(GL_TEXTURE_3D,
+					GL.ActiveTexture(GL.TEXTURE8);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_tex);
+					GL.ActiveTexture(GL.TEXTURE9);
+					GL.BindTexture(GL.TEXTURE_3D,
 							g_claude_volume.cascades_coarse_tex);
 				}
-				glActiveTexture(prev_active);
+				GL.ActiveTexture(prev_active);
 
 				SamplerLayer_t layer = 10;
 				m_volume_sampler_pixel.set(&layer, services);
@@ -1742,13 +1754,13 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 // GL_LUMINANCE was REMOVED in the OpenGL core profile, so these uploads
 // silently produced nothing there: the coarse brick map read zero everywhere,
 // every ray leapt past all geometry, and the traced world came out as pure
-// sky. GL_R8/GL_RED is the core replacement and exists from 3.0; the legacy
+// sky. GL.R8/GL.RED is the core replacement and exists from 3.0; the legacy
 // 2.1 driver has only LUMINANCE. Shaders read .r either way.
 static bool claudeUseR8()
 {
 	static int cached = -1;
 	if (cached < 0) {
-		const char *v = (const char *)glGetString(GL_VERSION);
+		const char *v = (const char *)GL.GetString(GL.VERSION);
 		int major = (v && v[0] >= '0' && v[0] <= '9') ? (v[0] - '0') : 2;
 		cached = (major >= 3) ? 1 : 0;
 	}
@@ -1756,7 +1768,7 @@ static bool claudeUseR8()
 }
 
 // claude_volume_snapshot: walk the client's loaded map ±SIZE/2 nodes around
-// the camera into a solid/air occupancy grid and upload it as a GL_R8 3D
+// the camera into a solid/air occupancy grid and upload it as a GL.R8 3D
 // texture on unit 4. One-shot: the volume does not follow the camera
 // afterwards (streaming updates are a later patch). Unloaded map (IGNORE)
 // reads as air, so rays pass through it and miss. Runs on the main thread
@@ -1920,21 +1932,21 @@ static void claudeVolumeSnapshot(Client *client)
 	}
 	g_claude_volume.content_hash = hash;
 	// Save the unit the driver's cache believes is active and restore it
-	// at the end — restoring a hard-coded GL_TEXTURE0 desyncs the
+	// at the end — restoring a hard-coded GL.TEXTURE0 desyncs the
 	// COpenGLCoreCacheHandler mirror (see the per-frame rebind block).
-	GLint prev_active_unit = GL_TEXTURE0;
-	glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
+	GLint prev_active_unit = GL.TEXTURE0;
+	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
 	if (!g_claude_volume.tex)
-		glGenTextures(1, &g_claude_volume.tex);
-	glActiveTexture(GL_TEXTURE10);
-	glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, S, S, S, 0, GL_RGBA,
-			GL_UNSIGNED_BYTE, occ.data());
+		GL.GenTextures(1, &g_claude_volume.tex);
+	GL.ActiveTexture(GL.TEXTURE10);
+	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, S, S, S, 0, GL.RGBA,
+			GL.UNSIGNED_BYTE, occ.data());
 	// OCCUPANCY MIP PYRAMID on unit 11 (Teardown's accelerator, ADR-0007
 	// overnight 2026-08-12): the old 32^3 brick map becomes level 2 of a
 	// 128^3 R8 texture with real GL mips 0..5 (any-content, max-reduced).
@@ -2027,28 +2039,28 @@ static void claudeVolumeSnapshot(Client *client)
 				}
 			}
 		}
-		GLint prev_au = GL_TEXTURE0;
-		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_au);
+		GLint prev_au = GL.TEXTURE0;
+		GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_au);
 		bool fresh_sv = !g_claude_volume.subvox_tex;
 		if (fresh_sv)
-			glGenTextures(1, &g_claude_volume.subvox_tex);
-		glActiveTexture(GL_TEXTURE7);
-		glBindTexture(GL_TEXTURE_3D, g_claude_volume.subvox_tex);
+			GL.GenTextures(1, &g_claude_volume.subvox_tex);
+		GL.ActiveTexture(GL.TEXTURE7);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.subvox_tex);
 		if (fresh_sv) {
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-			glTexImage3D(GL_TEXTURE_3D, 0,
-					claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 64, 512, 512,
-					0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
-					GL_UNSIGNED_BYTE, nullptr);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+			GL.TexImage3D(GL.TEXTURE_3D, 0,
+					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 64, 512, 512,
+					0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, nullptr);
 		}
-		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
-				claudeUseR8() ? GL_RED : GL_LUMINANCE,
-				GL_UNSIGNED_BYTE, sv.data());
-		glActiveTexture(prev_au);
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, sv.data());
+		GL.ActiveTexture(prev_au);
 	}
 
 		static std::vector<u8> pyr0(S * S * S), pyr1(64 * 64 * 64),
@@ -2073,87 +2085,87 @@ static void claudeVolumeSnapshot(Client *client)
 		reduce(pyr0, pyr1, 64); reduce(pyr1, pyr2, 32);
 		reduce(pyr2, pyr3, 16); reduce(pyr3, pyr4, 8); reduce(pyr4, pyr5, 4);
 		if (!g_claude_volume.coarse_tex)
-			glGenTextures(1, &g_claude_volume.coarse_tex);
-		glActiveTexture(GL_TEXTURE11);
-		glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER,
-				GL_NEAREST_MIPMAP_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 5);
-		GLenum ifmt = claudeUseR8() ? GL_R8 : GL_LUMINANCE8;
-		GLenum fmt = claudeUseR8() ? GL_RED : GL_LUMINANCE;
-		glTexImage3D(GL_TEXTURE_3D, 0, ifmt, S, S, S, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr0.data());
-		glTexImage3D(GL_TEXTURE_3D, 1, ifmt, 64, 64, 64, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr1.data());
-		glTexImage3D(GL_TEXTURE_3D, 2, ifmt, 32, 32, 32, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr2.data());
-		glTexImage3D(GL_TEXTURE_3D, 3, ifmt, 16, 16, 16, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr3.data());
-		glTexImage3D(GL_TEXTURE_3D, 4, ifmt, 8, 8, 8, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr4.data());
-		glTexImage3D(GL_TEXTURE_3D, 5, ifmt, 4, 4, 4, 0, fmt,
-				GL_UNSIGNED_BYTE, pyr5.data());
+			GL.GenTextures(1, &g_claude_volume.coarse_tex);
+		GL.ActiveTexture(GL.TEXTURE11);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.coarse_tex);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER,
+				GL.NEAREST_MIPMAP_NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_BASE_LEVEL, 0);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAX_LEVEL, 5);
+		GLenum ifmt = claudeUseR8() ? GL.R8 : GL_LUMINANCE8;
+		GLenum fmt = claudeUseR8() ? GL.RED : GL_LUMINANCE;
+		GL.TexImage3D(GL.TEXTURE_3D, 0, ifmt, S, S, S, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr0.data());
+		GL.TexImage3D(GL.TEXTURE_3D, 1, ifmt, 64, 64, 64, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr1.data());
+		GL.TexImage3D(GL.TEXTURE_3D, 2, ifmt, 32, 32, 32, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr2.data());
+		GL.TexImage3D(GL.TEXTURE_3D, 3, ifmt, 16, 16, 16, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr3.data());
+		GL.TexImage3D(GL.TEXTURE_3D, 4, ifmt, 8, 8, 8, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr4.data());
+		GL.TexImage3D(GL.TEXTURE_3D, 5, ifmt, 4, 4, 4, 0, fmt,
+				GL.UNSIGNED_BYTE, pyr5.data());
 	}
 	(void)coarse;
 	// material-id volume on unit 6
 	if (!g_claude_volume.material_tex)
-		glGenTextures(1, &g_claude_volume.material_tex);
-	glActiveTexture(GL_TEXTURE12);
-	glBindTexture(GL_TEXTURE_3D, g_claude_volume.material_tex);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
-			S, S, S, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
-			GL_UNSIGNED_BYTE, mids.data());
+		GL.GenTextures(1, &g_claude_volume.material_tex);
+	GL.ActiveTexture(GL.TEXTURE12);
+	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.material_tex);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+	GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
+			S, S, S, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
+			GL.UNSIGNED_BYTE, mids.data());
 	// tile atlas on unit 7 (uploaded only when the palette grew)
 	if (g_claude_volume.atlas_dirty) {
 		if (!g_claude_volume.atlas_tex)
-			glGenTextures(1, &g_claude_volume.atlas_tex);
-		glActiveTexture(GL_TEXTURE13);
-		glBindTexture(GL_TEXTURE_2D, g_claude_volume.atlas_tex);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_BGRA,
-				GL_UNSIGNED_BYTE, g_claude_volume.atlas.data());
+			GL.GenTextures(1, &g_claude_volume.atlas_tex);
+		GL.ActiveTexture(GL.TEXTURE13);
+		GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.atlas_tex);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 256, 0, GL.BGRA,
+				GL.UNSIGNED_BYTE, g_claude_volume.atlas.data());
 		if (!g_claude_volume.micro_tex)
-			glGenTextures(1, &g_claude_volume.micro_tex);
-		glActiveTexture(GL_TEXTURE14);
-		glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-		glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
-				256, 256, 16, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
-				GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
+			GL.GenTextures(1, &g_claude_volume.micro_tex);
+		GL.ActiveTexture(GL.TEXTURE14);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.micro_tex);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+		GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
+				256, 256, 16, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, g_claude_volume.micro.data());
 
 		// per-material response params (256x1 RGBA), unit 15
 		if (!g_claude_volume.matparams_tex)
-			glGenTextures(1, &g_claude_volume.matparams_tex);
+			GL.GenTextures(1, &g_claude_volume.matparams_tex);
 		if (g_claude_volume.matparams.empty())
 			g_claude_volume.matparams.assign(256 * 4, 0);
-		glActiveTexture(GL_TEXTURE15);
-		glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA,
-				GL_UNSIGNED_BYTE, g_claude_volume.matparams.data());
+		GL.ActiveTexture(GL.TEXTURE15);
+		GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.matparams_tex);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 1, 0, GL.RGBA,
+				GL.UNSIGNED_BYTE, g_claude_volume.matparams.data());
 		g_claude_volume.atlas_dirty = false;
 	}
-	glActiveTexture(prev_active_unit);
+	GL.ActiveTexture(prev_active_unit);
 	// nearest-8 emitters to the camera (= volume center) for NEE
 	std::sort(emitters.begin(), emitters.end(),
 			[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
@@ -2441,43 +2453,43 @@ static void claudeCascadeUpdate(Client *client)
 		if (solid == 0 && !L.valid)
 			return; // no data yet; retry next poll (and skip coarser too)
 
-		GLint prev_active_unit = GL_TEXTURE0;
-		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
+		GLint prev_active_unit = GL.TEXTURE0;
+		GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
 		bool fresh_alloc = !g_claude_volume.cascades_tex;
 		if (fresh_alloc) {
-			glGenTextures(1, &g_claude_volume.cascades_tex);
-			glGenTextures(1, &g_claude_volume.cascades_coarse_tex);
+			GL.GenTextures(1, &g_claude_volume.cascades_tex);
+			GL.GenTextures(1, &g_claude_volume.cascades_coarse_tex);
 		}
-		glActiveTexture(GL_TEXTURE8);
-		glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
+		GL.ActiveTexture(GL.TEXTURE8);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_tex);
 		if (fresh_alloc) {
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-			glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 128, 128, 640, 0,
-					GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+			GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
+					GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
 		}
-		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
-				GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-		glActiveTexture(GL_TEXTURE9);
-		glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
+				GL.RGBA, GL.UNSIGNED_BYTE, rgba.data());
+		GL.ActiveTexture(GL.TEXTURE9);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
 		if (fresh_alloc) {
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-			glTexImage3D(GL_TEXTURE_3D, 0,
-					claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 32, 32, 160, 0,
-					claudeUseR8() ? GL_RED : GL_LUMINANCE,
-					GL_UNSIGNED_BYTE, nullptr);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+			GL.TexImage3D(GL.TEXTURE_3D, 0,
+					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 32, 32, 160, 0,
+					claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, nullptr);
 		}
-		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, lv * 32, 32, 32, 32,
-				claudeUseR8() ? GL_RED : GL_LUMINANCE,
-				GL_UNSIGNED_BYTE, coarse.data());
-		glActiveTexture(prev_active_unit);
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 32, 32, 32, 32,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, coarse.data());
+		GL.ActiveTexture(prev_active_unit);
 
 		L.origin = origin;
 		L.valid = true;
