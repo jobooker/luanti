@@ -264,6 +264,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_cache_remap_pixel{"claudeCacheRemap"};
 	float m_far_hist = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_far_hist_pixel{"claudeFarHist"};
+	float m_light_ladder = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_light_ladder_pixel{"claudeLightLadder"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -306,7 +308,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 32> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 33> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -339,6 +341,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_face_texels",
 		"claude_cache_remap",
 		"claude_far_hist",
+		"claude_light_ladder",
 	};
 
 	static float readGoldenHourStrength()
@@ -580,6 +583,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_far_hist", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = far cells read the cached light ladder (ADR-0008)
+	static float readLightLadder()
+	{
+		if (!g_settings->exists("claude_light_ladder"))
+			return 1.0f;
+		return g_settings->getFloat("claude_light_ladder", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -663,6 +674,8 @@ public:
 			m_cache_remap = readCacheRemap();
 		if (name == "claude_far_hist")
 			m_far_hist = readFarHist();
+		if (name == "claude_light_ladder")
+			m_light_ladder = readLightLadder();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -711,6 +724,7 @@ public:
 		m_face_texels = readFaceTexels();
 		m_cache_remap = readCacheRemap();
 		m_far_hist = readFarHist();
+		m_light_ladder = readLightLadder();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -851,6 +865,7 @@ public:
 			m_origin_delta_pixel.set(g_claude_volume.origin_delta, services);
 			m_cache_remap_pixel.set(&m_cache_remap, services);
 			m_far_hist_pixel.set(&m_far_hist, services);
+			m_light_ladder_pixel.set(&m_light_ladder, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
@@ -2160,8 +2175,15 @@ static void claudeCascadeUpdate(Client *client)
 		u64 t0 = porting::getTimeMs();
 		v3s16 origin = center - v3s16(half, half, half);
 		// snap to one coarse brick (4 cells) so brick boundaries and
-		// world-space cell identity are stable across recenters
-		const s16 snap_mask = (s16)~(CELL[lv] * 4 - 1);
+		// world-space cell identity are stable across recenters — AND to
+		// whole MapBlocks (16): buildCascade2 tiles blocks from the
+		// origin, so an 8-aligned-but-not-16-aligned origin displaced
+		// the ENTIRE 2m level by 8 nodes on half of all rebuilds. That
+		// parity roulette was John's "fucked up wall" + comb teeth: a
+		// seam mismatch can never exceed one coarse cell (his invariant)
+		// unless a level is bodily shifted. Caught 2026-08-12 ~09:50.
+		const s16 snapv = (s16)std::max(CELL[lv] * 4, 16);
+		const s16 snap_mask = (s16)~(snapv - 1);
 		origin.X &= snap_mask; origin.Y &= snap_mask; origin.Z &= snap_mask;
 		static std::vector<u8> rgba, coarse;
 		u32 solid = lv == 0
