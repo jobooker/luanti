@@ -426,7 +426,8 @@ void main(void)
 	// uniform sphere point), directions hashed from node+face+frame so
 	// successive refreshes rotate the set and the EMA integrates them
 	vec3 acc = vec3(0.0);
-	for (int k = 0; k < 4; k++) {
+	for (int k = 0; k < 6; k++) {
+		if (k >= 6) break;
 		float seed = claudeRadianceFrame * 4.0 + float(k) + f * 31.7;
 		vec2 h = vec2(
 			fract(sin(dot(node, vec3(12.9898, 78.233, 37.719))
@@ -442,7 +443,7 @@ void main(void)
 			dir = normalize(dir - 2.0 * dot(dir, n) * n);
 		acc += gatherRay(ro, dir);
 	}
-	vec3 fresh = inj + acc * 0.25;
+	vec3 fresh = inj + acc * 0.1667;
 
 	// EMA, ASYMMETRIC: darkening converges twice as fast as brightening —
 	// this is the fix for "torch light takes forever to go away" (the

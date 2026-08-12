@@ -288,7 +288,7 @@ float rungVis(float lv, vec3 corigin0, float csz0, vec3 pvol, vec3 sd,
 		// coarser rungs continue it at 2x the meters per step — same
 		// total reach (+/-2km), ~1/3 the samples of full-box marches
 		// (34ms -> target under 10 at grazing sun angles)
-		for (int i = 0; i < 24; i++) {
+		for (int i = 0; i < 40; i++) {
 			if (float(i) >= steps)
 				break;
 			if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
@@ -356,7 +356,7 @@ vec4 lightRung()
 		return old;
 	vec3 pos = corigin + vec3(cxy.x + 0.5, cxy.y + 0.5, zl + 0.5) * lsz;
 	// one sun march + one jittered sky march per refresh, in MY grid
-	float sunv = rungVis(lv, corigin, csz, pos, volumeSunDir, 24.0);
+	float sunv = rungVis(lv, corigin, csz, pos, volumeSunDir, 40.0);
 	vec2 h = vec2(
 		fract(sin(dot(vec3(cxy, zl) + claudeRadianceFrame * 0.37,
 			vec3(12.9898, 78.233, 37.719))) * 43758.5453),
@@ -366,7 +366,7 @@ vec4 lightRung()
 	float rr = sqrt(max(1.0 - zr * zr, 0.0));
 	vec3 skyd = normalize(vec3(rr * cos(6.2831853 * h.y), zr + 0.35,
 			rr * sin(6.2831853 * h.y)));
-	float skyv = rungVis(lv, corigin, csz, pos, skyd, 10.0);
+	float skyv = rungVis(lv, corigin, csz, pos, skyd, 16.0);
 	// v2 (SOTA research + John's angular thread): SUN VISIBILITY gets
 	// its own channel — rgb stores sky/ambient irradiance only, alpha
 	// packs sun visibility as 0.25 + 0.75*vis (a < 0.2 = cold). The
@@ -574,8 +574,8 @@ void main(void)
 	}
 
 	vec3 acc = vec3(0.0);
-	for (int k = 0; k < 4; k++) {
-		float seed = claudeRadianceFrame * 4.0 + float(k) + f * 31.7
+	for (int k = 0; k < 8; k++) {
+		float seed = claudeRadianceFrame * 8.0 + float(k) + f * 31.7
 				+ texel.x * 7.3 + texel.y * 3.1;
 		vec2 h = vec2(
 			fract(sin(dot(node, vec3(12.9898, 78.233, 37.719))
@@ -591,7 +591,7 @@ void main(void)
 			dir = normalize(dir - 2.0 * dot(dir, n) * n);
 		acc += gatherRay(ro, dir);
 	}
-	vec3 fresh = inj + acc * 0.25;
+	vec3 fresh = inj + acc * 0.125;
 
 	float aUp = 0.25;
 	float aDown = 0.5;
