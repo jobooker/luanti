@@ -2005,8 +2005,10 @@ static void claudeUpdateAccum(Client *client)
 	// so rebasing makes every cell wrong. Two reset frames clear both
 	// ping-pong targets. Wrapped at 8 so the float compare in the shader
 	// stays exact forever.
+	// wrapped at 16 (was 8) so coarse light-ladder rungs can ride a
+	// 1/16 wheel; every mod-4/mod-8 consumer divides 16 evenly
 	g_claude_volume.radiance_frame =
-			std::fmod(g_claude_volume.radiance_frame + 1.0f, 8.0f);
+			std::fmod(g_claude_volume.radiance_frame + 1.0f, 16.0f);
 	if (origin_changed)
 		g_claude_volume.radiance_reset = 2;
 	else if (g_claude_volume.radiance_reset > 0)
