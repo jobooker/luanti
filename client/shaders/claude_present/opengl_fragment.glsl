@@ -25,6 +25,16 @@ void main(void)
 		return;
 	}
 
+	// CLAUDE-DEBUG (temporary): pure-green 12px block in the bottom-left
+	// proves the TRACED present path executed. A raster frame passed
+	// through (volumeDebug lost/reverted) scores scene-level stddev too,
+	// which fooled the harness once (afb4168) — the marker cannot appear
+	// on that path, so verdict = marker AND stddev.
+	if (gl_FragCoord.x < 12.0 && gl_FragCoord.y < 12.0) {
+		gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);
+		return;
+	}
+
 	// full-res raster depth -> linear distance in node units
 	float d = texture2D(depthmap, uv).r;
 	float zn = volumeDepthRange.x;
