@@ -356,9 +356,28 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	radiance->setRenderSource(buffer);
 	radiance->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_RCACHE_2));
 
+	// claude_faces: per-FACE irradiance cache (ADR-0006 v1), successor to
+	// the 2-node lattice above. 128^3 nodes x 6 faces flattened to
+	// 4096x3072 (one 128x128 tile per face/z-slice, 32 tiles per row).
+	// Same ping-pong + reset discipline as the lattice; the accum pass
+	// reads faces for its multi-bounce term, the lattice stays as the
+	// feed for anything not yet migrated and as the one-line revert path.
+	static const u8 TEXTURE_FCACHE_1 = 36;
+	static const u8 TEXTURE_FCACHE_2 = 37;
+	buffer->setTexture(TEXTURE_FCACHE_1, core::dimension2du(4096, 3072),
+			"claude_fcache_1", accum_format, /*clear:*/ true);
+	buffer->setTexture(TEXTURE_FCACHE_2, core::dimension2du(4096, 3072),
+			"claude_fcache_2", accum_format, /*clear:*/ true);
+
+	shader_id = client->getShaderSource()->getShaderRaw("claude_faces");
+	PostProcessingStep *faces = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_FCACHE_1 });
+	faces->setRenderSource(buffer);
+	faces->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_FCACHE_2));
+
 	shader_id = client->getShaderSource()->getShaderRaw("claude_accum");
 	PostProcessingStep *accum = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2 });
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2, TEXTURE_FCACHE_2 });
 	accum->setRenderSource(buffer);
 	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
 
@@ -381,6 +400,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_RCACHE_1, TEXTURE_RCACHE_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_FCACHE_1, TEXTURE_FCACHE_2);
 
 	return present;
 }

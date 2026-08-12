@@ -91,6 +91,13 @@ struct ClaudeVolume
 	float emitters[8][4] = {};
 	int emitter_count = 0;      // static (snapshot) emitters
 	int emitter_runtime = 0;    // static + held light this frame
+	// Held (wielded) light lives in its OWN slot, never in emitters[]:
+	// writing it into emitters[7] STOMPED the 8th-nearest real torch in
+	// place, and the content-hash snapshot gate preserved the corruption
+	// indefinitely — a dark pool around the stomped torch plus a phantom
+	// light at a stale camera position ("circular shadow" bug,
+	// 2026-08-12). w = 0 means no held light this frame.
+	float held_emitter[4] = {};
 	// textured-albedo path: per-cell material id volume (unit 6) + a
 	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
 	u32 material_tex = 0;
@@ -219,6 +226,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
 	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
+	float m_bounce2 = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
+	float m_cache_sky = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_cache_sky_pixel{"cacheSkyStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -242,6 +253,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		{"claudeEmitter3"}, {"claudeEmitter4"}, {"claudeEmitter5"},
 		{"claudeEmitter6"}, {"claudeEmitter7"}};
 	CachedPixelShaderSetting<float> m_emitter_count_pixel{"claudeEmitterCount"};
+	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
@@ -257,7 +269,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 20> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 22> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -278,6 +290,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_night_sky",
 		"claude_moon_gain",
 		"claude_radiance",
+		"claude_bounce2",
+		"claude_cache_sky",
 	};
 
 	static float readGoldenHourStrength()
@@ -414,6 +428,26 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_radiance", 0.0f, 1.0f);
 	}
 
+	// Third bounce: the ambient ray's hit fires ONE more hop at full
+	// sub-voxel fidelity (bounce 3). 0 = off (default).
+	static float readBounce2()
+	{
+		if (!g_settings->exists("claude_bounce2"))
+			return 0.0f;
+		return g_settings->getFloat("claude_bounce2", 0.0f, 1.0f);
+	}
+
+	// Cache sky seeding: gather rays that escape to sky deposit the sky's
+	// radiance into the cell instead of 0, so skylight propagates into
+	// caves cell-to-cell. 0 = off (the old surfaces-only cache).
+	static float readCacheSky()
+	{
+		if (!g_settings->exists("claude_cache_sky"))
+			return 0.0f;
+		return g_settings->getFloat("claude_cache_sky", 0.0f, 2.0f);
+	}
+
+
 	static float readMicro()
 	{
 		if (!g_settings->exists("claude_micro"))
@@ -472,6 +506,10 @@ public:
 			m_moongain = readMoonGain();
 		if (name == "claude_radiance")
 			m_radiance = readRadiance();
+		if (name == "claude_bounce2")
+			m_bounce2 = readBounce2();
+		if (name == "claude_cache_sky")
+			m_cache_sky = readCacheSky();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -508,6 +546,8 @@ public:
 		m_nightsky = readNightSky();
 		m_moongain = readMoonGain();
 		m_radiance = readRadiance();
+		m_bounce2 = readBounce2();
+		m_cache_sky = readCacheSky();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -618,6 +658,7 @@ public:
 				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
 			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
+			m_held_emitter_pixel.set(g_claude_volume.held_emitter, services);
 			// Radiance cache controls: delivered UNCONDITIONALLY (like the
 			// samplers below) because the claude_radiance update pass runs
 			// every frame regardless of mode and must be able to early-out
@@ -625,6 +666,9 @@ public:
 			// would leave the pass reading stale state after a toggle-off.
 			float rad = g_claude_volume.valid ? m_radiance : 0.0f;
 			m_radiance_pixel.set(&rad, services);
+			float b2 = g_claude_volume.valid ? m_bounce2 : 0.0f;
+			m_bounce2_pixel.set(&b2, services);
+			m_cache_sky_pixel.set(&m_cache_sky, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
@@ -1463,17 +1507,24 @@ static void claudeVolumeSnapshot(Client *client)
 		// Small emitters (torches) are thin sticks inside their cell.
 		// Class 165 renders them as a sub-voxel nub instead of a full
 		// glowing cube that looks like it replaced a block.
-		if (f.light_source > 0 && (f.drawtype == NDT_TORCHLIKE
-				|| f.drawtype == NDT_PLANTLIKE
-				|| f.drawtype == NDT_FIRELIKE)) {
-			emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
+		if (f.light_source > 0 && !f.isLiquid()
+				&& f.drawtype != NDT_NORMAL) {
+			// Any sub-block light model (Mineclonia torches are MESH,
+			// not torchlike; also lanterns, plants, fire): pure point.
+			// Only full-cube glowing blocks (glowstone, lamps,
+			// NDT_NORMAL) keep their geometry.
+			// PURE POINT LIGHT (John, 2026-08-12: "stop them being an
+			// emissive light block, let them just be a point light at
+			// their real source"): the torch contributes NO geometry to
+			// the traced volume — no nub cell, no occupancy — only an
+			// emitter at flame height. Its own model can never occlude
+			// or re-radiate its own light. Trade: the torch stick is
+			// invisible in traced view until it gets an authored model
+			// (ADR-0005).
+			emitters.push_back({(float)x + 0.5f, (float)y + 0.65f,
 					(float)z + 0.5f,
 					std::min<int>(f.light_source, 14) / 14.0f});
-			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
-			occ[i * 4 + 3] = 165;
-			coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 			hash = hash * 1099511628211ULL + (u64)i * 7919 + 165;
-			solid++;
 			continue;
 		}
 		if (f.light_source > 0) {
@@ -1678,6 +1729,7 @@ static void claudeUpdateAccum(Client *client)
 	// emitter at the camera every frame. Real-time by construction — no
 	// server round trip, no snapshot lag, no light node in the world.
 	g_claude_volume.emitter_runtime = g_claude_volume.emitter_count;
+	g_claude_volume.held_emitter[3] = 0.0f; // cleared unless wielding a light
 	if (g_claude_volume.valid) {
 		LocalPlayer *lp = client->getEnv().getLocalPlayer();
 		const NodeDefManager *ndef = client->getNodeDefManager();
@@ -1689,15 +1741,13 @@ static void claudeUpdateAccum(Client *client)
 					&& cid != CONTENT_IGNORE) {
 				u8 ls = ndef->get(cid).light_source;
 				if (ls > 0) {
-					int slot = std::min(g_claude_volume.emitter_count, 7);
 					v3f lpos = p / BS - v3f(g_claude_volume.origin.X,
 							g_claude_volume.origin.Y, g_claude_volume.origin.Z);
-					g_claude_volume.emitters[slot][0] = lpos.X;
-					g_claude_volume.emitters[slot][1] = lpos.Y + 0.2f;
-					g_claude_volume.emitters[slot][2] = lpos.Z;
-					g_claude_volume.emitters[slot][3] =
+					g_claude_volume.held_emitter[0] = lpos.X;
+					g_claude_volume.held_emitter[1] = lpos.Y + 0.2f;
+					g_claude_volume.held_emitter[2] = lpos.Z;
+					g_claude_volume.held_emitter[3] =
 							std::min<int>(ls, 14) / 14.0f;
-					g_claude_volume.emitter_runtime = slot + 1;
 				}
 			}
 		}
@@ -2986,6 +3036,10 @@ void Game::processKeyInput()
 		toggleClaudeTrace();
 	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_BOUNCE)) {
 		toggleClaudeBounce();
+	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_BACK)) {
+		claudeTimeNudge(-1);
+	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_FWD)) {
+		claudeTimeNudge(1);
 	} else if (wasKeyDown(KeyType::TOGGLE_UPDATE_CAMERA)) {
 		toggleUpdateCamera();
 	} else if (wasKeyPressed(KeyType::CAMERA_MODE)) {
@@ -3305,6 +3359,19 @@ void Game::toggleClaudeBounce()
 		m_game_ui->showTranslatedStatusText("Multi-bounce ON");
 	else
 		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
+}
+
+// [ / ]: nudge server time an hour back/forward (sends /time; the
+// player account carries settime). Golden-hour hunting without typing.
+void Game::claudeTimeNudge(int dir)
+{
+	u32 tod = client->getEnv().getTimeOfDay(); // 0..23999
+	int t = ((int)tod + dir * 1000 + 24000) % 24000;
+	client->sendChatMessage(utf8_to_wide("/time " + std::to_string(t)));
+	if (dir > 0)
+		m_game_ui->showTranslatedStatusText("Time +1 hour");
+	else
+		m_game_ui->showTranslatedStatusText("Time -1 hour");
 }
 
 void Game::toggleFog()

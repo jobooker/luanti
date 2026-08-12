@@ -1,37 +1,27 @@
-// claude_radiance: world-space radiance cache UPDATE pass.
+// claude_faces: per-FACE irradiance cache UPDATE pass (ADR-0006 v1).
 //
-// A persistent 64^3 cache (2-node cells, same 128-node footprint as the
-// volume) of surface-bounced light, stored FLATTENED into a 512x512 2D
-// texture: an 8x8 grid of 64x64 tiles, one tile per z-slice. GL 4.1 has
-// no image store and cannot bind all layers of a 3D texture as one FBO
-// target, so the cache lives in 2D with manual addressing; ping-pong via
-// texture0 (last frame's cache) -> this render target, swapped per frame.
+// The successor to claude_radiance's 2-node air-cell lattice: one cached
+// irradiance value per exposed block FACE. Faces have what air cells
+// never did — an orientation — so gathers are cosine-weighted around the
+// true normal, a crease face genuinely collects less light than an open
+// one (emergent AO at block resolution), and light cannot leak through a
+// one-block wall because opposite faces are different texels.
 //
-// Each texel is one cell. Per updated cell: shoot a few gather rays at
-// the world; a hit returns that surface's outgoing radiance computed as
-// albedo * (sun direct + LAST FRAME'S CACHE at the hit). The cache
-// feeding its own update is the whole trick — every full refresh cycle
-// deepens the light by one more bounce, so torch light diffuses through
-// rooms over ~a second instead of costing an exponential ray tree.
+// v1 scope: ONE value per face (sub-face texel patches come later).
+// Self-feeding exactly like the lattice: gather hits read LAST frame's
+// face cache at the hit face, so every full refresh deepens the light by
+// one bounce. Sky escape seeds via cacheSkyStrength (claude_cache_sky).
 //
-// Deliberate exclusions, so the cache stays strictly COMPLEMENTARY to
-// the one-bounce paths claude_accum already has (no double counting):
-// - sky escape contributes 0 (bounceRay already adds one sky bounce);
-// - no emitter NEE at gather hits — instead emitter light is INJECTED
-//   directly into cells (visibility-tested point term), which is what
-//   makes the cache's content start at bounce 2 when bounceRay reads it
-//   (cache * albedo_hit2 * ... -> eye). emitterLight() covers bounce 1.
-//
-// Amortization: 1/8 of cells refresh per frame (interleaved groups, not
-// slabs, so refresh never sweeps as a visible wave); all other texels
-// copy last frame's value through. Updated cells blend EMA 0.25 to
-// smooth the few-ray noise. A volume-origin shift zero-resets the cache
-// wholesale for two frames (both ping-pong targets), accepted for v1.
-#define prevCache texture0
+// Layout: 128^3 nodes x 6 faces, flattened to 4096x3072. One 128x128
+// tile per (face, z-slice): tileIndex = face*128 + z in [0,768), grid 32
+// tiles wide x 24 rows. Texel (x,y) within tile = node x,y. Face index:
+// 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z. Keep addressing in sync with
+// faceCache() in claude_accum/opengl_fragment.glsl.
+#define prevFaces texture0
 
-uniform sampler2D prevCache;
+uniform sampler2D prevFaces;
 uniform lowp float volumeDebug;
-uniform lowp float radianceStrength; // claude_radiance: 0 = pass disabled
+uniform lowp float radianceStrength; // shared master dial with the lattice
 uniform lowp float cacheSkyStrength; // claude_cache_sky: sky-escape seeding
 uniform lowp float skyBounce;
 uniform lowp float nightSkyGain;
@@ -58,12 +48,10 @@ uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
-// cache geometry — keep in sync with secondstage.cpp (512x512 target)
-// and cacheRadiance() in claude_accum/opengl_fragment.glsl
-#define CACHE_N 64.0     // cells per axis
-#define CACHE_CELL 2.0   // nodes per cell
-#define CACHE_TILES 8.0  // tile grid is 8x8 slices
-#define CACHE_TEX 512.0
+#define FTEX_W 4096.0
+#define FTEX_H 3072.0
+#define FTILE 128.0
+#define FGRIDW 32.0
 
 float cellTransmit(float a)
 {
@@ -79,10 +67,41 @@ vec3 pathAlbedo(vec3 raw)
 	return max(pow(raw, vec3(2.2)), vec3(0.005));
 }
 
+vec4 getEmitter(int i)
+{
+	if (i == 0) return claudeEmitter0;
+	if (i == 1) return claudeEmitter1;
+	if (i == 2) return claudeEmitter2;
+	if (i == 3) return claudeEmitter3;
+	if (i == 4) return claudeEmitter4;
+	if (i == 5) return claudeEmitter5;
+	if (i == 6) return claudeEmitter6;
+	return claudeEmitter7;
+}
+
+// face index from an axis-aligned normal
+float faceIndex(vec3 n)
+{
+	if (n.x > 0.5) return 0.0;
+	if (n.x < -0.5) return 1.0;
+	if (n.y > 0.5) return 2.0;
+	if (n.y < -0.5) return 3.0;
+	if (n.z > 0.5) return 4.0;
+	return 5.0;
+}
+
+// LAST frame's cached irradiance at a face (solid cell + outward normal)
+vec3 faceFetch(vec3 cell, vec3 n)
+{
+	vec3 c = clamp(cell, vec3(0.0), vec3(127.0));
+	float tileIndex = faceIndex(n) * 128.0 + c.z;
+	vec2 tile = vec2(mod(tileIndex, FGRIDW), floor(tileIndex / FGRIDW));
+	vec2 uv = (tile * FTILE + c.xy + 0.5) / vec2(FTEX_W, FTEX_H);
+	return texture2D(prevFaces, uv).rgb;
+}
+
 // Trimmed pathSkyRadiance (claude_accum) — gradient + night dome only, no
-// sun disc / mie / stars: the cache is low-frequency fill and the disc
-// would inject the sun twice (NEE at gather hits already counts it).
-// Keep the palette in sync with claude_accum's pathSkyRadiance.
+// sun disc / mie / stars. Keep the palette in sync.
 vec3 cacheSky(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
@@ -101,30 +120,8 @@ vec3 cacheSky(vec3 rd)
 	return c + nightSky * night * nightSkyGain;
 }
 
-vec4 getEmitter(int i)
-{
-	if (i == 0) return claudeEmitter0;
-	if (i == 1) return claudeEmitter1;
-	if (i == 2) return claudeEmitter2;
-	if (i == 3) return claudeEmitter3;
-	if (i == 4) return claudeEmitter4;
-	if (i == 5) return claudeEmitter5;
-	if (i == 6) return claudeEmitter6;
-	return claudeEmitter7;
-}
-
-// last frame's cache, addressed by a point in volume node coords
-vec3 cacheFetch(vec3 pnode)
-{
-	vec3 c = clamp(floor(pnode / CACHE_CELL), vec3(0.0), vec3(CACHE_N - 1.0));
-	vec2 cuv = (c.xy + vec2(mod(c.z, CACHE_TILES),
-			floor(c.z / CACHE_TILES)) * CACHE_N + 0.5) / CACHE_TEX;
-	return texture2D(prevCache, cuv).rgb;
-}
-
 // occlusion toward the sun/moon: 1 lit, 0 blocked, partial through
-// leaves/glass. lightVis minus the micro branch — the cache is 2-node
-// resolution, sub-voxel shadow detail is invisible at this frequency.
+// leaves/glass (same as claude_radiance's cacheShadow)
 float cacheShadow(vec3 ro, vec3 sd)
 {
 	const float S = 128.0;
@@ -158,7 +155,6 @@ float cacheShadow(vec3 ro, vec3 sd)
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		if (a > 0.25) {
-			// emissive cells pass (a torch must not shade its own cell)
 			if (a > 0.6 && a < 0.97)
 				continue;
 			float tr = cellTransmit(a);
@@ -200,15 +196,11 @@ float cacheEmitterVis(vec3 ro, vec3 ld, float maxT)
 	return 1.0;
 }
 
-// radiance arriving at the cell from direction rd. Sky escape used to
-// return 0 unconditionally (to avoid re-counting the SKY_BOUNCE term at
-// bounce hits) — but that left the cache with NOTHING to propagate in
-// caves, whose entire light supply is sky through the entrance. With
-// claude_cache_sky > 0 an escaping ray returns the (disc-free) sky
-// radiance: each cell measures its own sky visibility with real rays,
-// so a cave seeds exactly as much as its opening admits and a sealed
-// cave stays black. The overlap with SKY_BOUNCE outdoors is mild (cache
-// is only read at solid bounce hits) and the dial owns the tradeoff.
+// radiance arriving at the face from direction rd. A solid hit returns
+// that surface's outgoing light: albedo * (sun direct + ITS cached face
+// value from last frame) — the self-feed that deepens one bounce per
+// refresh. Sky escape seeds skylight via cacheSkyStrength; a sealed cave
+// stays black because no ray escapes.
 vec3 gatherRay(vec3 ro, vec3 rd)
 {
 	const float S = 128.0;
@@ -254,8 +246,7 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 			continue;
 		}
 		if (s.a > 0.25) {
-			// emissive surface (lava, glowstone): area lights enter the
-			// cache here, same glow model as bounceRay
+			// emissive surface (lava, glowstone): area lights enter here
 			if (s.a > 0.6 && s.a < 0.97) {
 				float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
 				return pathAlbedo(s.rgb) * (0.4 + e * 2.0) * trans;
@@ -270,9 +261,7 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 			vec3 direct = ndl > 0.0
 					? volumeLightCol * ndl * cacheShadow(hp, volumeSunDir)
 					: vec3(0.0);
-			// LAST frame's cache at the hit: this term is what turns one
-			// bounce into N over successive refresh cycles
-			vec3 cached = cacheFetch(hp + n);
+			vec3 cached = faceFetch(cell, n);
 			return pathAlbedo(s.rgb) * (direct + cached) * trans;
 		}
 	}
@@ -281,54 +270,57 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 
 void main(void)
 {
-	vec2 uv = varTexCoord.st;
-	// origin shift: the cache is volume-local, so a rebased volume makes
-	// every cell's content wrong — zero it (2 frames clears both targets)
+	// origin shift: cache is volume-local — zero it (2 frames clears both)
 	if (claudeRadianceReset > 0.5) {
 		gl_FragColor = vec4(0.0);
 		return;
 	}
-	// off or not in traced mode: keep the cache empty, near-zero cost
+	// off or not in traced mode: keep the cache empty
 	if (volumeDebug < 2.5 || radianceStrength <= 0.0) {
 		gl_FragColor = vec4(0.0);
 		return;
 	}
 
 	vec2 px = floor(gl_FragCoord.xy);
-	vec2 tile = floor(px / CACHE_N);
-	vec3 cell = vec3(px - tile * CACHE_N, tile.y * CACHE_TILES + tile.x);
+	vec2 tile = floor(px / FTILE);
+	float tileIndex = tile.y * FGRIDW + tile.x;
+	float f = floor(tileIndex / 128.0);
+	float z = tileIndex - f * 128.0;
+	vec3 node = vec3(px - tile * FTILE, z);
 
-	vec4 old = texture2D(prevCache, uv);
+	vec4 old = texture2D(prevFaces, varTexCoord.st);
 	// amortize: only this frame's interleaved 1/8 group recomputes
-	float group = mod(cell.x + cell.y * 2.0 + cell.z * 4.0, 8.0);
+	float group = mod(node.x + node.y * 2.0 + node.z * 4.0 + f * 3.0, 8.0);
 	if (abs(mod(claudeRadianceFrame, 8.0) - group) > 0.5) {
 		gl_FragColor = old;
 		return;
 	}
 
-	// gather origin: first AIR node among the cell's 2x2x2 nodes. Cells
-	// straddling a surface (exactly the ones bounce rays read) get an
-	// origin on the air side; fully solid cells store nothing.
-	vec3 base = cell * CACHE_CELL;
-	vec3 ro = vec3(-1.0);
-	for (int k = 0; k < 8; k++) {
-		vec3 o = vec3(mod(float(k), 2.0), mod(floor(float(k) / 2.0), 2.0),
-				floor(float(k) / 4.0));
-		vec3 node = base + o;
-		if (texture3D(claudeVolume, (node + 0.5) / 128.0).a <= 0.25) {
-			ro = node + 0.5;
-			break;
-		}
-	}
-	if (ro.x < 0.0) {
+	// live-face test: my node solid (not liquid/leaves-thin), the node in
+	// front of the face air. Everything else stores nothing.
+	vec3 n = vec3(0.0);
+	if (f < 0.5) n = vec3(1.0, 0.0, 0.0);
+	else if (f < 1.5) n = vec3(-1.0, 0.0, 0.0);
+	else if (f < 2.5) n = vec3(0.0, 1.0, 0.0);
+	else if (f < 3.5) n = vec3(0.0, -1.0, 0.0);
+	else if (f < 4.5) n = vec3(0.0, 0.0, 1.0);
+	else n = vec3(0.0, 0.0, -1.0);
+
+	float aSelf = texture3D(claudeVolume, (node + 0.5) / 128.0).a;
+	vec3 nb = node + n;
+	bool nbIn = all(greaterThanEqual(nb, vec3(0.0)))
+			&& all(lessThan(nb, vec3(128.0)));
+	float aNb = nbIn ? texture3D(claudeVolume, (nb + 0.5) / 128.0).a : 1.0;
+	if (aSelf <= 0.25 || aNb > 0.25) {
 		gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
 		return;
 	}
 
-	// emitter injection: direct torch light deposited INTO the cell.
-	// Same falloff as emitterLight but no ndl (a cell has no normal);
-	// the 0.5 stands in for the hemisphere-average cosine, so a wall lit
-	// via the cache roughly matches one lit by emitterLight directly.
+	// gather origin: just off the face center
+	vec3 ro = node + 0.5 + n * 0.51;
+
+	// emitter injection with the face's true cosine (the lattice used a
+	// 0.5 hemisphere fudge because cells had no normal; faces do)
 	vec3 inj = vec3(0.0);
 	for (int i = 0; i < 9; i++) {
 		if (i < 8 && float(i) >= claudeEmitterCount)
@@ -341,31 +333,46 @@ void main(void)
 		if (d2 > 625.0)
 			continue; // beyond 25 nodes: negligible
 		float dist = max(sqrt(d2), 0.8);
-		float vis = cacheEmitterVis(ro, L / dist, dist - 0.9);
+		vec3 ld = L / dist;
+		float ndl = max(dot(n, ld), 0.0);
+		if (ndl <= 0.0)
+			continue;
+		float vis = cacheEmitterVis(ro, ld, dist - 0.9);
 		inj += vec3(1.0, 0.72, 0.42)
-				* (em.w * em.w * 10.0 * 0.5 * vis / max(d2, 1.0));
+				* (em.w * em.w * 10.0 * ndl * vis / max(d2, 1.0));
 	}
 
-	// gather: 4 uniform-sphere rays, directions hashed from cell+frame so
+	// gather: 4 COSINE-weighted rays around the face normal (normal +
+	// uniform sphere point), directions hashed from node+face+frame so
 	// successive refreshes rotate the set and the EMA integrates them
 	vec3 acc = vec3(0.0);
 	for (int k = 0; k < 4; k++) {
-		float seed = claudeRadianceFrame * 4.0 + float(k);
+		float seed = claudeRadianceFrame * 4.0 + float(k) + f * 31.7;
 		vec2 h = vec2(
-			fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))
+			fract(sin(dot(node, vec3(12.9898, 78.233, 37.719))
 					+ seed * 17.13) * 43758.5453),
-			fract(sin(dot(cell, vec3(93.9898, 12.233, 57.719))
+			fract(sin(dot(node, vec3(93.9898, 12.233, 57.719))
 					+ seed * 9.71) * 24634.6345));
-		float z = 1.0 - 2.0 * h.x;
-		float r = sqrt(max(1.0 - z * z, 0.0));
+		float zr = 1.0 - 2.0 * h.x;
+		float r = sqrt(max(1.0 - zr * zr, 0.0));
 		float ph = 6.2831853 * h.y;
-		vec3 dir = vec3(r * cos(ph), r * sin(ph), z);
+		vec3 sph = vec3(r * cos(ph), r * sin(ph), zr);
+		vec3 dir = normalize(n + sph + vec3(1e-4));
+		if (dot(dir, n) < 0.0)
+			dir = normalize(dir - 2.0 * dot(dir, n) * n);
 		acc += gatherRay(ro, dir);
 	}
 	vec3 fresh = inj + acc * 0.25;
 
-	// EMA against the previous value (alpha marks "has been written":
-	// after a reset the first refresh takes the fresh sample whole)
-	vec3 outc = old.a > 0.5 ? mix(old.rgb, fresh, 0.25) : fresh;
+	// EMA, ASYMMETRIC: darkening converges twice as fast as brightening —
+	// this is the fix for "torch light takes forever to go away" (the
+	// memory drains faster than it fills; brightening keeps the slow
+	// blend that smooths few-ray noise)
+	float aUp = 0.25;
+	float aDown = 0.5;
+	float goingDown = dot(fresh, vec3(1.0)) < dot(old.rgb, vec3(1.0)) ? 1.0 : 0.0;
+	vec3 outc = old.a > 0.5
+			? mix(old.rgb, fresh, mix(aUp, aDown, goingDown))
+			: fresh;
 	gl_FragColor = vec4(outc, 1.0);
 }

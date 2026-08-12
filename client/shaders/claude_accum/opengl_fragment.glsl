@@ -6,12 +6,14 @@
 // teleport/volume-swap (hard reset), higher while moving, low while
 // still (deep accumulation).
 #define history texture0
+#define faceCacheTex texture2
 // world-space radiance cache (claude_radiance pass): 64^3 cells of
 // 2 nodes, flattened to 512x512 as 8x8 tiles of 64x64 z-slices
 #define radianceCache texture1
 
 uniform sampler2D history;
 uniform sampler2D radianceCache;
+uniform sampler2D faceCacheTex;
 uniform lowp float radianceStrength; // claude_radiance dial, 0 = off
 uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
@@ -22,6 +24,7 @@ uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles; .a = height
 uniform sampler2D claudeMatParams; // 256x1 per-material: R=spec G=gloss B=ore
 #define MICRO_CARVE 2.0            // max sub-voxels a face may recede
 uniform lowp float skyBounce;      // how much sky a bounced-off surface relays
+uniform lowp float bounce2Strength; // claude_bounce2: 3rd bounce, 0 = off
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -58,6 +61,7 @@ uniform vec4 claudeEmitter5;
 uniform vec4 claudeEmitter6;
 uniform vec4 claudeEmitter7;
 uniform lowp float claudeEmitterCount;
+uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -737,6 +741,95 @@ vec3 cacheRadiance(vec3 pnode)
 	return texture2D(radianceCache, cuv).rgb;
 }
 
+// Per-FACE cached irradiance (claude_faces pass, ADR-0006 v1): the hit
+// face's own value — oriented, leak-proof, corner-aware at block
+// resolution. Addressing mirrors claude_faces: 4096x3072, one 128x128
+// tile per (face, z-slice), tileIndex = face*128 + z, 32 tiles/row.
+// Face order 0:+x 1:-x 2:+y 3:-y 4:+z 5:-z.
+vec3 faceCache(vec3 cell, vec3 n)
+{
+	float f;
+	if (n.x > 0.5) f = 0.0;
+	else if (n.x < -0.5) f = 1.0;
+	else if (n.y > 0.5) f = 2.0;
+	else if (n.y < -0.5) f = 3.0;
+	else if (n.z > 0.5) f = 4.0;
+	else f = 5.0;
+	vec3 c = clamp(cell, vec3(0.0), vec3(127.0));
+	float tileIndex = f * 128.0 + c.z;
+	vec2 tile = vec2(mod(tileIndex, 32.0), floor(tileIndex / 32.0));
+	vec2 uv = (tile * 128.0 + c.xy + 0.5) / vec2(4096.0, 3072.0);
+	return texture2D(faceCacheTex, uv).rgb;
+}
+
+// The THIRD bounce (claude_bounce2): one more cosine hop fired from a
+// bounce ray's hit. Escape returns sky — the same energy the SKY_BOUNCE
+// approximation estimated, now properly sampled along one direction —
+// and a solid hit returns that surface's sun-lit color, which is
+// genuinely new light: a sunlit floor warming a ceiling. No deeper
+// recursion; the radiance cache carries everything beyond.
+// forward decl: defined after bounceRay, but bounce hits need torch NEE
+vec3 emitterLight(vec3 hp, vec3 n);
+
+vec3 skyProbe(vec3 ro, vec3 rd, vec3 sd)
+{
+	const float S = 128.0;
+	float trans = 1.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	int axis = -1;
+	for (int i = 0; i < 96; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return pathSkyRadiance(rd) * SKY_BOUNCE * trans;
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+					* max(abs(rd), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z);
+			vec3 p2 = ro + rd * (tj + 1e-3);
+			cell = floor(p2);
+			sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			axis = -1;
+			continue;
+		}
+		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (s.a > 0.25) {
+			float tr = cellTransmit(s.a);
+			if (tr > 0.0) {
+				trans *= tr;
+				if (trans < 0.05)
+					return vec3(0.0);
+				continue;
+			}
+			if (axis < 0)
+				return vec3(0.0);
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			vec3 hp = cell + 0.5 + n * 0.51;
+			float ndl = max(dot(n, sd), 0.0);
+			vec3 lit = pathSkyRadiance(n) * SKY_BOUNCE * 0.5;
+			if (ndl > 0.0)
+				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+			return pathAlbedo(s.rgb) * lit * trans;
+		}
+	}
+	return vec3(0.0);
+}
+
 // radiance arriving from direction rd: sky on genuine exit, sun-lit
 // one-bounce on hit, darkness otherwise (sd = jittered light direction)
 vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
@@ -813,8 +906,12 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				if (ndlm > 0.0)
 					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
 				if (radianceStrength > 0.0)
-					litm += cacheRadiance(hpm + mn) * radianceStrength
-							* smoothstep(0.5, 3.0, t);
+					litm += faceCache(cell, mn) * radianceStrength;
+				// torch NEE at the bounce vertex: a facet tilted away from
+				// the torch gets filled by bounced torchlight from the lit
+				// surfaces it faces (2026-08-12 — the missing second-bounce
+				// term behind the "circular shadow" saga)
+				litm += emitterLight(hpm, mn);
 				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
@@ -839,22 +936,50 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			// an estimator that returns 0 or a large value has far more
 			// variance than one that returns a smooth range.
 			vec3 hp = ro + rd * t + n * 0.01;
-			vec3 lit = pathSkyRadiance(n) * lightVis(hp, n) * SKY_BOUNCE;
+			vec3 lit;
+			if (bounce2Strength > 0.0) {
+				// THIRD bounce (claude_bounce2): fire the next cosine
+				// hop instead of the directional sky approximation.
+				// skyProbe returns the same sky energy on escape (no
+				// double counting) plus sun-lit surface color on a hit —
+				// the genuinely new light (sunlit floor warms ceiling).
+				// Direction hashed from position + frame so accumulation
+				// integrates the hemisphere.
+				vec3 h3 = vec3(
+					fract(sin(dot(hp + fract(animationTimer * 9.17),
+						vec3(12.9898, 78.233, 37.719))) * 43758.5453),
+					fract(sin(dot(hp + fract(animationTimer * 9.17),
+						vec3(93.989, 12.233, 57.719))) * 24634.6345),
+					fract(sin(dot(hp + fract(animationTimer * 9.17),
+						vec3(45.332, 88.443, 19.113))) * 31578.2846));
+				vec3 ad2 = normalize(n + normalize(h3 * 2.0 - 1.0
+						+ vec3(1e-4)));
+				if (dot(ad2, n) < 0.0)
+					ad2 = normalize(ad2 - 2.0 * dot(ad2, n) * n);
+				vec3 hop = skyProbe(hp, ad2, sd);
+				vec3 approx = pathSkyRadiance(n) * lightVis(hp, n)
+						* SKY_BOUNCE;
+				lit = mix(approx, hop, bounce2Strength);
+			} else {
+				lit = pathSkyRadiance(n) * lightVis(hp, n) * SKY_BOUNCE;
+			}
 			float ndl = max(dot(n, sd), 0.0);
 			if (ndl > 0.0)
 				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
 			// multi-bounce term: light already circulating in the cache
 			// (this is what lets a torch fill a room instead of dying at
-			// its first bounce). CONTACT-ATTENUATED: a bounce ray that hit
-			// within ~2 nodes is probing a crease or contact, where the
-			// 2-node cache is too coarse to know the light is occluded —
-			// unattenuated it back-fills corners and erases the ambient
-			// occlusion ("vanilla has better ambient occlusion right
-			// now"). Ramping the cache in over hit distance keeps contact
-			// shadows dark while rooms still fill at range.
+			// its first bounce). Read UNATTENUATED, deliberately (John,
+			// 2026-08-11: "let's kill it, we'll learn how to get it back
+			// for real"): the old contact ramp was fake occlusion
+			// canceling fake light — the 2-node cache is too coarse to
+			// know a crease is occluded and back-fills corners. The
+			// honest fix is a cache that resolves occlusion itself
+			// (per-face irradiance, ADR-0006); until then corners may
+			// wash bright near creases rather than fake-darken.
 			if (radianceStrength > 0.0)
-				lit += cacheRadiance(hp + n) * radianceStrength
-						* smoothstep(0.5, 3.0, t);
+				lit += faceCache(cell, n) * radianceStrength;
+			// torch NEE at the bounce vertex (see micro branch above)
+			lit += emitterLight(hp, n);
 			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}
@@ -899,6 +1024,28 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 {
 	const float S = 128.0;
 	vec3 cell = floor(ro);
+	// UNIFORM SUB-VOXEL TRACING (2026-08-12, John: "16x16 subvoxels
+	// with real tracing, same as if we had 16 one-metre voxels"). The
+	// origin cell is tested like every other cell — the old exemption
+	// let pit floors skip their own walls (falsely lit) while flush
+	// tops got dinged by neighbours (falsely dark): inverted shadows.
+	// Callers bias the origin ~1 sub-voxel off the surface, so features
+	// must stand taller than a single sub-voxel to cast — that's the
+	// quantization floor, not a hack.
+	if (microStrength > 0.0) {
+		float a0 = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		if (a0 > 0.97 && a0 < 0.99) {
+			float m0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
+			vec3 mh0, mn0;
+			float r0 = fract(sin(dot(cell + volumeOrigin,
+					vec3(41.3, 289.1, 77.7))) * 21311.7);
+			vec3 nbN0, nbP0;
+			microNeighbours(cell, nbN0, nbP0);
+			if (m0 > 0.5 && microDDA(clamp(ro - cell, 0.0, 1.0), ld,
+					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0))
+				return 0.0;
+		}
+	}
 	vec3 stepDir = sign(ld);
 	vec3 invRd = 1.0 / max(abs(ld), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
@@ -916,11 +1063,8 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
-		// Emitters must march the sub-grid too. Testing only the 1 m cell made
-		// every carved block a solid CUBE to torch light: lightVis (sun/moon)
-		// respected the sub-voxels while emitterVis did not, so a torch cast a
-		// hard 1 m shadow onto surfaces the carve actually leaves open — the
-		// boundary shadow that grew with distance from the lamp.
+		// carved cells: march the sub-grid, binary, same rule as the
+		// origin cell above — sub-voxels ARE voxels, no special cases
 		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0) {
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
@@ -948,20 +1092,33 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc)
 {
 	vec3 acc = vec3(0.0);
-	for (int i = 0; i < 8; i++) {
-		if (float(i) >= claudeEmitterCount)
-			break;
-		vec4 em = getEmitter(i);
+	// slots 0-7 = static torches; slot 8 = the held (wielded) light,
+	// which lives in its own uniform so it can NEVER stomp a real torch
+	for (int i = 0; i < 9; i++) {
+		if (i < 8 && float(i) >= claudeEmitterCount)
+			continue;
+		vec4 em = i < 8 ? getEmitter(i) : claudeHeldEmitter;
+		if (em.w <= 0.0)
+			continue;
 		vec3 L = em.xyz - hp;
 		float d2 = dot(L, L);
 		if (d2 > 625.0)
 			continue; // beyond 25 cells: negligible
 		float dist = max(sqrt(d2), 0.8);
 		vec3 ld = L / dist;
-		float ndl = max(dot(n, ld), 0.0);
+		// WRAPPED cosine, emitters only: a real flame has size and rough
+		// ground scatters, so torch light curls slightly past the 90 deg
+		// cutoff. With the hard cutoff, grazing views of carved floors
+		// showed the unlit BACKS of the bump flanks — a pitch-black
+		// semicircle between viewer and lamp ("dark semi circles",
+		// 2026-08-12). Wrap keeps direction and shadows, kills the void.
+		float ndl = max((dot(n, ld) + 0.35) / 1.35, 0.0);
 		if (ndl <= 0.0)
 			continue;
-		float vis = emitterVis(hp, ld, dist - 0.9);
+		// standoff 0.25 (was 0.9, a relic of torches-as-glowing-blocks:
+		// bodiless point lights need no self-occlusion guard, and 0.9
+		// left a shadowless bubble around every flame)
+		float vis = emitterVis(hp, ld, dist - 0.25);
 		float fall = em.w * em.w * 10.0 * vis / max(d2, 1.0);
 		acc += vec3(1.0, 0.72, 0.42) * (fall * ndl);
 		if (gloss > 0.0) {
@@ -1122,7 +1279,29 @@ void main(void)
 					vec3 ad2 = normalize(hn + sp2);
 					if (dot(ad2, hn) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, hn) * hn);
 					vec3 amb2 = bounceRay(hp2, ad2, sd2) * 1.15;
-					fresh = alb * (dir2 + amb2 + emitterLight(hp2, hn));
+					// emitter shadow rays leave from the RIDGE plane, not
+					// the valley floor: a surface must not be occluded by
+					// its own bump texture (dark-circle bug, 2026-08-12)
+					// origin biased ~1.5 sub-voxels off the surface: with
+					// uniform own-cell tracing, shadow features must stand
+					// taller than a sub-voxel to cast (quantization floor)
+					vec3 em2 = emitterLight(hp2 + hn * 0.0625, hn);
+					fresh = alb * (dir2 + amb2 + em2);
+					// term-isolation heatmaps (modes 7-10): render ONE
+					// lighting term, no albedo, so artifacts name their
+					// own source. 7 torch, 8 bounce/cache, 9 sun,
+					// 10 raw visibility toward the nearest emitter.
+					if (volumeDebug > 6.5) {
+						if (volumeDebug < 7.5) fresh = em2;
+						else if (volumeDebug < 8.5) fresh = amb2;
+						else if (volumeDebug < 9.5) fresh = dir2;
+						else {
+							vec3 eL = claudeEmitter0.xyz - hp2;
+							float eD = max(length(eL), 1e-3);
+							fresh = vec3(emitterVis(hp2 + nn0 * 0.15,
+									eL / eD, eD - 0.9));
+						}
+					}
 					done = true;
 					break;
 				}
