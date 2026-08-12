@@ -597,7 +597,7 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 				c = mix(c, pathSkyFog(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
 			// debug 5: per-level tint (2m red, 4m orange, 8m yellow...)
-			if (volumeDebug > 4.5)
+			if (volumeDebug > 4.5 && volumeDebug < 5.5)
 				c = tint * (0.4 + 0.6 * ndl);
 			// aerial perspective: the beauty term, and the concealer for
 			// the data frontier (unseen terrain fades into atmosphere).
@@ -1147,9 +1147,20 @@ void main(void)
 				// voxel artifacts'): launching secondary rays from exact
 				// hit points quantizes occlusion into blocky staircases
 				vec3 hp = ro + rd * t + n * 0.01;
-				vec3 tj = (rnd2.zxy - 0.5) * 0.35;
-				hp += tj - n * dot(tj, n); // jitter within the face plane
-				vec3 albedo = volumeDebug > 3.5
+				if (volumeDebug > 5.5) {
+					// mode 6 — sub-voxel light quantization look-test:
+					// ONE lighting sample position per 1/16-node texel,
+					// so light snaps to the same lattice as geometry and
+					// texture. Every pixel in a texel converges to the
+					// same value; shadows stair-step at 6.25 cm. A/B
+					// against mode 3 live via claude_volume_debug.
+					vec3 hq = (floor(hp * 16.0) + 0.5) / 16.0;
+					hp = mix(hq, hp, abs(n));
+				} else {
+					vec3 tj = (rnd2.zxy - 0.5) * 0.35;
+					hp += tj - n * dot(tj, n); // jitter within the face plane
+				}
+				vec3 albedo = (volumeDebug > 3.5 && volumeDebug < 5.5)
 						? vec3(0.55) : pathAlbedo(s.rgb);
 				// Per-block colour jitter: Teardown's answer to flatness
 				// without textures — a stone wall becomes a thousand
@@ -1194,7 +1205,7 @@ void main(void)
 				float specGloss = 0.0;
 				float specMask = 1.0;
 				if ((textureAmount > 0.0 || reliefStrength > 0.0)
-						&& volumeDebug < 3.5) {
+						&& (volumeDebug < 3.5 || volumeDebug > 5.5)) {
 					float mid = texture3D(claudeMaterials,
 							(cell + 0.5) / S).r * 255.0;
 					if (mid > 0.5) {

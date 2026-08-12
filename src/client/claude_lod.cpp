@@ -117,12 +117,16 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// nodes per cell fits; u32 color sums).
 	static std::vector<u16> occ_acc, water_acc;
 	static std::vector<u32> r_acc, g_acc, b_acc;
+	static std::vector<s16> top_acc;   // highest occupied subcell layer
+	static std::vector<u16> top_n;     // counted nodes in that layer
 	constexpr size_t NC = (size_t)N * N * N;
 	occ_acc.assign(NC, 0);
 	water_acc.assign(NC, 0);
 	r_acc.assign(NC, 0);
 	g_acc.assign(NC, 0);
 	b_acc.assign(NC, 0);
+	top_acc.assign(NC, -32768);
+	top_n.assign(NC, 0);
 
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -149,16 +153,34 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 						+ ((rel.X + sx * 4) / CELL);
 				occ_acc[ci] += s.occ[sub];
 				water_acc[ci] += s.water[sub];
-				r_acc[ci] += s.rsum[sub];
-				g_acc[ci] += s.gsum[sub];
-				b_acc[ci] += s.bsum[sub];
+				// COLOR = the cell's TOP occupied layer only. The volume
+				// average mixed one white snow cap with seven dirt nodes
+				// into green-brown ("snow at 1m rendered as maybe green,
+				// before we go to it") — the face you SEE is the top.
+				s16 subY = (s16)(rel.Y + sy * 4);
+				if (subY > top_acc[ci]) {
+					top_acc[ci] = subY;
+					top_n[ci] = (u16)cnt;
+					r_acc[ci] = s.rsum[sub];
+					g_acc[ci] = s.gsum[sub];
+					b_acc[ci] = s.bsum[sub];
+				} else if (subY == top_acc[ci]) {
+					top_n[ci] = (u16)(top_n[ci] + cnt);
+					r_acc[ci] += s.rsum[sub];
+					g_acc[ci] += s.gsum[sub];
+					b_acc[ci] += s.bsum[sub];
+				}
 			}
 		}
 	}
 
-	// threshold pass: >= 50% occupancy => solid; water wins only when it
-	// outnumbers solid matter (a lake surface cell)
-	const u32 half = (u32)CELL * CELL * CELL / 2;
+	// threshold pass: >= 62% occupancy => solid. Biased ABOVE half so the
+	// coarse surface ERODES rather than dilates: at 50% a cell just over
+	// half full rounded the surface UP a full metre, and at the ring
+	// boundary that rounding stood next to exact 1m terrain as a raised
+	// rampart (John: "a tall border wall" at the 1m/2m seam). A slight
+	// dip at the seam reads as terrain; a wall reads as a wall.
+	const u32 half = (u32)((u32)CELL * CELL * CELL * 62 / 100);
 	u32 solid_cells = 0;
 	size_t i = 0;
 	for (int cz = 0; cz < N; cz++)
@@ -174,9 +196,10 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			cls = 100;
 		else
 			continue;
-		rgba[i * 4 + 0] = (u8)(r_acc[i] / counted);
-		rgba[i * 4 + 1] = (u8)(g_acc[i] / counted);
-		rgba[i * 4 + 2] = (u8)(b_acc[i] / counted);
+		u32 tn = std::max(top_n[i], (u16)1);
+		rgba[i * 4 + 0] = (u8)std::min(r_acc[i] / tn, 255u);
+		rgba[i * 4 + 1] = (u8)std::min(g_acc[i] / tn, 255u);
+		rgba[i * 4 + 2] = (u8)std::min(b_acc[i] / tn, 255u);
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
 		coarse[((cz / 4) * 32 + (cy / 4)) * 32 + (cx / 4)] = 255;
@@ -278,7 +301,9 @@ u32 buildCascade2(Client *client, v3s16 origin_nodes,
 		for (int cz = 0; cz < 8; cz++)
 		for (int cy = 0; cy < 8; cy++)
 		for (int cx = 0; cx < 8; cx++) {
-			u32 occ = 0, water = 0, r = 0, g = 0, b = 0;
+			u32 occ = 0, water = 0;
+			u32 rl[2] = {0, 0}, gl[2] = {0, 0}, bl[2] = {0, 0};
+			u32 nl[2] = {0, 0};
 			for (int oz = 0; oz < 2; oz++)
 			for (int oy = 0; oy < 2; oy++)
 			for (int ox = 0; ox < 2; ox++) {
@@ -289,25 +314,30 @@ u32 buildCascade2(Client *client, v3s16 origin_nodes,
 					continue;
 				u32 col = nodeColor2m(ndef, n, cls);
 				if ((cls & 7) == 3) water++; else occ++;
-				r += (col >> 16) & 0xFF;
-				g += (col >> 8) & 0xFF;
-				b += col & 0xFF;
+				rl[oy] += (col >> 16) & 0xFF;
+				gl[oy] += (col >> 8) & 0xFF;
+				bl[oy] += col & 0xFF;
+				nl[oy]++;
 			}
+			// top-layer color (see buildCascadeSummary)
+			int tl = nl[1] > 0 ? 1 : 0;
+			u32 r = rl[tl], g = gl[tl], b = bl[tl];
+			u32 cn = std::max(nl[tl], 1u);
 			u32 counted = occ + water;
 			if (counted == 0)
 				continue;
 			u8 cls = 0;
-			if (occ >= 4)
+			if (occ >= 5) // 62%: erode, don't dilate (see buildCascadeSummary)
 				cls = 255;
-			else if (water >= 4 && water > occ)
+			else if (water >= 5 && water > occ)
 				cls = 100;
 			else
 				continue;
 			size_t i = ((size_t)(cbz + cz) * N + (cby + cy)) * N
 					+ (cbx + cx);
-			rgba[i * 4 + 0] = (u8)(r / counted);
-			rgba[i * 4 + 1] = (u8)(g / counted);
-			rgba[i * 4 + 2] = (u8)(b / counted);
+			rgba[i * 4 + 0] = (u8)std::min(r / cn, 255u);
+			rgba[i * 4 + 1] = (u8)std::min(g / cn, 255u);
+			rgba[i * 4 + 2] = (u8)std::min(b / cn, 255u);
 			rgba[i * 4 + 3] = cls;
 			solid_cells++;
 			coarse[(((cbz + cz) / 4) * 32 + ((cby + cy) / 4)) * 32
