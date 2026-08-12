@@ -342,11 +342,19 @@ void main(void)
 	vec3 node = vec3(px - tile * FTILE, z);
 
 	vec4 old = texture2D(prevFaces, varTexCoord.st);
-	// amortize: only this frame's interleaved 1/8 group recomputes
+	// amortize: only this frame's interleaved 1/8 group recomputes —
+	// EXCEPT cold texels (new geometry, no history), which ride a
+	// 2-frame wheel instead: an 8-frame dark wait on freshly-arrived
+	// terrain read as "LOD pop pulses dark" (John, 2026-08-12)
 	float group = mod(node.x + node.y * 2.0 + node.z * 4.0 + f * 3.0, 8.0);
 	if (abs(mod(claudeRadianceFrame, 8.0) - group) > 0.5) {
-		gl_FragColor = old;
-		return;
+		bool cold = old.a < 0.5;
+		bool fastwheel = abs(mod(claudeRadianceFrame, 2.0)
+				- mod(group, 2.0)) < 0.5;
+		if (!(cold && fastwheel)) {
+			gl_FragColor = old;
+			return;
+		}
 	}
 
 	// live-face test: my node solid (not liquid/leaves-thin), the node in
@@ -424,8 +432,16 @@ void main(void)
 	float aUp = 0.25;
 	float aDown = 0.5;
 	float goingDown = dot(fresh, vec3(1.0)) < dot(old.rgb, vec3(1.0)) ? 1.0 : 0.0;
-	vec3 outc = old.a > 0.5
-			? mix(old.rgb, fresh, mix(aUp, aDown, goingDown))
-			: fresh;
+	// cold texel (geometry new to the volume): seed from the tracer's
+	// own sky term — the energy a gather returns for an unoccluded
+	// face, assumed half-visible. Converges to the traced answer via
+	// the EMA within a few refreshes; kills the dark flash on arrival.
+	vec3 outc;
+	if (old.a > 0.5) {
+		outc = mix(old.rgb, fresh, mix(aUp, aDown, goingDown));
+	} else {
+		vec3 seed = cacheSky(n) * skyBounce * cacheSkyStrength * 0.5;
+		outc = mix(seed, fresh, 0.4);
+	}
 	gl_FragColor = vec4(outc, 1.0);
 }

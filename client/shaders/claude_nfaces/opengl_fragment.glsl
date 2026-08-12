@@ -322,9 +322,10 @@ void main(void)
 	}
 
 	// amortize 1/4 per frame (twice the coarse cache's rate: near-field
-	// AO is what eyes track)
+	// AO is what eyes track); cold texels (no history — new geometry or
+	// ring edge) skip the wheel entirely and fill NOW
 	float group = mod(texel.x + texel.y * 2.0 + zl + f, 4.0);
-	if (abs(mod(claudeRadianceFrame, 4.0) - group) > 0.5) {
+	if (abs(mod(claudeRadianceFrame, 4.0) - group) > 0.5 && old.a > 0.5) {
 		gl_FragColor = old;
 		return;
 	}
@@ -401,8 +402,11 @@ void main(void)
 	float aUp = 0.25;
 	float aDown = 0.5;
 	float goingDown = dot(fresh, vec3(1.0)) < dot(old.rgb, vec3(1.0)) ? 1.0 : 0.0;
+	// cold texel: INHERIT the coarse rung's cached value for this face
+	// (John's "new geometry starts from old geometry's cache") and blend
+	// the fresh gather in — seamless hand-off down the ladder
 	vec3 outc = old.a > 0.5
 			? mix(old.rgb, fresh, mix(aUp, aDown, goingDown))
-			: fresh;
+			: mix(faceFetch(node, n), fresh, 0.4);
 	gl_FragColor = vec4(outc, 1.0);
 }
