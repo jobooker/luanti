@@ -14,6 +14,7 @@ uniform sampler3D claudeVolume;
 uniform sampler3D claudeCoarse; // 32^3 any-solid brick map (empty-leap)
 uniform sampler3D claudeMaterials; // per-cell material id (x255)
 uniform sampler2D claudeAtlas;     // 16x16 grid of 16px tiles; .a = height
+uniform sampler2D claudeMatParams; // 256x1 per-material: R=spec G=gloss B=ore
 #define MICRO_CARVE 2.0            // max sub-voxels a face may recede
 uniform lowp float skyBounce;      // how much sky a bounced-off surface relays
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
@@ -543,7 +544,10 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 // Next-event estimation: aimed contribution from the nearest emitters.
 // The fix for John's lopsided torch pools — light no longer waits for a
 // random ambient ray to stumble into the torch.
-vec3 emitterLight(vec3 hp, vec3 n)
+// Diffuse torch light; when gloss > 0 also accumulates a Blinn-Phong
+// glint into specAcc, reusing the SAME visibility trace and falloff —
+// specular costs no extra rays. v is the direction toward the eye.
+vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc)
 {
 	vec3 acc = vec3(0.0);
 	for (int i = 0; i < 8; i++) {
@@ -560,10 +564,21 @@ vec3 emitterLight(vec3 hp, vec3 n)
 		if (ndl <= 0.0)
 			continue;
 		float vis = emitterVis(hp, ld, dist - 0.9);
-		acc += vec3(1.0, 0.72, 0.42)
-				* (em.w * em.w * 10.0 * ndl * vis / max(d2, 1.0));
+		float fall = em.w * em.w * 10.0 * vis / max(d2, 1.0);
+		acc += vec3(1.0, 0.72, 0.42) * (fall * ndl);
+		if (gloss > 0.0) {
+			float nh = max(dot(n, normalize(ld + v)), 0.0);
+			specAcc += vec3(1.0, 0.72, 0.42)
+					* (pow(nh, mix(16.0, 96.0, gloss)) * fall);
+		}
 	}
 	return acc;
+}
+
+vec3 emitterLight(vec3 hp, vec3 n)
+{
+	vec3 dummy = vec3(0.0);
+	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy);
 }
 
 // Reproject a volume-local point into last frame's screen; returns
@@ -777,6 +792,9 @@ void main(void)
 				// Surface relief is INDEPENDENT of color texture: John's
 				// ask — carved depth on clay-colored blocks. Both read the
 				// same atlas, one for height (alpha), one for color (rgb).
+				float specStr = 0.0;   // per-material glint (ore bits)
+				float specGloss = 0.0;
+				float specMask = 1.0;
 				if ((textureAmount > 0.0 || reliefStrength > 0.0)
 						&& volumeDebug < 3.5) {
 					float mid = texture3D(claudeMaterials,
@@ -786,6 +804,18 @@ void main(void)
 						float slot = floor(mid + 0.5);
 						vec2 auv = (vec2(mod(slot, 16.0),
 								floor(slot / 16.0)) + uv2) / 16.0;
+						// Per-material response. For ores the spec is
+						// MASKED to texels standing proud of the face —
+						// the atlas height doubles as "is this an ore
+						// bit": stone base recedes, ore stays flush, so
+						// only the bits glint.
+						vec3 mp = texture2D(claudeMatParams,
+								vec2((slot + 0.5) / 256.0, 0.5)).rgb;
+						specStr = mp.r;
+						specGloss = mp.g;
+						if (mp.b > 0.5)
+							specMask = smoothstep(0.70, 0.90,
+									atlasHeight(auv));
 						// micro relief: slope of the detail map perturbs
 						// the normal (texel-scale surface roughness)
 						// Parallax: step along the view ray inside the
@@ -848,8 +878,11 @@ void main(void)
 				vec3 sd = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 				float ndl = max(dot(n, sd), 0.0);
 				vec3 direct = vec3(0.0);
-				if (ndl > 0.0)
-					direct = vec3(ndl * lightVis(hp, sd)) * volumeLightCol;
+				float sunVis = 0.0;
+				if (ndl > 0.0) {
+					sunVis = lightVis(hp, sd);
+					direct = vec3(ndl * sunVis) * volumeLightCol;
+				}
 
 				// one cosine-weighted ambient ray: uniform sphere point
 				// added to the normal
@@ -862,7 +895,21 @@ void main(void)
 					ad = normalize(ad - 2.0 * dot(ad, n) * n);
 				vec3 amb = bounceRay(hp, ad, sd) * 1.15;
 
-				fresh = albedo * (direct + amb + emitterLight(hp, n));
+				// Specular rides the same visibility as diffuse — the
+				// glint appears only where the light already lands.
+				vec3 specAcc = vec3(0.0);
+				float glossOn = specStr * specMask;
+				vec3 emDiff = emitterLightSpec(hp, n, -rd,
+						glossOn > 0.005 ? specGloss : 0.0, specAcc);
+				fresh = albedo * (direct + amb + emDiff);
+				if (glossOn > 0.005) {
+					if (sunVis > 0.0) {
+						float nh = max(dot(n, normalize(sd - rd)), 0.0);
+						specAcc += volumeLightCol * (sunVis
+								* pow(nh, mix(16.0, 96.0, specGloss)));
+					}
+					fresh += specAcc * glossOn;
+				}
 
 				// mirror water: one traced reflection + jittered glint
 				// (water = alpha band around 100/255)

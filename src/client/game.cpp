@@ -95,9 +95,11 @@ struct ClaudeVolume
 	u32 material_tex = 0;
 	u32 atlas_tex = 0;
 	u32 micro_tex = 0;          // 256x256x16: 16x16 materials of 16^3 grids
+	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
+	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
 	bool atlas_dirty = false;
 	// temporal accumulation state (updated once per frame)
 	v3f prev_cam_pos;
@@ -170,6 +172,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_micro_sampler_pixel{"claudeMicro"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matparams_sampler_pixel{"claudeMatParams"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
@@ -615,6 +618,10 @@ public:
 					glActiveTexture(GL_TEXTURE14);
 					glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
 				}
+				if (g_claude_volume.matparams_tex) {
+					glActiveTexture(GL_TEXTURE15);
+					glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
+				}
 				glActiveTexture(prev_active);
 
 				SamplerLayer_t layer = 10;
@@ -627,6 +634,8 @@ public:
 				m_atlas_sampler_pixel.set(&alayer, services);
 				SamplerLayer_t mlayer2 = 14;
 				m_micro_sampler_pixel.set(&mlayer2, services);
+				SamplerLayer_t player = 15;
+				m_matparams_sampler_pixel.set(&player, services);
 			}
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				v3f vorg((float)g_claude_volume.origin.X,
@@ -997,6 +1006,39 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
 	bool ok = false;
 	const std::string &tname = f.tiledef[0].name;
+	// Ore materials (Mineclonia "stone_with_<kind>" / deepslate variants):
+	// the little bits should POKE OUT of the stone and glint. Luminance
+	// height gets this exactly backwards for coal — dark specks read as
+	// holes — so ores switch to a color-distance rule below, and their
+	// per-material spec/gloss row drives the shader's glint (masked to the
+	// proud texels, so the stone base stays matte).
+	bool is_ore = false;
+	float ore_spec = 0.0f, ore_gloss = 0.0f;
+	{
+		size_t w = f.name.find("_with_");
+		if (w != std::string::npos) {
+			is_ore = true;
+			std::string kind = f.name.substr(w + 6);
+			if (kind == "coal") { ore_spec = 0.75f; ore_gloss = 0.65f; }
+			else if (kind == "iron") { ore_spec = 0.60f; ore_gloss = 0.45f; }
+			else if (kind == "copper") { ore_spec = 0.80f; ore_gloss = 0.55f; }
+			else if (kind == "gold") { ore_spec = 0.95f; ore_gloss = 0.70f; }
+			else if (kind == "diamond") { ore_spec = 1.00f; ore_gloss = 0.85f; }
+			else if (kind == "emerald") { ore_spec = 0.90f; ore_gloss = 0.75f; }
+			else if (kind == "redstone") { ore_spec = 0.30f; ore_gloss = 0.30f; }
+			else if (kind == "lapis") { ore_spec = 0.35f; ore_gloss = 0.40f; }
+			else { ore_spec = 0.50f; ore_gloss = 0.50f; }
+		}
+	}
+	if (g_claude_volume.matparams.empty())
+		g_claude_volume.matparams.assign(256 * 4, 0);
+	{
+		u8 *row = &g_claude_volume.matparams[(size_t)mid * 4];
+		row[0] = (u8)(ore_spec * 255.0f + 0.5f);
+		row[1] = (u8)(ore_gloss * 255.0f + 0.5f);
+		row[2] = is_ore ? 255 : 0;
+		row[3] = 255;
+	}
 	if (!tname.empty()) {
 		video::IImage *img = client->tsrc()->claudeGetImage(tname);
 		if (img) {
@@ -1056,6 +1098,26 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 				// flat material: fully flush, no carve at all
 				for (int k = 0; k < 256; k++)
 					hgt[k] = 1.0f;
+			}
+			if (is_ore) {
+				// Height from COLOR DISTANCE to the tile mean, not
+				// luminance: stone base (near the mean) recedes one
+				// sub-voxel, ore bits (far from it) stay flush — coal
+				// pokes out instead of reading as holes. The ^1.5 pushes
+				// stone-noise mids down so only real bits stand proud
+				// (the spec mask keys off h > ~0.78).
+				double dist[256], dmax = 1.0;
+				for (int k = 0; k < 256; k++) {
+					double dr = (double)((buf[k] >> 16) & 0xFF) - avg[0];
+					double dg = (double)((buf[k] >> 8) & 0xFF) - avg[1];
+					double db = (double)(buf[k] & 0xFF) - avg[2];
+					dist[k] = std::sqrt(dr * dr + dg * dg + db * db);
+					dmax = std::max(dmax, dist[k]);
+				}
+				for (int k = 0; k < 256; k++) {
+					double nd = std::pow(std::clamp(dist[k] / dmax, 0.0, 1.0), 1.5);
+					hgt[k] = (float)(0.65 + 0.35 * nd);
+				}
 			}
 			for (int py = 0; py < 16; py++) {
 				for (int px = 0; px < 16; px++) {
@@ -1133,6 +1195,31 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 				h[15][i2] = std::max(h[15][i2], h[14][i2]);
 				h[i2][0] = std::max(h[i2][0], h[i2][1]);
 				h[i2][15] = std::max(h[i2][15], h[i2][14]);
+			}
+			if (is_ore) {
+				// same color-distance rule as the atlas height: stone
+				// recedes, ore bits stand proud (see comment there)
+				double mr = 0, mg = 0, mb = 0;
+				for (int k = 0; k < 256; k++) {
+					mr += (buf2[k] >> 16) & 0xFF;
+					mg += (buf2[k] >> 8) & 0xFF;
+					mb += buf2[k] & 0xFF;
+				}
+				mr /= 256.0; mg /= 256.0; mb /= 256.0;
+				double dist[256], dmax = 1.0;
+				for (int k = 0; k < 256; k++) {
+					double dr = (double)((buf2[k] >> 16) & 0xFF) - mr;
+					double dg = (double)((buf2[k] >> 8) & 0xFF) - mg;
+					double db = (double)(buf2[k] & 0xFF) - mb;
+					dist[k] = std::sqrt(dr * dr + dg * dg + db * db);
+					dmax = std::max(dmax, dist[k]);
+				}
+				for (int y = 0; y < 16; y++)
+					for (int x = 0; x < 16; x++) {
+						double nd = std::pow(std::clamp(
+								dist[y * 16 + x] / dmax, 0.0, 1.0), 1.5);
+						h[y][x] = (float)(0.65 + 0.35 * nd);
+					}
 			}
 		}
 		const int CARVE = 2; // max sub-voxels removed from a face
@@ -1401,6 +1488,20 @@ static void claudeVolumeSnapshot(Client *client)
 		glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
 				256, 256, 16, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
 				GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
+
+		// per-material response params (256x1 RGBA), unit 15
+		if (!g_claude_volume.matparams_tex)
+			glGenTextures(1, &g_claude_volume.matparams_tex);
+		if (g_claude_volume.matparams.empty())
+			g_claude_volume.matparams.assign(256 * 4, 0);
+		glActiveTexture(GL_TEXTURE15);
+		glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, g_claude_volume.matparams.data());
 		g_claude_volume.atlas_dirty = false;
 	}
 	glActiveTexture(prev_active_unit);

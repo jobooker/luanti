@@ -87,8 +87,17 @@ void main(void)
 	}
 	vec3 c = sum / wsum;
 
-	// Teardown's filmic rolloff: highlights compress instead of clip
+	// Filmic rolloff, HUE-PRESERVING. The old per-channel exp compressed
+	// warm torchlight (1.0, 0.72, 0.42) toward white — every channel
+	// saturates to 1 independently, so overexposed walls near torches read
+	// as white plastic sheen ("the walls are very shiny") instead of hot
+	// orange glow. Compress by the max channel and rescale, keeping the
+	// ratios; blend 25% of the per-channel curve back in so extreme values
+	// still drift gently toward white (pure max-based looks neon).
 	vec3 lin = pow(max(c, vec3(0.0)), vec3(2.2));
-	lin = vec3(1.0) - exp(-lin * 1.6);
+	float m = max(max(lin.r, lin.g), lin.b);
+	vec3 hue = m > 1e-5 ? lin * ((1.0 - exp(-m * 1.6)) / m) : lin;
+	vec3 chan = vec3(1.0) - exp(-lin * 1.6);
+	lin = mix(hue, chan, 0.25);
 	gl_FragColor = vec4(pow(lin, vec3(1.0 / 2.2)), 1.0);
 }
