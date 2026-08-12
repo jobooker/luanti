@@ -123,6 +123,11 @@ vec3 pathAlbedo(vec3 raw)
 	return max(pow(raw, vec3(2.2)), vec3(0.005));
 }
 
+// forward-declared: fog tint for far terrain = the sky WITHOUT the
+// sun/moon disc. Mixing toward the full sky burned the 40x disc through
+// distant mountains ("the moon and sun shine right through them").
+vec3 pathSkyFog(vec3 rd);
+
 vec3 pathSkyRadiance(vec3 rd)
 {
 	float up = clamp(rd.y, 0.0, 1.0);
@@ -176,6 +181,28 @@ vec3 pathSkyRadiance(vec3 rd)
 	nightSky += vec3(0.9, 0.92, 1.0) * step(0.9992, st) * smoothstep(0.05, 0.35, up) * 1.6;
 	c += nightSky * night * nightSkyGain;
 	return c;
+}
+
+// the sky's colour WITHOUT the sun/moon disc (see forward decl above):
+// horizon/zenith gradient + a mild halo only, for fogging far terrain
+vec3 pathSkyFog(vec3 rd)
+{
+	float up = clamp(rd.y, 0.0, 1.0);
+	float day = pathDayLin();
+	float low = smoothstep(0.35, -0.05, volumeSunDir.y);
+	vec3 zenith = mix(vec3(0.16, 0.34, 0.72), vec3(0.10, 0.15, 0.34), low);
+	vec3 horizon = mix(vec3(0.62, 0.74, 0.92), vec3(0.95, 0.50, 0.22), low);
+	vec3 sky = mix(horizon, zenith, pow(up, 0.42));
+	float cosSun = max(dot(rd, volumeSunDir), 0.0);
+	float mie = pow(cosSun, mix(28.0, 6.0, low)) * mix(0.12, 0.5, low);
+	float night = 1.0 - day;
+	float moonUp = clamp(volumeSunDir.y, 0.0, 1.0);
+	float moonAmt = dot(volumeLightCol, vec3(0.33)) * 1.6 * moonUp;
+	vec3 nightSky = mix(vec3(0.006, 0.010, 0.026),
+			vec3(0.010, 0.016, 0.040), up);
+	return sky * day + volumeLightCol * mie
+			+ (nightSky + vec3(0.04, 0.06, 0.12) * moonAmt)
+				* night * nightSkyGain;
 }
 
 // Nested DDA: the SAME traversal as the world, one scale down. A ray
@@ -369,11 +396,20 @@ float farShadowL(float slab, vec3 corigin, float csz, vec3 pvol, vec3 sd)
 	return -1.0;
 }
 
-// 8 m to +/-512, then 32 m to +/-2048: a mountain a mile out still
-// blocks the sun. The 16 m level is skipped for shadows — at that range
-// the 32 m answer is identical and half the marching.
+// Shadow chain: 2 m to +/-128, then 8 m to +/-512, then 32 m to
+// +/-2048 — a mountain a mile out still blocks the sun. The chain MUST
+// start at the finest far level: 8 m-only shadows let dawn light pour
+// through every ridge thinner than half an 8 m cell, and the whole
+// slope read backlit ("sun shines through it"). Grazing light is
+// exactly when thin crests matter. 4 m and 16 m are skipped — each is
+// close enough to its neighbour that the extra march buys nothing.
 float farShadow(vec3 pvol, vec3 sd)
 {
+	if (cascadeValid.x > 0.5) {
+		float v = farShadowL(0.0, cascade0Origin, 2.0, pvol, sd);
+		if (v >= 0.0)
+			return v;
+	}
 	if (cascadeValid.z > 0.5) {
 		float v = farShadowL(2.0, cascade2Origin, 8.0, pvol, sd);
 		if (v >= 0.0)
@@ -392,7 +428,7 @@ float farShadow(vec3 pvol, vec3 sd)
 // caller resumes the NEXT level exactly where this one left off — one
 // continuous t across every octave, no cracks, no double hits.
 vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
-		vec3 ro, vec3 rd, float t0)
+		vec3 ro, vec3 rd, vec3 sd, float t0)
 {
 	vec3 p0 = ro + rd * (t0 + 0.01 * csz);
 	vec3 pc = (p0 - corigin) / csz;
@@ -443,27 +479,35 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			vec3 hpv = ro + rd * tw;
 			// reduced far shading: albedo x (sun + sky), per-cell jitter
 			// so distant fields aren't flat. No micro, atlas, emitters,
-			// or bounce — invisible at this angular size.
+			// or bounce — invisible at this angular size. Jitter SCALES
+			// with cell size: +/-10% tuned for 8m read as loud noise on
+			// 2m cells ("the 2m has a very different look").
 			vec3 albedo = pathAlbedo(s.rgb);
 			float jh = fract(sin(dot(cell + slab * 17.0,
 					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-			albedo *= 0.9 + 0.2 * jh;
-			float ndl = max(dot(n, volumeSunDir), 0.0);
+			float jamp = min(0.10, 0.015 + 0.012 * csz);
+			albedo *= 1.0 + (jh - 0.5) * 2.0 * jamp;
+			// sd is the caller's DISC-JITTERED sun: accumulation averages
+			// the binary shadow into penumbras. Unjittered, grazing dusk
+			// light flipped adjacent cells fully lit/dark — the "picket
+			// fence" checkerboard across far slopes.
+			float ndl = max(dot(n, sd), 0.0);
 			vec3 direct = ndl > 0.0
 					? volumeLightCol * (ndl
-						* farShadow(hpv + n * csz, volumeSunDir))
+						* farShadow(hpv + n * csz, sd))
 					: vec3(0.0);
 			vec3 c = albedo * (direct + pathSkyRadiance(n) * SKY_BOUNCE);
 			if (s.a < 0.6) // far water: flat sky mirror
-				c = mix(c, pathSkyRadiance(
+				c = mix(c, pathSkyFog(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
-			// debug 5: per-level tint (2m red, 4m orange, 8m yellow)
+			// debug 5: per-level tint (2m red, 4m orange, 8m yellow...)
 			if (volumeDebug > 4.5)
 				c = tint * (0.4 + 0.6 * ndl);
 			// aerial perspective: the beauty term, and the concealer for
 			// the data frontier (unseen terrain fades into atmosphere).
-			// 1400-node scale keeps the 2 km ring visible through the haze
-			c = mix(c, pathSkyRadiance(rd), 1.0 - exp(-tw / 1400.0));
+			// pathSkyFog, NOT pathSkyRadiance: the full sky contains the
+			// 40x sun/moon disc, which burned straight through mountains.
+			c = mix(c, pathSkyFog(rd), 1.0 - exp(-tw / 1400.0));
 			return vec4(c, tw);
 		}
 	}
@@ -473,41 +517,41 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 // Chain the octaves: 2 m -> 4 m -> 8 m, each resuming at the previous
 // level's exit t. An invalid level is skipped (the next one covers its
 // box anyway, just coarser).
-vec4 farTrace(vec3 ro, vec3 rd, float t0)
+vec4 farTrace(vec3 ro, vec3 rd, vec3 sd, float t0)
 {
 	float tcur = t0;
 	vec4 r;
 	if (cascadeValid.x > 0.5) {
 		r = farTraceL(0.0, cascade0Origin, 2.0,
-				vec3(0.9, 0.15, 0.15), ro, rd, tcur);
+				vec3(0.9, 0.15, 0.15), ro, rd, sd, tcur);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValid.y > 0.5) {
 		r = farTraceL(1.0, cascade1Origin, 4.0,
-				vec3(0.9, 0.55, 0.1), ro, rd, tcur);
+				vec3(0.9, 0.55, 0.1), ro, rd, sd, tcur);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValid.z > 0.5) {
 		r = farTraceL(2.0, cascade2Origin, 8.0,
-				vec3(0.9, 0.9, 0.15), ro, rd, tcur);
+				vec3(0.9, 0.9, 0.15), ro, rd, sd, tcur);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValidB.x > 0.5) {
 		r = farTraceL(3.0, cascade3Origin, 16.0,
-				vec3(0.2, 0.85, 0.25), ro, rd, tcur);
+				vec3(0.2, 0.85, 0.25), ro, rd, sd, tcur);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValidB.y > 0.5) {
 		r = farTraceL(4.0, cascade4Origin, 32.0,
-				vec3(0.2, 0.8, 0.9), ro, rd, tcur);
+				vec3(0.2, 0.8, 0.9), ro, rd, sd, tcur);
 		if (r.w > 0.0)
 			return r;
 	}
@@ -1178,8 +1222,11 @@ void main(void)
 				break;
 			}
 		} else if (i > 0) {
-			// near volume exhausted: continue into the 8 m cascade
-			vec4 far = farTrace(ro, rd, t);
+			// near volume exhausted: continue into the far cascades,
+			// with a disc-jittered sun so far shadows average into
+			// penumbras exactly like near ones
+			vec3 fsd = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
+			vec4 far = farTrace(ro, rd, fsd, t);
 			if (far.w > 0.0) {
 				fresh = far.rgb;
 				t = far.w;
