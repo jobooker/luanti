@@ -307,8 +307,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			return 0.0f;
 		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
 		// 3 = pure path-traced view (zero ambient, all light via rays),
-		// 4 = mode 3 with neutral albedo (lighting-only diagnostic)
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 4.0f);
+		// 4 = mode 3 with neutral albedo (lighting-only diagnostic),
+		// 5 = cascade-level tint, 6 = sub-voxel light quantization.
+		// The old 4.0 clamp silently rewrote every mode-5/6 request to 4
+		// — a whole evening of "nothing changed" (John caught it).
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 10.0f);
 	}
 
 	static float readWaterReflections()

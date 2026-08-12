@@ -71,6 +71,21 @@ void main(void)
 		}
 	}
 
+	// mode 6 (sub-voxel light quantization): the joint-bilateral blend
+	// below re-smooths quantized lighting at presentation — the LAST
+	// smoother in the chain. One point sample keeps the lattice.
+	if (volumeDebug > 5.5) {
+		vec3 cq = texture2D(accum, uv).rgb;
+		vec3 linq = pow(max(cq, vec3(0.0)), vec3(2.2));
+		float mq = max(max(linq.r, linq.g), linq.b);
+		vec3 hueq = mq > 1e-5
+				? linq * ((1.0 - exp(-mq * 1.6)) / mq) : linq;
+		vec3 chanq = vec3(1.0) - exp(-linq * 1.6);
+		gl_FragColor = vec4(pow(mix(hueq, chanq, 0.25),
+				vec3(1.0 / 2.2)), 1.0);
+		return;
+	}
+
 	// 4 nearest half-res texels, bilinear x depth-agreement weights
 	vec2 ht = texelSize0 * 2.0;
 	vec2 base = (floor(uv / ht - 0.5) + 0.5) * ht;
