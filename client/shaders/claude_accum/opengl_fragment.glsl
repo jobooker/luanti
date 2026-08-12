@@ -6,8 +6,13 @@
 // teleport/volume-swap (hard reset), higher while moving, low while
 // still (deep accumulation).
 #define history texture0
+// world-space radiance cache (claude_radiance pass): 64^3 cells of
+// 2 nodes, flattened to 512x512 as 8x8 tiles of 64x64 z-slices
+#define radianceCache texture1
 
 uniform sampler2D history;
+uniform sampler2D radianceCache;
+uniform lowp float radianceStrength; // claude_radiance dial, 0 = off
 uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
 uniform sampler3D claudeVolume;
@@ -354,6 +359,22 @@ float lightVis(vec3 ro, vec3 sd)
 	return 0.0;
 }
 
+// Cached multi-bounce radiance at a point (volume node coords). The
+// cache stores light that has ALREADY bounced off at least one surface
+// (sun/emitter light reflected around corners), updated incrementally by
+// the claude_radiance pass — so adding it at a bounce hit turns the one
+// explicit bounce into effectively N bounces over time. Addressing must
+// match the update pass: cell = point/2, tile (z%8, z/8) of 64x64.
+// Sampled one node off the face (hp + n) so the fetch lands in a cell
+// whose air side the gather pass actually filled.
+vec3 cacheRadiance(vec3 pnode)
+{
+	vec3 c = clamp(floor(pnode / 2.0), vec3(0.0), vec3(63.0));
+	vec2 cuv = (c.xy + vec2(mod(c.z, 8.0), floor(c.z / 8.0)) * 64.0 + 0.5)
+			/ 512.0;
+	return texture2D(radianceCache, cuv).rgb;
+}
+
 // radiance arriving from direction rd: sky on genuine exit, sun-lit
 // one-bounce on hit, darkness otherwise (sd = jittered light direction)
 vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
@@ -429,6 +450,8 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				float ndlm = max(dot(mn, sd), 0.0);
 				if (ndlm > 0.0)
 					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
+				if (radianceStrength > 0.0)
+					litm += cacheRadiance(hpm + mn) * radianceStrength;
 				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
@@ -457,6 +480,11 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			float ndl = max(dot(n, sd), 0.0);
 			if (ndl > 0.0)
 				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+			// multi-bounce term: light already circulating in the cache
+			// (this is what lets a torch fill a room instead of dying at
+			// its first bounce)
+			if (radianceStrength > 0.0)
+				lit += cacheRadiance(hp + n) * radianceStrength;
 			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}

@@ -331,9 +331,34 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
+	// claude_radiance: world-space radiance cache, updated on the GPU as a
+	// fragment pass. GL 4.1 has no image store and cannot FBO-attach every
+	// layer of a 3D texture at once, so the 64^3 cache (2-node cells, same
+	// 128-node footprint as the volume) is FLATTENED: 512x512 = an 8x8 grid
+	// of 64x64 tiles, one per z-slice, addressed manually in the shaders.
+	// Ping-pong pair, fixed size (not screen-scaled), float so torch-level
+	// HDR values survive; clear:true so the first frames read zeros, not
+	// uninitialized memory. Update order per frame: radiance pass reads
+	// RCACHE_1 -> writes RCACHE_2; accum reads the fresh RCACHE_2; the swap
+	// at the pipeline tail renames it to RCACHE_1 for next frame.
+	// The pass early-outs (writes zeros) while claude_radiance is 0, so its
+	// standing cost when off is a 512x512 fill — negligible.
+	static const u8 TEXTURE_RCACHE_1 = 34;
+	static const u8 TEXTURE_RCACHE_2 = 35;
+	buffer->setTexture(TEXTURE_RCACHE_1, core::dimension2du(512, 512),
+			"claude_rcache_1", accum_format, /*clear:*/ true);
+	buffer->setTexture(TEXTURE_RCACHE_2, core::dimension2du(512, 512),
+			"claude_rcache_2", accum_format, /*clear:*/ true);
+
+	shader_id = client->getShaderSource()->getShaderRaw("claude_radiance");
+	PostProcessingStep *radiance = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_RCACHE_1 });
+	radiance->setRenderSource(buffer);
+	radiance->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_RCACHE_2));
+
 	shader_id = client->getShaderSource()->getShaderRaw("claude_accum");
 	PostProcessingStep *accum = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1 });
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2 });
 	accum->setRenderSource(buffer);
 	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
 
@@ -355,6 +380,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	present->setRenderSource(buffer);
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_RCACHE_1, TEXTURE_RCACHE_2);
 
 	return present;
 }

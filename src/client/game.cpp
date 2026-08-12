@@ -116,6 +116,13 @@ struct ClaudeVolume
 	float shader_prev_tanx = 1.0f, shader_prev_tany = 1.0f;
 	v3f cur_pos, cur_fwd, cur_rightu, cur_upu;
 	float cur_tanx = 1.0f, cur_tany = 1.0f;
+	// radiance cache (claude_radiance): frame counter drives which 1/8 of
+	// cells the GPU update pass refreshes; reset > 0 makes the pass write
+	// zeros — the cache is volume-local, so an origin shift invalidates it
+	// wholesale (2 frames, to clear both ping-pong targets). Starts at 2
+	// as belt-and-braces over the FBO clear.
+	float radiance_frame = 0.0f;
+	int radiance_reset = 2;
 };
 static ClaudeVolume g_claude_volume;
 
@@ -183,8 +190,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_skybounce_pixel{"skyBounce"};
 	CachedPixelShaderSetting<float, 1, false> m_sunangle_pixel{"sunAngle"};
 	CachedPixelShaderSetting<float, 1, false> m_nightsky_pixel{"nightSkyGain"};
+	CachedPixelShaderSetting<float, 1, false> m_radiance_pixel{"radianceStrength"};
+	CachedPixelShaderSetting<float, 1, false> m_radiance_frame_pixel{"claudeRadianceFrame"};
+	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
 	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
-	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
+	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -223,7 +233,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 19> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 20> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -243,6 +253,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_sun_angle",
 		"claude_night_sky",
 		"claude_moon_gain",
+		"claude_radiance",
 	};
 
 	static float readGoldenHourStrength()
@@ -366,6 +377,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_skybounce", 0.0f, 2.0f);
 	}
 
+	// Multi-bounce dial: how strongly bounce rays add the world-space
+	// radiance cache's circulating light. 0 disables both the read path
+	// and (via early-out) the GPU update pass. 1 = physical-ish weight.
+	static float readRadiance()
+	{
+		if (!g_settings->exists("claude_radiance"))
+			return 0.0f;
+		return g_settings->getFloat("claude_radiance", 0.0f, 1.0f);
+	}
+
 	static float readMicro()
 	{
 		if (!g_settings->exists("claude_micro"))
@@ -422,6 +443,8 @@ public:
 			m_nightsky = readNightSky();
 		if (name == "claude_moon_gain")
 			m_moongain = readMoonGain();
+		if (name == "claude_radiance")
+			m_radiance = readRadiance();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -457,6 +480,7 @@ public:
 		m_sunangle = readSunAngle();
 		m_nightsky = readNightSky();
 		m_moongain = readMoonGain();
+		m_radiance = readRadiance();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -567,6 +591,17 @@ public:
 				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
 			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
+			// Radiance cache controls: delivered UNCONDITIONALLY (like the
+			// samplers below) because the claude_radiance update pass runs
+			// every frame regardless of mode and must be able to early-out
+			// on its own uniforms; a value only set when a consumer is on
+			// would leave the pass reading stale state after a toggle-off.
+			float rad = g_claude_volume.valid ? m_radiance : 0.0f;
+			m_radiance_pixel.set(&rad, services);
+			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
+					services);
+			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
+			m_radiance_reset_pixel.set(&rreset, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
@@ -1554,6 +1589,19 @@ static void claudeUpdateAccum(Client *client)
 	// the smoothing); when still, a TRUE running average (weight 1/N)
 	// so the image converges to actual stillness instead of the EMA's
 	// perpetual 5%-new-sample pulse.
+	// radiance cache housekeeping: advance the amortization counter (the
+	// GPU pass refreshes cells whose interleave group == frame mod 8), and
+	// invalidate wholesale on an origin shift — the cache is volume-local,
+	// so rebasing makes every cell wrong. Two reset frames clear both
+	// ping-pong targets. Wrapped at 8 so the float compare in the shader
+	// stays exact forever.
+	g_claude_volume.radiance_frame =
+			std::fmod(g_claude_volume.radiance_frame + 1.0f, 8.0f);
+	if (origin_changed)
+		g_claude_volume.radiance_reset = 2;
+	else if (g_claude_volume.radiance_reset > 0)
+		g_claude_volume.radiance_reset--;
+
 	if (origin_changed || moved > 20.0f) {
 		g_claude_volume.accum_alpha = 1.0f;
 		g_claude_volume.still_frames = 0.0f;
