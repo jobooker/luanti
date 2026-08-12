@@ -141,6 +141,10 @@ struct ClaudeVolume
 	// cell coords, plus last frame's for cross-shift address remapping
 	v3f near_origin = v3f(48.0f, 48.0f, 48.0f);
 	v3f near_prev = v3f(48.0f, 48.0f, 48.0f);
+	// volume-rebase delta in cells (origin_new - origin_old) on the shift
+	// frame, zero otherwise: lets cache passes REMAP instead of zeroing
+	// (the pulse-to-black John caught 2026-08-12)
+	v3f origin_delta = v3f(0.0f, 0.0f, 0.0f);
 	// far cascades (claude_lod Phase 2+3): detail degrades in OCTAVES —
 	// 2 m to +/-128, 4 m to +/-256, 8 m to +/-512, 16 m to +/-1024,
 	// 32 m to +/-2048 — so the eye never jumps more than one resolution
@@ -256,6 +260,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_bounce_stride_pixel{"claudeBounceStride"};
 	float m_face_texels = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_face_texels_pixel{"claudeFaceTexels"};
+	float m_cache_remap = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_cache_remap_pixel{"claudeCacheRemap"};
+	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
@@ -297,7 +304,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 30> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 31> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -328,6 +335,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_tiers",
 		"claude_bounce_stride",
 		"claude_face_texels",
+		"claude_cache_remap",
 	};
 
 	static float readGoldenHourStrength()
@@ -552,6 +560,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_face_texels", 1.0f, 2.0f);
 	}
 
+	// 1 (default) = shift face caches across a volume rebase; 0 = the
+	// old zero-and-rebuild (the pulse), kept for A/B
+	static float readCacheRemap()
+	{
+		if (!g_settings->exists("claude_cache_remap"))
+			return 1.0f;
+		return g_settings->getFloat("claude_cache_remap", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -631,6 +648,8 @@ public:
 			m_bounce_stride = readBounceStride();
 		if (name == "claude_face_texels")
 			m_face_texels = readFaceTexels();
+		if (name == "claude_cache_remap")
+			m_cache_remap = readCacheRemap();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -677,6 +696,7 @@ public:
 		m_tiers = readTiers();
 		m_bounce_stride = readBounceStride();
 		m_face_texels = readFaceTexels();
+		m_cache_remap = readCacheRemap();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -810,8 +830,12 @@ public:
 			m_near_prev_pixel.set(g_claude_volume.near_prev, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
-			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
+			// the COUNTER (2/1/0), not a flag: 2 = remap frame (apply
+			// origin delta), 1 = carry frame (plain copy of the remap)
+			float rreset = (float)g_claude_volume.radiance_reset;
 			m_radiance_reset_pixel.set(&rreset, services);
+			m_origin_delta_pixel.set(g_claude_volume.origin_delta, services);
+			m_cache_remap_pixel.set(&m_cache_remap, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
@@ -1905,12 +1929,19 @@ static void claudeUpdateAccum(Client *client)
 	float moved = p.getDistanceFrom(g_claude_volume.prev_cam_pos);
 	float turned = (d - g_claude_volume.prev_cam_dir).getLength();
 	bool origin_changed = g_claude_volume.origin != g_claude_volume.prev_origin;
+	v3s16 odelta = g_claude_volume.origin - g_claude_volume.prev_origin;
+	g_claude_volume.origin_delta = origin_changed
+			? v3f(odelta.X, odelta.Y, odelta.Z) : v3f(0.0f, 0.0f, 0.0f);
 	g_claude_volume.prev_cam_pos = p;
 	g_claude_volume.prev_cam_dir = d;
 	g_claude_volume.prev_origin = g_claude_volume.origin;
 	// near-ring sub-face atlas follows the camera, corner clamped so the
-	// 32^3 ring never leaves the volume; prev kept one frame for remap
-	g_claude_volume.near_prev = g_claude_volume.near_origin;
+	// 32^3 ring never leaves the volume; prev kept one frame for remap.
+	// Across a volume rebase, express last frame's corner in the NEW
+	// volume space so the remap keeps pointing at the same world cells.
+	g_claude_volume.near_prev = origin_changed
+			? g_claude_volume.near_origin - g_claude_volume.origin_delta
+			: g_claude_volume.near_origin;
 	v3f lp = p / BS - v3f(g_claude_volume.origin.X,
 			g_claude_volume.origin.Y, g_claude_volume.origin.Z);
 	g_claude_volume.near_origin = v3f(
@@ -2080,6 +2111,18 @@ static void claudeCascadeUpdate(Client *client)
 	static const int CELL[5] = {2, 4, 8, 16, 32};
 	static const u64 CADENCE[5] = {8000, 6000, 4000, 12000, 20000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
+	// far-data feed: sweep <path_user>/claude_far/ for new server-sampled
+	// terrain every ~5 s (each file ingested once; version bump triggers
+	// the normal cascade rebuild below)
+	static u64 far_last = 0;
+	u64 now_ms = porting::getTimeMs();
+	if (now_ms - far_last > 5000) {
+		far_last = now_ms;
+		size_t n = claude_lod::ingestFarDir(client);
+		if (n)
+			infostream << "claude_far: ingested " << n << " blocks"
+					<< std::endl;
+	}
 	u64 ver = claude_lod::contentVersion();
 
 	for (int lv = 0; lv < 5; lv++) {

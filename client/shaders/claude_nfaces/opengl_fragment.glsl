@@ -28,6 +28,7 @@ uniform lowp float dayNightRatio;
 uniform float claudeRadianceFrame;
 uniform lowp float claudeRadianceReset;
 uniform lowp float claudeFaceTexels; // <1.5 = pass idle (cheap fill)
+uniform lowp float claudeCacheRemap; // 0 = zero on rebase (the pulse)
 uniform vec3 claudeNearOrigin;
 uniform vec3 claudeNearPrev;
 uniform sampler3D claudeVolume;
@@ -285,7 +286,10 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 
 void main(void)
 {
-	if (claudeRadianceReset > 0.5) {
+	// volume rebase: no zeroing needed — the per-frame ring remap plus
+	// the CPU's rebase-corrected claudeNearPrev already re-addresses
+	// every surviving texel (claude_cache_remap=0 restores the pulse)
+	if (claudeRadianceReset > 0.5 && claudeCacheRemap < 0.5) {
 		gl_FragColor = vec4(0.0);
 		return;
 	}

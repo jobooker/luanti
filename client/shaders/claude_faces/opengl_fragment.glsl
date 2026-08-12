@@ -43,6 +43,8 @@ uniform vec4 claudeEmitter7;
 uniform lowp float claudeEmitterCount;
 uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 uniform lowp float claudePyramid; // occupancy-pyramid leap climb dial
+uniform vec3 claudeOriginDelta;   // cells, non-zero only on the rebase frame
+uniform lowp float claudeCacheRemap; // 1 = shift across rebase, 0 = zero (pulse)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -295,9 +297,35 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 
 void main(void)
 {
-	// origin shift: cache is volume-local — zero it (2 frames clears both)
+	// origin shift: the cache is volume-local, but the LIGHT it stores is
+	// world-anchored — so SHIFT addresses by the origin delta instead of
+	// zeroing (zeroing showed as a pulse-to-black under face-direct;
+	// John, 2026-08-12). Reset counter: 2 = remap frame, 1 = carry the
+	// remapped data into the other ping-pong target.
 	if (claudeRadianceReset > 0.5) {
-		gl_FragColor = vec4(0.0);
+		if (claudeCacheRemap < 0.5) {
+			gl_FragColor = vec4(0.0);
+			return;
+		}
+		if (claudeRadianceReset > 1.5) {
+			vec2 rpx = floor(gl_FragCoord.xy);
+			vec2 rtile = floor(rpx / FTILE);
+			float rti = rtile.y * FGRIDW + rtile.x;
+			float rf = floor(rti / 128.0);
+			vec3 rnode = vec3(rpx - rtile * FTILE, rti - rf * 128.0);
+			vec3 oldn = rnode + claudeOriginDelta;
+			if (any(lessThan(oldn, vec3(0.0)))
+					|| any(greaterThanEqual(oldn, vec3(128.0)))) {
+				gl_FragColor = vec4(0.0);
+				return;
+			}
+			float ti2 = rf * 128.0 + oldn.z;
+			vec2 t2 = vec2(mod(ti2, FGRIDW), floor(ti2 / FGRIDW));
+			gl_FragColor = texture2D(prevFaces,
+					(t2 * FTILE + oldn.xy + 0.5) / vec2(FTEX_W, FTEX_H));
+		} else {
+			gl_FragColor = texture2D(prevFaces, varTexCoord.st);
+		}
 		return;
 	}
 	// off or not in traced mode: keep the cache empty
