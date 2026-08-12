@@ -5,6 +5,28 @@
 // converged soft lighting. accumAlpha comes from the CPU: 1.0 on
 // teleport/volume-swap (hard reset), higher while moving, low while
 // still (deep accumulation).
+//
+// NVIDIA-only build note (2026-08-12, Windows port): NVIDIA's back-end
+// dies here with "Internal error: assembly compile error ... at offset
+// ~1692600". MEASURED, not guessed: changing the 384-step march bound to
+// 96 moved that offset by ONE byte, so the loops are not being unrolled
+// and the bound is not the lever. The pragma below is kept only because
+// it is inert elsewhere; it did not fix the link.
+#pragma optionNV(unroll none)
+// The actual NVIDIA limit is NVfp5.0's 65536-instruction ceiling; this
+// shader assembles to 65709 — over by 173 (0.3%). Set to 1 to restore the
+// volume_debug 7-12 diagnostic views (term-isolation heatmaps, WHY-map,
+// normals); each inlines a whole emitterVis() march, which is what puts
+// us over. They are instrumentation only — modes 0-6 are unaffected.
+#define CLAUDE_DIAG_MODES 0
+// Cascade/far-field family (cascadeSample..farTrace, ~430 lines with the
+// heaviest marches). PURE-1M PHOTO retires the ladder (claude_cascades=0),
+// so at runtime every cascadeValid is 0 and farTrace/farShadow already
+// return their miss values. Compiling the family out is therefore exact
+// for that config, not an approximation — the stubs below return those
+// same values. Set to 1 to restore the ladder (needs the instruction
+// budget headroom that NVIDIA does not currently have).
+#define CLAUDE_FAR_FIELD 0
 #define history texture0
 #define faceCacheTex texture2
 #define nearFacesTex texture3
@@ -444,6 +466,7 @@ uniform vec3 cascade4Origin;  // 32 m
 uniform vec3 cascadeValid;    // levels 0-2, 0/1 each
 uniform vec3 cascadeValidB;   // levels 3-4 in .xy
 
+#if CLAUDE_FAR_FIELD
 vec4 cascadeSample(float slab, vec3 c)
 {
 	return texture3D(claudeCascades,
@@ -488,8 +511,10 @@ float lrungFaceAO(float lv, vec3 corigin, float csz, vec3 pvol, vec3 n)
 	vec4 b = texture2D(nearFacesTex, uv);
 	if (b.a < 0.5)
 		return 1.0; // cold: no occlusion knowledge yet
-	float packed = abs(n.x) > 0.5 ? b.r : abs(n.y) > 0.5 ? b.g : b.b;
-	float v = packed * 1024.0;
+	// NB: not `packed` — that is a reserved word in GLSL. Apple's compiler
+	// accepted it; NVIDIA's rejects it outright (syntax error at the '=').
+	float packedBits = abs(n.x) > 0.5 ? b.r : abs(n.y) > 0.5 ? b.g : b.b;
+	float v = packedBits * 1024.0;
 	float qa = floor(v / 32.0);
 	float qb = v - qa * 32.0;
 	bool pos = n.x > 0.5 || n.y > 0.5 || n.z > 0.5;
@@ -870,6 +895,19 @@ vec4 farTrace(vec3 ro, vec3 rd, vec3 sd, float t0)
 	}
 	return vec4(0.0, 0.0, 0.0, -1.0);
 }
+#else
+// Exactly what the full versions return once every cascade is invalid,
+// which is the standing state at claude_cascades = 0.
+vec4 farTrace(vec3 ro, vec3 rd, vec3 sd, float t0)
+{
+	return vec4(0.0, 0.0, 0.0, -1.0);
+}
+
+float farShadow(vec3 pvol, vec3 sd)
+{
+	return 1.0;
+}
+#endif
 
 float lightVis(vec3 ro, vec3 sd)
 {
@@ -2024,6 +2062,7 @@ void main(void)
 					// lighting term, no albedo, so artifacts name their
 					// own source. 7 torch, 8 bounce/cache, 9 sun,
 					// 10 raw visibility toward the nearest emitter.
+#if CLAUDE_DIAG_MODES
 					if (volumeDebug > 6.5) {
 						if (volumeDebug < 7.5) fresh = em2;
 						else if (volumeDebug < 8.5) fresh = amb2;
@@ -2059,6 +2098,7 @@ void main(void)
 							fresh = hn * 0.5 + 0.5;
 						}
 					}
+#endif
 					done = true;
 					break;
 				}
