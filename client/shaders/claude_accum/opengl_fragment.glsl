@@ -2047,13 +2047,17 @@ void main(void)
 			// out there. LOD 2+ has no world-space light cache yet
 			// (task: per-cell far irradiance); without this, far cells
 			// re-trace sun+ambient per frame and BOIL while flying.
-			if (claudeFarHist > 0.5 && tHit > 70.0 && tHit < 4095.0) {
-				float farness = clamp((tHit - 70.0) / 200.0, 0.0, 1.0);
+			// ramp starts AT the volume edge (64) and maxes by 128:
+			// the first cascade band was the "specially goofy" flicker
+			// zone — beyond the face caches but before the old ramp
+			// (70..270) granted meaningful history depth.
+			if (claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0) {
+				float farness = clamp((tHit - 64.0) / 64.0, 0.0, 1.0);
 				a = min(accumAlpha, mix(accumAlpha, 0.12, farness));
 				band = mix(band, 1.0, farness);
 			}
 			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-band), vec3(band));
-			if (!(claudeFarHist > 0.5 && tHit > 70.0 && tHit < 4095.0))
+			if (!(claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0))
 				a = accumAlpha;
 		} else {
 			// depth mismatch = aliased edge flipping under subpixel
