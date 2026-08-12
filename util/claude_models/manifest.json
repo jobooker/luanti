@@ -1,0 +1,41 @@
+{
+ "rotate_param2": true,
+ "nodes": {
+  "furnace_baked": [
+   "mcl_furnaces:furnace_active",
+   "mcl_furnaces:furnace"
+  ],
+  "chest_custom": [
+   "mcl_chests:chest_small",
+   "mcl_chests:chest"
+  ],
+  "crafting_baked": [
+   "mcl_crafting_table:crafting_table"
+  ],
+  "torch_baked": [
+   "mcl_torches:torch",
+   "mcl_torches:torch_wall"
+  ],
+  "bookshelf_baked": [
+   "mcl_books:bookshelf"
+  ],
+  "bed_red_foot": [
+   "mcl_beds:bed_red_bottom"
+  ],
+  "bed_red_head": [
+   "mcl_beds:bed_red_top"
+  ],
+  "lantern_floor": [
+   "mcl_lanterns:lantern_floor"
+  ],
+  "campfire_lit": [
+   "mcl_campfires:campfire_lit"
+  ],
+  "carpet_white": [
+   "mcl_wool:white_carpet"
+  ],
+  "flowerpot_poppy": [
+   "mcl_flowerpots:flower_pot"
+  ]
+ }
+}

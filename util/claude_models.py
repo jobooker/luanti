@@ -258,6 +258,141 @@ def model_crafting_baked():
         maxdepth=2)
 
 
+def model_bookshelf_baked():
+    mods = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "games", "mineclonia", "mods", "ITEMS")
+    return bake_from_tiles(
+        "bookshelf_baked",
+        dict(side=os.path.join(mods, "mcl_books", "textures",
+                               "default_bookshelf.png"),
+             top=os.path.join(mods, "mcl_core", "textures",
+                              "default_wood.png"),
+             bottom=os.path.join(mods, "mcl_core", "textures",
+                                 "default_wood.png")),
+        maxdepth=1)  # book spines recess a single voxel
+
+
+def model_bed(part):
+    """Two-cell bed, authored (MCL beds are mesh nodes, no cube
+    tiles). Canonical orientation: foot at low z, head at high z;
+    the bake rotates by param2. Half-height per the real thing."""
+    pal = [
+        None,
+        dict(rgb=(126, 84, 44), emit=0),    # 1 oak frame
+        dict(rgb=(96, 62, 30), emit=0),     # 2 dark frame edge / legs
+        dict(rgb=(178, 34, 34), emit=0),    # 3 red blanket
+        dict(rgb=(210, 48, 48), emit=0),    # 4 blanket highlight fold
+        dict(rgb=(235, 232, 224), emit=0),  # 5 white sheet
+        dict(rgb=(250, 249, 245), emit=0),  # 6 pillow
+    ]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    head = part == "head"
+    # legs: 2x2x3 at the cell's OUTER end corners only
+    zleg = (13, 14) if head else (1, 2)
+    for x in (1, 2, 13, 14):
+        for z in zleg:
+            v[z, 0:3, x] = 2
+    # base slab + side rails
+    v[0:16, 3, 1:15] = 1
+    v[0:16, 4, 1] = 2
+    v[0:16, 4, 14] = 2
+    if not head:
+        v[0, 4, 1:15] = 2       # footboard lip
+        v[0, 5, 1:15] = 2
+    else:
+        v[15, 4:8, 1:15] = 2    # headboard
+    # mattress + covers
+    if head:
+        v[0:9, 5, 2:14] = 3     # blanket reaches partway up the bed
+        v[0:8, 6, 2:14] = 4
+        v[9:14, 5, 2:14] = 5    # sheet
+        v[10:14, 6, 3:13] = 6   # pillow
+        v[11:13, 7, 4:12] = 6
+    else:
+        v[1:16, 5, 2:14] = 3
+        v[2:15, 6, 2:14] = 4    # folded top layer
+    return "bed_red_%s" % part, pal, v
+
+
+def model_lantern():
+    """Floor lantern: iron cage, emissive core — the cozy house's
+    fourth emitter class gets a real body."""
+    pal = [
+        None,
+        dict(rgb=(70, 72, 80), emit=0),      # 1 iron cage
+        dict(rgb=(48, 50, 56), emit=0),      # 2 dark iron base/cap
+        dict(rgb=(255, 214, 120), emit=12),  # 3 glowing core
+    ]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    v[5:11, 0, 5:11] = 2                     # base plate
+    for x, z in ((5, 5), (5, 10), (10, 5), (10, 10)):
+        v[z, 1:7, x] = 1                     # corner posts
+    v[6:10, 1:6, 6:10] = 3                   # core
+    v[5:11, 6, 5:11] = 2                     # cap
+    v[7:9, 7, 7:9] = 1                       # hanger nub
+    v[7:9, 8, 7:9] = 1
+    return "lantern_floor", pal, v
+
+
+def model_campfire():
+    """Crossed logs, ember bed, low flame — the hearth's centerpiece.
+    Fire voxels emissive at the campfire's light level."""
+    pal = [
+        None,
+        dict(rgb=(110, 72, 36), emit=0),     # 1 log
+        dict(rgb=(76, 48, 24), emit=0),      # 2 log end/dark
+        dict(rgb=(255, 120, 30), emit=11),   # 3 embers
+        dict(rgb=(255, 200, 60), emit=13),   # 4 flame
+        dict(rgb=(40, 36, 32), emit=0),      # 5 char
+    ]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    # two logs along x (bottom), two along z (crossed on top)
+    for z0 in (2, 11):
+        v[z0:z0 + 3, 0:3, 0:16] = 1
+        v[z0:z0 + 3, 0:3, 0] = 2
+        v[z0:z0 + 3, 0:3, 15] = 2
+    for x0 in (2, 11):
+        v[0:16, 3:6, x0:x0 + 3] = 1
+        v[0, 3:6, x0:x0 + 3] = 2
+        v[15, 3:6, x0:x0 + 3] = 2
+    # char where flame licks the logs
+    v[5:11, 3, 5:11] = 5
+    # ember bed + flame column
+    v[5:11, 0:2, 5:11] = 3
+    v[6:10, 2:5, 6:10] = 4
+    v[7:9, 5:7, 7:9] = 4
+    return "campfire_lit", pal, v
+
+
+def model_carpet():
+    pal = [None, dict(rgb=(232, 230, 226), emit=0),
+           dict(rgb=(210, 206, 200), emit=0)]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    v[:, 0, :] = 1
+    v[0, 0, :] = 2                           # subtle woven border
+    v[15, 0, :] = 2
+    v[:, 0, 0] = 2
+    v[:, 0, 15] = 2
+    return "carpet_white", pal, v
+
+
+def model_flowerpot():
+    pal = [
+        None,
+        dict(rgb=(150, 82, 50), emit=0),    # 1 terracotta
+        dict(rgb=(96, 60, 36), emit=0),     # 2 soil
+        dict(rgb=(58, 120, 48), emit=0),    # 3 stem
+        dict(rgb=(214, 64, 64), emit=0),    # 4 poppy bloom
+    ]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    v[6:10, 0:4, 6:10] = 1                  # pot
+    v[7:9, 3, 7:9] = 2                      # soil
+    v[8, 4:8, 8] = 3                        # stem
+    v[7:10, 8:10, 7:10] = 4                 # bloom
+    v[8, 9, 8] = 4
+    return "flowerpot_poppy", pal, v
+
+
 def extrude_cutout(name, path, thick=2, emit_level=12):
     """Torch-class bake: a mostly-transparent 16x16 tile extruded into
     a `thick`-voxel standing model centered in the cell. Bright warm
@@ -367,14 +502,41 @@ def preview(pal, v, px=420):
     return Image.fromarray(img.astype(np.uint8))
 
 
+# model -> node substitution map: at snapshot-bake time (the phase 4.5
+# re-land) cells holding these nodes take the named model's mask +
+# colors + emission instead of the texture-heightfield default; the
+# model is rotated by the node's param2. The cozy house already
+# contains every one of these nodes, so "placement" is automatic.
+MANIFEST = {
+    "furnace_baked": ["mcl_furnaces:furnace_active",
+                      "mcl_furnaces:furnace"],
+    "chest_custom": ["mcl_chests:chest_small", "mcl_chests:chest"],
+    "crafting_baked": ["mcl_crafting_table:crafting_table"],
+    "torch_baked": ["mcl_torches:torch", "mcl_torches:torch_wall"],
+    "bookshelf_baked": ["mcl_books:bookshelf"],
+    "bed_red_foot": ["mcl_beds:bed_red_bottom"],
+    "bed_red_head": ["mcl_beds:bed_red_top"],
+    "lantern_floor": ["mcl_lanterns:lantern_floor"],
+    "campfire_lit": ["mcl_campfires:campfire_lit"],
+    "carpet_white": ["mcl_wool:white_carpet"],
+    "flowerpot_poppy": ["mcl_flowerpots:flower_pot"],
+}
+
+
 def main():
     outdir = sys.argv[1] if len(sys.argv) > 1 else \
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "claude_models")
     os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "manifest.json"), "w") as f:
+        json.dump(dict(rotate_param2=True, nodes=MANIFEST), f,
+                  indent=1)
     for fn in (model_furnace, model_chest, model_crafting,
                model_furnace_baked, model_crafting_baked,
-               model_torch_baked):
+               model_torch_baked, model_bookshelf_baked,
+               lambda: model_bed("foot"), lambda: model_bed("head"),
+               model_lantern, model_campfire, model_carpet,
+               model_flowerpot):
         name, pal, v = fn()
         data = dict(name=name,
                     palette=[None] + [dict(rgb=list(p["rgb"]),
