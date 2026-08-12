@@ -10,7 +10,8 @@ Idempotent: skips columns whose output file already exists.
 """
 import sys, os, json, time, subprocess
 
-WORLD = "/opt/luanti/config/worlds/world"
+import os as _os
+WORLD = _os.environ.get("CLAUDE_WORLD", "/opt/luanti/config/worlds/world")
 FARDIR = os.path.expanduser(
     "~/Library/Application Support/minetest/claude_far")
 CHUNK = 24  # columns per bridge call
