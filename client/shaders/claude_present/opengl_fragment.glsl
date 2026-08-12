@@ -75,7 +75,17 @@ void main(void)
 	// below re-smooths quantized lighting at presentation — the LAST
 	// smoother in the chain. One point sample keeps the lattice.
 	if (volumeDebug > 5.5) {
-		vec3 cq = texture2D(accum, uv).rgb;
+		// TRUE nearest fetch: snap to the accum texel grid ourselves.
+		// texture2D at full-res uv goes through the GPU's BILINEAR
+		// magnification of the 0.75-scale buffer — four samples blended
+		// per pixel, which re-smoothed the quantized lattice at the very
+		// last stage no matter what the accum pass computed.
+		vec2 uvq = uv;
+#if __VERSION__ >= 130
+		vec2 asz = vec2(textureSize(accum, 0));
+		uvq = (floor(uv * asz) + 0.5) / asz;
+#endif
+		vec3 cq = texture2D(accum, uvq).rgb;
 		vec3 linq = pow(max(cq, vec3(0.0)), vec3(2.2));
 		float mq = max(max(linq.r, linq.g), linq.b);
 		vec3 hueq = mq > 1e-5
