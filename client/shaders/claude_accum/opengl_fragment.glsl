@@ -58,6 +58,10 @@ uniform lowp float claudeBounceStride;
 // 1 = coarse per-face cache only; 2 = near-ring 4x4 sub-face atlas
 // (0.25m ambient resolution around the camera — AO without the quilt).
 uniform lowp float claudeFaceTexels;
+// 1 (default) = depth-aware history: far pixels keep deep temporal
+// history even in motion (their reprojection is near-identity), so the
+// uncached far field stops boiling in flight. 0 = uniform history.
+uniform lowp float claudeFarHist;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
@@ -2038,8 +2042,19 @@ void main(void)
 			// but NOT when deeply converged: yanking settled history
 			// toward each frame's noise was itself a pulse source
 			float band = accumAlpha < 0.1 ? 4.0 : 0.3;
+			// far field: parallax shrinks with distance, so history
+			// reprojects almost perfectly even in flight — run it DEEP
+			// out there. LOD 2+ has no world-space light cache yet
+			// (task: per-cell far irradiance); without this, far cells
+			// re-trace sun+ambient per frame and BOIL while flying.
+			if (claudeFarHist > 0.5 && tHit > 70.0 && tHit < 4095.0) {
+				float farness = clamp((tHit - 70.0) / 200.0, 0.0, 1.0);
+				a = min(accumAlpha, mix(accumAlpha, 0.12, farness));
+				band = mix(band, 1.0, farness);
+			}
 			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-band), vec3(band));
-			a = accumAlpha;
+			if (!(claudeFarHist > 0.5 && tHit > 70.0 && tHit < 4095.0))
+				a = accumAlpha;
 		} else {
 			// depth mismatch = aliased edge flipping under subpixel
 			// jitter. Rejecting outright makes edges shimmer forever;

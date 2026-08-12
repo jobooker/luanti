@@ -262,6 +262,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_face_texels_pixel{"claudeFaceTexels"};
 	float m_cache_remap = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_cache_remap_pixel{"claudeCacheRemap"};
+	float m_far_hist = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_far_hist_pixel{"claudeFarHist"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -304,7 +306,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 31> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 32> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -336,6 +338,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bounce_stride",
 		"claude_face_texels",
 		"claude_cache_remap",
+		"claude_far_hist",
 	};
 
 	static float readGoldenHourStrength()
@@ -569,6 +572,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_cache_remap", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = deep temporal history for the far field in motion
+	static float readFarHist()
+	{
+		if (!g_settings->exists("claude_far_hist"))
+			return 1.0f;
+		return g_settings->getFloat("claude_far_hist", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -650,6 +661,8 @@ public:
 			m_face_texels = readFaceTexels();
 		if (name == "claude_cache_remap")
 			m_cache_remap = readCacheRemap();
+		if (name == "claude_far_hist")
+			m_far_hist = readFarHist();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -697,6 +710,7 @@ public:
 		m_bounce_stride = readBounceStride();
 		m_face_texels = readFaceTexels();
 		m_cache_remap = readCacheRemap();
+		m_far_hist = readFarHist();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -836,6 +850,7 @@ public:
 			m_radiance_reset_pixel.set(&rreset, services);
 			m_origin_delta_pixel.set(g_claude_volume.origin_delta, services);
 			m_cache_remap_pixel.set(&m_cache_remap, services);
+			m_far_hist_pixel.set(&m_far_hist, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
