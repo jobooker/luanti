@@ -635,6 +635,14 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 							* (0.25 * clamp(volumeSunDir.y, 0.0, 1.0));
 			}
 			vec3 c = albedo * (direct + amb);
+			// foliage cells (class 180, alpha ~0.71): light as sky-bathed
+			// canopy — full hemisphere skylight, softened sun dependence.
+			// Folded-opaque forests shaded like cliffs WERE the "LOD 2
+			// wall" (John, 2026-08-12, Riverflow flyover).
+			if (s.a > 0.6 && s.a < 0.8)
+				c = albedo * (direct * 0.6
+						+ pathSkyRadiance(vec3(0.0, 1.0, 0.0)) * 0.55
+						+ amb * 0.5);
 			if (s.a < 0.6) // far water: flat sky mirror
 				c = mix(c, pathSkyFog(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
@@ -2051,13 +2059,21 @@ void main(void)
 			// the first cascade band was the "specially goofy" flicker
 			// zone — beyond the face caches but before the old ramp
 			// (70..270) granted meaningful history depth.
-			if (claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0) {
+			// representation-flip guard: a pixel whose history lived on
+			// the OTHER side of the volume/cascade seam (~64) carries the
+			// other representation's shading — deep-blending it painted
+			// the standing ghost ring at the seam. Flip pixels stay
+			// shallow; the far interior keeps deep history (no flicker).
+			bool repFlip = (tPrev > 66.0) != (tHit > 66.0);
+			if (claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0
+					&& !repFlip) {
 				float farness = clamp((tHit - 64.0) / 64.0, 0.0, 1.0);
 				a = min(accumAlpha, mix(accumAlpha, 0.12, farness));
 				band = mix(band, 1.0, farness);
 			}
 			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-band), vec3(band));
-			if (!(claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0))
+			if (!(claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0
+					&& !repFlip))
 				a = accumAlpha;
 		} else {
 			// depth mismatch = aliased edge flipping under subpixel
