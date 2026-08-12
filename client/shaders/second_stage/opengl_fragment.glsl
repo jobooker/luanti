@@ -557,7 +557,7 @@ void main(void)
 	// Traced lighting in the real render (claude_water_reflections +
 	// claude_gi): reconstruct this pixel's position from the depth buffer
 	// once, then let each effect consult the volume.
-	if (false) { // gated: uniform unreliable on core
+	if ((waterReflStrength > 0.0 || giStrength > 0.0) && volumeDebug < 0.5) {
 		float dw = texture2D(depthmap, uv).r;
 		if (dw < 0.9999) {
 			vec2 ndcw = uv * 2.0 - 1.0;
@@ -720,7 +720,7 @@ void main(void)
 	}
 
 	// SSAO: darken creases before exposure/bloom so glow stays clean
-	if (false) { // gated: uniform unreliable on core
+	if (ssaoStrength > 0.0) {
 		float ao = sampleAO(uv, texture2D(depthmap, uv).r);
 		color.rgb *= 1.0 - ssaoStrength * 0.7 * ao;
 	}
@@ -758,7 +758,7 @@ void main(void)
 		// Golden hour: warm the whole frame through dawn/dusk transitions,
 		// keyed to the engine's day-night ratio. Zero at full day and full
 		// night; golden_hour_strength setting scales it (0 disables).
-		if (false) { // gated: uniform unreliable on core
+		if (goldenHourStrength > 0.0) {
 			float g = smoothstep(0.30, 0.60, dayNightRatio)
 				* (1.0 - smoothstep(0.85, 0.97, dayNightRatio));
 			vec3 warm = vec3(1.12, 1.03, 0.88);
