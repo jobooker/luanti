@@ -71,6 +71,10 @@ uniform lowp float claudeLightLadder;
 // accumulation turns the stochastic band into a cross-fade — ONE
 // transition rule, every seam (the moat/wall line dissolves).
 uniform lowp float claudeLodDither;
+// 1 (default) = multi-scale albedo grain inside far cell faces — one
+// flat color per cell read as "shipping containers, not mountains"
+// (John, 2026-08-12); 1m + 4m world-anchored hash restores rock.
+uniform lowp float claudeFarGrain;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
@@ -626,6 +630,15 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
 			float jamp = min(0.10, 0.015 + 0.012 * csz);
 			albedo *= 1.0 + (jh - 0.5) * 2.0 * jamp;
+			if (claudeFarGrain > 0.5) {
+				// grain INSIDE the face: 1m speckle + 4m patchiness,
+				// anchored to position so it sticks to terrain
+				float g1 = fract(sin(dot(floor(hpv),
+						vec3(17.13, 31.71, 53.73))) * 43758.5453);
+				float g2 = fract(sin(dot(floor(hpv * 0.25),
+						vec3(29.31, 11.97, 71.33))) * 24634.6345);
+				albedo *= 0.80 + 0.26 * g1 + 0.14 * g2;
+			}
 			// ---- light ladder consumer (ADR-0008 v1): cached per-cell
 			// irradiance replaces the per-pixel shadow + bounce marches
 			// whose per-frame variance WAS the mid-band flicker

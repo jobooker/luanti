@@ -268,6 +268,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_light_ladder_pixel{"claudeLightLadder"};
 	float m_lod_dither = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_lod_dither_pixel{"claudeLodDither"};
+	float m_far_grain = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_far_grain_pixel{"claudeFarGrain"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -310,7 +312,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 34> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 35> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -345,6 +347,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_far_hist",
 		"claude_light_ladder",
 		"claude_lod_dither",
+		"claude_far_grain",
 	};
 
 	static float readGoldenHourStrength()
@@ -602,6 +605,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_lod_dither", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = multi-scale grain inside far cell faces
+	static float readFarGrain()
+	{
+		if (!g_settings->exists("claude_far_grain"))
+			return 1.0f;
+		return g_settings->getFloat("claude_far_grain", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -689,6 +700,8 @@ public:
 			m_light_ladder = readLightLadder();
 		if (name == "claude_lod_dither")
 			m_lod_dither = readLodDither();
+		if (name == "claude_far_grain")
+			m_far_grain = readFarGrain();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -739,6 +752,7 @@ public:
 		m_far_hist = readFarHist();
 		m_light_ladder = readLightLadder();
 		m_lod_dither = readLodDither();
+		m_far_grain = readFarGrain();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -881,6 +895,7 @@ public:
 			m_far_hist_pixel.set(&m_far_hist, services);
 			m_light_ladder_pixel.set(&m_light_ladder, services);
 			m_lod_dither_pixel.set(&m_lod_dither, services);
+			m_far_grain_pixel.set(&m_far_grain, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
