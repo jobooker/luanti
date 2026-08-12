@@ -423,6 +423,69 @@ float farShadow(vec3 pvol, vec3 sd)
 	return 1.0;
 }
 
+// Ambient bounce for a far hit, marched in the SAME level's grid —
+// John's principle: the pipeline is identical at every cascade level,
+// only the block size changes. This is bounceRay's exact shape one
+// octave up: a cosine ray that darkens in valleys (real AO), returns
+// sky on escape (SKY_BOUNCE), and picks up sun-lit terrain color at its
+// hit — which is what the hand-tuned skyAmb/ground-bounce approximation
+// could never match ("the dynamic lighting range changes a lot").
+vec3 farBounce(float slab, vec3 corigin, float csz, vec3 pvol, vec3 rd,
+		vec3 sd)
+{
+	vec3 pc = (pvol - corigin) / csz;
+	vec3 cell = floor(pc);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
+	int axis = -1;
+	for (int i = 0; i < 48; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0)))
+				|| any(greaterThanEqual(cell, vec3(128.0))))
+			return pathSkyRadiance(rd) * SKY_BOUNCE; // escaped: sky bounce
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCascadeCoarse, vec3((cc.xy + 0.5) / 32.0,
+				(slab * 32.0 + cc.z + 0.5) / 160.0)).r < 0.5) {
+			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+					* max(abs(rd), vec3(1e-6));
+			vec3 tt = (bb - pc) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z);
+			vec3 p2 = pc + rd * (tj + 1e-3);
+			cell = floor(p2);
+			sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
+		vec4 s = cascadeSample(slab, cell);
+		if (s.a > 0.35 && axis >= 0) {
+			// same shading bounceRay gives ITS hits: sky + sun, one deep
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			vec3 hpv = corigin + (pc + rd * max(
+					min(min(sideDist.x, sideDist.y), sideDist.z), 0.0))
+					* csz; // approximate: cell-resolution is plenty here
+			vec3 lit = pathSkyRadiance(n) * SKY_BOUNCE;
+			float ndl = max(dot(n, sd), 0.0);
+			if (ndl > 0.0)
+				lit += volumeLightCol * ndl * 1.4
+						* farShadow(corigin + (cell + n) * csz
+							+ vec3(csz * 0.5), sd);
+			return pathAlbedo(s.rgb) * lit;
+		}
+	}
+	return pathSkyRadiance(rd) * SKY_BOUNCE * 0.5; // ran out: dim sky
+}
+
 // March ONE cascade level from world-node t0 along rd. Returns rgb +
 // hit t in w on a hit; on box exit returns w = -(exitT + 1.0) so the
 // caller resumes the NEXT level exactly where this one left off — one
@@ -491,18 +554,45 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			// the binary shadow into penumbras. Unjittered, grazing dusk
 			// light flipped adjacent cells fully lit/dark — the "picket
 			// fence" checkerboard across far slopes.
+			// direct: shadow origin QUANTIZED to the cell center — one
+			// shadow value per face. Per-texel origins clipped the
+			// uphill neighbour for texels near an edge, drawing a dark
+			// frame around every far cell ("the frame stuff").
 			float ndl = max(dot(n, sd), 0.0);
 			vec3 direct = ndl > 0.0
-					? volumeLightCol * (ndl
-						* farShadow(hpv + n * csz, sd))
+					? volumeLightCol * (ndl * farShadow(
+						corigin + (cell + 0.5 + n) * csz, sd))
 					: vec3(0.0);
-			// ambient: sky, warmed toward the terrain's own color — the
-			// near field's ambient is a traced bounce that picks up
-			// ground warmth, and pure sky ambient here made the far side
-			// of the seam read cold and blue by comparison
-			vec3 skyAmb = pathSkyRadiance(n);
-			vec3 c = albedo * (direct
-					+ mix(skyAmb, skyAmb * albedo * 2.5, 0.25) * SKY_BOUNCE);
+			// ambient: the near pipeline's own shape, one octave up — a
+			// cosine bounce ray in THIS level's grid (farBounce). Frame-
+			// varying direction hashed per cell; accumulation averages
+			// it into a converged hemisphere exactly like the near field.
+			float ftick = fract(animationTimer * 7.31);
+			vec3 sp3 = vec3(
+				fract(sin(dot(cell + ftick,
+					vec3(12.9898, 78.233, 37.719))) * 43758.5453),
+				fract(sin(dot(cell + ftick,
+					vec3(93.989, 12.233, 57.719))) * 24634.6345),
+				fract(sin(dot(cell + ftick,
+					vec3(45.332, 88.443, 19.113))) * 31578.2846));
+			vec3 ad = normalize(n + normalize(sp3 * 2.0 - 1.0 + vec3(1e-4)));
+			if (dot(ad, n) < 0.0)
+				ad = normalize(ad - 2.0 * dot(ad, n) * n);
+			// true traced bounce for the rings you stare at (2m/4m,
+			// where the seam lives); the 8m+ rings are fog-dominated and
+			// keep the cheap sky/ground approximation — full bounce on
+			// every ring cost ~5 fps for detail the haze erases anyway
+			vec3 amb;
+			if (slab < 1.5) {
+				amb = farBounce(slab, corigin, csz,
+						hpv + n * (0.5 * csz), ad, sd) * 1.15;
+			} else {
+				vec3 skyAmb = pathSkyRadiance(n);
+				amb = mix(skyAmb, skyAmb * albedo * 2.5, 0.25) * SKY_BOUNCE
+						+ volumeLightCol * albedo
+							* (0.25 * clamp(volumeSunDir.y, 0.0, 1.0));
+			}
+			vec3 c = albedo * (direct + amb);
 			if (s.a < 0.6) // far water: flat sky mirror
 				c = mix(c, pathSkyFog(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
@@ -513,7 +603,11 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			// the data frontier (unseen terrain fades into atmosphere).
 			// pathSkyFog, NOT pathSkyRadiance: the full sky contains the
 			// 40x sun/moon disc, which burned straight through mountains.
-			c = mix(c, pathSkyFog(rd), 1.0 - exp(-tw / 1400.0));
+			// Fog STARTS past the near seam (64 nodes) — fogging at the
+			// seam itself drew an abrupt haze line exactly where the
+			// resolution changes, doubling the visual discontinuity.
+			c = mix(c, pathSkyFog(rd),
+					1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
 			return vec4(c, tw);
 		}
 	}

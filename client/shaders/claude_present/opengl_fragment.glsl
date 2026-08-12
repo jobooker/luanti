@@ -84,9 +84,11 @@ void main(void)
 		float bw = (o.x > 0.5 ? f.x : 1.0 - f.x)
 				* (o.y > 0.5 ? f.y : 1.0 - f.y);
 		// depth-agreement weight, RELATIVE at range: at 800 nodes a
-		// per-node penalty would zero every tap
+		// per-node penalty would zero every tap. 0.8%, not 2% — the
+		// looser band blended across far cell edges and BLURRED the
+		// whole cascade field ("softwarey")
 		float dw = exp(-abs(s.a * 4096.0 - guide)
-				/ max(1.7, 0.02 * guide));
+				/ max(1.7, 0.008 * guide));
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
 		wsum += w;
