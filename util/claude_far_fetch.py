@@ -13,7 +13,7 @@ import sys, os, json, time, subprocess
 WORLD = "/opt/luanti/config/worlds/world"
 FARDIR = os.path.expanduser(
     "~/Library/Application Support/minetest/claude_far")
-CHUNK = 12  # columns per bridge call
+CHUNK = 24  # columns per bridge call
 
 
 def bridge(op, **kw):
