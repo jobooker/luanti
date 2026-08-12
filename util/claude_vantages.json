@@ -1,0 +1,14 @@
+{
+  "cozy-night":   { "set": "gallery", "pos": [7, 9, 2],  "yaw": 55,  "pitch": -5, "time": 0.0,
+                    "notes": "hearth+lantern+dark corner; zenith moon" },
+  "cozy-midday":  { "set": "gallery", "pos": [7, 9, 6],  "yaw": 149, "pitch": -8, "time": 0.5,
+                    "notes": "south wall+door; zenith sun (south glass never gets direct sun)" },
+  "cozy-golden":  { "set": "gallery", "pos": [8, 9, 3],  "yaw": 90,  "pitch": -8, "time": 0.78,
+                    "notes": "west slot raking the hearth; sun_y 0.138 west" },
+  "furnace-050":  { "set": "gallery", "pos": [18, 9, 3], "yaw": 270, "pitch": 0,  "time": 0.5,
+                    "notes": "door plugged with wall node before capture" },
+  "furnace-073":  { "set": "gallery", "pos": [31, 9, 3], "yaw": 270, "pitch": 0,  "time": 0.5,
+                    "notes": "door plugged with wall node before capture" },
+  "cornell":      { "set": "gallery", "pos": [47, 9, 1], "yaw": 0,   "pitch": 12, "time": 0.5,
+                    "notes": "door plugged claude_bridge:gray221; red left, green right" }
+}

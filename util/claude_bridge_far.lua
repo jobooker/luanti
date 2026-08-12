@@ -12,7 +12,11 @@ core.register_globalstep(function(dtime)
     if weather_timer < 60 then return end
     weather_timer = 0
     if mcl_weather and mcl_weather.state and mcl_weather.state ~= "none" then
-        mcl_weather.change_weather("none")
+        -- changer name MUST be passed: mineclonia's change_weather
+        -- logs debug.getinfo(2).name and an anonymous globalstep has
+        -- none — concatenating that nil KILLED the server (2026-08-13,
+        -- first weather roll ~15 min into the gallery session)
+        mcl_weather.change_weather("none", nil, "claude_bridge")
     end
 end)
 
