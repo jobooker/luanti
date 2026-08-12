@@ -104,6 +104,11 @@ function OPS.hall(p)
         box({ x = dx - 1, y = y, z = -4 }, { x = dx + 1, y = y + 3, z = -1 }, wall)
         box({ x = dx, y = y + 1, z = -4 }, { x = dx, y = y + 2, z = -1 }, "air")
     end
+    -- walk-in entrances at both hall ends (the rooms are only
+    -- reachable through the hall — caught by John on the first
+    -- walkthrough, 2026-08-13: a gallery you cannot enter)
+    box({ x = p.x0, y = y + 1, z = -6 }, { x = p.x0, y = y + 2, z = -6 }, "air")
+    box({ x = p.x1, y = y + 1, z = -6 }, { x = p.x1, y = y + 2, z = -6 }, "air")
     local torch = core.registered_nodes["mcl_torches:torch_wall"]
             and "mcl_torches:torch_wall" or "default:torch_wall"
     local wm = core.dir_to_wallmounted({ x = 0, y = 0, z = -1 })
