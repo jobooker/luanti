@@ -12,8 +12,10 @@ import sys, os, json, time, subprocess
 
 import os as _os
 WORLD = _os.environ.get("CLAUDE_WORLD", "/opt/luanti/config/worlds/world")
-FARDIR = os.path.expanduser(
-    "~/Library/Application Support/minetest/claude_far")
+FARDIR = os.path.join(
+    os.environ.get("CLAUDE_MT_DIR") or os.path.expanduser(
+        "~/Library/Application Support/minetest"),
+    "claude_far")
 CHUNK = int(os.environ.get("CLAUDE_FAR_CHUNK", "24"))
 THROTTLE = float(os.environ.get("CLAUDE_FAR_THROTTLE", "0"))  # s between calls
 

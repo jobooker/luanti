@@ -23,7 +23,11 @@ import sys, os, time, glob
 import numpy as np
 from PIL import Image
 
-MTDIR = os.path.expanduser("~/Library/Application Support/minetest")
+# Luanti user dir. Override with CLAUDE_MT_DIR when the client is not on
+# this machine's macOS default — e.g. the Windows box (%APPDATA%\Minetest)
+# when renders move off the M4.
+MTDIR = os.environ.get("CLAUDE_MT_DIR") or os.path.expanduser(
+    "~/Library/Application Support/minetest")
 SHOTS = os.path.join(MTDIR, "screenshots")
 PATCH = os.path.join(MTDIR, "claude_settings_patch.conf")
 OUT = os.path.expanduser("~/Downloads/luanti-shots")
