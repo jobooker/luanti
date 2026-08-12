@@ -45,6 +45,8 @@ function OPS.sample_columns(p)
                     and (dt == "plantlike" or dt == "plantlike_rooted"
                         or dt == "firelike" or dt == "signlike"
                         or dt == "raillike" or dt == "torchlike")
+                -- thin leveled layers (snow) are air, not a +1m wall
+                if def.paramtype2 == "leveled" then skip = true end
                 if not skip and (def.light_source or 0) > 0
                         and dt == "airlike" then
                     skip = true

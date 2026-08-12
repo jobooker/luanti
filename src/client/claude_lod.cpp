@@ -60,6 +60,12 @@ void summarizeBlock(Client *client, MapBlock *block)
 			continue;
 		if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
 			continue;
+		// thin leveled layers (snow): counting them as full nodes raised
+		// coarse ground +1m over snowfields — the LOD "wall" John caught
+		// 2026-08-12. The snow LOOK survives: MCL ground under layers is
+		// the white snowy-grass variant, full snow blocks aren't leveled.
+		if (f.param_type_2 == CPT2_LEVELED)
+			continue;
 		int sub = (z / 4) * 16 + (y / 4) * 4 + (x / 4);
 		video::SColor col(255, 180, 180, 180);
 		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
@@ -327,6 +333,8 @@ static inline u8 classify(const NodeDefManager *ndef, content_t c)
 		cls = 1;
 	else if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
 		cls = 1;
+	else if (f.param_type_2 == CPT2_LEVELED)
+		cls = 1; // thin snow layers: air, not a +1m wall (see summarize)
 	else if (f.isLiquid())
 		cls = 3;
 	if (cls != 1 && f.visuals && f.visuals->minimap_color.getAlpha() > 0) {
