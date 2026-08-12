@@ -1887,13 +1887,12 @@ static void claudeVolumeSnapshot(Client *client)
 		if (f.light_source > 0) {
 			// emissive beats liquid: lava must GLOW, not mirror
 			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;
-			// NEE list is for POINT lights only. Area emitters (lava
-			// lakes) are barn doors the random ambient ray can't miss —
-			// and they'd flood all 8 aimed slots with adjacent cells.
-			if (!f.isLiquid())
-				emitters.push_back({(float)x + 0.5f, (float)y + 0.5f,
-						(float)z + 0.5f,
-						std::min<int>(f.light_source, 14) / 14.0f});
+			// NEE list is for POINT lights only (ADR-0009 #4). Full-cube
+			// area emitters were ALSO pushed here, double-counting them:
+			// once as geometry the path hits, once as an aimed point
+			// light — in an all-emissive furnace room the 8 nearest wall
+			// cells became extra lights. Area emitters are barn doors
+			// the ambient ray can't miss; they get no aimed slot.
 		} else if (f.isLiquid())
 			acls = 100;
 		else if (f.drawtype == NDT_ALLFACES
