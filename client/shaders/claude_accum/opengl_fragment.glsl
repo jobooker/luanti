@@ -695,7 +695,11 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			vec3 albedo = pathAlbedo(s.rgb);
 			float jh = fract(sin(dot(cell + slab * 17.0,
 					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
-			float jamp = min(0.10, 0.015 + 0.012 * csz);
+			// jitter capped LOW at big rungs: at 30-60px cells, ±10%
+			// random brightness read as "mottled tiled canvas" (John,
+			// zoomed on the Everest) — noise fighting form. Per-face AO
+			// and sunvis carry variation now; jitter is just seasoning.
+			float jamp = min(0.035, 0.01 + 0.006 * csz);
 			albedo *= 1.0 + (jh - 0.5) * 2.0 * jamp;
 			if (claudeFarGrain > 0.5) {
 				// grain INSIDE the face: 1m speckle + 4m patchiness,
