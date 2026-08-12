@@ -37,6 +37,10 @@ struct BlockSummary
 	// lets ONE fold build every rung — the separate 2m block-walker
 	// (whose alignment contract caused the origin-parity wall) is gone.
 	u8 fine[64], finew[64];
+	// per-octant mean color, RGB565 (0 = unset -> fall back to the
+	// subcell mean): real 2m-scale variation folded from real nodes —
+	// John's law: "variation comes from more voxels, not texture"
+	u16 fineCol[64][8];
 	u16 rsum[64], gsum[64], bsum[64]; // summed minimap color of counted nodes
 };
 
@@ -49,8 +53,12 @@ void summarizeBlock(Client *client, MapBlock *block)
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	BlockSummary s = {};
 	static thread_local u8 so[64][8], wo[64][8];
+	static thread_local u32 rc[64][8], gc[64][8], bc[64][8];
 	memset(so, 0, sizeof(so));
 	memset(wo, 0, sizeof(wo));
+	memset(rc, 0, sizeof(rc));
+	memset(gc, 0, sizeof(gc));
+	memset(bc, 0, sizeof(bc));
 	for (s16 z = 0; z < MAP_BLOCKSIZE; z++)
 	for (s16 y = 0; y < MAP_BLOCKSIZE; y++)
 	for (s16 x = 0; x < MAP_BLOCKSIZE; x++) {
@@ -106,6 +114,9 @@ void summarizeBlock(Client *client, MapBlock *block)
 			if (f.drawtype == NDT_ALLFACES_OPTIONAL)
 				s.leaf[sub]++;
 		}
+		rc[sub][oct] += col.getRed();
+		gc[sub][oct] += col.getGreen();
+		bc[sub][oct] += col.getBlue();
 		s.rsum[sub] += col.getRed();
 		s.gsum[sub] += col.getGreen();
 		s.bsum[sub] += col.getBlue();
@@ -116,6 +127,12 @@ void summarizeBlock(Client *client, MapBlock *block)
 				s.fine[sub] |= (u8)(1 << o);
 			if (wo[sub][o] >= 5)
 				s.finew[sub] |= (u8)(1 << o);
+			u32 n = (u32)so[sub][o] + wo[sub][o];
+			if (n > 0)
+				s.fineCol[sub][o] = (u16)(
+					(((rc[sub][o] / n) >> 3) << 11)
+					| (((gc[sub][o] / n) >> 2) << 5)
+					| ((bc[sub][o] / n) >> 3));
 		}
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -274,9 +291,17 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 					// shared from the subcell (color grain at 2m is
 					// invisible past the 64-node promotion distance)
 					bool leafdom = s.leaf[sub] * 2 > s.occ[sub];
-					u32 mr = s.rsum[sub] / cnt, mg = s.gsum[sub] / cnt,
-						mb = s.bsum[sub] / cnt;
+					u32 smr = s.rsum[sub] / cnt, smg = s.gsum[sub] / cnt,
+						smb = s.bsum[sub] / cnt;
 					for (int o = 0; o < 8; o++) {
+						// real octant color; 0 = unset (far-fed data)
+						u32 mr = smr, mg = smg, mb = smb;
+						u16 fc = s.fineCol[sub][o];
+						if (fc != 0) {
+							mr = ((fc >> 11) & 31) << 3;
+							mg = ((fc >> 5) & 63) << 2;
+							mb = (fc & 31) << 3;
+						}
 						bool fs = (s.fine[sub] >> o) & 1;
 						bool fw = (s.finew[sub] >> o) & 1;
 						if (!fs && !fw)
