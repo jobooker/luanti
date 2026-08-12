@@ -118,9 +118,12 @@ struct ClaudeVolume
 	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
 	// REAL SUB-VOXEL BITS (round-8): 16^3 bits per node for the 32^3
 	// ring at volume-local [48,80)^3 — the carve law baked per NODE at
-	// snapshot; the shader's microSolid is one fetch. R32UI 16x512x512.
+	// snapshot; the shader's microSolid is one fetch. R8 64x512x512
+	// (one byte = 8 x-subvoxels): integer samplers silently kill the
+	// Irrlicht material (the flat-blue outage), so bits ride a float
+	// sampler with floor/mod extraction.
 	u32 subvox_tex = 0;
-	std::vector<u32> subvox;
+	std::vector<u8> subvox;
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
@@ -1921,8 +1924,8 @@ static void claudeVolumeSnapshot(Client *client)
 	{
 		auto &sv = g_claude_volume.subvox;
 		if (sv.empty())
-			sv.assign((size_t)16 * 512 * 512, 0u);
-		std::fill(sv.begin(), sv.end(), 0u);
+			sv.assign((size_t)64 * 512 * 512, 0);
+		std::fill(sv.begin(), sv.end(), 0);
 		const float mstr = g_settings->exists("claude_micro")
 				? g_settings->getFloat("claude_micro", 0.0f, 2.0f) : 1.0f;
 		const int C = std::max(1, (int)std::floor(2.0f * mstr + 0.5f));
@@ -1949,13 +1952,15 @@ static void claudeVolumeSnapshot(Client *client)
 			if (a <= 230)
 				continue; // air / water / glass / nub: no bits
 			if (a != 250) {
-				// plain solid: 16 consecutive x-bits per (y,z) row
-				u32 m = 0xFFFFu << ((rx & 1) * 16);
-				size_t wx = (size_t)(rx >> 1);
+				// plain solid: two full bytes per (y,z) row
+				size_t bx = (size_t)rx * 2;
 				for (int s2 = 0; s2 < 16; s2++)
-				for (int t2 = 0; t2 < 16; t2++)
-					sv[((size_t)(rz * 16 + s2) * 512
-							+ (ry * 16 + t2)) * 16 + wx] |= m;
+				for (int t2 = 0; t2 < 16; t2++) {
+					size_t row = ((size_t)(rz * 16 + s2) * 512
+							+ (ry * 16 + t2)) * 64 + bx;
+					sv[row] = 0xFF;
+					sv[row + 1] = 0xFF;
+				}
 				continue;
 			}
 			u8 slot = mids[vi];
@@ -1987,8 +1992,8 @@ static void claudeVolumeSnapshot(Client *client)
 				if (sol) {
 					int gx = rx * 16 + sx2;
 					sv[((size_t)(rz * 16 + sz2) * 512
-							+ (ry * 16 + sy2)) * 16 + (gx >> 5)]
-							|= (1u << (gx & 31));
+							+ (ry * 16 + sy2)) * 64 + (gx >> 3)]
+							|= (u8)(1 << (gx & 7));
 				}
 			}
 		}
@@ -2005,11 +2010,14 @@ static void claudeVolumeSnapshot(Client *client)
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-			glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI, 16, 512, 512, 0,
-					GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+			glTexImage3D(GL_TEXTURE_3D, 0,
+					claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 64, 512, 512,
+					0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
+					GL_UNSIGNED_BYTE, nullptr);
 		}
-		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 16, 512, 512,
-				GL_RED_INTEGER, GL_UNSIGNED_INT, sv.data());
+		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
+				claudeUseR8() ? GL_RED : GL_LUMINANCE,
+				GL_UNSIGNED_BYTE, sv.data());
 		glActiveTexture(prev_au);
 	}
 

@@ -82,7 +82,7 @@ uniform lowp float claudeFarFog;
 // at volume-local [48,80)^3, baked once per snapshot from the same
 // carve law. 1 (default) = one-fetch microSolid; 0 = trace-time carve.
 uniform lowp float claudeSubvox;
-uniform usampler3D claudeSubvoxTex;
+uniform sampler3D claudeSubvoxTex; // R8: one byte = 8 x-subvoxels
 uniform lowp float claudeSkyAz;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
@@ -341,11 +341,12 @@ bool microSolid(vec3 node, float slot, vec3 sc, float rot,
 		vec3 rl = node - vec3(48.0);
 		if (all(greaterThanEqual(rl, vec3(0.0)))
 				&& all(lessThan(rl, vec3(32.0)))) {
-			ivec3 svc = ivec3(rl) * 16
-					+ ivec3(clamp(sc, vec3(0.0), vec3(15.0)));
-			uint w = texelFetch(claudeSubvoxTex,
-					ivec3(svc.x >> 5, svc.y, svc.z), 0).r;
-			return ((w >> uint(svc.x & 31)) & 1u) == 1u;
+			vec3 svc = rl * 16.0 + clamp(sc, vec3(0.0), vec3(15.0));
+			float b = texture3D(claudeSubvoxTex,
+					(vec3(floor(svc.x / 8.0), svc.y, svc.z) + 0.5)
+						/ vec3(64.0, 512.0, 512.0)).r;
+			float bytev = floor(b * 255.0 + 0.5);
+			return mod(floor(bytev / exp2(mod(svc.x, 8.0))), 2.0) > 0.5;
 		}
 		return true; // beyond the ring: plain cube (near-only detail)
 	}
@@ -467,6 +468,27 @@ vec4 lrungFetch(float lv, vec3 corigin, float csz, vec3 pvol)
 	// rgb = cached sky/ambient irradiance; a = 0.25 + 0.75*sunVis
 	// (a < 0.2 = cold). The caller recombines with live sun color.
 	return mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
+}
+
+// plane B: per-face AO for a far cell (see claude_nfaces lightRungFaces)
+float lrungFaceAO(float lv, vec3 corigin, float csz, vec3 pvol, vec3 n)
+{
+	float lsz = csz * 2.0;
+	vec3 lc = clamp((pvol - corigin) / lsz, vec3(0.0), vec3(63.999));
+	float zl = floor(lc.z);
+	float tileIndex = lv * 64.0 + zl;
+	vec2 tile = vec2(mod(tileIndex, 16.0), floor(tileIndex / 16.0));
+	vec2 uv = (vec2(1024.0, 1536.0) + tile * 64.0 + floor(lc.xy)
+			+ 0.5) / vec2(2048.0, 2816.0);
+	vec4 b = texture2D(nearFacesTex, uv);
+	if (b.a < 0.5)
+		return 1.0; // cold: no occlusion knowledge yet
+	float packed = abs(n.x) > 0.5 ? b.r : abs(n.y) > 0.5 ? b.g : b.b;
+	float v = packed * 1024.0;
+	float qa = floor(v / 32.0);
+	float qb = v - qa * 32.0;
+	bool pos = n.x > 0.5 || n.y > 0.5 || n.z > 0.5;
+	return clamp((pos ? qa : qb) / 31.0, 0.0, 1.0);
 }
 
 // Binary sun occlusion marched in ONE cascade level from a volume-local
@@ -700,7 +722,13 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 				// ndl — distant shadows keep shape, sunsets graze right
 				vec3 direct2 = volumeLightCol * sunvis
 						* (fol ? (0.35 + 0.45 * ndl2) : ndl2);
-				vec3 c2 = albedo * (direct2 + skyamb * (fol ? 1.3 : 1.0));
+				// v3 (photorealistic legos): PER-FACE ambient occlusion —
+				// each face of a far block is individually shaded, so
+				// distant terrain reads as lit blocks, not pixel art
+				float fao = lrungFaceAO(slab, corigin, csz,
+						hpv + n * csz * 1.2, n);
+				vec3 c2 = albedo * (direct2
+						+ skyamb * mix(0.3, 1.15, fao) * (fol ? 1.3 : 1.0));
 				if (volumeDebug > 4.5 && volumeDebug < 5.5)
 					c2 = tint * (0.4 + 0.6 * ndl2);
 				if (s.a < 0.6)
