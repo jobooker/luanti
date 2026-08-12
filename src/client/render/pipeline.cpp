@@ -5,8 +5,15 @@
 #include "pipeline.h"
 #include "client/client.h"
 #include "client/hud.h"
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
+// ClaudeGpuProf times passes with raw GL queries. Same cross-platform
+// story as game.cpp: <OpenGL/gl3.h> was Apple-only, and the timer-query
+// entry points are not in Windows' GL 1.1 opengl32.dll, so they have to
+// come from the engine's loader.
+#include <mt_opengl.h>
+// mt_opengl keeps its scalar typedefs private; this is the one we use,
+// with its standard Khronos definition.
+#include <cstdint>
+using GLuint64 = std::uint64_t;
 #include <algorithm>
 #include "gettext.h"
 #include "IRenderTarget.h"
@@ -315,14 +322,14 @@ void RenderPipeline::run(PipelineContext &context)
 	int mydepth = P.depth++;
 	if (mydepth == 0) {
 		if (!P.inited) {
-			glGenQueries(ClaudeGpuProf::MAXQ, P.q[0]);
-			glGenQueries(ClaudeGpuProf::MAXQ, P.q[1]);
+			GL.GenQueries(ClaudeGpuProf::MAXQ, P.q[0]);
+			GL.GenQueries(ClaudeGpuProf::MAXQ, P.q[1]);
 			P.inited = true;
 		}
 		int prev = 1 - P.cur;
 		for (int i = 0; i < P.count[prev]; i++) {
 			GLuint64 ns = 0;
-			glGetQueryObjectui64v(P.q[prev][i], GL_QUERY_RESULT, &ns);
+			GL.GetQueryObjectui64v(P.q[prev][i], GL.QUERY_RESULT, &ns);
 			float msv = (float)(ns * 1e-6);
 			P.ms[i] = P.ms[i] * 0.9f + msv * 0.1f;
 		}
@@ -337,11 +344,11 @@ void RenderPipeline::run(PipelineContext &context)
 		if (timed) {
 			slot = P.cursor++;
 			P.timing = true;
-			glBeginQuery(GL_TIME_ELAPSED, P.q[P.cur][slot]);
+			GL.BeginQuery(GL.TIME_ELAPSED, P.q[P.cur][slot]);
 		}
 		step->run(context);
 		if (timed) {
-			glEndQuery(GL_TIME_ELAPSED);
+			GL.EndQuery(GL.TIME_ELAPSED);
 			P.timing = false;
 		}
 	}

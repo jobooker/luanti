@@ -63,9 +63,7 @@ using GLint = int;
 using GLenum = unsigned int;
 using GLuint = unsigned int;
 #include "client/render/pipeline.h"
-#ifndef GL.RED_INTEGER
-#define GL.RED_INTEGER 0x8D94
-#endif // ClaudeGpuProf (per-pass GPU times)
+// ClaudeGpuProf (per-pass GPU times)
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
