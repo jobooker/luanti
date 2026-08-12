@@ -172,6 +172,7 @@ void set_default_settings()
 	settings->setDefault("keymap_toggle_claude_carve", "SYSTEM_SCANCODE_25"); // KEY_KEY_V
 	settings->setDefault("keymap_claude_time_back", "SYSTEM_SCANCODE_47"); // [
 	settings->setDefault("keymap_claude_time_fwd", "SYSTEM_SCANCODE_48"); // ]
+	settings->setDefault("keymap_claude_time_toggle", "SYSTEM_SCANCODE_19"); // P
 #ifndef NDEBUG
 	settings->setDefault("keymap_toggle_update_camera", "SYSTEM_SCANCODE_61"); // KEY_F4
 #else

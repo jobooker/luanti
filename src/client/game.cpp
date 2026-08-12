@@ -3243,6 +3243,9 @@ void Game::processUserInput(f32 dtime)
 		runData.jump_timer_down += dtime;
 
 	processKeyInput();
+	// P: tap start/stop time, hold to fast-forward (needs dtime, so it
+	// lives outside the pressed-key chain)
+	claudeTimeKey(isKeyDown(KeyType::CLAUDE_TIME_TOGGLE), dtime);
 	processItemSelection(&runData.new_playeritem);
 }
 
@@ -3666,6 +3669,36 @@ void Game::toggleClaudeCarve()
 		m_game_ui->showTranslatedStatusText("Carving ON");
 	else
 		m_game_ui->showTranslatedStatusText("Carving OFF (flat blocks)");
+}
+
+// P: tap = start/stop time, hold (>0.4s) = fast-forward while held,
+// releasing restores the tap state. The client tracks running/stopped
+// itself (it can't read the server setting), so a manual /set
+// time_speed can drift the toggle by one tap — self-corrects on use.
+void Game::claudeTimeKey(bool down, f32 dtime)
+{
+	if (down) {
+		m_claude_time_held += dtime;
+		if (m_claude_time_held > 0.4f && !m_claude_time_fast) {
+			m_claude_time_fast = true;
+			client->sendChatMessage(utf8_to_wide("/set time_speed 5000"));
+			m_game_ui->showTranslatedStatusText("Time: fast-forward");
+		}
+		return;
+	}
+	if (m_claude_time_held <= 0.0f)
+		return;
+	if (m_claude_time_fast)
+		m_claude_time_fast = false; // release restores the tap state
+	else
+		m_claude_time_running = !m_claude_time_running;
+	client->sendChatMessage(utf8_to_wide(m_claude_time_running
+			? "/set time_speed 72" : "/set time_speed 0"));
+	if (m_claude_time_running)
+		m_game_ui->showTranslatedStatusText("Time: running");
+	else
+		m_game_ui->showTranslatedStatusText("Time: stopped");
+	m_claude_time_held = 0.0f;
 }
 
 // [ / ]: nudge server time an hour back/forward (sends /time; the
