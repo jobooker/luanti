@@ -56,16 +56,18 @@ def main():
     std = meas.std(axis=(0, 1))
     clipped = float((patch >= 254.0 / 255.0).mean())
 
-    # engine-assigned per-channel stored color after the warm force
-    stored = np.array([255.0, max(tex, 200.0), max(tex, 120.0)])
+    # authored color survives the snapshot since ADR-0009 #3 (40720f6+)
+    stored = np.array([tex, tex, tex])
     rho = (stored / 255.0) ** 2.2
     e = 1.0  # light_source 14 -> class 240 -> e clamps to 1
-    le = rho * (0.4 + 2.0 * e)          # what light rays see
-    eyehit = rho * (0.5 + 5.0 * e)      # what the primary ray returns
-    # 4-bounce truncated series for the diverging red channel
+    le = rho * (0.4 + 2.0 * e)          # ADR-0009 emitStrength(e)
+    eyehit = rho * (0.5 + 5.0 * e)      # legacy eye-hit constant
     analytic = np.where(rho < 0.999,
                         le / (1.0 - rho),
                         le * sum(rho ** k for k in range(4)))
+    # photoPath caps at 4 bounces (eye hit + 4): the honest expectation
+    # for a correct-but-truncated integrator
+    trunc5 = le * sum(rho ** k for k in range(5))
 
     print("furnace %s  patch(%d,%d)-(%d,%d)  clipped %.1f%%"
           % (variant, x0, y0, x1, y1, clipped * 100))
@@ -73,8 +75,10 @@ def main():
     for i, ch in enumerate("RGB"):
         note = "  [rho=1: 4-bounce truncated sum]" if rho[i] > 0.999 else ""
         print("%s  measured %.3f +/- %.3f | analytic Le/(1-rho) %.3f "
-              "(ratio %.3f) | eye-hit-only %.3f (ratio %.3f)%s"
+              "(ratio %.3f) | 5-event trunc %.3f (ratio %.3f) | "
+              "eye-hit-only %.3f (ratio %.3f)%s"
               % (ch, mean[i], std[i], analytic[i], mean[i] / analytic[i],
+                 trunc5[i], mean[i] / trunc5[i],
                  eyehit[i], mean[i] / eyehit[i], note))
     print("Le (transport) per channel: %s" % np.round(le, 3))
 

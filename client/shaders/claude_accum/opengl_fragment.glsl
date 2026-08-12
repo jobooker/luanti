@@ -232,6 +232,18 @@ vec3 pathAlbedo(vec3 raw)
 	return max(pow(raw, vec3(2.2)), vec3(0.005));
 }
 
+// ADR-0009 #1: ONE emission strength. Le = pathAlbedo(cellColor) *
+// emitStrength(e), identical for eye hits, photo paths, and bounce
+// rays. Replaces the era of three constants (eye 0.5+5e, light
+// 0.4+2e, nub 4.0 — the nub keeps its billboard constant, exempted:
+// it is the visible body of a POINT light whose energy flows through
+// NEE, not area emission). The light-path curve won: world-received
+// energy is unchanged, only the emitter's displayed face changed.
+float emitStrength(float e)
+{
+	return 0.4 + 2.0 * e;
+}
+
 // forward-declared: fog tint for far terrain = the sky WITHOUT the
 // sun/moon disc. Mixing toward the full sky burned the 40x disc through
 // distant mountains ("the moon and sun shine right through them").
@@ -1149,8 +1161,11 @@ float lightVisCheap(vec3 ro, vec3 sd)
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		if (a > 0.25) {
 			// carved cells block as their 1m cube at this rung
-			if (a > 0.6 && a < 0.97)
-				continue; // emissive passes
+			// ADR-0009: area-emissive cells are SURFACES and occlude
+			// aimed rays like any solid; only the torch-nub band (the
+			// bodiless point-light billboard) stays transparent
+			if (a > 0.63 && a < 0.66)
+				continue; // nub passes
 			float tr = cellTransmit(a);
 			if (a > 0.97 && a < 0.99)
 				tr = 0.0;
@@ -1335,11 +1350,14 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 		}
 		if (s.a > 0.25) {
 			float fall = 1.0 - t / 160.0;
-			// emissive hit: the surface IS a light — return its glow
-			// directly (this is how torches light nearby walls)
+			// ADR-0009 #2: emissive surfaces emit AND reflect on the
+			// bounce path too — glow adds to the lit estimate below
+			// instead of replacing it (this is how torches light
+			// nearby walls AND those walls keep their own shading)
+			vec3 selfGlow = vec3(0.0);
 			if (s.a > 0.6 && s.a < 0.97) {
 				float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
-				return pathAlbedo(s.rgb) * (0.4 + e * 2.0) * fall * trans;
+				selfGlow = pathAlbedo(s.rgb) * emitStrength(e);
 			}
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
@@ -1397,7 +1415,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				lit += faceCache(cell, n) * radianceStrength;
 			// torch NEE at the bounce vertex (see micro branch above)
 			lit += emitterLightCheap(hp, n);
-			return pathAlbedo(s.rgb) * lit * fall * trans;
+			return (pathAlbedo(s.rgb) * lit + selfGlow) * fall * trans;
 		}
 	}
 	return vec3(0.0);
@@ -1407,8 +1425,10 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 // photoMarch: raw-hit segment marcher. Unlike bounceRay it does NOT
 // shade — it returns what it found and lets the path loop own the
 // light. Transmissive cells attenuate `tp` in place. Result codes:
-// 0 = sky escape, 1 = solid hit (hp/n/alb filled), 2 = emissive hit
-// (alb = glow radiance), 3 = absorbed (void floor / budget / opacity).
+// 0 = sky escape, 1 = solid hit (hp/n/alb filled), 3 = absorbed
+// (void floor / budget / opacity), 4 = emissive solid hit (hp/n/alb
+// filled with rho; g_photoGlow carries Le — ADR-0009).
+vec3 g_photoGlow = vec3(0.0);
 int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
 		out vec3 hp, out vec3 n, out vec3 alb)
 {
@@ -1466,17 +1486,20 @@ int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
 				return 3;
 			continue;
 		}
-		if (s.a > 0.6 && s.a < 0.97) {
-			float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
-			alb = pathAlbedo(s.rgb) * (0.4 + e * 2.0);
-			return 2;
-		}
 		n = vec3(0.0);
 		if (axis == 0) n.x = -stepDir.x;
 		else if (axis == 1) n.y = -stepDir.y;
 		else n.z = -stepDir.z;
 		hp = ro + rd * t + n * 0.01;
 		alb = pathAlbedo(s.rgb);
+		// ADR-0009 #2: emissive hit = solid hit that also glows. The
+		// caller adds g_photoGlow and CONTINUES the path with rho —
+		// the old return-glow-and-stop made Le/(1-rho) inexpressible.
+		if (s.a > 0.6 && s.a < 0.97) {
+			float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
+			g_photoGlow = alb * emitStrength(e);
+			return 4;
+		}
 		return 1;
 	}
 	return 3;
@@ -1498,8 +1521,9 @@ vec3 photoPath(vec3 p0, vec3 rd0, vec3 sd, vec3 seed)
 		vec3 hp, n, alb;
 		int res = photoMarch(p, dir, tp, hp, n, alb);
 		if (res == 0) { L += tp * pathSkyRadiance(dir); break; }
-		if (res == 2) { L += tp * alb; break; }
 		if (res == 3) break;
+		if (res == 4) // emissive surface: collect Le, then bounce off it
+			L += tp * g_photoGlow;
 		float ndl = max(dot(n, sd), 0.0);
 		if (ndl > 0.0)
 			L += tp * alb * volumeLightCol * ndl
@@ -2108,12 +2132,16 @@ void main(void)
 				microMiss = true;
 			}
 			if (!microMiss && s.a > 0.25 && axis >= 0) {
-				// emissive primary hit: self-lit, no rays needed
+				// ADR-0009 #2: an emissive surface EMITS AND REFLECTS.
+				// It used to return its glow and stop, which made rho
+				// meaningless on glowing cells and capped a sealed
+				// emissive room at Le instead of Le/(1-rho). Now it
+				// contributes Le and falls through to the full solid
+				// shading below — a normal surface that happens to glow.
+				vec3 selfGlow = vec3(0.0);
 				if (s.a > 0.6 && s.a < 0.97) {
 					float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
-					fresh = pathAlbedo(s.rgb) * (0.5 + e * 5.0);
-					done = true;
-					break;
+					selfGlow = pathAlbedo(s.rgb) * emitStrength(e);
 				}
 				vec3 n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
@@ -2294,7 +2322,7 @@ void main(void)
 						|| claudeCost > 3.5;
 				vec3 emDiff = skipE ? vec3(0.0) : emitterLightSpec(hp, n, -rd,
 						glossOn > 0.005 ? specGloss : 0.0, specAcc, 8);
-				fresh = albedo * (direct + amb + emDiff);
+				fresh = albedo * (direct + amb + emDiff) + selfGlow;
 				if (glossOn > 0.005) {
 					if (sunVis > 0.0) {
 						float nh = max(dot(n, normalize(sd - rd)), 0.0);
