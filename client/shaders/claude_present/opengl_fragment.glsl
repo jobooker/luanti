@@ -35,14 +35,16 @@ void main(void)
 		return;
 	}
 
-	// full-res raster depth -> linear distance in node units
+	// full-res raster depth -> linear distance in node units.
+	// Depth scale is 4096 (cascade hits reach ~900 nodes; the old 200
+	// clamp classified all far terrain as sky and painted raster over it)
 	float d = texture2D(depthmap, uv).r;
 	float zn = volumeDepthRange.x;
 	float zf = volumeDepthRange.y;
-	float guide = 200.0;
+	float guide = 4096.0;
 	if (d < 0.9999) {
 		float ez = 2.0 * zn * zf / (zf + zn - (2.0 * d - 1.0) * (zf - zn));
-		guide = min(ez / 10.0, 200.0); // BS = 10
+		guide = min(ez / 10.0, 4090.0); // BS = 10
 	} else {
 		// Empty raster depth means this pixel is SKY. Luanti already draws a
 		// proper one there — sun, clouds, stars, and Mineclonia's phase-correct
@@ -61,8 +63,9 @@ void main(void)
 		// range, and the tracer sees further than the mesh does. Taking raster
 		// there punched sky-coloured holes straight through traced terrain.
 		// Require the TRACED ray to have escaped as well (alpha carries
-		// tHit/200, so a miss sits at the far end).
-		if (texture2D(accum, uv).a > 0.97) {
+		// tHit/4096, so a miss sits at the far end — and cascade hits at
+		// hundreds of nodes must NOT be mistaken for sky, hence 0.998).
+		if (texture2D(accum, uv).a > 0.998) {
 			gl_FragColor = vec4(texture2D(merged, uv).rgb, 1.0);
 			return;
 		}
@@ -80,7 +83,10 @@ void main(void)
 		vec4 s = texture2D(accum, base + o * ht);
 		float bw = (o.x > 0.5 ? f.x : 1.0 - f.x)
 				* (o.y > 0.5 ? f.y : 1.0 - f.y);
-		float dw = exp(-abs(s.a * 200.0 - guide) * 0.6);
+		// depth-agreement weight, RELATIVE at range: at 800 nodes a
+		// per-node penalty would zero every tap
+		float dw = exp(-abs(s.a * 4096.0 - guide)
+				/ max(1.7, 0.02 * guide));
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
 		wsum += w;

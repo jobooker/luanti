@@ -299,6 +299,152 @@ void microNeighbours(vec3 cell, out vec3 nbNeg, out vec3 nbPos)
 		texture3D(claudeVolume, (cell + vec3(0.5, 0.5, 1.5)) / S).a > 0.9 ? 1.0 : 0.0);
 }
 
+// ---- far cascade (claude_lod Phase 1): one 8 m level to +/-512 m ----
+// Full CONCENTRIC volume, not an annulus: it covers the near field too
+// (coarsely), so promoted rays are always correct-but-coarse and never
+// need demotion. Slab 0 of a 5-slab texture (later levels are data, not
+// layout). All positions here are VOLUME-LOCAL node coords; cascade
+// cells are (p - cascade0Origin) / cascade0Cell.
+uniform sampler3D claudeCascades;      // 128x128x640 RGBA8
+uniform sampler3D claudeCascadeCoarse; // 32x32x160 R8 any-solid bricks
+uniform vec3 cascade0Origin;  // cascade cell (0,0,0), volume-local nodes
+uniform float cascade0Cell;   // nodes per cell (8)
+uniform float claudeCascadeCount; // 0 = off / not built yet
+
+vec4 cascadeSample(vec3 c)
+{
+	return texture3D(claudeCascades,
+			vec3((c.xy + 0.5) / 128.0, (c.z + 0.5) / 640.0));
+}
+
+// Binary sun occlusion marched in 8 m cells from a volume-local point:
+// this is what lets a mountain 400 nodes west dim the camp at sunset.
+// Start is biased 1.2 cells along the ray — the launch point sits on
+// (or exits near) real terrain whose own coarse cell is >50% solid, and
+// sampling it would self-shadow everything near any slope. The bias
+// trades that for a slight light leak at terrain-scale silhouettes,
+// invisible at 8 m frequency.
+float farShadow(vec3 pvol, vec3 sd)
+{
+	if (claudeCascadeCount < 0.5)
+		return 1.0;
+	vec3 pc = (pvol - cascade0Origin) / cascade0Cell + sd * 1.2;
+	vec3 cell = floor(pc);
+	vec3 stepDir = sign(sd);
+	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
+	for (int i = 0; i < 160; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0)))
+				|| any(greaterThanEqual(cell, vec3(128.0))))
+			return 1.0;
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCascadeCoarse,
+				vec3((cc.xy + 0.5) / 32.0, (cc.z + 0.5) / 160.0)).r < 0.5) {
+			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
+					* max(abs(sd), vec3(1e-6));
+			vec3 tt = (bb - pc) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z) + 1e-3;
+			vec3 p2 = pc + sd * tj;
+			cell = floor(p2);
+			sideDist = tj + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
+		if (cascadeSample(cell).a > 0.9)
+			return 0.0;
+	}
+	return 1.0;
+}
+
+// Eye/bounce continuation into the cascade after the near volume is
+// exhausted. t is WORLD-NODE units along rd from ro (same t the caller
+// tracks), so depth stays continuous across the promotion. Returns rgb
+// + hit t in w (w < 0 = escaped to sky).
+vec4 farTrace(vec3 ro, vec3 rd, float t0)
+{
+	if (claudeCascadeCount < 0.5)
+		return vec4(0.0, 0.0, 0.0, -1.0);
+	vec3 p0 = ro + rd * (t0 + 1e-2);
+	vec3 pc = (p0 - cascade0Origin) / cascade0Cell;
+	vec3 cell = floor(pc);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
+	float tc = 0.0;
+	int axis = -1;
+	for (int i = 0; i < 224; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			tc = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			tc = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			tc = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0)))
+				|| any(greaterThanEqual(cell, vec3(128.0))))
+			return vec4(0.0, 0.0, 0.0, -1.0);
+		vec3 cc = floor(cell / 4.0);
+		if (texture3D(claudeCascadeCoarse,
+				vec3((cc.xy + 0.5) / 32.0, (cc.z + 0.5) / 160.0)).r < 0.5) {
+			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+					* max(abs(rd), vec3(1e-6));
+			vec3 tt = (bb - pc) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z);
+			if (tt.x <= tt.y && tt.x <= tt.z) axis = 0;
+			else if (tt.y <= tt.z) axis = 1;
+			else axis = 2;
+			tc = tj;
+			vec3 p2 = pc + rd * (tj + 1e-3);
+			cell = floor(p2);
+			sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
+		vec4 s = cascadeSample(cell);
+		if (s.a > 0.35 && axis >= 0) {
+			vec3 n = vec3(0.0);
+			if (axis == 0) n.x = -stepDir.x;
+			else if (axis == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			float tw = t0 + tc * cascade0Cell;
+			vec3 hpv = ro + rd * tw;
+			// reduced far shading: albedo x (sun + sky), per-cell jitter
+			// so distant fields aren't flat. No micro, atlas, emitters,
+			// or bounce — invisible at this angular size.
+			vec3 albedo = pathAlbedo(s.rgb);
+			float jh = fract(sin(dot(cell,
+					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+			albedo *= 0.9 + 0.2 * jh;
+			float ndl = max(dot(n, volumeSunDir), 0.0);
+			vec3 direct = ndl > 0.0
+					? volumeLightCol * (ndl
+						* farShadow(hpv + n * cascade0Cell, volumeSunDir))
+					: vec3(0.0);
+			vec3 c = albedo * (direct + pathSkyRadiance(n) * SKY_BOUNCE);
+			if (s.a < 0.6) // far water: flat sky mirror
+				c = mix(c, pathSkyRadiance(
+						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
+			// debug 5: paint the cascade's contribution red
+			if (volumeDebug > 4.5)
+				c = vec3(0.9, 0.15, 0.15) * (0.4 + 0.6 * ndl);
+			// aerial perspective: the beauty term, and the concealer for
+			// the data frontier (unseen terrain fades into atmosphere)
+			c = mix(c, pathSkyRadiance(rd), 1.0 - exp(-tw / 900.0));
+			return vec4(c, tw);
+		}
+	}
+	return vec4(0.0, 0.0, 0.0, -1.0);
+}
+
 float lightVis(vec3 ro, vec3 sd)
 {
 	const float S = 128.0;
@@ -317,7 +463,10 @@ float lightVis(vec3 ro, vec3 sd)
 			tcur = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
-			return vis;
+			// left the near volume unblocked: promote into the 8 m
+			// cascade so FAR terrain still occludes — the mile-long
+			// mountain shadow. No-op (returns 1) when cascades are off.
+			return vis * farShadow(ro + sd * tcur, sd);
 		vec3 cc = floor(cell / 4.0);
 		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
 			// empty brick: leap to its far side in one step
@@ -960,6 +1109,15 @@ void main(void)
 				break;
 			}
 		} else if (i > 0) {
+			// near volume exhausted: continue into the 8 m cascade
+			vec4 far = farTrace(ro, rd, t);
+			if (far.w > 0.0) {
+				fresh = far.rgb;
+				t = far.w;
+				axis = 0; // synthetic: far hits are real geometry
+				done = true;
+				break;
+			}
 			fresh = pathSkyRadiance(rd);
 			done = true;
 			break;
@@ -979,9 +1137,14 @@ void main(void)
 	// Reprojection: find where THIS pixel's world point was on last
 	// frame's screen, and only trust history whose stored hit distance
 	// (alpha channel) agrees with the previous camera's view of it.
-	float tHit = done && axis >= 0 ? min(t, 199.0) : 200.0;
-	vec3 W = ro + rd * min(t, 400.0);
-	if (tHit >= 199.5)
+	// Depth scale is 4096 now, not 200: cascade hits land out to ~900
+	// nodes and clamping them to 200 classified ALL far terrain as sky —
+	// the present pass would then paint raster over it. Sky is the top
+	// of the range; the history tolerance goes RELATIVE (2% of distance)
+	// because at 800 nodes a 1.5-node absolute band rejects everything.
+	float tHit = done && axis >= 0 ? min(t, 4090.0) : 4096.0;
+	vec3 W = ro + rd * min(t, 4090.0);
+	if (tHit >= 4095.0)
 		W = ro + rd * 400.0; // sky: reproject by direction, far point
 	vec3 fresh_g = pow(max(fresh, vec3(0.0)), vec3(1.0 / 2.2));
 	vec3 rp = reprojectUv(W);
@@ -989,10 +1152,10 @@ void main(void)
 	vec3 prev = vec3(0.0);
 	if (rp.z > 0.5 && accumAlpha < 0.99) {
 		vec4 h = texture2D(history, rp.xy);
-		float tPrev = h.a * 200.0;
-		float tExp = min(length(W - (prevCamPos + 0.5)), 200.0);
-		bool skyMatch = tHit >= 199.5 && tPrev >= 190.0;
-		if (skyMatch || abs(tPrev - tExp) < 1.5) {
+		float tPrev = h.a * 4096.0;
+		float tExp = min(length(W - (prevCamPos + 0.5)), 4096.0);
+		bool skyMatch = tHit >= 4095.0 && tPrev >= 3900.0;
+		if (skyMatch || abs(tPrev - tExp) < max(1.5, 0.02 * tExp)) {
 			// clamp history's drift while moving (bounds resample mush) —
 			// but NOT when deeply converged: yanking settled history
 			// toward each frame's noise was itself a pulse source
@@ -1009,5 +1172,5 @@ void main(void)
 	}
 
 	// accumulate in gamma space (RGBA8 history: better dark precision)
-	gl_FragColor = vec4(mix(prev, fresh_g, a), tHit / 200.0);
+	gl_FragColor = vec4(mix(prev, fresh_g, a), tHit / 4096.0);
 }

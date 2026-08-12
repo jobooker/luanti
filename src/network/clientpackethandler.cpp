@@ -3,6 +3,7 @@
 // Copyright (C) 2015 nerzhul, Loic Blot <loic.blot@unix-experience.fr>
 
 #include "client/client.h"
+#include "client/claude_lod.h"
 
 #include "exceptions.h"
 #include "irr_v2d.h"
@@ -332,6 +333,10 @@ void Client::handleCommand_BlockData(NetworkPacket* pkt)
 	if (m_localdb) {
 		ServerMap::saveBlock(block, m_localdb.get());
 	}
+
+	// claude_lod: fold this block into the far-cascade summary cache at
+	// the only moment its nodes are guaranteed hot in cache anyway
+	claude_lod::summarizeBlock(this, block);
 
 	/*
 		Add it to mesh update queue and set it to be acknowledged after update.

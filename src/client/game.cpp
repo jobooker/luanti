@@ -32,6 +32,7 @@
 #include "network/networkexceptions.h"
 #include "nodedef.h"         // Needed for determining pointing to nodes
 #include "node_visuals.h"    // claude_volume: per-nodetype minimap_color
+#include "client/claude_lod.h" // far cascade (Phase 1)
 #include "nodemetadata.h"
 #include "particles.h"
 #include "porting.h"
@@ -123,6 +124,17 @@ struct ClaudeVolume
 	// as belt-and-braces over the FBO clear.
 	float radiance_frame = 0.0f;
 	int radiance_reset = 2;
+	// far cascade (claude_lod Phase 1): the 8 m level, live. Textures are
+	// allocated at the FULL 5-slab layout from day one (levels are data,
+	// not layout — see luanti-lod-clipmap-plan.md); only slab 0 is filled.
+	u32 cascades_tex = 0;        // 128x128x640 RGBA8, unit 8
+	u32 cascades_coarse_tex = 0; // 32x32x160 R8, unit 9
+	v3s16 cascade8_origin;       // WORLD node coords of cell (0,0,0)
+	bool cascade8_valid = false;
+	u64 cascade8_version = 0;    // summary contentVersion at last build
+	u64 cascade8_build_ms = 0;
+	u32 cascade8_solid = 0;
+	float cascade8_ms = 0.0f;    // last build+upload cost (stats)
 };
 static ClaudeVolume g_claude_volume;
 
@@ -180,6 +192,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_micro_sampler_pixel{"claudeMicro"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matparams_sampler_pixel{"claudeMatParams"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_sampler_pixel{"claudeCascades"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_coarse_sampler_pixel{"claudeCascadeCoarse"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade0_origin_pixel{"cascade0Origin"};
+	CachedPixelShaderSetting<float, 1, false> m_cascade0_cell_pixel{"cascade0Cell"};
+	CachedPixelShaderSetting<float, 1, false> m_cascade_count_pixel{"claudeCascadeCount"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
@@ -657,6 +674,13 @@ public:
 					glActiveTexture(GL_TEXTURE15);
 					glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
 				}
+				if (g_claude_volume.cascades_tex) {
+					glActiveTexture(GL_TEXTURE8);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
+					glActiveTexture(GL_TEXTURE9);
+					glBindTexture(GL_TEXTURE_3D,
+							g_claude_volume.cascades_coarse_tex);
+				}
 				glActiveTexture(prev_active);
 
 				SamplerLayer_t layer = 10;
@@ -671,6 +695,25 @@ public:
 				m_micro_sampler_pixel.set(&mlayer2, services);
 				SamplerLayer_t player = 15;
 				m_matparams_sampler_pixel.set(&player, services);
+				SamplerLayer_t cascl = 8;
+				m_cascades_sampler_pixel.set(&cascl, services);
+				SamplerLayer_t casccl = 9;
+				m_cascades_coarse_sampler_pixel.set(&casccl, services);
+				// cascade origin handed to the shader VOLUME-LOCAL (cascade
+				// world origin minus volume world origin), so the shader
+				// converts a volume-local point to cascade cells with one
+				// subtract and a divide
+				v3f corg = v3f((float)(g_claude_volume.cascade8_origin.X
+							- g_claude_volume.origin.X),
+						(float)(g_claude_volume.cascade8_origin.Y
+							- g_claude_volume.origin.Y),
+						(float)(g_claude_volume.cascade8_origin.Z
+							- g_claude_volume.origin.Z));
+				m_cascade0_origin_pixel.set(corg, services);
+				float ccell = 8.0f;
+				m_cascade0_cell_pixel.set(&ccell, services);
+				float ccount = g_claude_volume.cascade8_valid ? 1.0f : 0.0f;
+				m_cascade_count_pixel.set(&ccount, services);
 			}
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				v3f vorg((float)g_claude_volume.origin.X,
@@ -1702,11 +1745,100 @@ static void claudeWriteStats(f32 dtime)
 					+ g_claude_volume.prev_light_col.Y
 					+ g_claude_volume.prev_light_col.Z) / 3.0f
 			<< ", \"still_frames\": " << g_claude_volume.still_frames
+			<< ", \"cascade8_valid\": " << (g_claude_volume.cascade8_valid ? 1 : 0)
+			<< ", \"cascade8_solid\": " << g_claude_volume.cascade8_solid
+			<< ", \"cascade8_ms\": " << g_claude_volume.cascade8_ms
+			<< ", \"summary_blocks\": " << claude_lod::summaryCount()
 			<< "}\n";
 	std::ofstream f(porting::path_user + "/claude_stats.json",
 			std::ios::trunc);
 	f << os.str();
 	window = 0.0f; frames = 0; worst = 0.0f; best = 1e9f; total = 0.0f;
+}
+
+// claude_lod Phase 1: (re)build and upload the 8 m cascade when it's
+// stale or the camera has strayed. Runs from the 1 Hz settings poll, so
+// worst case one build+upload (~a few ms) per second — never per frame.
+static void claudeCascadeUpdate(Client *client)
+{
+	if (!g_settings->exists("claude_cascades")
+			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f)
+		return;
+	constexpr int N = 128, CELL = 8;
+	constexpr int HALF = N * CELL / 2; // 512 nodes
+	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
+	u64 ver = claude_lod::contentVersion();
+	bool need = !g_claude_volume.cascade8_valid;
+	if (!need) {
+		v3s16 c0 = g_claude_volume.cascade8_origin
+				+ v3s16(HALF, HALF, HALF);
+		v3s16 d = center - c0;
+		if (std::abs(d.X) > 128 || std::abs(d.Y) > 128 || std::abs(d.Z) > 128)
+			need = true; // strayed: recenter (full rebuild is ~2 MB, fine)
+		else if (ver != g_claude_volume.cascade8_version
+				&& porting::getTimeMs() - g_claude_volume.cascade8_build_ms
+						> 4000)
+			need = true; // world changed: refresh at 4 s cadence
+	}
+	if (!need)
+		return;
+	u64 t0 = porting::getTimeMs();
+	v3s16 origin = center - v3s16(HALF, HALF, HALF);
+	// snap to 32 nodes (one coarse brick = 4 cells) so cell identity is
+	// stable in world space across recenters
+	origin.X &= ~31; origin.Y &= ~31; origin.Z &= ~31;
+	static std::vector<u8> rgba, coarse;
+	u32 solid = claude_lod::buildCascade8(origin, rgba, coarse);
+	actionstream << "[claude_lod] build origin=(" << origin.X << ","
+			<< origin.Y << "," << origin.Z << ") solid=" << solid
+			<< " summaries=" << claude_lod::summaryCount() << std::endl;
+	if (solid == 0 && !g_claude_volume.cascade8_valid)
+		return; // no summaries yet: nothing worth uploading
+
+	GLint prev_active_unit = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
+	bool fresh_alloc = !g_claude_volume.cascades_tex;
+	if (fresh_alloc) {
+		glGenTextures(1, &g_claude_volume.cascades_tex);
+		glGenTextures(1, &g_claude_volume.cascades_coarse_tex);
+	}
+	glActiveTexture(GL_TEXTURE8);
+	glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
+	if (fresh_alloc) {
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+		glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 128, 128, 640, 0, GL_RGBA,
+				GL_UNSIGNED_BYTE, nullptr);
+	}
+	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 128, 128, 128, GL_RGBA,
+			GL_UNSIGNED_BYTE, rgba.data());
+	glActiveTexture(GL_TEXTURE9);
+	glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
+	if (fresh_alloc) {
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+		glTexImage3D(GL_TEXTURE_3D, 0,
+				claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 32, 32, 160, 0,
+				claudeUseR8() ? GL_RED : GL_LUMINANCE,
+				GL_UNSIGNED_BYTE, nullptr);
+	}
+	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 32, 32, 32,
+			claudeUseR8() ? GL_RED : GL_LUMINANCE,
+			GL_UNSIGNED_BYTE, coarse.data());
+	glActiveTexture(prev_active_unit);
+
+	g_claude_volume.cascade8_origin = origin;
+	g_claude_volume.cascade8_valid = true;
+	g_claude_volume.cascade8_version = ver;
+	g_claude_volume.cascade8_build_ms = porting::getTimeMs();
+	g_claude_volume.cascade8_solid = solid;
+	g_claude_volume.cascade8_ms = (float)(porting::getTimeMs() - t0);
 }
 
 static void pollSettingsPatch(f32 dtime, Client *client)
@@ -1748,6 +1880,8 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 							- g_claude_volume.last_snap_ms > 2000))
 				claudeVolumeSnapshot(client);
 		}
+		if (consumer_on)
+			claudeCascadeUpdate(client);
 	}
 
 	std::ifstream f(porting::path_user + "/claude_settings_patch.conf");
