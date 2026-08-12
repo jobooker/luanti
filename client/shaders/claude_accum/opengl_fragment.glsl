@@ -62,6 +62,15 @@ uniform lowp float claudeFaceTexels;
 // history even in motion (their reprojection is near-identity), so the
 // uncached far field stops boiling in flight. 0 = uniform history.
 uniform lowp float claudeFarHist;
+// light ladder (ADR-0008 v1): far cells read cached per-cell
+// irradiance from the ladder strip instead of firing per-pixel shadow
+// + bounce marches — deletes the mid-band flicker's source.
+uniform lowp float claudeLightLadder;
+// 1 (default) = dithered LOD promotion: each pixel hands off to the
+// coarser rung at a jittered distance inside a band, and temporal
+// accumulation turns the stochastic band into a cross-fade — ONE
+// transition rule, every seam (the moat/wall line dissolves).
+uniform lowp float claudeLodDither;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
@@ -391,6 +400,32 @@ vec4 cascadeSample(float slab, vec3 c)
 			vec3((c.xy + 0.5) / 128.0, (slab * 128.0 + c.z + 0.5) / 640.0));
 }
 
+// cached irradiance for a far point from the light-ladder strip (the
+// region below y=1536 of the near atlas; written by claude_nfaces).
+// Manual xy bilinear inside the z-slice tile, nearest z — light at
+// these scales is smooth. Cold cells fall back to a sky prior.
+vec3 lrungFetch(float lv, vec3 corigin, float csz, vec3 pvol)
+{
+	float lsz = csz * 2.0;
+	vec3 lc = clamp((pvol - corigin) / lsz, vec3(0.0), vec3(63.999));
+	float zl = floor(lc.z);
+	float tileIndex = lv * 64.0 + zl;
+	vec2 tile = vec2(mod(tileIndex, 16.0), floor(tileIndex / 16.0));
+	vec2 base = vec2(tile.x * 64.0, 1536.0 + tile.y * 64.0);
+	vec2 tf = clamp(lc.xy, vec2(0.5), vec2(63.5)) - 0.5;
+	vec2 i0 = floor(tf);
+	vec2 fr = tf - i0;
+	vec2 inv = vec2(1.0 / 2048.0, 1.0 / 2816.0);
+	vec4 t00 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 0.5)) * inv);
+	vec4 t10 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 0.5)) * inv);
+	vec4 t01 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 1.5)) * inv);
+	vec4 t11 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 1.5)) * inv);
+	vec4 c4 = mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
+	if (c4.a < 0.3)
+		return pathSkyRadiance(vec3(0.0, 1.0, 0.0)) * 0.5;
+	return c4.rgb;
+}
+
 // Binary sun occlusion marched in ONE cascade level from a volume-local
 // point. Returns 1 lit, 0 blocked, -1 = left the box unblocked (caller
 // continues in a coarser level). Start is biased 1.2 cells along the
@@ -533,7 +568,7 @@ vec3 farBounce(float slab, vec3 corigin, float csz, vec3 pvol, vec3 rd,
 // caller resumes the NEXT level exactly where this one left off — one
 // continuous t across every octave, no cracks, no double hits.
 vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
-		vec3 ro, vec3 rd, vec3 sd, float t0)
+		vec3 ro, vec3 rd, vec3 sd, float t0, float capT)
 {
 	vec3 p0 = ro + rd * (t0 + 0.01 * csz);
 	vec3 pc = (p0 - corigin) / csz;
@@ -592,6 +627,25 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
 			float jamp = min(0.10, 0.015 + 0.012 * csz);
 			albedo *= 1.0 + (jh - 0.5) * 2.0 * jamp;
+			// ---- light ladder consumer (ADR-0008 v1): cached per-cell
+			// irradiance replaces the per-pixel shadow + bounce marches
+			// whose per-frame variance WAS the mid-band flicker
+			if (claudeLightLadder > 0.5) {
+				float ndl2 = max(dot(n, sd), 0.0);
+				vec3 cached = lrungFetch(slab, corigin, csz,
+						hpv + n * csz * 1.2);
+				bool fol = s.a > 0.6 && s.a < 0.8;
+				vec3 c2 = albedo * cached
+						* (fol ? 1.05 : (0.5 + 0.5 * ndl2));
+				if (volumeDebug > 4.5 && volumeDebug < 5.5)
+					c2 = tint * (0.4 + 0.6 * ndl2);
+				if (s.a < 0.6)
+					c2 = mix(c2, pathSkyFog(reflect(rd,
+							vec3(0.0, 1.0, 0.0))), 0.6);
+				c2 = mix(c2, pathSkyFog(rd),
+						1.0 - exp(-max(tw - 64.0, 0.0) / 2000.0));
+				return vec4(c2, tw);
+			}
 			// sd is the caller's DISC-JITTERED sun: accumulation averages
 			// the binary shadow into penumbras. Unjittered, grazing dusk
 			// light flipped adjacent cells fully lit/dark — the "picket
@@ -671,37 +725,44 @@ vec4 farTrace(vec3 ro, vec3 rd, vec3 sd, float t0)
 {
 	float tcur = t0;
 	vec4 r;
+	// per-pixel jitter for the dithered hand-off band (last ~quarter of
+	// each level's reach); accumulation averages the band into a fade
+	float dcap = 1.0;
+	if (claudeLodDither > 0.5)
+		dcap = 0.72 + 0.26 * fract(sin(dot(gl_FragCoord.xy
+				+ fract(animationTimer * 5.13) * 29.3,
+				vec2(269.5, 183.3))) * 43758.5453);
 	if (cascadeValid.x > 0.5) {
 		r = farTraceL(0.0, cascade0Origin, 2.0,
-				vec3(0.9, 0.15, 0.15), ro, rd, sd, tcur);
+				vec3(0.9, 0.15, 0.15), ro, rd, sd, tcur, 128.0 * dcap);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValid.y > 0.5) {
 		r = farTraceL(1.0, cascade1Origin, 4.0,
-				vec3(0.9, 0.55, 0.1), ro, rd, sd, tcur);
+				vec3(0.9, 0.55, 0.1), ro, rd, sd, tcur, 256.0 * dcap);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValid.z > 0.5) {
 		r = farTraceL(2.0, cascade2Origin, 8.0,
-				vec3(0.9, 0.9, 0.15), ro, rd, sd, tcur);
+				vec3(0.9, 0.9, 0.15), ro, rd, sd, tcur, 512.0 * dcap);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValidB.x > 0.5) {
 		r = farTraceL(3.0, cascade3Origin, 16.0,
-				vec3(0.2, 0.85, 0.25), ro, rd, sd, tcur);
+				vec3(0.2, 0.85, 0.25), ro, rd, sd, tcur, 1024.0 * dcap);
 		if (r.w > 0.0)
 			return r;
 		tcur = -r.w - 1.0;
 	}
 	if (cascadeValidB.y > 0.5) {
 		r = farTraceL(4.0, cascade4Origin, 32.0,
-				vec3(0.2, 0.8, 0.9), ro, rd, sd, tcur);
+				vec3(0.2, 0.8, 0.9), ro, rd, sd, tcur, 1e9);
 		if (r.w > 0.0)
 			return r;
 	}
@@ -848,7 +909,7 @@ vec3 faceCacheHP(vec3 cell, vec3 n, vec3 hp)
 	vec2 tf = clamp(st * 4.0, vec2(0.5), vec2(3.5)) - 0.5;
 	vec2 i0 = floor(tf);
 	vec2 fr = tf - i0;
-	vec2 inv = vec2(1.0 / 2048.0, 1.0 / 1536.0);
+	vec2 inv = vec2(1.0 / 2048.0, 1.0 / 2816.0);
 	vec4 t00 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 0.5)) * inv);
 	vec4 t10 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 0.5)) * inv);
 	vec4 t01 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 1.5)) * inv);
@@ -1490,7 +1551,28 @@ void main(void)
 	vec3 viewTint = vec3(1.0);
 	bool done = false;
 
+	float promoteT = 1e9;
+	if (claudeLodDither > 0.5) {
+		float dh = fract(sin(dot(gl_FragCoord.xy
+				+ fract(animationTimer * 3.71) * 43.7,
+				vec2(127.1, 311.7))) * 43758.5453);
+		promoteT = 46.0 + 18.0 * dh; // volume->L0 band: 46..64
+	}
 	for (int i = 0; i < 384; i++) {
+		if (i > 0 && t > promoteT) {
+			vec3 fsd = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
+			vec4 far = farTrace(ro, rd, fsd, t);
+			if (far.w > 0.0) {
+				fresh = far.rgb;
+				t = far.w;
+				axis = 0;
+				done = true;
+				break;
+			}
+			fresh = pathSkyRadiance(rd);
+			done = true;
+			break;
+		}
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			vec3 cc = floor(cell / 4.0);
 			if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {

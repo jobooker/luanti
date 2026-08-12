@@ -28,13 +28,6 @@ void summarizeBlock(Client *client, MapBlock *block);
 u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		std::vector<u8> &rgba, std::vector<u8> &coarse);
 
-// Build the 2 m level: FINER than the summaries, so it walks loaded
-// MapBlocks directly (getNodeNoCheck + a per-content classification LUT
-// — no per-node NodeDefManager lookups). Unloaded blocks read as air.
-// ~16M node reads; tens of ms, so the caller schedules it sparsely.
-u32 buildCascade2(Client *client, v3s16 origin_nodes,
-		std::vector<u8> &rgba, std::vector<u8> &coarse);
-
 // Far-data feed (2026-08-12): ingest server-sampled terrain summaries
 // from <path_user>/claude_far/*.json — synthetic BlockSummaries for
 // terrain the client has never visited, entering the SAME summary map

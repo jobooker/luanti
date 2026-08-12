@@ -266,6 +266,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_far_hist_pixel{"claudeFarHist"};
 	float m_light_ladder = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_light_ladder_pixel{"claudeLightLadder"};
+	float m_lod_dither = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_lod_dither_pixel{"claudeLodDither"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -308,7 +310,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 33> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 34> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -342,6 +344,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_cache_remap",
 		"claude_far_hist",
 		"claude_light_ladder",
+		"claude_lod_dither",
 	};
 
 	static float readGoldenHourStrength()
@@ -591,6 +594,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_light_ladder", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = dithered LOD hand-off bands (one transition rule)
+	static float readLodDither()
+	{
+		if (!g_settings->exists("claude_lod_dither"))
+			return 1.0f;
+		return g_settings->getFloat("claude_lod_dither", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -676,6 +687,8 @@ public:
 			m_far_hist = readFarHist();
 		if (name == "claude_light_ladder")
 			m_light_ladder = readLightLadder();
+		if (name == "claude_lod_dither")
+			m_lod_dither = readLodDither();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -725,6 +738,7 @@ public:
 		m_cache_remap = readCacheRemap();
 		m_far_hist = readFarHist();
 		m_light_ladder = readLightLadder();
+		m_lod_dither = readLodDither();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -866,6 +880,7 @@ public:
 			m_cache_remap_pixel.set(&m_cache_remap, services);
 			m_far_hist_pixel.set(&m_far_hist, services);
 			m_light_ladder_pixel.set(&m_light_ladder, services);
+			m_lod_dither_pixel.set(&m_lod_dither, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
 			// they were only bound inside claudeVolumeSnapshot() — which
@@ -2186,10 +2201,12 @@ static void claudeCascadeUpdate(Client *client)
 		const s16 snap_mask = (s16)~(snapv - 1);
 		origin.X &= snap_mask; origin.Y &= snap_mask; origin.Z &= snap_mask;
 		static std::vector<u8> rgba, coarse;
-		u32 solid = lv == 0
-				? claude_lod::buildCascade2(client, origin, rgba, coarse)
-				: claude_lod::buildCascadeSummary(origin, CELL[lv],
-						rgba, coarse);
+		// ONE fold for every rung (John's consolidation, 2026-08-12):
+		// the 2m level now builds from summary fine-bits through the
+		// same scatter as every other level — one alignment contract,
+		// the origin-parity bug class is unrepresentable.
+		u32 solid = claude_lod::buildCascadeSummary(origin, CELL[lv],
+				rgba, coarse);
 		if (solid == 0 && !L.valid)
 			return; // no data yet; retry next poll (and skip coarser too)
 

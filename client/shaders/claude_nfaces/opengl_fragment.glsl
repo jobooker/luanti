@@ -29,6 +29,16 @@ uniform float claudeRadianceFrame;
 uniform lowp float claudeRadianceReset;
 uniform lowp float claudeFaceTexels; // <1.5 = pass idle (cheap fill)
 uniform lowp float claudeCacheRemap; // 0 = zero on rebase (the pulse)
+// light ladder (ADR-0008 v1): rungs 1-5 in the strip below y=1536
+uniform lowp float claudeLightLadder;
+uniform sampler3D claudeCascades;
+uniform vec3 cascade0Origin;
+uniform vec3 cascade1Origin;
+uniform vec3 cascade2Origin;
+uniform vec3 cascade3Origin;
+uniform vec3 cascade4Origin;
+uniform vec3 cascadeValid;
+uniform vec3 cascadeValidB;
 uniform vec3 claudeNearOrigin;
 uniform vec3 claudeNearPrev;
 uniform sampler3D claudeVolume;
@@ -53,7 +63,8 @@ uniform lowp float claudePyramid;
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
 #define NTEX_W 2048.0
-#define NTEX_H 1536.0
+#define NTEX_H 2816.0
+#define NRING_H 1536.0
 #define NTILE 128.0
 #define NGRIDW 16.0
 #define NSUB 4.0
@@ -207,6 +218,108 @@ float cacheEmitterVis(vec3 ro, vec3 ld, float maxT)
 	return 1.0;
 }
 
+// ---- light ladder rungs 1-5 (ADR-0008 v1) ----
+// One irradiance value per light cell (= 2x the geometry cell), 64^3
+// cells per cascade level. Same law at every rung: amortized refresh,
+// cold cells jump the queue, EMA memory. Consumers (farTraceL in
+// claude_accum) read this instead of firing per-pixel far shadow +
+// bounce marches — the mid-band flicker's SOURCE, deleted.
+
+vec4 cascadeSample(float slab, vec3 c)
+{
+	return texture3D(claudeCascades,
+			vec3((c.xy + 0.5) / 128.0, (slab * 128.0 + c.z + 0.5) / 640.0));
+}
+
+// visibility march in ONE cascade level's grid; foliage transmits
+float rungVis(float lv, vec3 corigin, float csz, vec3 pvol, vec3 sd)
+{
+	vec3 pc = (pvol - corigin) / csz + sd * 1.2;
+	if (any(lessThan(pc, vec3(0.0)))
+			|| any(greaterThanEqual(pc, vec3(128.0))))
+		return 1.0;
+	vec3 cell = floor(pc);
+	vec3 stepDir = sign(sd);
+	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
+	float vis = 1.0;
+	for (int i = 0; i < 64; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0)))
+				|| any(greaterThanEqual(cell, vec3(128.0))))
+			return vis;
+		vec4 s = cascadeSample(lv, cell);
+		if (s.a > 0.6 && s.a < 0.8) {
+			vis *= 0.7; // canopy: soft partial shadow
+			if (vis < 0.1)
+				return 0.0;
+		} else if (s.a > 0.35) {
+			return 0.0;
+		}
+	}
+	return vis;
+}
+
+vec4 lightRung()
+{
+	if (claudeLightLadder < 0.5 || volumeDebug < 2.5
+			|| radianceStrength <= 0.0)
+		return vec4(0.0);
+	vec2 px = floor(gl_FragCoord.xy);
+	float py = px.y - NRING_H;
+	float tileIndex = floor(py / 64.0) * 16.0 + floor(px.x / 64.0);
+	float lv = floor(tileIndex / 64.0);
+	if (lv > 4.5)
+		return vec4(0.0);
+	float zl = tileIndex - lv * 64.0;
+	vec2 cxy = vec2(mod(px.x, 64.0), mod(py, 64.0));
+	float csz = exp2(lv + 1.0); // 2,4,8,16,32
+	float lsz = csz * 2.0;
+	vec3 corigin = lv < 0.5 ? cascade0Origin : lv < 1.5 ? cascade1Origin
+			: lv < 2.5 ? cascade2Origin : lv < 3.5 ? cascade3Origin
+			: cascade4Origin;
+	float valid = lv < 0.5 ? cascadeValid.x : lv < 1.5 ? cascadeValid.y
+			: lv < 2.5 ? cascadeValid.z : lv < 3.5 ? cascadeValidB.x
+			: cascadeValidB.y;
+	vec4 old = texture2D(prevNear,
+			gl_FragCoord.xy / vec2(NTEX_W, NTEX_H));
+	if (valid < 0.5)
+		return old;
+	// amortize 1/8; cold cells (no history) refresh immediately
+	float group = mod(cxy.x + cxy.y * 2.0 + zl + lv * 3.0, 8.0);
+	if (abs(mod(claudeRadianceFrame, 8.0) - group) > 0.5 && old.a > 0.5)
+		return old;
+	vec3 pos = corigin + vec3(cxy.x + 0.5, cxy.y + 0.5, zl + 0.5) * lsz;
+	// one sun march + one jittered sky march per refresh, in MY grid
+	float sunv = rungVis(lv, corigin, csz, pos, volumeSunDir);
+	vec2 h = vec2(
+		fract(sin(dot(vec3(cxy, zl) + claudeRadianceFrame * 0.37,
+			vec3(12.9898, 78.233, 37.719))) * 43758.5453),
+		fract(sin(dot(vec3(cxy, zl), vec3(93.989, 12.233, 57.719))
+			+ claudeRadianceFrame * 5.91) * 24634.6345));
+	float zr = h.x;
+	float rr = sqrt(max(1.0 - zr * zr, 0.0));
+	vec3 skyd = normalize(vec3(rr * cos(6.2831853 * h.y), zr + 0.35,
+			rr * sin(6.2831853 * h.y)));
+	float skyv = rungVis(lv, corigin, csz, pos, skyd);
+	float sunUp = clamp(volumeSunDir.y, 0.0, 1.0);
+	vec3 fresh = volumeLightCol * sunv * sunUp
+			+ cacheSky(vec3(0.0, 1.0, 0.0)) * skyBounce * skyv * 0.9;
+	float aUp = 0.25;
+	float aDown = 0.5;
+	float gd = dot(fresh, vec3(1.0)) < dot(old.rgb, vec3(1.0)) ? 1.0 : 0.0;
+	vec3 outc = old.a > 0.5
+			? mix(old.rgb, fresh, mix(aUp, aDown, gd))
+			: fresh;
+	return vec4(outc, 1.0);
+}
+
 vec3 gatherRay(vec3 ro, vec3 rd)
 {
 	const float S = 128.0;
@@ -291,6 +404,13 @@ void main(void)
 	// every surviving texel (claude_cache_remap=0 restores the pulse)
 	if (claudeRadianceReset > 0.5 && claudeCacheRemap < 0.5) {
 		gl_FragColor = vec4(0.0);
+		return;
+	}
+
+	// the strip below the near ring holds the light-ladder rungs;
+	// cascade origins are volume-local, so a rebase needs no remap here
+	if (gl_FragCoord.y >= NRING_H) {
+		gl_FragColor = lightRung();
 		return;
 	}
 	if (volumeDebug < 2.5 || radianceStrength <= 0.0

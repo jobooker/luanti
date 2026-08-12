@@ -381,11 +381,16 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// own ping-pong (remap across ring shifts) + the fresh coarse cache
 	// for gather-hit self-feed. Idle (cheap zero fill) unless
 	// claude_face_texels >= 2.
+	// 2048x1536 near-ring region + a 2048x1280 LIGHT-LADDER strip below
+	// it (ADR-0008 v1): rungs 1-5 store one irradiance value per 2x
+	// geometry cell — 64^3 light cells per cascade level, 320 z-slice
+	// tiles of 64px in a 16x20 grid (1024 wide). One pass, one texture,
+	// every rung — no special caching at different boundary limits.
 	static const u8 TEXTURE_NCACHE_1 = 38;
 	static const u8 TEXTURE_NCACHE_2 = 39;
-	buffer->setTexture(TEXTURE_NCACHE_1, core::dimension2du(2048, 1536),
+	buffer->setTexture(TEXTURE_NCACHE_1, core::dimension2du(2048, 2816),
 			"claude_ncache_1", accum_format, /*clear:*/ true);
-	buffer->setTexture(TEXTURE_NCACHE_2, core::dimension2du(2048, 1536),
+	buffer->setTexture(TEXTURE_NCACHE_2, core::dimension2du(2048, 2816),
 			"claude_ncache_2", accum_format, /*clear:*/ true);
 
 	shader_id = client->getShaderSource()->getShaderRaw("claude_nfaces");

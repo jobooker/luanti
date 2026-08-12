@@ -14,6 +14,7 @@
 #include "porting.h"
 
 #include <json/json.h>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
@@ -29,6 +30,13 @@ struct BlockSummary
 {
 	u8 occ[64];    // solid-ish nodes per subcell (0..64)
 	u8 water[64];  // liquid nodes per subcell
+	u8 leaf[64];   // of occ: foliage nodes — leaf-dominant cells fold to
+	               // class 180 so forests read as canopy, not cliff wall
+	// 2m-grain occupancy: bit o of fine[sub] = octant o (2^3 nodes) of
+	// the subcell is >=5/8 solid; finew = same for liquids. This is what
+	// lets ONE fold build every rung — the separate 2m block-walker
+	// (whose alignment contract caused the origin-parity wall) is gone.
+	u8 fine[64], finew[64];
 	u16 rsum[64], gsum[64], bsum[64]; // summed minimap color of counted nodes
 };
 
@@ -40,6 +48,9 @@ void summarizeBlock(Client *client, MapBlock *block)
 {
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	BlockSummary s = {};
+	static thread_local u8 so[64][8], wo[64][8];
+	memset(so, 0, sizeof(so));
+	memset(wo, 0, sizeof(wo));
 	for (s16 z = 0; z < MAP_BLOCKSIZE; z++)
 	for (s16 y = 0; y < MAP_BLOCKSIZE; y++)
 	for (s16 x = 0; x < MAP_BLOCKSIZE; x++) {
@@ -67,6 +78,7 @@ void summarizeBlock(Client *client, MapBlock *block)
 		if (f.param_type_2 == CPT2_LEVELED)
 			continue;
 		int sub = (z / 4) * 16 + (y / 4) * 4 + (x / 4);
+		int oct = ((z % 4) / 2) * 4 + ((y % 4) / 2) * 2 + (x % 4) / 2;
 		video::SColor col(255, 180, 180, 180);
 		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
 			col = f.visuals->minimap_color;
@@ -87,13 +99,24 @@ void summarizeBlock(Client *client, MapBlock *block)
 		}
 		if (f.isLiquid()) {
 			s.water[sub]++;
+			wo[sub][oct]++;
 		} else {
 			s.occ[sub]++;
+			so[sub][oct]++;
+			if (f.drawtype == NDT_ALLFACES_OPTIONAL)
+				s.leaf[sub]++;
 		}
 		s.rsum[sub] += col.getRed();
 		s.gsum[sub] += col.getGreen();
 		s.bsum[sub] += col.getBlue();
 	}
+	for (int sub = 0; sub < 64; sub++)
+		for (int o = 0; o < 8; o++) {
+			if (so[sub][o] >= 5)
+				s.fine[sub] |= (u8)(1 << o);
+			if (wo[sub][o] >= 5)
+				s.finew[sub] |= (u8)(1 << o);
+		}
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_summaries[block->getPos()] = s;
@@ -211,13 +234,14 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// which breaks the one-block-per-cell gather — is handled for free.
 	// Accumulators are static and reused (u16 counts: max 32^3 = 32768
 	// nodes per cell fits; u32 color sums).
-	static std::vector<u16> occ_acc, water_acc;
+	static std::vector<u16> occ_acc, water_acc, leaf_acc;
 	static std::vector<u32> r_acc, g_acc, b_acc;
 	static std::vector<s16> top_acc;   // highest occupied subcell layer
 	static std::vector<u16> top_n;     // counted nodes in that layer
 	constexpr size_t NC = (size_t)N * N * N;
 	occ_acc.assign(NC, 0);
 	water_acc.assign(NC, 0);
+	leaf_acc.assign(NC, 0);
 	r_acc.assign(NC, 0);
 	g_acc.assign(NC, 0);
 	b_acc.assign(NC, 0);
@@ -244,11 +268,52 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 				u32 cnt = (u32)s.occ[sub] + s.water[sub];
 				if (cnt == 0)
 					continue;
+				if (CELL == 2) {
+					// octant expansion: one 4m subcell = 8 2m cells,
+					// occupancy from the fine bit-sets, color/class
+					// shared from the subcell (color grain at 2m is
+					// invisible past the 64-node promotion distance)
+					bool leafdom = s.leaf[sub] * 2 > s.occ[sub];
+					u32 mr = s.rsum[sub] / cnt, mg = s.gsum[sub] / cnt,
+						mb = s.bsum[sub] / cnt;
+					for (int o = 0; o < 8; o++) {
+						bool fs = (s.fine[sub] >> o) & 1;
+						bool fw = (s.finew[sub] >> o) & 1;
+						if (!fs && !fw)
+							continue;
+						int cxo = (rel.X + sx * 4 + (o & 1) * 2) / 2;
+						int cyo = (rel.Y + sy * 4 + ((o >> 1) & 1) * 2) / 2;
+						int czo = (rel.Z + sz * 4 + ((o >> 2) & 1) * 2) / 2;
+						size_t ci2 = ((size_t)czo * N + cyo) * N + cxo;
+						if (fs) {
+							occ_acc[ci2] += 8;
+							if (leafdom)
+								leaf_acc[ci2] += 8;
+						} else {
+							water_acc[ci2] += 8;
+						}
+						s16 subY2 = (s16)(rel.Y + sy * 4);
+						if (subY2 > top_acc[ci2]) {
+							top_acc[ci2] = subY2;
+							top_n[ci2] = 8;
+							r_acc[ci2] = mr * 8;
+							g_acc[ci2] = mg * 8;
+							b_acc[ci2] = mb * 8;
+						} else if (subY2 == top_acc[ci2]) {
+							top_n[ci2] = (u16)(top_n[ci2] + 8);
+							r_acc[ci2] += mr * 8;
+							g_acc[ci2] += mg * 8;
+							b_acc[ci2] += mb * 8;
+						}
+					}
+					continue;
+				}
 				size_t ci = (((size_t)(rel.Z + sz * 4) / CELL) * N
 						+ ((rel.Y + sy * 4) / CELL)) * N
 						+ ((rel.X + sx * 4) / CELL);
 				occ_acc[ci] += s.occ[sub];
 				water_acc[ci] += s.water[sub];
+				leaf_acc[ci] += s.leaf[sub];
 				// COLOR = the cell's TOP occupied layer only. The volume
 				// average mixed one white snow cap with seven dirt nodes
 				// into green-brown ("snow at 1m rendered as maybe green,
@@ -287,7 +352,10 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			continue;
 		u8 cls = 0;
 		if (occ_acc[i] >= half)
-			cls = 255;
+			// leaf-dominant solids are FOLIAGE (180): the far shader
+			// lights them as sky-bathed canopy and lets sun through —
+			// opaque-black forest ramparts were "the LOD 2 wall"
+			cls = leaf_acc[i] * 2 > occ_acc[i] ? 180 : 255;
 		else if (water_acc[i] >= half && water_acc[i] > occ_acc[i])
 			cls = 100;
 		else
@@ -299,148 +367,6 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
 		coarse[((cz / 4) * 32 + (cy / 4)) * 32 + (cx / 4)] = 255;
-	}
-	return solid_cells;
-}
-
-// per-content classification LUT so the 2 m walk never touches the
-// NodeDefManager in its inner loop. 0 = unknown (resolve), 1 = air/skip,
-// 2 = solid, 3 = water; bit 4 (|8) marks palette-tinted contents whose
-// color needs a per-node param2 lookup. Color packed 0xRRGGBB alongside.
-static std::vector<u8> g_cls_lut;
-static std::vector<u32> g_col_lut;
-
-static inline u8 classify(const NodeDefManager *ndef, content_t c)
-{
-	if (c >= g_cls_lut.size()) {
-		g_cls_lut.resize(c + 256, 0);
-		g_col_lut.resize(c + 256, 0xB4B4B4);
-	}
-	u8 cls = g_cls_lut[c];
-	if (cls)
-		return cls;
-	const ContentFeatures &f = ndef->get(c);
-	cls = 2;
-	if (c == CONTENT_AIR || c == CONTENT_IGNORE)
-		cls = 1;
-	else if (f.light_source == 0
-			&& (f.drawtype == NDT_PLANTLIKE
-				|| f.drawtype == NDT_PLANTLIKE_ROOTED
-				|| f.drawtype == NDT_FIRELIKE
-				|| f.drawtype == NDT_SIGNLIKE
-				|| f.drawtype == NDT_RAILLIKE
-				|| f.drawtype == NDT_TORCHLIKE))
-		cls = 1;
-	else if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
-		cls = 1;
-	else if (f.param_type_2 == CPT2_LEVELED)
-		cls = 1; // thin snow layers: air, not a +1m wall (see summarize)
-	else if (f.isLiquid())
-		cls = 3;
-	if (cls != 1 && f.visuals && f.visuals->minimap_color.getAlpha() > 0) {
-		video::SColor col = f.visuals->minimap_color;
-		g_col_lut[c] = (col.getRed() << 16) | (col.getGreen() << 8)
-				| col.getBlue();
-		// does this content tint per node? probe with a nonzero param2:
-		// palette'd defs return a non-white color, plain ones don't
-		video::SColor probe(255, 255, 255, 255);
-		f.visuals->getColor(1, &probe);
-		video::SColor probe0(255, 255, 255, 255);
-		f.visuals->getColor(0, &probe0);
-		if (probe.color != 0xFFFFFFFFu || probe0.color != 0xFFFFFFFFu)
-			cls |= 8;
-	}
-	g_cls_lut[c] = cls;
-	return cls;
-}
-
-// per-node color for the 2 m walk: LUT base, times the param2 biome
-// tint when the content is palette'd (grayscale grass/leaves/water)
-static inline u32 nodeColor2m(const NodeDefManager *ndef, MapNode n, u8 cls)
-{
-	u32 col = g_col_lut[n.getContent()];
-	if (cls & 8) {
-		const ContentFeatures &f = ndef->get(n.getContent());
-		if (f.visuals) {
-			video::SColor tint(255, 255, 255, 255);
-			f.visuals->getColor(n.getParam2(), &tint);
-			u32 r = ((col >> 16) & 0xFF) * tint.getRed() / 255;
-			u32 g = ((col >> 8) & 0xFF) * tint.getGreen() / 255;
-			u32 b = (col & 0xFF) * tint.getBlue() / 255;
-			col = (r << 16) | (g << 8) | b;
-		}
-	}
-	return col;
-}
-
-u32 buildCascade2(Client *client, v3s16 origin_nodes,
-		std::vector<u8> &rgba, std::vector<u8> &coarse)
-{
-	constexpr int N = 128, CELL = 2;
-	rgba.assign((size_t)N * N * N * 4, 0);
-	coarse.assign(32 * 32 * 32, 0);
-	u32 solid_cells = 0;
-	Map &map = client->getEnv().getMap();
-	const NodeDefManager *ndef = client->getNodeDefManager();
-
-	// walk whole loaded MapBlocks (16^3 = 8^3 cells each); origin is
-	// 32-node snapped so blocks tile the box exactly
-	constexpr int BLOCKS = N * CELL / 16; // 16 across
-	for (int bz = 0; bz < BLOCKS; bz++)
-	for (int by = 0; by < BLOCKS; by++)
-	for (int bx = 0; bx < BLOCKS; bx++) {
-		v3s16 bpos((origin_nodes.X >> 4) + bx, (origin_nodes.Y >> 4) + by,
-				(origin_nodes.Z >> 4) + bz);
-		MapBlock *block = map.getBlockNoCreateNoEx(bpos);
-		if (!block)
-			continue; // not loaded: air
-		// cell base within the level: 8 cells per axis per block
-		int cbx = bx * 8, cby = by * 8, cbz = bz * 8;
-		for (int cz = 0; cz < 8; cz++)
-		for (int cy = 0; cy < 8; cy++)
-		for (int cx = 0; cx < 8; cx++) {
-			u32 occ = 0, water = 0;
-			u32 rl[2] = {0, 0}, gl[2] = {0, 0}, bl[2] = {0, 0};
-			u32 nl[2] = {0, 0};
-			for (int oz = 0; oz < 2; oz++)
-			for (int oy = 0; oy < 2; oy++)
-			for (int ox = 0; ox < 2; ox++) {
-				MapNode n = block->getNodeNoCheck(cx * 2 + ox,
-						cy * 2 + oy, cz * 2 + oz);
-				u8 cls = classify(ndef, n.getContent());
-				if ((cls & 7) == 1)
-					continue;
-				u32 col = nodeColor2m(ndef, n, cls);
-				if ((cls & 7) == 3) water++; else occ++;
-				rl[oy] += (col >> 16) & 0xFF;
-				gl[oy] += (col >> 8) & 0xFF;
-				bl[oy] += col & 0xFF;
-				nl[oy]++;
-			}
-			// top-layer color (see buildCascadeSummary)
-			int tl = nl[1] > 0 ? 1 : 0;
-			u32 r = rl[tl], g = gl[tl], b = bl[tl];
-			u32 cn = std::max(nl[tl], 1u);
-			u32 counted = occ + water;
-			if (counted == 0)
-				continue;
-			u8 cls = 0;
-			if (occ >= 5) // 62%: erode, don't dilate (see buildCascadeSummary)
-				cls = 255;
-			else if (water >= 5 && water > occ)
-				cls = 100;
-			else
-				continue;
-			size_t i = ((size_t)(cbz + cz) * N + (cby + cy)) * N
-					+ (cbx + cx);
-			rgba[i * 4 + 0] = (u8)std::min(r / cn, 255u);
-			rgba[i * 4 + 1] = (u8)std::min(g / cn, 255u);
-			rgba[i * 4 + 2] = (u8)std::min(b / cn, 255u);
-			rgba[i * 4 + 3] = cls;
-			solid_cells++;
-			coarse[(((cbz + cz) / 4) * 32 + ((cby + cy) / 4)) * 32
-					+ ((cbx + cx) / 4)] = 255;
-		}
 	}
 	return solid_cells;
 }
