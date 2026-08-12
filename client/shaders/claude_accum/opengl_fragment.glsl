@@ -2242,7 +2242,10 @@ void main(void)
 	vec3 W = ro + rd * min(t, 4090.0);
 	if (tHit >= 4095.0)
 		W = ro + rd * 400.0; // sky: reproject by direction, far point
-	vec3 fresh_g = pow(max(fresh, vec3(0.0)), vec3(1.0 / 2.2));
+	// history is LINEAR radiance in a 16F target — averaging must happen
+	// in linear light or jittered shadows/noise converge biased dark
+	// (gamma packing predates the 16F buffer; RGBA8 precision is gone)
+	vec3 fresh_g = max(fresh, vec3(0.0));
 	vec3 rp = reprojectUv(W);
 	float a = 1.0; // no valid history: fresh sample stands alone
 	vec3 prev = vec3(0.0);
@@ -2265,7 +2268,7 @@ void main(void)
 						tHit / 4096.0);
 				return;
 			}
-			float band = accumAlpha < 0.1 ? 4.0 : 0.3;
+			float band = accumAlpha < 0.1 ? 4.0 : 0.6; // linear-domain width
 			// far field: parallax shrinks with distance, so history
 			// reprojects almost perfectly even in flight — run it DEEP
 			// out there. LOD 2+ has no world-space light cache yet
@@ -2285,7 +2288,7 @@ void main(void)
 					&& !repFlip) {
 				float farness = clamp((tHit - 64.0) / 64.0, 0.0, 1.0);
 				a = min(accumAlpha, mix(accumAlpha, 0.12, farness));
-				band = mix(band, 1.0, farness);
+				band = mix(band, 2.0, farness); // linear-domain width
 			}
 			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-band), vec3(band));
 			if (!(claudeFarHist > 0.5 && tHit > 64.0 && tHit < 4095.0
@@ -2295,11 +2298,10 @@ void main(void)
 			// depth mismatch = aliased edge flipping under subpixel
 			// jitter. Rejecting outright makes edges shimmer forever;
 			// tightly-clamped history lets them settle into stable AA.
-			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.12), vec3(0.12));
+			prev = fresh_g + clamp(h.rgb - fresh_g, vec3(-0.25), vec3(0.25));
 			a = max(accumAlpha, 0.3);
 		}
 	}
 
-	// accumulate in gamma space (RGBA8 history: better dark precision)
 	gl_FragColor = vec4(mix(prev, fresh_g, a), tHit / 4096.0);
 }
