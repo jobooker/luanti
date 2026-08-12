@@ -375,9 +375,28 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	faces->setRenderSource(buffer);
 	faces->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_FCACHE_2));
 
+	// claude_nfaces: NEAR-RING sub-face atlas (ADR-0006 v2) — 4x4 texels
+	// per face for the 32^3 cells around the camera, 0.25m ambient
+	// resolution where the coarse cache's 1m quilt is visible. Reads its
+	// own ping-pong (remap across ring shifts) + the fresh coarse cache
+	// for gather-hit self-feed. Idle (cheap zero fill) unless
+	// claude_face_texels >= 2.
+	static const u8 TEXTURE_NCACHE_1 = 38;
+	static const u8 TEXTURE_NCACHE_2 = 39;
+	buffer->setTexture(TEXTURE_NCACHE_1, core::dimension2du(2048, 1536),
+			"claude_ncache_1", accum_format, /*clear:*/ true);
+	buffer->setTexture(TEXTURE_NCACHE_2, core::dimension2du(2048, 1536),
+			"claude_ncache_2", accum_format, /*clear:*/ true);
+
+	shader_id = client->getShaderSource()->getShaderRaw("claude_nfaces");
+	PostProcessingStep *nfaces = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_NCACHE_1, TEXTURE_FCACHE_2 });
+	nfaces->setRenderSource(buffer);
+	nfaces->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_NCACHE_2));
+
 	shader_id = client->getShaderSource()->getShaderRaw("claude_accum");
 	PostProcessingStep *accum = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2, TEXTURE_FCACHE_2 });
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2, TEXTURE_FCACHE_2, TEXTURE_NCACHE_2 });
 	accum->setRenderSource(buffer);
 	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
 
@@ -401,6 +420,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_RCACHE_1, TEXTURE_RCACHE_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_FCACHE_1, TEXTURE_FCACHE_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_NCACHE_1, TEXTURE_NCACHE_2);
 
 	return present;
 }

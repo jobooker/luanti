@@ -7,6 +7,7 @@
 // still (deep accumulation).
 #define history texture0
 #define faceCacheTex texture2
+#define nearFacesTex texture3
 // world-space radiance cache (claude_radiance pass): 64^3 cells of
 // 2 nodes, flattened to 512x512 as 8x8 tiles of 64x64 z-slices
 #define radianceCache texture1
@@ -14,6 +15,7 @@
 uniform sampler2D history;
 uniform sampler2D radianceCache;
 uniform sampler2D faceCacheTex;
+uniform sampler2D nearFacesTex;
 uniform lowp float radianceStrength; // claude_radiance dial, 0 = off
 uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
@@ -53,6 +55,10 @@ uniform lowp float claudeTiers;
 // jittered shadow noise. Keeps per-pixel AO, trades convergence speed.
 // 1 (default) = every pixel every frame.
 uniform lowp float claudeBounceStride;
+// 1 = coarse per-face cache only; 2 = near-ring 4x4 sub-face atlas
+// (0.25m ambient resolution around the camera — AO without the quilt).
+uniform lowp float claudeFaceTexels;
+uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -800,6 +806,48 @@ vec3 faceCache(vec3 cell, vec3 n)
 	vec2 tile = vec2(mod(tileIndex, 32.0), floor(tileIndex / 32.0));
 	vec2 uv = (tile * 128.0 + c.xy + 0.5) / vec2(4096.0, 3072.0);
 	return texture2D(faceCacheTex, uv).rgb;
+}
+
+// Sub-face read (ADR-0006 v2): inside the near ring, sample the 4x4
+// per-face atlas at the hit point's position on the face, manual
+// bilinear clamped to the cell's own texel block; cross-fade to the
+// coarse value near the ring edge so the resolution seam never shows.
+// Addressing mirrors claude_nfaces — keep in sync.
+vec3 faceCacheHP(vec3 cell, vec3 n, vec3 hp)
+{
+	if (claudeFaceTexels < 1.5)
+		return faceCache(cell, n);
+	vec3 lc = cell - claudeNearOrigin;
+	if (any(lessThan(lc, vec3(0.0))) || any(greaterThanEqual(lc, vec3(32.0))))
+		return faceCache(cell, n);
+	float f;
+	vec2 st;
+	if (n.x > 0.5)      { f = 0.0; st = fract(hp.yz); }
+	else if (n.x < -0.5){ f = 1.0; st = fract(hp.yz); }
+	else if (n.y > 0.5) { f = 2.0; st = fract(hp.xz); }
+	else if (n.y < -0.5){ f = 3.0; st = fract(hp.xz); }
+	else if (n.z > 0.5) { f = 4.0; st = fract(hp.xy); }
+	else                { f = 5.0; st = fract(hp.xy); }
+	float tileIndex = f * 32.0 + lc.z;
+	vec2 tile = vec2(mod(tileIndex, 16.0), floor(tileIndex / 16.0));
+	vec2 base = tile * 128.0 + lc.xy * 4.0;
+	// texel coords within the 4x4 block, clamped half a texel inside so
+	// bilinear never bleeds into the neighbouring cell's block
+	vec2 tf = clamp(st * 4.0, vec2(0.5), vec2(3.5)) - 0.5;
+	vec2 i0 = floor(tf);
+	vec2 fr = tf - i0;
+	vec2 inv = vec2(1.0 / 2048.0, 1.0 / 1536.0);
+	vec4 t00 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 0.5)) * inv);
+	vec4 t10 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 0.5)) * inv);
+	vec4 t01 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 1.5)) * inv);
+	vec4 t11 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 1.5)) * inv);
+	vec4 c4 = mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
+	if (c4.a < 0.5)
+		return faceCache(cell, n); // not yet converged / just reset
+	vec3 edge = min(lc + 0.5, 32.0 - (lc + 0.5));
+	float fade = clamp((min(min(edge.x, edge.y), edge.z) - 0.5) / 2.0,
+			0.0, 1.0);
+	return mix(faceCache(cell, n), c4.rgb, fade);
 }
 
 // The THIRD bounce (claude_bounce2): one more cosine hop fired from a
@@ -1621,7 +1669,7 @@ void main(void)
 					vec3 amb2 = vec3(0.0);
 					if (claudeCost < 2.5) {
 						if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
-							amb2 = faceCache(cell, bnB) * radianceStrength * 1.15;
+							amb2 = faceCacheHP(cell, bnB, bpos) * radianceStrength * 1.15;
 						} else {
 							float bw2 = bounceLottery();
 							if (bw2 > 0.0)
@@ -1862,7 +1910,7 @@ void main(void)
 				vec3 amb = vec3(0.0);
 				if (!skipB) {
 					if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
-						amb = faceCache(cell, n) * radianceStrength * 1.15;
+						amb = faceCacheHP(cell, n, hp) * radianceStrength * 1.15;
 					} else {
 						float bw = bounceLottery();
 						if (bw > 0.0)

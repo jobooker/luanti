@@ -137,6 +137,10 @@ struct ClaudeVolume
 	// as belt-and-braces over the FBO clear.
 	float radiance_frame = 0.0f;
 	int radiance_reset = 2;
+	// near-ring sub-face atlas (ADR-0006 v2): ring corner in volume-local
+	// cell coords, plus last frame's for cross-shift address remapping
+	v3f near_origin = v3f(48.0f, 48.0f, 48.0f);
+	v3f near_prev = v3f(48.0f, 48.0f, 48.0f);
 	// far cascades (claude_lod Phase 2+3): detail degrades in OCTAVES —
 	// 2 m to +/-128, 4 m to +/-256, 8 m to +/-512, 16 m to +/-1024,
 	// 32 m to +/-2048 — so the eye never jumps more than one resolution
@@ -250,6 +254,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_tiers_pixel{"claudeTiers"};
 	float m_bounce_stride = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce_stride_pixel{"claudeBounceStride"};
+	float m_face_texels = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_face_texels_pixel{"claudeFaceTexels"};
+	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
+	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -289,7 +297,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 29> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 30> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -319,6 +327,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_face_direct",
 		"claude_tiers",
 		"claude_bounce_stride",
+		"claude_face_texels",
 	};
 
 	static float readGoldenHourStrength()
@@ -535,6 +544,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_bounce_stride", 1.0f, 8.0f);
 	}
 
+	// 1 = coarse per-face cache only; 2 = near-ring 4x4 sub-face atlas
+	static float readFaceTexels()
+	{
+		if (!g_settings->exists("claude_face_texels"))
+			return 1.0f;
+		return g_settings->getFloat("claude_face_texels", 1.0f, 2.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -612,6 +629,8 @@ public:
 			m_tiers = readTiers();
 		if (name == "claude_bounce_stride")
 			m_bounce_stride = readBounceStride();
+		if (name == "claude_face_texels")
+			m_face_texels = readFaceTexels();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -657,6 +676,7 @@ public:
 		m_face_direct = readFaceDirect();
 		m_tiers = readTiers();
 		m_bounce_stride = readBounceStride();
+		m_face_texels = readFaceTexels();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -785,6 +805,9 @@ public:
 			m_face_direct_pixel.set(&m_face_direct, services);
 			m_tiers_pixel.set(&m_tiers, services);
 			m_bounce_stride_pixel.set(&m_bounce_stride, services);
+			m_face_texels_pixel.set(&m_face_texels, services);
+			m_near_origin_pixel.set(g_claude_volume.near_origin, services);
+			m_near_prev_pixel.set(g_claude_volume.near_prev, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
@@ -1885,6 +1908,15 @@ static void claudeUpdateAccum(Client *client)
 	g_claude_volume.prev_cam_pos = p;
 	g_claude_volume.prev_cam_dir = d;
 	g_claude_volume.prev_origin = g_claude_volume.origin;
+	// near-ring sub-face atlas follows the camera, corner clamped so the
+	// 32^3 ring never leaves the volume; prev kept one frame for remap
+	g_claude_volume.near_prev = g_claude_volume.near_origin;
+	v3f lp = p / BS - v3f(g_claude_volume.origin.X,
+			g_claude_volume.origin.Y, g_claude_volume.origin.Z);
+	g_claude_volume.near_origin = v3f(
+			core::clamp(std::floor(lp.X) - 16.0f, 0.0f, 96.0f),
+			core::clamp(std::floor(lp.Y) - 16.0f, 0.0f, 96.0f),
+			core::clamp(std::floor(lp.Z) - 16.0f, 0.0f, 96.0f));
 	// With reprojection the shader revalidates history per pixel; the CPU
 	// only forces a full reset when the coordinate space itself changes.
 	// Teardown-style shallow history in motion (spatial denoise carries
