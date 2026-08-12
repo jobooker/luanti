@@ -404,7 +404,7 @@ vec4 cascadeSample(float slab, vec3 c)
 // region below y=1536 of the near atlas; written by claude_nfaces).
 // Manual xy bilinear inside the z-slice tile, nearest z — light at
 // these scales is smooth. Cold cells fall back to a sky prior.
-vec3 lrungFetch(float lv, vec3 corigin, float csz, vec3 pvol)
+vec4 lrungFetch(float lv, vec3 corigin, float csz, vec3 pvol)
 {
 	float lsz = csz * 2.0;
 	vec3 lc = clamp((pvol - corigin) / lsz, vec3(0.0), vec3(63.999));
@@ -420,10 +420,9 @@ vec3 lrungFetch(float lv, vec3 corigin, float csz, vec3 pvol)
 	vec4 t10 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 0.5)) * inv);
 	vec4 t01 = texture2D(nearFacesTex, (base + i0 + vec2(0.5, 1.5)) * inv);
 	vec4 t11 = texture2D(nearFacesTex, (base + i0 + vec2(1.5, 1.5)) * inv);
-	vec4 c4 = mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
-	if (c4.a < 0.3)
-		return pathSkyRadiance(vec3(0.0, 1.0, 0.0)) * 0.5;
-	return c4.rgb;
+	// rgb = cached sky/ambient irradiance; a = 0.25 + 0.75*sunVis
+	// (a < 0.2 = cold). The caller recombines with live sun color.
+	return mix(mix(t00, t10, fr.x), mix(t01, t11, fr.x), fr.y);
 }
 
 // Binary sun occlusion marched in ONE cascade level from a volume-local
@@ -632,11 +631,23 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 			// whose per-frame variance WAS the mid-band flicker
 			if (claudeLightLadder > 0.5) {
 				float ndl2 = max(dot(n, sd), 0.0);
-				vec3 cached = lrungFetch(slab, corigin, csz,
+				vec4 lr = lrungFetch(slab, corigin, csz,
 						hpv + n * csz * 1.2);
+				vec3 skyamb;
+				float sunvis;
+				if (lr.a < 0.2) { // cold: sky prior, sun assumed half
+					skyamb = pathSkyRadiance(vec3(0.0, 1.0, 0.0)) * 0.4;
+					sunvis = 0.6;
+				} else {
+					skyamb = lr.rgb;
+					sunvis = clamp((lr.a - 0.25) / 0.75, 0.0, 1.0);
+				}
 				bool fol = s.a > 0.6 && s.a < 0.8;
-				vec3 c2 = albedo * cached
-						* (fol ? 1.05 : (0.5 + 0.5 * ndl2));
+				// v2: cached sun VISIBILITY x live sun color x per-pixel
+				// ndl — distant shadows keep shape, sunsets graze right
+				vec3 direct2 = volumeLightCol * sunvis
+						* (fol ? (0.35 + 0.45 * ndl2) : ndl2);
+				vec3 c2 = albedo * (direct2 + skyamb * (fol ? 1.3 : 1.0));
 				if (volumeDebug > 4.5 && volumeDebug < 5.5)
 					c2 = tint * (0.4 + 0.6 * ndl2);
 				if (s.a < 0.6)

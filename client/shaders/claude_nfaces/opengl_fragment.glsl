@@ -308,16 +308,22 @@ vec4 lightRung()
 	vec3 skyd = normalize(vec3(rr * cos(6.2831853 * h.y), zr + 0.35,
 			rr * sin(6.2831853 * h.y)));
 	float skyv = rungVis(lv, corigin, csz, pos, skyd);
-	float sunUp = clamp(volumeSunDir.y, 0.0, 1.0);
-	vec3 fresh = volumeLightCol * sunv * sunUp
-			+ cacheSky(vec3(0.0, 1.0, 0.0)) * skyBounce * skyv * 0.9;
-	float aUp = 0.25;
-	float aDown = 0.5;
-	float gd = dot(fresh, vec3(1.0)) < dot(old.rgb, vec3(1.0)) ? 1.0 : 0.0;
-	vec3 outc = old.a > 0.5
-			? mix(old.rgb, fresh, mix(aUp, aDown, gd))
-			: fresh;
-	return vec4(outc, 1.0);
+	// v2 (SOTA research + John's angular thread): SUN VISIBILITY gets
+	// its own channel — rgb stores sky/ambient irradiance only, alpha
+	// packs sun visibility as 0.25 + 0.75*vis (a < 0.2 = cold). The
+	// consumer recombines with live sun color and ndl shaping, so
+	// distant shadows stay sharp and sunsets graze correctly.
+	vec3 freshSky = cacheSky(vec3(0.0, 1.0, 0.0)) * skyBounce * skyv * 0.9;
+	bool hasOld = old.a >= 0.2;
+	float oldSunv = hasOld ? clamp((old.a - 0.25) / 0.75, 0.0, 1.0) : sunv;
+	// hot-cell fast blend: samples diverging hard from the EMA converge
+	// at 0.6 instead of 0.25 — the terminator sweeps, not crawls
+	float divergence = abs(sunv - oldSunv)
+			+ abs(dot(freshSky - old.rgb, vec3(0.33)));
+	float aBlend = hasOld ? (divergence > 0.25 ? 0.6 : 0.3) : 1.0;
+	vec3 outSky = mix(hasOld ? old.rgb : freshSky, freshSky, aBlend);
+	float outSunv = mix(oldSunv, sunv, aBlend);
+	return vec4(outSky, 0.25 + 0.75 * outSunv);
 }
 
 vec3 gatherRay(vec3 ro, vec3 rd)
