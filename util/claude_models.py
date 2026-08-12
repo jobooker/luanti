@@ -146,6 +146,160 @@ def model_crafting():
     return "crafting_custom", pal, v
 
 
+# ---- texture-derived bake: the 16x16 gift ---------------------------
+# Mineclonia tiles are 16x16 and our grid is 16^3: each face's texels
+# become surface voxel colors; depth comes from a per-face luminance
+# heightfield (dark recesses, maxdepth voxels); bright warm texels on
+# designated faces become emissive voxels. Hand-authored models above
+# remain the fallback for nodes whose derived depth reads wrong.
+
+def _face_map(face, u, v, d):
+    """(texel u,v, carve depth d) -> voxel x,y,z for each cube face."""
+    if face == "front":   return u, 15 - v, 15 - d          # +z
+    if face == "back":    return 15 - u, 15 - v, d          # -z
+    if face == "right":   return 15 - d, 15 - v, u          # +x
+    if face == "left":    return d, 15 - v, 15 - u          # -x
+    if face == "top":     return u, 15 - d, v               # +y
+    if face == "bottom":  return u, d, 15 - v               # -y
+    raise ValueError(face)
+
+
+def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
+                    emit_level=13):
+    """tiles: {face: png path}. Returns (name, palette, voxels) in the
+    same shape the authored models use. Palette grows per unique
+    (rgb, emit) — texel-true colors, no quantization."""
+    imgs = {}
+    for face, path in tiles.items():
+        imgs[face] = np.asarray(
+            Image.open(path).convert("RGB").resize((N, N),
+                                                   Image.NEAREST),
+            dtype=np.float32)
+    # interior filler: mean of the side-ish faces
+    fillsrc = [f for f in ("side", "left", "right", "back")
+               if f in tiles] or list(tiles)
+    fill = tuple(int(c) for c in
+                 np.mean([imgs[f].mean(axis=(0, 1)) for f in fillsrc],
+                         axis=0))
+    pal = [None]
+    pindex = {}
+
+    def pi(rgb, emit=0):
+        key = (rgb, emit)
+        if key not in pindex:
+            pal.append(dict(rgb=list(rgb), emit=emit))
+            pindex[key] = len(pal) - 1
+        return pindex[key]
+
+    v = np.full((N, N, N), pi(fill), dtype=np.uint16)
+    # 'side' shorthand expands to the four lateral faces
+    faces = {}
+    for face, img in imgs.items():
+        if face == "side":
+            for f in ("left", "right", "back"):
+                faces.setdefault(f, img)
+            faces.setdefault("front", img)
+        else:
+            faces[face] = img
+    for face, img in faces.items():
+        lum = img @ np.array([0.2126, 0.7152, 0.0722])
+        lo, hi = lum.min(), max(lum.max(), lum.min() + 1.0)
+        med = float(np.median(lum))
+        for vv in range(N):
+            for u in range(N):
+                r, g, b = img[vv, u]
+                is_fire = (face in emissive_faces and r > 140.0
+                           and r > 1.5 * b and g > 40.0)
+                if is_fire:
+                    d = maxdepth  # fire sits at the back of its recess
+                else:
+                    # STEP rule, not linear: a noisy stone texture must
+                    # stay a solid block with 1-voxel grain — only
+                    # near-black features (the mouth) carve deep. The
+                    # linear heightfield swiss-cheesed the furnace.
+                    t = (lum[vv, u] - lo) / (hi - lo)
+                    if t < 0.18:
+                        d = maxdepth
+                    elif lum[vv, u] < med - 0.10 * (hi - lo):
+                        d = 1
+                    else:
+                        d = 0
+                for dd in range(d):
+                    x, y, z = _face_map(face, u, vv, dd)
+                    v[z, y, x] = 0
+                x, y, z = _face_map(face, u, vv, d)
+                v[z, y, x] = pi((int(r), int(g), int(b)),
+                                emit_level if is_fire else 0)
+    return name, pal, v
+
+
+def model_furnace_baked():
+    tdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "games", "mineclonia", "mods", "ITEMS",
+                        "mcl_furnaces", "textures")
+    return bake_from_tiles(
+        "furnace_baked",
+        dict(front=os.path.join(tdir, "default_furnace_front_active.png"),
+             side=os.path.join(tdir, "default_furnace_side.png"),
+             top=os.path.join(tdir, "default_furnace_top.png"),
+             bottom=os.path.join(tdir, "default_furnace_bottom.png")),
+        maxdepth=3, emissive_faces=("front",), emit_level=13)
+
+
+def model_crafting_baked():
+    tdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "games", "mineclonia", "mods", "ITEMS",
+                        "mcl_crafting_table", "textures")
+    return bake_from_tiles(
+        "crafting_baked",
+        dict(front=os.path.join(tdir, "crafting_workbench_front.png"),
+             side=os.path.join(tdir, "crafting_workbench_side.png"),
+             top=os.path.join(tdir, "crafting_workbench_top.png")),
+        maxdepth=2)
+
+
+def extrude_cutout(name, path, thick=2, emit_level=12):
+    """Torch-class bake: a mostly-transparent 16x16 tile extruded into
+    a `thick`-voxel standing model centered in the cell. Bright warm
+    texels (the flame) become emissive voxels — the point light gets a
+    real sub-voxel body instead of an analytic nub."""
+    img = np.asarray(Image.open(path).convert("RGBA").resize(
+        (N, N), Image.NEAREST), dtype=np.float32)
+    pal = [None]
+    pindex = {}
+
+    def pi(rgb, emit=0):
+        key = (rgb, emit)
+        if key not in pindex:
+            pal.append(dict(rgb=list(rgb), emit=emit))
+            pindex[key] = len(pal) - 1
+        return pindex[key]
+
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    z0 = (N - thick) // 2
+    for vv in range(N):
+        for u in range(N):
+            r, g, b, a = img[vv, u]
+            if a < 128:
+                continue
+            is_flame = r > 180.0 and g > 100.0 and r > 1.4 * b
+            idx = pi((int(r), int(g), int(b)),
+                     emit_level if is_flame else 0)
+            for z in range(z0, z0 + thick):
+                v[z, 15 - vv, u] = idx
+    return name, pal, v
+
+
+def model_torch_baked():
+    tdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "games", "mineclonia", "mods", "ITEMS",
+                        "mcl_torches", "textures")
+    return extrude_cutout(
+        "torch_baked",
+        os.path.join(tdir, "default_torch_on_floor.png"),
+        thick=2, emit_level=12)
+
+
 # ---- isometric preview (orthographic ray march, front-right-top) ----
 
 def preview(pal, v, px=420):
@@ -218,7 +372,9 @@ def main():
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "claude_models")
     os.makedirs(outdir, exist_ok=True)
-    for fn in (model_furnace, model_chest, model_crafting):
+    for fn in (model_furnace, model_chest, model_crafting,
+               model_furnace_baked, model_crafting_baked,
+               model_torch_baked):
         name, pal, v = fn()
         data = dict(name=name,
                     palette=[None] + [dict(rgb=list(p["rgb"]),
