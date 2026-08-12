@@ -1091,23 +1091,6 @@ void main(void)
 					// the surface shadowed itself — acne read as "shadows that
 					// shouldn't be there".
 					vec3 hp2 = cell + hl + hn * 0.03125;
-					// mode 6: quantize THIS branch too — micro-carved
-					// surfaces (dirt, cobble, most textured ground) shade
-					// here, not in the plain-cube path, and an unquantized
-					// micro branch kept every shadow falling on them
-					// smooth ("the shadows are NOT stair stepping")
-					vec3 mrnd = rnd;
-					vec3 mrnd2 = rnd2;
-					if (volumeDebug > 5.5) {
-						vec3 hq2 = (floor(hp2 * 16.0) + 0.5) / 16.0;
-						hp2 = mix(hq2, hp2, abs(hn));
-						vec2 ts2 = hq2.xy * 16.0 + vec2(hq2.z * 271.0,
-								hq2.z * 97.0)
-								+ (volumeOrigin.xy + volumeOrigin.z);
-						mrnd = noise3(ts2, animationTimer * 100.0);
-						mrnd2 = noise3(ts2 + vec2(131.0, 71.0),
-								animationTimer * 100.0 + 37.7);
-					}
 					vec3 alb = pathAlbedo(s.rgb);
 					// Texture the SUB-VOXEL, not just the block. Carved
 					// surfaces previously took the cell's average colour and
@@ -1130,12 +1113,12 @@ void main(void)
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
 							* 43758.5453);
 					alb *= 1.0 + (jh - 0.5) * 2.0 * jitterStrength;
-					vec3 sd2 = normalize(volumeSunDir + (mrnd2 - 0.5) * sunAngle);
+					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 					float ndl2 = max(dot(hn, sd2), 0.0);
 					vec3 dir2 = ndl2 > 0.0
 							? vec3(ndl2 * lightVis(hp2, sd2)) * volumeLightCol
 							: vec3(0.0);
-					vec3 sp2 = normalize(mrnd * 2.0 - 1.0);
+					vec3 sp2 = normalize(rnd * 2.0 - 1.0);
 					vec3 ad2 = normalize(hn + sp2);
 					if (dot(ad2, hn) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, hn) * hn);
 					vec3 amb2 = bounceRay(hp2, ad2, sd2) * 1.15;
@@ -1164,32 +1147,9 @@ void main(void)
 				// voxel artifacts'): launching secondary rays from exact
 				// hit points quantizes occlusion into blocky staircases
 				vec3 hp = ro + rd * t + n * 0.01;
-				// qrnd/qrnd2 drive every stochastic lighting choice below.
-				// Default: the per-pixel noise. Mode 6 reseeds them from
-				// the WORLD TEXEL id — every pixel in a 1/16-node texel
-				// then draws the same jitter sequence and computes
-				// literally the same light. Quantizing only the ray
-				// origin was not enough: penumbra jitter and the ambient
-				// direction stayed screen-seeded, so shadows still
-				// resolved per pixel (John caught it).
-				vec3 qrnd = rnd;
-				vec3 qrnd2 = rnd2;
-				if (volumeDebug > 5.5) {
-					// mode 6 — sub-voxel light quantization look-test:
-					// ONE lighting value per 1/16-node texel. A/B against
-					// mode 3 live via claude_volume_debug.
-					vec3 hq = (floor(hp * 16.0) + 0.5) / 16.0;
-					hp = mix(hq, hp, abs(n));
-					vec2 tseed = hq.xy * 16.0 + vec2(hq.z * 271.0,
-							hq.z * 97.0) + (volumeOrigin.xy + volumeOrigin.z);
-					qrnd = noise3(tseed, animationTimer * 100.0);
-					qrnd2 = noise3(tseed + vec2(131.0, 71.0),
-							animationTimer * 100.0 + 37.7);
-				} else {
-					vec3 tj = (rnd2.zxy - 0.5) * 0.35;
-					hp += tj - n * dot(tj, n); // jitter within the face plane
-				}
-				vec3 albedo = (volumeDebug > 3.5 && volumeDebug < 5.5)
+				vec3 tj = (rnd2.zxy - 0.5) * 0.35;
+				hp += tj - n * dot(tj, n); // jitter within the face plane
+				vec3 albedo = volumeDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
 				// Per-block colour jitter: Teardown's answer to flatness
 				// without textures — a stone wall becomes a thousand
@@ -1218,9 +1178,7 @@ void main(void)
 				// Analytic bevel: near a cell edge, tilt the normal toward
 				// the neighbouring face so cubes read as chamfered blocks
 				// (Teardown's rounded look) — no art, no height map.
-				// (mode 6 skips the bevel: an analytic smooth rounding is
-				// the one term that CANNOT sit on the lattice)
-				if (bevelStrength > 0.0 && volumeDebug < 5.5) {
+				if (bevelStrength > 0.0) {
 					vec2 e = (fuv - 0.5) * 2.0;             // -1..1
 					vec2 k = sign(e) * smoothstep(0.55, 1.0, abs(e));
 					n = normalize(n + (udir * k.x + vdir * k.y)
@@ -1236,7 +1194,7 @@ void main(void)
 				float specGloss = 0.0;
 				float specMask = 1.0;
 				if ((textureAmount > 0.0 || reliefStrength > 0.0)
-						&& (volumeDebug < 3.5 || volumeDebug > 5.5)) {
+						&& volumeDebug < 3.5) {
 					float mid = texture3D(claudeMaterials,
 							(cell + 0.5) / S).r * 255.0;
 					if (mid > 0.5) {
@@ -1315,7 +1273,7 @@ void main(void)
 
 				// direct light: jittered within the solar/lunar disc
 				// so the average converges to soft penumbras
-				vec3 sd = normalize(volumeSunDir + (qrnd2 - 0.5) * sunAngle);
+				vec3 sd = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 				float ndl = max(dot(n, sd), 0.0);
 				vec3 direct = vec3(0.0);
 				float sunVis = 0.0;
@@ -1326,7 +1284,7 @@ void main(void)
 
 				// one cosine-weighted ambient ray: uniform sphere point
 				// added to the normal
-				vec3 sp = normalize(qrnd * 2.0 - 1.0);
+				vec3 sp = normalize(rnd * 2.0 - 1.0);
 				vec3 ad = n + sp;
 				if (dot(ad, ad) < 1e-4)
 					ad = n;
