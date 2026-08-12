@@ -237,6 +237,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_cache_sky_pixel{"cacheSkyStrength"};
 	float m_bisect = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bisect_pixel{"claudeBisect"};
+	float m_pyramid = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_pyramid_pixel{"claudePyramid"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -276,7 +278,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 23> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 24> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -300,6 +302,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bounce2",
 		"claude_cache_sky",
 		"claude_bisect",
+		"claude_pyramid",
 	};
 
 	static float readGoldenHourStrength()
@@ -468,6 +471,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_bisect", 0.0f, 5.0f);
 	}
 
+	// Occupancy-pyramid leap climb (overnight 2026-08-12): 0 = classic
+	// 4-cell brick leap only, 1 = climb mips for 8/16/32-cell leaps.
+	static float readPyramid()
+	{
+		if (!g_settings->exists("claude_pyramid"))
+			return 0.0f;
+		return g_settings->getFloat("claude_pyramid", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -533,6 +545,8 @@ public:
 			m_cache_sky = readCacheSky();
 		if (name == "claude_bisect")
 			m_bisect = readBisect();
+		if (name == "claude_pyramid")
+			m_pyramid = readPyramid();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -572,6 +586,7 @@ public:
 		m_bounce2 = readBounce2();
 		m_cache_sky = readCacheSky();
 		m_bisect = readBisect();
+		m_pyramid = readPyramid();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -694,6 +709,7 @@ public:
 			m_bounce2_pixel.set(&b2, services);
 			m_cache_sky_pixel.set(&m_cache_sky, services);
 			m_bisect_pixel.set(&m_bisect, services);
+			m_pyramid_pixel.set(&m_pyramid, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
@@ -1641,19 +1657,62 @@ static void claudeVolumeSnapshot(Client *client)
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, S, S, S, 0, GL_RGBA,
 			GL_UNSIGNED_BYTE, occ.data());
-	// coarse any-solid brick map on unit 5: empty-space leaping
-	if (!g_claude_volume.coarse_tex)
-		glGenTextures(1, &g_claude_volume.coarse_tex);
-	glActiveTexture(GL_TEXTURE11);
-	glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, claudeUseR8() ? GL_R8 : GL_LUMINANCE8,
-			32, 32, 32, 0, claudeUseR8() ? GL_RED : GL_LUMINANCE,
-			GL_UNSIGNED_BYTE, coarse.data());
+	// OCCUPANCY MIP PYRAMID on unit 11 (Teardown's accelerator, ADR-0007
+	// overnight 2026-08-12): the old 32^3 brick map becomes level 2 of a
+	// 128^3 R8 texture with real GL mips 0..5 (any-content, max-reduced).
+	// Shaders sample with textureLod: level 2 reproduces the old leap
+	// exactly; the claude_pyramid dial lets marchers CLIMB to 8/16/32-
+	// cell leaps through deep emptiness. ~2.4 MB total.
+	{
+		static std::vector<u8> pyr0(S * S * S), pyr1(64 * 64 * 64),
+				pyr2(32 * 32 * 32), pyr3(16 * 16 * 16),
+				pyr4(8 * 8 * 8), pyr5(4 * 4 * 4);
+		for (int i = 0; i < S * S * S; i++)
+			pyr0[i] = occ[(size_t)i * 4 + 3] ? 255 : 0;
+		auto reduce = [](const std::vector<u8> &src, std::vector<u8> &dst,
+				int n) {
+			for (int z = 0; z < n; z++)
+			for (int y = 0; y < n; y++)
+			for (int x = 0; x < n; x++) {
+				u8 v = 0;
+				for (int k = 0; k < 8 && !v; k++) {
+					int sx = x * 2 + (k & 1), sy = y * 2 + ((k >> 1) & 1),
+						sz = z * 2 + (k >> 2);
+					v |= src[((size_t)sz * n * 2 + sy) * n * 2 + sx];
+				}
+				dst[((size_t)z * n + y) * n + x] = v;
+			}
+		};
+		reduce(pyr0, pyr1, 64); reduce(pyr1, pyr2, 32);
+		reduce(pyr2, pyr3, 16); reduce(pyr3, pyr4, 8); reduce(pyr4, pyr5, 4);
+		if (!g_claude_volume.coarse_tex)
+			glGenTextures(1, &g_claude_volume.coarse_tex);
+		glActiveTexture(GL_TEXTURE11);
+		glBindTexture(GL_TEXTURE_3D, g_claude_volume.coarse_tex);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER,
+				GL_NEAREST_MIPMAP_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_BASE_LEVEL, 0);
+		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAX_LEVEL, 5);
+		GLenum ifmt = claudeUseR8() ? GL_R8 : GL_LUMINANCE8;
+		GLenum fmt = claudeUseR8() ? GL_RED : GL_LUMINANCE;
+		glTexImage3D(GL_TEXTURE_3D, 0, ifmt, S, S, S, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr0.data());
+		glTexImage3D(GL_TEXTURE_3D, 1, ifmt, 64, 64, 64, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr1.data());
+		glTexImage3D(GL_TEXTURE_3D, 2, ifmt, 32, 32, 32, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr2.data());
+		glTexImage3D(GL_TEXTURE_3D, 3, ifmt, 16, 16, 16, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr3.data());
+		glTexImage3D(GL_TEXTURE_3D, 4, ifmt, 8, 8, 8, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr4.data());
+		glTexImage3D(GL_TEXTURE_3D, 5, ifmt, 4, 4, 4, 0, fmt,
+				GL_UNSIGNED_BYTE, pyr5.data());
+	}
+	(void)coarse;
 	// material-id volume on unit 6
 	if (!g_claude_volume.material_tex)
 		glGenTextures(1, &g_claude_volume.material_tex);

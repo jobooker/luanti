@@ -52,6 +52,7 @@ uniform vec4 claudeEmitter6;
 uniform vec4 claudeEmitter7;
 uniform lowp float claudeEmitterCount;
 uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
+uniform lowp float claudePyramid; // occupancy-pyramid leap climb dial
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -144,8 +145,20 @@ float cacheShadow(vec3 ro, vec3 sd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return vis;
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
-			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), sd) * lvl;
 			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
 					* max(abs(sd), vec3(1e-6));
 			vec3 tt = (bb - ro) / rdg;
@@ -230,8 +243,20 @@ vec3 gatherRay(vec3 ro, vec3 rd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return cacheSky(rd) * skyBounce * cacheSkyStrength * trans;
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
-			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), rd) * lvl;
 			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 					* max(abs(rd), vec3(1e-6));
 			vec3 tt = (bb - ro) / rdg;

@@ -30,6 +30,9 @@ uniform lowp float bounce2Strength; // claude_bounce2: 3rd bounce, 0 = off
 // ignore carve; 2 +micro normal; 3 +micro position (= full shading);
 // 5 +shadow-ray micro occlusion (= fully normal).
 uniform lowp float claudeBisect;
+// occupancy pyramid dial: 0 = classic 4-cell brick leap (exact old
+// behavior), 1 = climb mips for 8/16/32-cell leaps through emptiness
+uniform lowp float claudePyramid;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -690,9 +693,21 @@ float lightVis(vec3 ro, vec3 sd)
 			// mountain shadow. No-op (returns 1) when cascades are off.
 			return vis * farShadow(ro + sd * tcur, sd);
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
 			// empty brick: leap to its far side in one step
-			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), sd) * lvl;
 			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
 					* max(abs(sd), vec3(1e-6));
 			vec3 tt = (bb - ro) / rdg;
@@ -775,11 +790,80 @@ vec3 faceCache(vec3 cell, vec3 n)
 // recursion; the radiance cache carries everything beyond.
 // forward decl: defined after bounceRay, but bounce hits need torch NEE
 vec3 emitterLight(vec3 hp, vec3 n);
+vec3 emitterLightCheap(vec3 hp, vec3 n);
 
 // Mode-11 instrument: emitterVis records WHY it returned what it did.
 // 0 clear (never met a carved cell), 1 rim-passed, 2 blocked in OWN
 // cell, 3 blocked crossing another carved cell, 4 blocked by full cube.
 float g_evisCause = 0.0;
+
+// Coarse-rung sun visibility for INDIRECT consumers (bounce hits):
+// identical cell-exact A&W with pyramid leaps and far promotion, but no
+// sub-voxel descent — carve detail in an indirect shadow is invisible,
+// and this is where the old t<6/t<20 range gates' real insight lands
+// cleanly: the CONSUMER picks the rung, not a hidden gate. Still 100%
+// traced (John's no-cheats rule) — just a coarser rung of the ladder.
+float lightVisCheap(vec3 ro, vec3 sd)
+{
+	const float S = 128.0;
+	float vis = 1.0;
+	float tcur = 0.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(sd);
+	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	for (int i = 0; i < 128; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			tcur = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x;
+		} else if (sideDist.y < sideDist.z) {
+			tcur = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y;
+		} else {
+			tcur = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return vis * farShadow(ro + sd * tcur, sd);
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), sd) * lvl;
+			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
+					* max(abs(sd), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z) + 1e-3;
+			vec3 p2 = ro + sd * tj;
+			cell = floor(p2);
+			sideDist = tj + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			tcur = tj;
+			continue;
+		}
+		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
+		if (a > 0.25) {
+			// carved cells block as their 1m cube at this rung
+			if (a > 0.6 && a < 0.97)
+				continue; // emissive passes
+			float tr = cellTransmit(a);
+			if (a > 0.97 && a < 0.99)
+				tr = 0.0;
+			if (tr <= 0.0)
+				return 0.0;
+			vis *= tr;
+			if (vis < 0.04)
+				return 0.0;
+		}
+	}
+	return vis;
+}
 
 vec3 skyProbe(vec3 ro, vec3 rd, vec3 sd)
 {
@@ -801,8 +885,20 @@ vec3 skyProbe(vec3 ro, vec3 rd, vec3 sd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return pathSkyRadiance(rd) * SKY_BOUNCE * trans;
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
-			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), rd) * lvl;
 			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 					* max(abs(rd), vec3(1e-6));
 			vec3 tt = (bb - ro) / rdg;
@@ -833,7 +929,7 @@ vec3 skyProbe(vec3 ro, vec3 rd, vec3 sd)
 			float ndl = max(dot(n, sd), 0.0);
 			vec3 lit = pathSkyRadiance(n) * SKY_BOUNCE * 0.5;
 			if (ndl > 0.0)
-				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+				lit += volumeLightCol * ndl * lightVisCheap(hp, sd) * 1.4;
 			return pathAlbedo(s.rgb) * lit * trans;
 		}
 	}
@@ -866,8 +962,20 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			return pathSkyRadiance(rd) * trans;
 		}
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
-			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), rd) * lvl;
 			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 					* max(abs(rd), vec3(1e-6));
 			vec3 tt = (bb - ro) / rdg;
@@ -911,17 +1019,17 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn)) {
 				float fallm = 1.0 - t / 160.0;
 				vec3 hpm = cell + mh + mn * 0.03125;
-				vec3 litm = pathSkyRadiance(mn) * lightVis(hpm, mn) * SKY_BOUNCE;
+				vec3 litm = pathSkyRadiance(mn) * lightVisCheap(hpm, mn) * SKY_BOUNCE;
 				float ndlm = max(dot(mn, sd), 0.0);
 				if (ndlm > 0.0)
-					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
+					litm += volumeLightCol * ndlm * lightVisCheap(hpm, sd) * 1.4;
 				if (radianceStrength > 0.0)
 					litm += faceCache(cell, mn) * radianceStrength;
 				// torch NEE at the bounce vertex: a facet tilted away from
 				// the torch gets filled by bounced torchlight from the lit
 				// surfaces it faces (2026-08-12 — the missing second-bounce
 				// term behind the "circular shadow" saga)
-				litm += emitterLight(hpm, mn);
+				litm += emitterLightCheap(hpm, mn);
 				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
@@ -971,11 +1079,11 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 						* SKY_BOUNCE;
 				lit = mix(approx, hop, bounce2Strength);
 			} else {
-				lit = pathSkyRadiance(n) * lightVis(hp, n) * SKY_BOUNCE;
+				lit = pathSkyRadiance(n) * lightVisCheap(hp, n) * SKY_BOUNCE;
 			}
 			float ndl = max(dot(n, sd), 0.0);
 			if (ndl > 0.0)
-				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
+				lit += volumeLightCol * ndl * lightVisCheap(hp, sd) * 1.4;
 			// multi-bounce term: light already circulating in the cache
 			// (this is what lets a torch fill a room instead of dying at
 			// its first bounce). Read UNATTENUATED, deliberately (John,
@@ -989,7 +1097,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			if (radianceStrength > 0.0)
 				lit += faceCache(cell, n) * radianceStrength;
 			// torch NEE at the bounce vertex (see micro branch above)
-			lit += emitterLight(hp, n);
+			lit += emitterLightCheap(hp, n);
 			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}
@@ -1091,6 +1199,35 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 			return 1.0;
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
+		// pyramid leap (NEW for emitter shadows — they previously had no
+		// acceleration at all; dial-gated so dial-off is exact baseline)
+		if (claudePyramid > 0.5
+				&& textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), ld) * lvl;
+			vec3 rdg = (step(vec3(0.0), ld) * 2.0 - 1.0)
+					* max(abs(ld), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z) + 1e-3;
+			if (tj >= maxT)
+				return 1.0; // empty all the way to the flame
+			vec3 p2 = ro + ld * tj;
+			cell = floor(p2);
+			sideDist = tj + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			t = tj;
+			continue;
+		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		// carved cells: march the sub-grid, binary, same rule as the
 		// origin cell above — sub-voxels ARE voxels, no special cases
@@ -1142,13 +1279,14 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 // Diffuse torch light; when gloss > 0 also accumulates a Blinn-Phong
 // glint into specAcc, reusing the SAME visibility trace and falloff —
 // specular costs no extra rays. v is the direction toward the eye.
-vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc)
+vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc,
+		int nmax)
 {
 	vec3 acc = vec3(0.0);
 	// slots 0-7 = static torches; slot 8 = the held (wielded) light,
 	// which lives in its own uniform so it can NEVER stomp a real torch
 	for (int i = 0; i < 9; i++) {
-		if (i < 8 && float(i) >= claudeEmitterCount)
+		if (i < 8 && (i >= nmax || float(i) >= claudeEmitterCount))
 			continue;
 		vec4 em = i < 8 ? getEmitter(i) : claudeHeldEmitter;
 		if (em.w <= 0.0)
@@ -1186,7 +1324,17 @@ vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc)
 vec3 emitterLight(vec3 hp, vec3 n)
 {
 	vec3 dummy = vec3(0.0);
-	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy);
+	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy, 8);
+}
+
+// BOUNCE-VERTEX LIGHT BUDGET (overnight 2026-08-12, Teardown-tier
+// principle): indirect hits check only the 2 nearest torches (+ held).
+// Direct eye-hit lighting keeps the full list; the indirect tail gets
+// the cheap seat — same light, ~1/4 the aimed rays per bounce.
+vec3 emitterLightCheap(vec3 hp, vec3 n)
+{
+	vec3 dummy = vec3(0.0);
+	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy, 2);
 }
 
 // Reproject a volume-local point into last frame's screen; returns
@@ -1238,10 +1386,22 @@ void main(void)
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			vec3 cc = floor(cell / 4.0);
-			if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
+			if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
 				// empty brick: leap to its far side, keeping the crossing
 				// axis so a hit right after the jump gets a true normal
-				vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
+				vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), rd) * lvl;
 				vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 						* max(abs(rd), vec3(1e-6));
 				vec3 tt = (bb - ro) / rdg;
@@ -1417,7 +1577,7 @@ void main(void)
 					vec3 specAcc2 = vec3(0.0);
 					float glossOn2 = mSpecStr * mSpecMask;
 					vec3 em2 = emitterLightSpec(bpos + bnT * 0.0625, bnT, -rd,
-							glossOn2 > 0.005 ? mSpecGloss : 0.0, specAcc2);
+							glossOn2 > 0.005 ? mSpecGloss : 0.0, specAcc2, 8);
 					fresh = alb * (dir2 + amb2 + em2);
 					if (glossOn2 > 0.005) {
 						if (ndl2 > 0.0 && dir2.r + dir2.g + dir2.b > 0.0) {
@@ -1642,7 +1802,7 @@ void main(void)
 				vec3 specAcc = vec3(0.0);
 				float glossOn = specStr * specMask;
 				vec3 emDiff = emitterLightSpec(hp, n, -rd,
-						glossOn > 0.005 ? specGloss : 0.0, specAcc);
+						glossOn > 0.005 ? specGloss : 0.0, specAcc, 8);
 				fresh = albedo * (direct + amb + emDiff);
 				if (glossOn > 0.005) {
 					if (sunVis > 0.0) {
