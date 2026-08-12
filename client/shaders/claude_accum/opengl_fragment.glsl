@@ -496,7 +496,13 @@ vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
 					? volumeLightCol * (ndl
 						* farShadow(hpv + n * csz, sd))
 					: vec3(0.0);
-			vec3 c = albedo * (direct + pathSkyRadiance(n) * SKY_BOUNCE);
+			// ambient: sky, warmed toward the terrain's own color — the
+			// near field's ambient is a traced bounce that picks up
+			// ground warmth, and pure sky ambient here made the far side
+			// of the seam read cold and blue by comparison
+			vec3 skyAmb = pathSkyRadiance(n);
+			vec3 c = albedo * (direct
+					+ mix(skyAmb, skyAmb * albedo * 2.5, 0.25) * SKY_BOUNCE);
 			if (s.a < 0.6) // far water: flat sky mirror
 				c = mix(c, pathSkyFog(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);

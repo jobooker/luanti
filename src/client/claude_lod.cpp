@@ -58,6 +58,21 @@ void summarizeBlock(Client *client, MapBlock *block)
 		video::SColor col(255, 180, 180, 180);
 		if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
 			col = f.visuals->minimap_color;
+		// per-node biome tint (param2 palette): Mineclonia grass/leaves/
+		// water are GRAYSCALE textures tinted at render time. The near
+		// snapshot applies this; dropping it here turned every tinted
+		// block gray in the cascades ("the quality of the color changes
+		// dramatically" at the 1m/2m seam).
+		if (f.visuals) {
+			video::SColor tint(255, 255, 255, 255);
+			f.visuals->getColor(n.getParam2(), &tint);
+			if (tint.getRed() != 255 || tint.getGreen() != 255
+					|| tint.getBlue() != 255) {
+				col.setRed(col.getRed() * tint.getRed() / 255);
+				col.setGreen(col.getGreen() * tint.getGreen() / 255);
+				col.setBlue(col.getBlue() * tint.getBlue() / 255);
+			}
+		}
 		if (f.isLiquid()) {
 			s.water[sub]++;
 		} else {
@@ -171,7 +186,8 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 
 // per-content classification LUT so the 2 m walk never touches the
 // NodeDefManager in its inner loop. 0 = unknown (resolve), 1 = air/skip,
-// 2 = solid, 3 = water. Color packed 0xRRGGBB alongside.
+// 2 = solid, 3 = water; bit 4 (|8) marks palette-tinted contents whose
+// color needs a per-node param2 lookup. Color packed 0xRRGGBB alongside.
 static std::vector<u8> g_cls_lut;
 static std::vector<u32> g_col_lut;
 
@@ -204,9 +220,36 @@ static inline u8 classify(const NodeDefManager *ndef, content_t c)
 		video::SColor col = f.visuals->minimap_color;
 		g_col_lut[c] = (col.getRed() << 16) | (col.getGreen() << 8)
 				| col.getBlue();
+		// does this content tint per node? probe with a nonzero param2:
+		// palette'd defs return a non-white color, plain ones don't
+		video::SColor probe(255, 255, 255, 255);
+		f.visuals->getColor(1, &probe);
+		video::SColor probe0(255, 255, 255, 255);
+		f.visuals->getColor(0, &probe0);
+		if (probe.color != 0xFFFFFFFFu || probe0.color != 0xFFFFFFFFu)
+			cls |= 8;
 	}
 	g_cls_lut[c] = cls;
 	return cls;
+}
+
+// per-node color for the 2 m walk: LUT base, times the param2 biome
+// tint when the content is palette'd (grayscale grass/leaves/water)
+static inline u32 nodeColor2m(const NodeDefManager *ndef, MapNode n, u8 cls)
+{
+	u32 col = g_col_lut[n.getContent()];
+	if (cls & 8) {
+		const ContentFeatures &f = ndef->get(n.getContent());
+		if (f.visuals) {
+			video::SColor tint(255, 255, 255, 255);
+			f.visuals->getColor(n.getParam2(), &tint);
+			u32 r = ((col >> 16) & 0xFF) * tint.getRed() / 255;
+			u32 g = ((col >> 8) & 0xFF) * tint.getGreen() / 255;
+			u32 b = (col & 0xFF) * tint.getBlue() / 255;
+			col = (r << 16) | (g << 8) | b;
+		}
+	}
+	return col;
 }
 
 u32 buildCascade2(Client *client, v3s16 origin_nodes,
@@ -242,10 +285,10 @@ u32 buildCascade2(Client *client, v3s16 origin_nodes,
 				MapNode n = block->getNodeNoCheck(cx * 2 + ox,
 						cy * 2 + oy, cz * 2 + oz);
 				u8 cls = classify(ndef, n.getContent());
-				if (cls == 1)
+				if ((cls & 7) == 1)
 					continue;
-				u32 col = g_col_lut[n.getContent()];
-				if (cls == 3) water++; else occ++;
+				u32 col = nodeColor2m(ndef, n, cls);
+				if ((cls & 7) == 3) water++; else occ++;
 				r += (col >> 16) & 0xFF;
 				g += (col >> 8) & 0xFF;
 				b += col & 0xFF;
