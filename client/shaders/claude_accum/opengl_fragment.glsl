@@ -1365,6 +1365,130 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 	return vec3(0.0);
 }
 
+// ---- PHOTO MODE (at rest): true path tracing ----
+// photoMarch: raw-hit segment marcher. Unlike bounceRay it does NOT
+// shade — it returns what it found and lets the path loop own the
+// light. Transmissive cells attenuate `tp` in place. Result codes:
+// 0 = sky escape, 1 = solid hit (hp/n/alb filled), 2 = emissive hit
+// (alb = glow radiance), 3 = absorbed (void floor / budget / opacity).
+int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
+		out vec3 hp, out vec3 n, out vec3 alb)
+{
+	const float S = 128.0;
+	vec3 cell = floor(ro);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
+	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
+	float t = 0.0;
+	int axis = -1;
+	for (int i = 0; i < 160; i++) {
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += invRd.y; cell.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += invRd.z; cell.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
+			return cell.y < 0.0 ? 3 : 0;
+		if (textureLod(claudeCoarse, (cell + 0.5) / 128.0, 2.0).r < 0.5) {
+			float lvl = 4.0;
+			if (claudePyramid > 0.5 && textureLod(claudeCoarse,
+					(cell + 0.5) / 128.0, 3.0).r < 0.5) {
+				lvl = 8.0;
+				if (textureLod(claudeCoarse,
+						(cell + 0.5) / 128.0, 4.0).r < 0.5) {
+					lvl = 16.0;
+					if (textureLod(claudeCoarse,
+							(cell + 0.5) / 128.0, 5.0).r < 0.5)
+						lvl = 32.0;
+				}
+			}
+			vec3 bb = floor(cell / lvl) * lvl + step(vec3(0.0), rd) * lvl;
+			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
+					* max(abs(rd), vec3(1e-6));
+			vec3 tt = (bb - ro) / rdg;
+			float tj = min(min(tt.x, tt.y), tt.z);
+			if (tt.x <= tt.y && tt.x <= tt.z) axis = 0;
+			else if (tt.y <= tt.z) axis = 1;
+			else axis = 2;
+			t = tj;
+			vec3 p2 = ro + rd * (tj + 1e-3);
+			cell = floor(p2);
+			sideDist = tj + 1e-3 + (stepDir * (cell - p2)
+					+ stepDir * 0.5 + 0.5) * invRd;
+			continue;
+		}
+		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		if (s.a <= 0.25)
+			continue;
+		if (cellTransmit(s.a) > 0.0) {
+			tp *= cellTransmit(s.a);
+			if (max(tp.r, max(tp.g, tp.b)) < 0.02)
+				return 3;
+			continue;
+		}
+		if (s.a > 0.6 && s.a < 0.97) {
+			float e = clamp((s.a - 0.65) / 0.29, 0.0, 1.0);
+			alb = pathAlbedo(s.rgb) * (0.4 + e * 2.0);
+			return 2;
+		}
+		n = vec3(0.0);
+		if (axis == 0) n.x = -stepDir.x;
+		else if (axis == 1) n.y = -stepDir.y;
+		else n.z = -stepDir.z;
+		hp = ro + rd * t + n * 0.01;
+		alb = pathAlbedo(s.rgb);
+		return 1;
+	}
+	return 3;
+}
+
+// photoPath: radiance arriving at the eye hit along `rd0`, computed by
+// a genuine path — up to 4 bounces, per-vertex sun + emitter sampling,
+// Russian roulette past bounce 2. NO caches, NO tuned multipliers:
+// this is the reference the fast modes get judged against. Cosine
+// sampling keeps the caller's convention (pdf cancels the cos/PI, so
+// the estimator is just the incoming radiance).
+vec3 photoPath(vec3 p0, vec3 rd0, vec3 sd, vec3 seed)
+{
+	vec3 L = vec3(0.0);
+	vec3 tp = vec3(1.0);
+	vec3 p = p0;
+	vec3 dir = rd0;
+	for (int b = 0; b < 4; b++) {
+		vec3 hp, n, alb;
+		int res = photoMarch(p, dir, tp, hp, n, alb);
+		if (res == 0) { L += tp * pathSkyRadiance(dir); break; }
+		if (res == 2) { L += tp * alb; break; }
+		if (res == 3) break;
+		float ndl = max(dot(n, sd), 0.0);
+		if (ndl > 0.0)
+			L += tp * alb * volumeLightCol * ndl
+					* (b == 0 ? lightVis(hp, sd) : lightVisCheap(hp, sd));
+		L += tp * alb * emitterLightCheap(hp, n);
+		tp *= alb;
+		vec3 h = vec3(
+			fract(sin(dot(hp + seed + float(b) * 0.617,
+				vec3(12.9898, 78.233, 37.719))) * 43758.5453),
+			fract(sin(dot(hp + seed + float(b) * 0.617,
+				vec3(93.989, 12.233, 57.719))) * 24634.6345),
+			fract(sin(dot(hp + seed + float(b) * 0.617,
+				vec3(45.332, 88.443, 19.113))) * 31578.2846));
+		dir = normalize(n + normalize(h * 2.0 - 1.0 + vec3(1e-4)));
+		if (dot(dir, n) < 0.0)
+			dir = normalize(dir - 2.0 * dot(dir, n) * n);
+		p = hp;
+		if (b >= 1) {
+			float q = clamp(max(tp.r, max(tp.g, tp.b)), 0.05, 0.95);
+			if (h.x > q)
+				break;
+			tp /= q;
+		}
+	}
+	return L;
+}
+
 // Bilinear height from the atlas alpha. The atlas is NEAREST-filtered
 // (colour wants crisp pixels), so interpolate by hand: without this the
 // height is constant inside each texel and relief reads as stairs.
@@ -2108,27 +2232,17 @@ void main(void)
 				bool skipB = claudeCost > 2.5;
 				vec3 amb = vec3(0.0);
 				if (!skipB) {
-					if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
+					// PHOTO MODE at rest: one TRUE path per frame REPLACES
+					// the amortized ambient — no caches, no multipliers;
+					// 1/N accumulation converges it to the reference image
+					if (claudeRefine > 0.5 && accumAlpha < 0.08) {
+						amb = photoPath(hp, ad, sd, rnd);
+					} else if (claudeFaceDirect > 0.5 && radianceStrength > 0.0) {
 						amb = faceCacheHP(cell, n, hp) * radianceStrength * 1.15;
 					} else {
 						float bw = bounceLottery();
 						if (bw > 0.0)
 							amb = bounceRay(hp, ad, sd) * 1.15 * bw;
-					}
-					// at rest: two extra hemisphere samples per frame —
-					// per-pixel AO crisps toward ground truth while the
-					// camera is still (fps is free at rest)
-					if (claudeRefine > 0.5 && accumAlpha < 0.08) {
-						vec3 adR = normalize(n + normalize(
-								rnd.zxy * 2.0 - 1.0 + vec3(1e-4)));
-						if (dot(adR, n) < 0.0)
-							adR = normalize(adR - 2.0 * dot(adR, n) * n);
-						vec3 adS = normalize(n + normalize(
-								rnd.yzx * 2.0 - 1.0 + vec3(2e-4)));
-						if (dot(adS, n) < 0.0)
-							adS = normalize(adS - 2.0 * dot(adS, n) * n);
-						amb = (amb + bounceRay(hp, adR, sd) * 1.15
-								+ bounceRay(hp, adS, sd) * 1.15) / 3.0;
 					}
 				}
 

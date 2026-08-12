@@ -2372,9 +2372,18 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 // tens of ms walking 16M nodes) per second — never more.
 static void claudeCascadeUpdate(Client *client)
 {
+	// PURE 1 m MODE (claude_cascades = 0): the LOD ladder is not merely
+	// frozen, it is RETIRED — every level's validity is cleared so the
+	// shader's farTrace finds no valid rung and eye rays end at the 128^3
+	// volume edge (sky beyond). Without the invalidation, flipping the
+	// dial off at runtime only stopped REBUILDS and the stale ladder kept
+	// being marched, which would read as "the dial does nothing".
 	if (!g_settings->exists("claude_cascades")
-			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f)
+			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f) {
+		for (int lv = 0; lv < 5; lv++)
+			g_claude_volume.casc[lv].valid = false;
 		return;
+	}
 	static const int CELL[5] = {2, 4, 8, 16, 32};
 	static const u64 CADENCE[5] = {8000, 6000, 4000, 12000, 20000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
