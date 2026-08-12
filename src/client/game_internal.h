@@ -161,6 +161,7 @@ protected:
 	void toggleFog();
 	void toggleClaudeTrace();
 	void toggleClaudeBounce();
+	void toggleClaudeCarve();
 	void claudeTimeNudge(int dir);
 	void toggleDebug();
 	void toggleUpdateCamera();

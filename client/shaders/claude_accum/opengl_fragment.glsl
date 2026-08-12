@@ -25,6 +25,11 @@ uniform sampler2D claudeMatParams; // 256x1 per-material: R=spec G=gloss B=ore
 #define MICRO_CARVE 2.0            // max sub-voxels a face may recede
 uniform lowp float skyBounce;      // how much sky a bounced-off surface relays
 uniform lowp float bounce2Strength; // claude_bounce2: 3rd bounce, 0 = off
+// Bisection ladder (claude_bisect): 0 normal; 1 carve visible but
+// cube-recipe inputs (face normal + face position) and shadow rays
+// ignore carve; 2 +micro normal; 3 +micro position (= full shading);
+// 5 +shadow-ray micro occlusion (= fully normal).
+uniform lowp float claudeBisect;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -771,6 +776,11 @@ vec3 faceCache(vec3 cell, vec3 n)
 // forward decl: defined after bounceRay, but bounce hits need torch NEE
 vec3 emitterLight(vec3 hp, vec3 n);
 
+// Mode-11 instrument: emitterVis records WHY it returned what it did.
+// 0 clear (never met a carved cell), 1 rim-passed, 2 blocked in OWN
+// cell, 3 blocked crossing another carved cell, 4 blocked by full cube.
+float g_evisCause = 0.0;
+
 vec3 skyProbe(vec3 ro, vec3 rd, vec3 sd)
 {
 	const float S = 128.0;
@@ -1032,7 +1042,15 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 	// Callers bias the origin ~1 sub-voxel off the surface, so features
 	// must stand taller than a single sub-voxel to cast — that's the
 	// quantization floor, not a hack.
-	if (microStrength > 0.0) {
+	vec3 lo0 = ro - cell;
+	// own-cell test ONLY when the origin is genuinely inside the cell:
+	// clamping an above-the-cell origin onto the grid top started the
+	// march INSIDE the flush top slab — descending rays self-blocked
+	// instantly (elevated blocks black in mode 10, immune to rim rules)
+	if (microStrength > 0.0
+			&& (claudeBisect < 0.5 || claudeBisect > 4.5)
+			&& all(greaterThanEqual(lo0, vec3(0.0)))
+			&& all(lessThan(lo0, vec3(1.0)))) {
 		float a0 = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		if (a0 > 0.97 && a0 < 0.99) {
 			float m0 = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
@@ -1042,8 +1060,19 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 			vec3 nbN0, nbP0;
 			microNeighbours(cell, nbN0, nbP0);
 			if (m0 > 0.5 && microDDA(clamp(ro - cell, 0.0, 1.0), ld,
-					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0))
-				return 0.0;
+					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0)) {
+				// rim clip passes regardless of ray direction (see loop);
+				// sample behind the hit face (boundary coin-flip fix)
+				vec3 scA0 = floor((mh0 - mn0 * 0.03125) * 16.0)
+						+ vec3(0.0, 1.0, 0.0);
+				if (abs(mn0.y) < 0.5 && (scA0.y > 15.5
+						|| !microSolid(floor(m0 + 0.5), scA0, r0, nbN0, nbP0))) {
+					g_evisCause = max(g_evisCause, 1.0);
+				} else {
+					g_evisCause = 2.0;
+					return 0.0;
+				}
+			}
 		}
 	}
 	vec3 stepDir = sign(ld);
@@ -1065,7 +1094,8 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		// carved cells: march the sub-grid, binary, same rule as the
 		// origin cell above — sub-voxels ARE voxels, no special cases
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0) {
+		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0
+				&& (claudeBisect < 0.5 || claudeBisect > 4.5)) {
 			float mslot = texture3D(claudeMaterials, (cell + 0.5) / S).r * 255.0;
 			vec3 mh, mn;
 			float rotE = fract(sin(dot(cell + volumeOrigin,
@@ -1073,12 +1103,35 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 			vec3 nbNe, nbPe;
 			microNeighbours(cell, nbNe, nbPe);
 			if (mslot > 0.5 && microDDA(clamp(ro + ld * t - cell, 0.0, 1.0), ld,
-					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn))
-				return 0.0;
+					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn)) {
+				// RIM CLIP, shadow-march side (2026-08-12: after the
+				// eye-normal fix the circle became HARD and block-
+				// aligned; mode-10 heatmap showed whole ELEVATED blocks
+				// black — the first version only pardoned ASCENDING
+				// rays, damning every surface above flame height whose
+				// shadow rays point slightly down). Direction doesn't
+				// matter; the HIT FACE does: a clip on a column SIDE
+				// whose top is exposed is a pebble rim — passes. A hit
+				// on a column TOP, or a side continuing upward, is a
+				// real surface in the way — blocks. Tunnel-safe: steep
+				// piercing rays hit tops, tops block.
+				// sample behind the hit face (boundary coin-flip fix)
+				vec3 scAe = floor((mh - mn * 0.03125) * 16.0)
+						+ vec3(0.0, 1.0, 0.0);
+				if (abs(mn.y) < 0.5 && (scAe.y > 15.5
+						|| !microSolid(floor(mslot + 0.5), scAe, rotE, nbNe, nbPe))) {
+					g_evisCause = max(g_evisCause, 1.0);
+				} else {
+					g_evisCause = 3.0;
+					return 0.0;
+				}
+			}
 			continue;
 		}
-		if (a > 0.25 && !(a > 0.6 && a < 0.97))
+		if (a > 0.25 && !(a > 0.6 && a < 0.97)) {
+			g_evisCause = 4.0;
 			return 0.0;
+		}
 	}
 	return 1.0;
 }
@@ -1211,13 +1264,14 @@ void main(void)
 				viewTint *= vec3(0.86, 0.93, 0.90);
 				continue;
 			}
-			// torch nub: analytic sphere inside the cell — sub-voxel
-			// shape with no occupancy bitmask
+			// torch nub: analytic glowing sphere AT THE EMISSION POINT
+			// (flame height 0.65, matching the emitter) — the visible
+			// body of a pure point light, transparent to light rays
 			if (s.a > 0.63 && s.a < 0.66) {
-				vec3 ctr = cell + 0.5;
+				vec3 ctr = cell + vec3(0.5, 0.65, 0.5);
 				vec3 oc = ro - ctr;
 				float bq = dot(oc, rd);
-				float cq = dot(oc, oc) - 0.20 * 0.20;
+				float cq = dot(oc, oc) - 0.13 * 0.13;
 				if (bq * bq - cq > 0.0) {
 					fresh = pathAlbedo(s.rgb) * 4.0;
 					done = true;
@@ -1247,7 +1301,61 @@ void main(void)
 					// grazing angle re-entered the very sub-voxel it left, and
 					// the surface shadowed itself — acne read as "shadows that
 					// shouldn't be there".
+					// RIM-CLIP NORMAL FIX (2026-08-12, John: "it doesn't
+					// actually get carved" yet the circle appears): a
+					// grazing eye ray entering a flush field clips the
+					// SIDE of the first full-height column and inherits a
+					// sideways normal on what is visually a flat floor —
+					// wrong-facing shading with no visible geometry. If
+					// the sub-voxel above the hit is open sky within the
+					// grid, this is a TOP surface: shade it as one. Real
+					// walls (columns continuing upward) keep side normals.
+					// ENTRY-HIT GUARD (the circle's conviction, 2026-08-12
+					// bisect: step 1 fake-normal clean, step 2 real-normal
+					// circle — the normal is the whole artifact). A ray
+					// entering a cell already inside a solid column gets a
+					// hit with NO crossing axis: the normal comes back
+					// zero. Zero normal -> cosine ~0 -> near-black pixel,
+					// exactly in the grazing zone. Entry hits take the
+					// entry face's normal.
+					if (dot(hn, hn) < 0.5) {
+						// mode-12 verdict (2026-08-12 02:29): flat floors
+						// show a view-centered ARC of sideways normals —
+						// grazing rays cross cell corners where top-vs-
+						// side crossing is a float coin-toss, resolved
+						// coherently per direction. The entry face is NOT
+						// the surface; what's ABOVE the entry decides:
+						// open above = top (shade up), buried = wall.
+						vec3 scA2 = floor(hl * 16.0) + vec3(0.0, 1.0, 0.0);
+						if (scA2.y > 15.5 || !microSolid(floor(mid0 + 0.5),
+								scA2, rot0, nbN0, nbP0))
+							hn = vec3(0.0, 1.0, 0.0);
+						else
+							hn = nn0;
+					}
+					if (abs(hn.y) < 0.5) {
+						// sample the column BEHIND the hit face (bias
+						// against the normal): the hit sits exactly ON
+						// a face and floor() coin-flips the column —
+						// whole blocks flipped dark on rounding luck
+						vec3 scAbove = floor((hl - hn * 0.03125) * 16.0)
+								+ vec3(0.0, 1.0, 0.0);
+						if (scAbove.y > 15.5 || !microSolid(floor(mid0 + 0.5),
+								scAbove, rot0, nbN0, nbP0))
+							hn = vec3(0.0, 1.0, 0.0);
+					}
 					vec3 hp2 = cell + hl + hn * 0.03125;
+					// bisect substitutions: step 1 = cube normal AND cube
+					// position; step 2 = real normal, cube position;
+					// step >= 3 (or 0) = real normal and position
+					vec3 bnrm = hn;
+					vec3 bpos = hp2;
+					if (claudeBisect > 0.5 && claudeBisect < 1.5) {
+						bnrm = nn0;
+						bpos = ro + rd * t + nn0 * 0.01;
+					} else if (claudeBisect > 1.5 && claudeBisect < 2.5) {
+						bpos = ro + rd * t + nn0 * 0.01;
+					}
 					vec3 alb = pathAlbedo(s.rgb);
 					// Texture the SUB-VOXEL, not just the block. Carved
 					// surfaces previously took the cell's average colour and
@@ -1256,6 +1364,12 @@ void main(void)
 					// carve exposed — stones were the right shape and a flat
 					// colour. Pick the face from the hit normal and sample the
 					// same detail encoding the uncarved path uses.
+					// SHADING PARITY (John, 2026-08-12, caught by V-key A/B:
+					// "the places that were specular highlights... get
+					// darker" with carving on): this branch also samples the
+					// per-material spec params the cube branch has — carving
+					// must not switch surfaces to a poorer shading pipeline.
+					float mSpecStr = 0.0, mSpecGloss = 0.0, mSpecMask = 1.0;
 					if (textureAmount > 0.0) {
 						vec2 st = abs(hn.y) > 0.5
 								? vec2(hl.x, hn.y > 0.0 ? hl.z : 1.0 - hl.z)
@@ -1266,27 +1380,54 @@ void main(void)
 						vec2 auv0 = (mo0 + clamp(floor(st * 16.0), 0.0, 15.0) + 0.5) / 256.0;
 						vec3 det0 = texture2D(claudeAtlas, auv0).rgb * 2.0;
 						alb *= mix(vec3(1.0), det0, textureAmount);
+						vec3 mp0 = texture2D(claudeMatParams,
+								vec2((floor(mid0 + 0.5) + 0.5) / 256.0, 0.5)).rgb;
+						mSpecStr = mp0.r;
+						mSpecGloss = mp0.g;
+						if (mp0.b > 0.5)
+							mSpecMask = smoothstep(0.70, 0.90, atlasHeight(auv0));
 					}
 					float jh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719)))
 							* 43758.5453);
 					alb *= 1.0 + (jh - 0.5) * 2.0 * jitterStrength;
+					// sub-rungs 2.1/2.2/2.3: the real normal feeds ONLY the
+					// torch / sun / bounce term respectively; the other two
+					// use the cube normal. Names which formula circles.
+					vec3 bnT = bnrm, bnS = bnrm, bnB = bnrm;
+					if (claudeBisect > 2.05 && claudeBisect < 2.15) {
+						bnS = nn0; bnB = nn0;
+					} else if (claudeBisect > 2.15 && claudeBisect < 2.25) {
+						bnT = nn0; bnB = nn0;
+					} else if (claudeBisect > 2.25 && claudeBisect < 2.35) {
+						bnT = nn0; bnS = nn0;
+					}
 					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
-					float ndl2 = max(dot(hn, sd2), 0.0);
+					float ndl2 = max(dot(bnS, sd2), 0.0);
 					vec3 dir2 = ndl2 > 0.0
-							? vec3(ndl2 * lightVis(hp2, sd2)) * volumeLightCol
+							? vec3(ndl2 * lightVis(bpos, sd2)) * volumeLightCol
 							: vec3(0.0);
 					vec3 sp2 = normalize(rnd * 2.0 - 1.0);
-					vec3 ad2 = normalize(hn + sp2);
-					if (dot(ad2, hn) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, hn) * hn);
-					vec3 amb2 = bounceRay(hp2, ad2, sd2) * 1.15;
-					// emitter shadow rays leave from the RIDGE plane, not
-					// the valley floor: a surface must not be occluded by
-					// its own bump texture (dark-circle bug, 2026-08-12)
+					vec3 ad2 = normalize(bnB + sp2);
+					if (dot(ad2, bnB) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, bnB) * bnB);
+					vec3 amb2 = bounceRay(bpos, ad2, sd2) * 1.15;
 					// origin biased ~1.5 sub-voxels off the surface: with
 					// uniform own-cell tracing, shadow features must stand
-					// taller than a sub-voxel to cast (quantization floor)
-					vec3 em2 = emitterLight(hp2 + hn * 0.0625, hn);
+					// taller than a sub-voxel to cast (quantization floor).
+					// Specular rides the same visibility as the cube branch.
+					vec3 specAcc2 = vec3(0.0);
+					float glossOn2 = mSpecStr * mSpecMask;
+					vec3 em2 = emitterLightSpec(bpos + bnT * 0.0625, bnT, -rd,
+							glossOn2 > 0.005 ? mSpecGloss : 0.0, specAcc2);
 					fresh = alb * (dir2 + amb2 + em2);
+					if (glossOn2 > 0.005) {
+						if (ndl2 > 0.0 && dir2.r + dir2.g + dir2.b > 0.0) {
+							float nh2 = max(dot(bnrm, normalize(sd2 - rd)), 0.0);
+							fresh += volumeLightCol
+									* pow(nh2, mix(16.0, 96.0, mSpecGloss))
+									* glossOn2;
+						}
+						fresh += specAcc2 * glossOn2;
+					}
 					// term-isolation heatmaps (modes 7-10): render ONE
 					// lighting term, no albedo, so artifacts name their
 					// own source. 7 torch, 8 bounce/cache, 9 sun,
@@ -1295,11 +1436,35 @@ void main(void)
 						if (volumeDebug < 7.5) fresh = em2;
 						else if (volumeDebug < 8.5) fresh = amb2;
 						else if (volumeDebug < 9.5) fresh = dir2;
-						else {
+						else if (volumeDebug < 10.5) {
 							vec3 eL = claudeEmitter0.xyz - hp2;
 							float eD = max(length(eL), 1e-3);
-							fresh = vec3(emitterVis(hp2 + nn0 * 0.15,
-									eL / eD, eD - 0.9));
+							fresh = vec3(emitterVis(hp2 + hn * 0.0625,
+									eL / eD, eD - 0.25));
+						} else if (volumeDebug < 11.5) {
+							// mode 11: WHY-map. green clear, yellow
+							// rim-passed, red own-cell block, blue
+							// cross-cell block, white cube block.
+							vec3 eL = claudeEmitter0.xyz - hp2;
+							float eD = max(length(eL), 1e-3);
+							g_evisCause = 0.0;
+							float v11 = emitterVis(hp2 + hn * 0.0625,
+									eL / eD, eD - 0.25);
+							if (g_evisCause < 0.5)
+								fresh = vec3(0.0, 0.8, 0.1) * max(v11, 0.2);
+							else if (g_evisCause < 1.5)
+								fresh = vec3(0.9, 0.8, 0.1);
+							else if (g_evisCause < 2.5)
+								fresh = vec3(0.9, 0.05, 0.05);
+							else if (g_evisCause < 3.5)
+								fresh = vec3(0.15, 0.3, 0.95);
+							else
+								fresh = vec3(0.95);
+						} else {
+							// mode 12: the shading normal as color —
+							// lavender up, green/red sideways, dark
+							// down/zero. The circle paints its own cause.
+							fresh = hn * 0.5 + 0.5;
 						}
 					}
 					done = true;
@@ -1488,6 +1653,41 @@ void main(void)
 					fresh += specAcc * glossOn;
 				}
 
+				// term-isolation heatmaps on UNCARVED surfaces too — the
+				// first mode-7 seam read was garbage because grass
+				// rendered NORMAL shading next to heat-mapped dirt
+				// (instrument asymmetry, caught 2026-08-12 02:18)
+				if (volumeDebug > 6.5 && volumeDebug < 10.5) {
+					if (volumeDebug < 7.5) fresh = emDiff;
+					else if (volumeDebug < 8.5) fresh = amb;
+					else if (volumeDebug < 9.5) fresh = direct;
+					else {
+						vec3 eLc = claudeEmitter0.xyz - hp;
+						float eDc = max(length(eLc), 1e-3);
+						fresh = vec3(emitterVis(hp, eLc / eDc, eDc - 0.25));
+					}
+				}
+				// mode 12 normal-map on UNCARVED surfaces (seam parity)
+				if (volumeDebug > 11.5 && volumeDebug < 12.5)
+					fresh = n * 0.5 + 0.5;
+				// mode 11 WHY-map on UNCARVED surfaces too, so the seam
+				// is instrumented on both sides (colors as micro branch)
+				if (volumeDebug > 10.5 && volumeDebug < 11.5) {
+					vec3 eL = claudeEmitter0.xyz - hp;
+					float eD = max(length(eL), 1e-3);
+					g_evisCause = 0.0;
+					float v11c = emitterVis(hp, eL / eD, eD - 0.25);
+					if (g_evisCause < 0.5)
+						fresh = vec3(0.0, 0.8, 0.1) * max(v11c, 0.2);
+					else if (g_evisCause < 1.5)
+						fresh = vec3(0.9, 0.8, 0.1);
+					else if (g_evisCause < 2.5)
+						fresh = vec3(0.9, 0.05, 0.05);
+					else if (g_evisCause < 3.5)
+						fresh = vec3(0.15, 0.3, 0.95);
+					else
+						fresh = vec3(0.95);
+				}
 				// mirror water: one traced reflection + jittered glint
 				// (water = alpha band around 100/255)
 				if (s.a > 0.3 && s.a < 0.5 && n.y > 0.5) {

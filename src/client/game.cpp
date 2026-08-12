@@ -103,6 +103,11 @@ struct ClaudeVolume
 	u32 material_tex = 0;
 	u32 atlas_tex = 0;
 	u32 micro_tex = 0;          // 256x256x16: 16x16 materials of 16^3 grids
+	// per-material: true when the carve removed ZERO sub-voxels — such
+	// materials are classified plain solid (255), never micro (John,
+	// 2026-08-12: "carving shouldn't be doing anything at all" to a
+	// block whose carve is empty; no branch switch, no wasted marches)
+	bool micro_flat[256] = {};
 	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
@@ -230,6 +235,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
 	float m_cache_sky = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_cache_sky_pixel{"cacheSkyStrength"};
+	float m_bisect = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bisect_pixel{"claudeBisect"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -269,7 +276,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 22> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 23> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -292,6 +299,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_radiance",
 		"claude_bounce2",
 		"claude_cache_sky",
+		"claude_bisect",
 	};
 
 	static float readGoldenHourStrength()
@@ -322,10 +330,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
 		// 3 = pure path-traced view (zero ambient, all light via rays),
 		// 4 = mode 3 with neutral albedo (lighting-only diagnostic),
-		// 5 = cascade-level tint, 6 = sub-voxel light quantization.
+		// 5 = cascade-level tint, 6 = sub-voxel light quantization,
+		// 7-10 = term-isolation heatmaps (torch/bounce/sun/visibility),
+		// 11 = shadow-ray WHY-map (cause-coded colors).
 		// The old 4.0 clamp silently rewrote every mode-5/6 request to 4
 		// — a whole evening of "nothing changed" (John caught it).
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 10.0f);
+		return g_settings->getFloat("claude_volume_debug", 0.0f, 12.0f);
 	}
 
 	static float readWaterReflections()
@@ -447,6 +457,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_cache_sky", 0.0f, 2.0f);
 	}
 
+	// Carve-pipeline bisection ladder (2026-08-12 debugging instrument):
+	// 0 normal; 1 carve geometry only, cube-recipe shading, shadow rays
+	// ignore carve; 2 +micro normal; 3 +micro position; 4 +micro term
+	// recipe; 5 +shadow-ray micro occlusion (= full carving).
+	static float readBisect()
+	{
+		if (!g_settings->exists("claude_bisect"))
+			return 0.0f;
+		return g_settings->getFloat("claude_bisect", 0.0f, 5.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -510,6 +531,8 @@ public:
 			m_bounce2 = readBounce2();
 		if (name == "claude_cache_sky")
 			m_cache_sky = readCacheSky();
+		if (name == "claude_bisect")
+			m_bisect = readBisect();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -548,6 +571,7 @@ public:
 		m_radiance = readRadiance();
 		m_bounce2 = readBounce2();
 		m_cache_sky = readCacheSky();
+		m_bisect = readBisect();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -669,6 +693,7 @@ public:
 			float b2 = g_claude_volume.valid ? m_bounce2 : 0.0f;
 			m_bounce2_pixel.set(&b2, services);
 			m_cache_sky_pixel.set(&m_cache_sky, services);
+			m_bisect_pixel.set(&m_bisect, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
@@ -1361,23 +1386,46 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 					}
 			}
 		}
-		const int CARVE = 2; // max sub-voxels removed from a face
+		// Max sub-voxels removed from a face. 1 (was 2) per John's carve
+		// experiment (2026-08-12): one-deep relief keeps visible texture
+		// but sits under the emitter shadow-bias floor, so the carve
+		// cannot self-shadow against low point lights — the artifact
+		// family from the circular-shadow night is structurally excluded
+		// at this depth.
+		const int CARVE = 1;
+		// CARVE DOWN, NEVER UP (John, 2026-08-12: the old absolute rule
+		// carved the MAJORITY surface down and left bright texels flush
+		// at the 1 m plane — which read as pips RAISED above the block).
+		// Normalize per tile: the typical texel sits flush at 1 m, and
+		// only texels distinctly darker than the tile's own mean get cut
+		// one sub-voxel down. Features are recesses, not towers.
+		float hmean = 0.0f;
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				hmean += h[y][x];
+		hmean /= 256.0f;
+		bool cmask[16][16];
+		bool force_inset = (f.name == "mcl_core:stone_smooth");
+		for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++)
+				cmask[y][x] = force_inset || h[y][x] < hmean - 0.12f;
+		int removed = 0;
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
 			bool solid = true;
 			// +Y / -Y faces use (x,z); +X/-X use (z,y); +Z/-Z use (x,y)
-			int dTop = (int)((1.0f - h[z][x]) * CARVE + 0.5f);
+			int dTop = cmask[z][x] ? CARVE : 0;
 			if (15 - y < dTop) solid = false;
-			int dBot = (int)((1.0f - h[15 - z][x]) * CARVE + 0.5f);
+			int dBot = cmask[15 - z][x] ? CARVE : 0;
 			if (y < dBot) solid = false;
-			int dPX = (int)((1.0f - h[15 - y][z]) * CARVE + 0.5f);
+			int dPX = cmask[15 - y][z] ? CARVE : 0;
 			if (15 - x < dPX) solid = false;
-			int dNX = (int)((1.0f - h[15 - y][15 - z]) * CARVE + 0.5f);
+			int dNX = cmask[15 - y][15 - z] ? CARVE : 0;
 			if (x < dNX) solid = false;
-			int dPZ = (int)((1.0f - h[15 - y][x]) * CARVE + 0.5f);
+			int dPZ = cmask[15 - y][x] ? CARVE : 0;
 			if (15 - z < dPZ) solid = false;
-			int dNZ = (int)((1.0f - h[15 - y][15 - x]) * CARVE + 0.5f);
+			int dNZ = cmask[15 - y][15 - x] ? CARVE : 0;
 			if (z < dNZ) solid = false;
 			// NOTE: no baked chamfer. Carving the 12 cube edges put a
 			// perfectly straight groove at every block boundary — a
@@ -1388,7 +1436,10 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			int ax2 = (mid % 16) * 16 + x;
 			int ay2 = (mid / 16) * 16 + y;
 			g_claude_volume.micro[(z * 256 + ay2) * 256 + ax2] = solid ? 255 : 0;
+			if (!solid)
+				removed++;
 		}
+		g_claude_volume.micro_flat[mid] = (removed == 0);
 	}
 	(void)fallback;
 	g_claude_volume.atlas_dirty = true;
@@ -1513,18 +1564,20 @@ static void claudeVolumeSnapshot(Client *client)
 			// not torchlike; also lanterns, plants, fire): pure point.
 			// Only full-cube glowing blocks (glowstone, lamps,
 			// NDT_NORMAL) keep their geometry.
-			// PURE POINT LIGHT (John, 2026-08-12: "stop them being an
-			// emissive light block, let them just be a point light at
-			// their real source"): the torch contributes NO geometry to
-			// the traced volume — no nub cell, no occupancy — only an
-			// emitter at flame height. Its own model can never occlude
-			// or re-radiate its own light. Trade: the torch stick is
-			// invisible in traced view until it gets an authored model
-			// (ADR-0005).
+			// PURE POINT LIGHT (John, 2026-08-12): emitter at flame
+			// height, and the cell carries class 165 ONLY so the eye
+			// ray draws a small glowing nub at the emission point
+			// ("give the torch a single glowing thing right where it
+			// emits") — light rays pass through it (cellTransmit 1.0),
+			// so it still cannot occlude or re-radiate its own light.
 			emitters.push_back({(float)x + 0.5f, (float)y + 0.65f,
 					(float)z + 0.5f,
 					std::min<int>(f.light_source, 14) / 14.0f});
+			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
+			occ[i * 4 + 3] = 165;
+			coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 			hash = hash * 1099511628211ULL + (u64)i * 7919 + 165;
+			solid++;
 			continue;
 		}
 		if (f.light_source > 0) {
@@ -1559,6 +1612,10 @@ static void claudeVolumeSnapshot(Client *client)
 			claudeAtlasAdd(client, mid, f, col);
 			mids[i] = mid;
 		}
+		// carve removed nothing for this material: plain solid cube,
+		// carving must not touch it in any way (class 255, cube branch)
+		if (acls == 250 && mids[i] && g_claude_volume.micro_flat[mids[i]])
+			occ[i * 4 + 3] = 255;
 		solid++;
 	}
 	// world unchanged since the last snapshot: skip the upload and — key
@@ -3036,6 +3093,8 @@ void Game::processKeyInput()
 		toggleClaudeTrace();
 	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_BOUNCE)) {
 		toggleClaudeBounce();
+	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_CARVE)) {
+		toggleClaudeCarve();
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_BACK)) {
 		claudeTimeNudge(-1);
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_FWD)) {
@@ -3359,6 +3418,20 @@ void Game::toggleClaudeBounce()
 		m_game_ui->showTranslatedStatusText("Multi-bounce ON");
 	else
 		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
+}
+
+// V: flip the sub-voxel carve live — the standing suspect from the
+// circular-shadow night ("we know turning on the carving fucks it
+// up"), now one keypress to A/B.
+void Game::toggleClaudeCarve()
+{
+	float cur = g_settings->getFloat("claude_micro", 0.0f, 1.0f);
+	bool to_on = cur < 0.5f;
+	g_settings->set("claude_micro", to_on ? "1.0" : "0");
+	if (to_on)
+		m_game_ui->showTranslatedStatusText("Carving ON");
+	else
+		m_game_ui->showTranslatedStatusText("Carving OFF (flat blocks)");
 }
 
 // [ / ]: nudge server time an hour back/forward (sends /time; the
