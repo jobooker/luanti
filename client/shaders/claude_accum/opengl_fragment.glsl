@@ -451,7 +451,8 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				if (ndlm > 0.0)
 					litm += volumeLightCol * ndlm * lightVis(hpm, sd) * 1.4;
 				if (radianceStrength > 0.0)
-					litm += cacheRadiance(hpm + mn) * radianceStrength;
+					litm += cacheRadiance(hpm + mn) * radianceStrength
+							* smoothstep(0.5, 3.0, t);
 				return pathAlbedo(s.rgb) * litm * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
@@ -482,9 +483,16 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				lit += volumeLightCol * ndl * lightVis(hp, sd) * 1.4;
 			// multi-bounce term: light already circulating in the cache
 			// (this is what lets a torch fill a room instead of dying at
-			// its first bounce)
+			// its first bounce). CONTACT-ATTENUATED: a bounce ray that hit
+			// within ~2 nodes is probing a crease or contact, where the
+			// 2-node cache is too coarse to know the light is occluded —
+			// unattenuated it back-fills corners and erases the ambient
+			// occlusion ("vanilla has better ambient occlusion right
+			// now"). Ramping the cache in over hit distance keeps contact
+			// shadows dark while rooms still fill at range.
 			if (radianceStrength > 0.0)
-				lit += cacheRadiance(hp + n) * radianceStrength;
+				lit += cacheRadiance(hp + n) * radianceStrength
+						* smoothstep(0.5, 3.0, t);
 			return pathAlbedo(s.rgb) * lit * fall * trans;
 		}
 	}
