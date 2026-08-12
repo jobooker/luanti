@@ -14,7 +14,8 @@ import os as _os
 WORLD = _os.environ.get("CLAUDE_WORLD", "/opt/luanti/config/worlds/world")
 FARDIR = os.path.expanduser(
     "~/Library/Application Support/minetest/claude_far")
-CHUNK = 24  # columns per bridge call
+CHUNK = int(os.environ.get("CLAUDE_FAR_CHUNK", "24"))
+THROTTLE = float(os.environ.get("CLAUDE_FAR_THROTTLE", "0"))  # s between calls
 
 
 def bridge(op, **kw):
@@ -64,6 +65,10 @@ def main():
         if os.path.exists(fname):
             done += len(chunk)
             continue
+        if THROTTLE > 0:
+            time.sleep(THROTTLE)  # let the server tick breathe (block
+            # streaming starved during unthrottled runs — John's
+            # "LOD #1 is basically not there", 2026-08-12)
         res = bridge("sample_columns", cols=[list(c) for c in chunk],
                 ybot=ybot, ytop=ytop)
         blocks = res.get("blocks") or []
