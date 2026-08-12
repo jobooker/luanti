@@ -3,6 +3,19 @@
 -- beelink (before the register_globalstep block), then restart the
 -- server. Orchestrated by util/claude_far_fetch.py from the client Mac.
 
+-- Weather lock (John, 2026-08-12): keep the sky clear until the art
+-- pass gets to weather. Checks every 60 s; delete this block to give
+-- the weather cycle back.
+local weather_timer = 0
+core.register_globalstep(function(dtime)
+    weather_timer = weather_timer + dtime
+    if weather_timer < 60 then return end
+    weather_timer = 0
+    if mcl_weather and mcl_weather.state and mcl_weather.state ~= "none" then
+        mcl_weather.change_weather("none")
+    end
+end)
+
 -- Kick an async emerge so ungenerated terrain exists before sampling.
 -- Returns immediately; poll with sample_columns (ungenerated blocks
 -- simply come back empty until the emerge lands).
