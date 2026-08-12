@@ -740,8 +740,7 @@ vec4 farTrace(vec3 ro, vec3 rd, vec3 sd, float t0)
 	// each level's reach); accumulation averages the band into a fade
 	float dcap = 1.0;
 	if (claudeLodDither > 0.5)
-		dcap = 0.72 + 0.26 * fract(sin(dot(gl_FragCoord.xy
-				+ fract(animationTimer * 5.13) * 29.3,
+		dcap = 0.86 + 0.12 * fract(sin(dot(gl_FragCoord.xy,
 				vec2(269.5, 183.3))) * 43758.5453);
 	if (cascadeValid.x > 0.5) {
 		r = farTraceL(0.0, cascade0Origin, 2.0,
@@ -1564,10 +1563,13 @@ void main(void)
 
 	float promoteT = 1e9;
 	if (claudeLodDither > 0.5) {
-		float dh = fract(sin(dot(gl_FragCoord.xy
-				+ fract(animationTimer * 3.71) * 43.7,
+		// STATIC per-pixel threshold — re-rolling per frame meant a
+		// pixel never settled on one representation and the history
+		// averaged both forever ("mushy", John 2026-08-12). Stable
+		// stipple + the spatial denoiser = a converged crossfade.
+		float dh = fract(sin(dot(gl_FragCoord.xy,
 				vec2(127.1, 311.7))) * 43758.5453);
-		promoteT = 46.0 + 18.0 * dh; // volume->L0 band: 46..64
+		promoteT = 56.0 + 8.0 * dh; // volume->L0 band: 56..64
 	}
 	for (int i = 0; i < 384; i++) {
 		if (i > 0 && t > promoteT) {
