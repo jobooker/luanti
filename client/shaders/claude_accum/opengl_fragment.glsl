@@ -44,6 +44,9 @@ uniform lowp float claudeCost;
 // face cache at the eye hit — the ADR-0006 endgame, previewed with
 // v1's flat faces. All light still comes from real traced gathers.
 uniform lowp float claudeFaceDirect;
+// 1 (default) = bounce-vertex budget tiers (2-torch NEE, cell-exact
+// sun vis); 0 = full-quality shading at indirect hits (pre-tier look).
+uniform lowp float claudeTiers;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -816,6 +819,8 @@ float g_evisCause = 0.0;
 // traced (John's no-cheats rule) — just a coarser rung of the ladder.
 float lightVisCheap(vec3 ro, vec3 sd)
 {
+	if (claudeTiers < 0.5)
+		return lightVis(ro, sd);
 	const float S = 128.0;
 	float vis = 1.0;
 	float tcur = 0.0;
@@ -1353,7 +1358,8 @@ vec3 emitterLight(vec3 hp, vec3 n)
 vec3 emitterLightCheap(vec3 hp, vec3 n)
 {
 	vec3 dummy = vec3(0.0);
-	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy, 2);
+	return emitterLightSpec(hp, n, vec3(0.0), 0.0, dummy,
+			claudeTiers > 0.5 ? 2 : 8);
 }
 
 // Reproject a volume-local point into last frame's screen; returns
