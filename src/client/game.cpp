@@ -2763,6 +2763,8 @@ void Game::processKeyInput()
 		m_game_ui->toggleChat(client);
 	} else if (wasKeyPressed(KeyType::TOGGLE_FOG)) {
 		toggleFog();
+	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_TRACE)) {
+		toggleClaudeTrace();
 	} else if (wasKeyDown(KeyType::TOGGLE_UPDATE_CAMERA)) {
 		toggleUpdateCamera();
 	} else if (wasKeyPressed(KeyType::CAMERA_MODE)) {
@@ -3054,6 +3056,21 @@ void Game::toggleMinimap(bool shift_pressed)
 		m_game_ui->showStatusText(utf8_to_wide(mapper->getModeDef().label));
 	else
 		m_game_ui->showTranslatedStatusText("Minimap currently disabled by game or mod");
+}
+
+// One key, one client: vanilla raster vs the traced renderer. The whole
+// traced pipeline hangs off claude_volume_debug (0 = pass-through, 3 =
+// path traced), read live by the uniform setter, so flipping the setting
+// IS the toggle — no restart, no second build.
+void Game::toggleClaudeTrace()
+{
+	float cur = g_settings->getFloat("claude_volume_debug", 0.0f, 10.0f);
+	bool to_traced = cur < 2.5f;
+	g_settings->set("claude_volume_debug", to_traced ? "3" : "0");
+	if (to_traced)
+		m_game_ui->showTranslatedStatusText("Ray tracing ON");
+	else
+		m_game_ui->showTranslatedStatusText("Ray tracing OFF (vanilla)");
 }
 
 void Game::toggleFog()
