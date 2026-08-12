@@ -3,7 +3,7 @@
 # Enforces every environment lesson from the debugging session:
 #   - shaders copied to the app bundle (stale-shader trap)
 #   - video_driver forced AFTER any client exit (config-rewrite trap)
-#   - core profile asserted via the core-gated [claude_hist] log marker
+#   - core profile asserted via the core-gated [claude_core] log marker
 #   - verdict = traced-path green marker AND bottom-half stddev,
 #     gated on light_body==1 (day) so the 30s day/night cycle can't confound
 set -u
@@ -54,10 +54,10 @@ done
 [ "$AGE" -le 3 ] || { echo "VOID: never joined world (stats stale)"; exit 2; }
 
 # 4. CORE ASSERTION: core-gated marker logged after launch
-sleep 8   # give claude_hist (periodic) a chance to fire
-CORE=$(awk -v ts="$LAUNCH_TS" '$0 >= ts' "$DATA/debug.txt" | grep -c "claude_hist")
+sleep 2   # marker logs on the first core draw
+CORE=$(awk -v ts="$LAUNCH_TS" '$0 >= ts' "$DATA/debug.txt" | grep -c "claude_core")
 if [ "$CORE" -lt 1 ]; then
-  echo "VOID: no core-gated claude_hist marker since launch -> NOT core profile"
+  echo "VOID: no core-gated claude_core marker since launch -> NOT core profile"
   exit 2
 fi
 echo "core asserted ($CORE markers since launch)"

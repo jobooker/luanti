@@ -634,10 +634,6 @@ void COpenGL3DriverBase::drawBuffers(const scene::IVertexBuffer *vb,
 	drawVertexPrimitiveList(vertices, vb->getCount(), indexList,
 		PrimitiveCount, vb->getType(), PrimitiveType, ib->getType());
 
-	// TEMPORARY core-profile diagnostic: macOS 4.1 has no KHR_debug, so the
-	// only way to see why map geometry vanishes is to ask directly. Logs the
-	// first few distinct errors then goes quiet.
-
 	if (hw_weights) {
 		GL.DisableVertexAttribArray(EVA_WEIGHTS);
 		GL.VertexAttrib4f(EVA_WEIGHTS, 0.0f, 0.0f, 0.0f, 0.0f);
@@ -1071,78 +1067,19 @@ void COpenGL3DriverBase::drawGeneric(const void *vertices, const void *indexList
 		E_VERTEX_TYPE vType, scene::E_PRIMITIVE_TYPE pType, E_INDEX_TYPE iType)
 {
 	auto &vTypeDesc = getVertexTypeDescription(vType);
-	// TEMPORARY: narrow which GL call is invalid on core.
-	// TEMPORARY: terrain meshes have high primitive counts — log where the
-	// BIG draws actually land, and with what depth state.
-	// TEMPORARY: histogram of every 3D draw — how many, how big, into which
-	// framebuffer. Answers whether terrain is drawn at all under PP.
-	static int dbg = 0;
-	bool dbgOn = false;
+	// One-time core-profile marker: external tooling (util/claude/
+	// verify_tracer.sh) asserts the active profile by grepping for this
+	// line, which is compile-gated so it CANNOT appear under a
+	// compatibility context. Deliberately kept when the rest of the
+	// debugging instrumentation was removed.
 	if (Version.Spec == OpenGLSpec::Core) {
-		static int total = 0, big = 0, toZero = 0, toFbo = 0, bigToFbo = 0;
-		GLint f = 0;
-		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &f);
-		total++;
-		if (primitiveCount > 400) big++;
-		if (f == 0) toZero++; else toFbo++;
-		if (primitiveCount > 400 && f != 0) bigToFbo++;
-		// TEMPORARY: draw ORDER into the scene target. If big (terrain) draws
-		// come before small (sky) draws, the sky is painting over the world.
-		{
-			static int seq = 0;
-			if (f == 1 && seq < 24) {
-				seq++;
-				char b[128];
-				snprintf(b, sizeof(b), "[claude_seq] #%d prims=%u", seq, primitiveCount);
-				os::Printer::log(b, ELL_ERROR);
-			}
-		}
-		static int perFbo[16] = {0};
-		if (primitiveCount > 400 && f >= 0 && f < 16)
-			perFbo[f]++;
-		if (total == 3000 && dbg == 0) {
-			dbg = 1;
-			char b[256];
-			snprintf(b, sizeof(b),
-				"[claude_hist] big draws per fbo: "
-				"0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d 8=%d 9=%d 10=%d 11=%d",
-				perFbo[0], perFbo[1], perFbo[2], perFbo[3], perFbo[4], perFbo[5],
-				perFbo[6], perFbo[7], perFbo[8], perFbo[9], perFbo[10], perFbo[11]);
-			os::Printer::log(b, ELL_ERROR);
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			os::Printer::log("[claude_core] core profile active", ELL_ERROR);
 		}
 	}
-	if (dbgOn) {
-		while (GL.GetError() != GL_NO_ERROR) {}
-	}
-	// TEMPORARY EXPERIMENT: if terrain is discarded by the depth test,
-	// disabling it makes the world appear (wrongly sorted, but visible).
-	if (Version.Spec == OpenGLSpec::Core)
-		GL.Disable(GL_BLEND);       // EXPERIMENT: alpha=0 would hide opaque terrain
-		GL.ColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 	beginDraw(vTypeDesc, reinterpret_cast<uintptr_t>(vertices));
-	if (dbgOn) {
-		GLenum e = GL.GetError();
-		GLint vao = 0, prog = 0, fbo = -1, vp[4] = {0,0,0,0};
-		GL.GetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
-		GL.GetIntegerv(GL_CURRENT_PROGRAM, &prog);
-		GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &fbo);
-		GL.GetIntegerv(GL_VIEWPORT, vp);
-		GLint dObj = -1, dType = 0, dTest = 0, dMask = 0, dFunc = 0;
-		GL.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
-				GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &dObj);
-		GL.GetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,
-				GL_DEPTH_ATTACHMENT, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &dType);
-		dTest = GL.IsEnabled(GL_DEPTH_TEST) ? 1 : 0;
-		GL.GetIntegerv(GL_DEPTH_FUNC, &dFunc);
-		GL.GetIntegerv(GL_DEPTH_WRITEMASK, &dMask);
-		while (GL.GetError() != GL_NO_ERROR) {}
-		char b[192];
-		snprintf(b, sizeof(b),
-			"[claude_gl] BIG prims=%u fbo=%d depthObj=%d depthTest=%d depthMask=%d cull=%d",
-			primitiveCount, (int)fbo, (int)dObj, (int)dTest, (int)dMask,
-			(int)(GL.IsEnabled(GL_CULL_FACE) ? 1 : 0));
-		os::Printer::log(b, ELL_ERROR);
-	}
 	GLenum indexSize = 0;
 
 	switch (iType) {
@@ -1893,32 +1830,8 @@ bool COpenGL3DriverBase::setRenderTargetEx(IRenderTarget *target, u16 clearFlag,
 	if (target) {
 		COpenGL3RenderTarget *renderTarget = static_cast<COpenGL3RenderTarget *>(target);
 
-		{
-			static int n = 0;
-			if (n < 10) {
-				n++;
-				GLint before = 0;
-				GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &before);
-				char b[160];
-				snprintf(b, sizeof(b), "[claude_rt] setRT bufferID=%u glBound(before)=%d",
-					(unsigned)renderTarget->getBufferID(), (int)before);
-				os::Printer::log(b, ELL_ERROR);
-			}
-		}
 		CacheHandler->setFBO(renderTarget->getBufferID());
 		renderTarget->update();
-		{
-			static int n2 = 0;
-			if (n2 < 10) {
-				n2++;
-				GLint after = 0;
-				GL.GetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &after);
-				char b[160];
-				snprintf(b, sizeof(b), "[claude_rt] setRT bufferID=%u glBound(after)=%d",
-					(unsigned)renderTarget->getBufferID(), (int)after);
-				os::Printer::log(b, ELL_ERROR);
-			}
-		}
 
 		destRenderTargetSize = renderTarget->getSize();
 
