@@ -318,9 +318,12 @@ vec4 lightRung()
 			gl_FragCoord.xy / vec2(NTEX_W, NTEX_H));
 	if (valid < 0.5)
 		return old;
-	// amortize 1/8; cold cells (no history) refresh immediately
+	// amortize 1/8; cold cells (no history) refresh immediately.
+	// VALIDITY IS a >= 0.2 (v2 packs sunvis in alpha: 0.25+0.75*vis) —
+	// testing > 0.5 here made every SHADOWED cell refresh every frame
+	// (36ms ladder pass, fps 24 -> 14, caught by the pass profiler).
 	float group = mod(cxy.x + cxy.y * 2.0 + zl + lv * 3.0, 8.0);
-	if (abs(mod(claudeRadianceFrame, 8.0) - group) > 0.5 && old.a > 0.5)
+	if (abs(mod(claudeRadianceFrame, 8.0) - group) > 0.5 && old.a >= 0.2)
 		return old;
 	vec3 pos = corigin + vec3(cxy.x + 0.5, cxy.y + 0.5, zl + 0.5) * lsz;
 	// one sun march + one jittered sky march per refresh, in MY grid
