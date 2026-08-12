@@ -2255,6 +2255,16 @@ void main(void)
 			// clamp history's drift while moving (bounds resample mush) —
 			// but NOT when deeply converged: yanking settled history
 			// toward each frame's noise was itself a pulse source
+			// REFERENCE CONVERGENCE AT REST (the erichlof behavior):
+			// still camera => identity reprojection => ghosting is
+			// impossible => the anti-ghost clamp must SLEEP and let
+			// pure 1/N averaging run to ground truth. The clamp only
+			// exists for motion.
+			if (claudeRefine > 0.5 && accumAlpha < 0.08) {
+				gl_FragColor = vec4(mix(h.rgb, fresh_g, accumAlpha),
+						tHit / 4096.0);
+				return;
+			}
 			float band = accumAlpha < 0.1 ? 4.0 : 0.3;
 			// far field: parallax shrinks with distance, so history
 			// reprojects almost perfectly even in flight — run it DEEP
