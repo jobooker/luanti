@@ -1894,7 +1894,7 @@ void main(void)
 									* pow(nh2, mix(16.0, 96.0, mSpecGloss))
 									* glossOn2;
 						}
-						fresh += specAcc2 * glossOn2;
+						fresh += min(specAcc2, vec3(2.5)) * glossOn2;
 					}
 					// term-isolation heatmaps (modes 7-10): render ONE
 					// lighting term, no albedo, so artifacts name their
@@ -2147,7 +2147,11 @@ void main(void)
 						specAcc += volumeLightCol * (sunVis
 								* pow(nh, mix(16.0, 96.0, specGloss)));
 					}
-					fresh += specAcc * glossOn;
+					// firefly clamp: a rare hot specular sample must
+					// not spike a single pixel ("glinting in unexpected
+					// ways" in pixel-pure mode) — energy above the cap
+					// arrives over frames via accumulation instead
+					fresh += min(specAcc, vec3(2.5)) * glossOn;
 				}
 
 				// term-isolation heatmaps on UNCARVED surfaces too — the

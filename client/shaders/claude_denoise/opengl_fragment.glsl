@@ -7,6 +7,7 @@
 #define src texture0
 
 uniform sampler2D src;
+uniform lowp float claudeDenoise;
 uniform vec2 texelSize0;
 uniform lowp float volumeDebug;
 
@@ -14,6 +15,10 @@ CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
 void main(void)
 {
+	if (claudeDenoise < 0.5) { // raw-vs-denoised A/B (John's bisect)
+		gl_FragColor = texture2D(texture0, varTexCoord.st);
+		return;
+	}
 	vec2 uv = varTexCoord.st;
 	vec4 c = texture2D(src, uv);
 	if (volumeDebug < 2.5) {

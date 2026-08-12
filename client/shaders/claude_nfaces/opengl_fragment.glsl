@@ -319,6 +319,74 @@ float rungVis(float lv, vec3 corigin0, float csz0, vec3 pvol, vec3 sd,
 	return vis;
 }
 
+// plane B (x >= 1024 of the strip): SIX per-face AO factors per far
+// cell — "blocks with beautifully lit faces", not pixel art (John's
+// photorealistic-legos law). One jittered short march per face per
+// refresh, EMA'd; packed 5+5 bits per channel: R=(+x,-x) G=(+y,-y)
+// B=(+z,-z), A = validity.
+float packPair(float a, float b)
+{
+	return (floor(a * 31.0 + 0.5) * 32.0 + floor(b * 31.0 + 0.5)) / 1024.0;
+}
+
+vec4 lightRungFaces()
+{
+	if (claudeLightLadder < 0.5 || volumeDebug < 2.5
+			|| radianceStrength <= 0.0)
+		return vec4(0.0);
+	vec2 px = floor(gl_FragCoord.xy) - vec2(1024.0, NRING_H);
+	float tileIndex = floor(px.y / 64.0) * 16.0 + floor(px.x / 64.0);
+	float lv = floor(tileIndex / 64.0);
+	if (lv > 4.5)
+		return vec4(0.0);
+	float zl = tileIndex - lv * 64.0;
+	vec2 cxy = vec2(mod(px.x, 64.0), mod(px.y, 64.0));
+	float csz = exp2(lv + 1.0);
+	float lsz = csz * 2.0;
+	vec3 corigin = lv < 0.5 ? cascade0Origin : lv < 1.5 ? cascade1Origin
+			: lv < 2.5 ? cascade2Origin : lv < 3.5 ? cascade3Origin
+			: cascade4Origin;
+	float valid = lv < 0.5 ? cascadeValid.x : lv < 1.5 ? cascadeValid.y
+			: lv < 2.5 ? cascadeValid.z : lv < 3.5 ? cascadeValidB.x
+			: cascadeValidB.y;
+	vec4 old = texture2D(prevNear,
+			gl_FragCoord.xy / vec2(NTEX_W, NTEX_H));
+	if (valid < 0.5)
+		return old;
+	float wheel = lv < 1.5 ? 8.0 : 16.0;
+	float group = mod(cxy.x + cxy.y * 2.0 + zl + lv * 3.0, wheel);
+	if (abs(mod(claudeRadianceFrame, wheel) - group) > 0.5
+			&& old.a >= 0.5)
+		return old;
+	vec3 pos = corigin + vec3(cxy.x + 0.5, cxy.y + 0.5, zl + 0.5) * lsz;
+	// one jittered half-hemisphere march per face, 8 steps in my grid
+	float ao[6];
+	for (int f2 = 0; f2 < 6; f2++) {
+		vec3 n = f2 == 0 ? vec3(1.0, 0.0, 0.0)
+				: f2 == 1 ? vec3(-1.0, 0.0, 0.0)
+				: f2 == 2 ? vec3(0.0, 1.0, 0.0)
+				: f2 == 3 ? vec3(0.0, -1.0, 0.0)
+				: f2 == 4 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 0.0, -1.0);
+		vec2 h = vec2(
+			fract(sin(dot(vec3(cxy, zl) + float(f2) * 3.3
+				+ claudeRadianceFrame * 0.71,
+				vec3(12.9898, 78.233, 37.719))) * 43758.5453),
+			fract(sin(dot(vec3(cxy, zl) + float(f2) * 7.7,
+				vec3(93.989, 12.233, 57.719))
+				+ claudeRadianceFrame * 3.17) * 24634.6345));
+		vec3 sph = normalize(vec3(h.x * 2.0 - 1.0, h.y * 2.0 - 1.0,
+				fract(h.x * 5.7) * 2.0 - 1.0) + vec3(1e-4));
+		vec3 dir = normalize(n * 1.2 + sph * 0.8);
+		if (dot(dir, n) < 0.0)
+			dir = normalize(dir - 2.0 * dot(dir, n) * n);
+		ao[f2] = rungVis(lv, corigin, csz, pos + n * lsz * 0.6, dir, 8.0);
+	}
+	vec3 fresh = vec3(packPair(ao[0], ao[1]), packPair(ao[2], ao[3]),
+			packPair(ao[4], ao[5]));
+	vec3 outv = old.a >= 0.5 ? mix(old.rgb, fresh, 0.3) : fresh;
+	return vec4(outv, 1.0);
+}
+
 vec4 lightRung()
 {
 	if (claudeLightLadder < 0.5 || volumeDebug < 2.5
@@ -475,7 +543,8 @@ void main(void)
 	// the strip below the near ring holds the light-ladder rungs;
 	// cascade origins are volume-local, so a rebase needs no remap here
 	if (gl_FragCoord.y >= NRING_H) {
-		gl_FragColor = lightRung();
+		gl_FragColor = gl_FragCoord.x >= 1024.0
+				? lightRungFaces() : lightRung();
 		return;
 	}
 	if (volumeDebug < 2.5 || radianceStrength <= 0.0

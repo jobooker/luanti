@@ -292,6 +292,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_subvox_pixel{"claudeSubvox"};
 	float m_refine = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_refine_pixel{"claudeRefine"};
+	float m_denoise = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_denoise_pixel{"claudeDenoise"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
@@ -335,7 +337,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 39> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 40> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -375,6 +377,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_sky_azimuth",
 		"claude_subvox",
 		"claude_refine",
+		"claude_denoise",
 	};
 
 	static float readGoldenHourStrength()
@@ -672,6 +675,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_refine", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = edge-aware spatial denoise; 0 = raw samples
+	static float readDenoise()
+	{
+		if (!g_settings->exists("claude_denoise"))
+			return 1.0f;
+		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -769,6 +780,8 @@ public:
 			m_subvox = readSubvox();
 		if (name == "claude_refine")
 			m_refine = readRefine();
+		if (name == "claude_denoise")
+			m_denoise = readDenoise();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -824,6 +837,7 @@ public:
 		m_sky_az = readSkyAz();
 		m_subvox = readSubvox();
 		m_refine = readRefine();
+		m_denoise = readDenoise();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -1053,6 +1067,7 @@ public:
 				m_subvox_sampler_pixel.set(&svlayer, services);
 				m_subvox_pixel.set(&m_subvox, services);
 				m_refine_pixel.set(&m_refine, services);
+				m_denoise_pixel.set(&m_denoise, services);
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
