@@ -313,7 +313,7 @@ float lightVis(vec3 ro, vec3 sd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return vis;
 		vec3 cc = floor(cell / 4.0);
-		if (false /* BISECT: empty-brick leap disabled */) {
+		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
 			// empty brick: leap to its far side in one step
 			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
 			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
@@ -379,7 +379,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 			return pathSkyRadiance(rd) * trans;
 		}
 		vec3 cc = floor(cell / 4.0);
-		if (false /* BISECT: empty-brick leap disabled */) {
+		if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
 			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
 			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 					* max(abs(rd), vec3(1e-6));
@@ -615,7 +615,7 @@ void main(void)
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			vec3 cc = floor(cell / 4.0);
-			if (false /* BISECT: empty-brick leap disabled */) {
+			if (texture3D(claudeCoarse, (cc + 0.5) / 32.0).r < 0.5) {
 				// empty brick: leap to its far side, keeping the crossing
 				// axis so a hit right after the jump gets a true normal
 				vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
