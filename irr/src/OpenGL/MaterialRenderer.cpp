@@ -374,6 +374,11 @@ bool COpenGL3MaterialRenderer::setPixelShaderConstant(s32 index, const f32 *floa
 		GL.UniformMatrix4fv(UniformInfo[index].location, count / 16, false, floats);
 		break;
 	case GL_SAMPLER_2D:
+	case GL_SAMPLER_3D: // claude: GL3 driver silently dropped sampler3D —
+	                    // every volume sampler stayed at 0, aliasing unit 0
+	                    // with a sampler2D, invalidating the whole program
+	                    // on core. The legacy driver always handled it
+	                    // (COpenGLSLMaterialRenderer.cpp:428).
 	case GL_SAMPLER_CUBE: {
 		if (floats) {
 			const GLint id = (GLint)(*floats);
@@ -414,6 +419,7 @@ bool COpenGL3MaterialRenderer::setPixelShaderConstant(s32 index, const s32 *ints
 		GL.Uniform4iv(UniformInfo[index].location, count / 4, ints);
 		break;
 	case GL_SAMPLER_2D:
+	case GL_SAMPLER_3D: // claude: same gap as the f32 variant above
 	case GL_SAMPLER_CUBE:
 		GL.Uniform1iv(UniformInfo[index].location, 1, ints);
 		break;

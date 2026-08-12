@@ -564,16 +564,37 @@ public:
 				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
 			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
-			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
-				// REBIND EVERY FRAME. These 3D textures are bound with raw GL
-				// outside Irrlicht's material system, and they were only bound
-				// inside claudeVolumeSnapshot() — which runs every ~2 s, not
-				// per frame. Units 4-8 fall inside Irrlicht's managed range
-				// (MATERIAL_MAX_TEXTURES), and the GL3 cache handler resets
-				// those units between snapshots, so on a core profile every
-				// sampler read empty and every ray escaped to sky. The legacy
-				// 2.1 driver evidently left them alone, which is why this only
-				// ever showed on 4.1.
+			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
+			// bound with raw GL outside Irrlicht's material system, and
+			// they were only bound inside claudeVolumeSnapshot() — which
+			// runs every ~2 s, not per frame. Units 4-8 fall inside
+			// Irrlicht's managed range (MATERIAL_MAX_TEXTURES), and the
+			// GL3 cache handler resets those units between snapshots, so
+			// on a core profile every sampler read empty and every ray
+			// escaped to sky. The legacy 2.1 driver evidently left them
+			// alone, which is why this only ever showed on 4.1.
+			//
+			// Unconditional because a sampler3D uniform left at its
+			// default 0 aliases unit 0 with sampler2D texture0 — one unit,
+			// two sampler types — which makes the PROGRAM invalid on core
+			// and every draw it makes undefined. So the sampler uniforms
+			// must be delivered whenever the program runs, not only once
+			// a traced consumer is switched on. (Before the first volume
+			// snapshot the textures are 0 and the binds no-op; the
+			// uniforms still point the samplers at distinct units, which
+			// is what validity requires.)
+			//
+			// Also: restore the active-texture unit the DRIVER'S CACHE
+			// believes is current, not a hard-coded GL_TEXTURE0 — a raw
+			// restore to 0 desyncs COpenGLCoreCacheHandler's ActiveTexture
+			// mirror, after which cached setActiveTexture(X) calls are
+			// skipped as "already X" while GL really sits at 0, and
+			// subsequent material binds land on the wrong unit. That kind
+			// of frame-order-dependent corruption is exactly the
+			// works-once-never-again symptom.
+			{
+				GLint prev_active = GL_TEXTURE0;
+				glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
 				if (g_claude_volume.tex) {
 					glActiveTexture(GL_TEXTURE10);
 					glBindTexture(GL_TEXTURE_3D, g_claude_volume.tex);
@@ -594,7 +615,7 @@ public:
 					glActiveTexture(GL_TEXTURE14);
 					glBindTexture(GL_TEXTURE_3D, g_claude_volume.micro_tex);
 				}
-				glActiveTexture(GL_TEXTURE0);
+				glActiveTexture(prev_active);
 
 				SamplerLayer_t layer = 10;
 				m_volume_sampler_pixel.set(&layer, services);
@@ -606,6 +627,8 @@ public:
 				m_atlas_sampler_pixel.set(&alayer, services);
 				SamplerLayer_t mlayer2 = 14;
 				m_micro_sampler_pixel.set(&mlayer2, services);
+			}
+			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				v3f vorg((float)g_claude_volume.origin.X,
 						(float)g_claude_volume.origin.Y,
 						(float)g_claude_volume.origin.Z);
@@ -1312,6 +1335,11 @@ static void claudeVolumeSnapshot(Client *client)
 		return;
 	}
 	g_claude_volume.content_hash = hash;
+	// Save the unit the driver's cache believes is active and restore it
+	// at the end — restoring a hard-coded GL_TEXTURE0 desyncs the
+	// COpenGLCoreCacheHandler mirror (see the per-frame rebind block).
+	GLint prev_active_unit = GL_TEXTURE0;
+	glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
 	if (!g_claude_volume.tex)
 		glGenTextures(1, &g_claude_volume.tex);
 	glActiveTexture(GL_TEXTURE10);
@@ -1375,7 +1403,7 @@ static void claudeVolumeSnapshot(Client *client)
 				GL_UNSIGNED_BYTE, g_claude_volume.micro.data());
 		g_claude_volume.atlas_dirty = false;
 	}
-	glActiveTexture(GL_TEXTURE0);
+	glActiveTexture(prev_active_unit);
 	// nearest-8 emitters to the camera (= volume center) for NEE
 	std::sort(emitters.begin(), emitters.end(),
 			[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
