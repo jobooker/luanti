@@ -527,8 +527,11 @@ void main(void)
 	// instead of darkening ("light leakage", John 2026-08-12). Contact
 	// occlusion needs the gather origin ON the surface, like the
 	// per-pixel bounce's 1cm origin always had.
+	// n*0.58 measured from the block CENTER = face + 0.08. (The first
+	// version subtracted another 0.5n, putting gather origins INSIDE
+	// the solid — lateral rays died in the neighbor block: dark mottled
+	// edges + hash-dependent dapple on flat ground. John caught it.)
 	vec3 ro = node + 0.5 + n * 0.58 + tu * du + tv * dv;
-	ro -= n * 0.50; // = surface + 0.08
 
 	vec3 inj = vec3(0.0);
 	for (int i = 0; i < 9; i++) {
