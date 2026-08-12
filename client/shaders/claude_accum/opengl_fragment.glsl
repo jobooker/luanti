@@ -83,6 +83,11 @@ uniform lowp float claudeFarFog;
 // carve law. 1 (default) = one-fetch microSolid; 0 = trace-time carve.
 uniform lowp float claudeSubvox;
 uniform sampler3D claudeSubvoxTex; // R8: one byte = 8 x-subvoxels
+// progressive refinement at rest (John's three.js memory: "looked like
+// garbage until you stood still and it refined"): when the accumulator
+// is deep in its still-frames running average, spend extra bounce rays
+// per pixel — ground-truth AO crisps in exactly when fps is free.
+uniform lowp float claudeRefine;
 uniform lowp float claudeSkyAz;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
@@ -2105,6 +2110,21 @@ void main(void)
 						float bw = bounceLottery();
 						if (bw > 0.0)
 							amb = bounceRay(hp, ad, sd) * 1.15 * bw;
+					}
+					// at rest: two extra hemisphere samples per frame —
+					// per-pixel AO crisps toward ground truth while the
+					// camera is still (fps is free at rest)
+					if (claudeRefine > 0.5 && accumAlpha < 0.08) {
+						vec3 adR = normalize(n + normalize(
+								rnd.zxy * 2.0 - 1.0 + vec3(1e-4)));
+						if (dot(adR, n) < 0.0)
+							adR = normalize(adR - 2.0 * dot(adR, n) * n);
+						vec3 adS = normalize(n + normalize(
+								rnd.yzx * 2.0 - 1.0 + vec3(2e-4)));
+						if (dot(adS, n) < 0.0)
+							adS = normalize(adS - 2.0 * dot(adS, n) * n);
+						amb = (amb + bounceRay(hp, adR, sd) * 1.15
+								+ bounceRay(hp, adS, sd) * 1.15) / 3.0;
 					}
 				}
 
