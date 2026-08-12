@@ -1814,14 +1814,13 @@ static void claudeVolumeSnapshot(Client *client)
 				col.setBlue(col.getBlue() * tint.getBlue() / 255);
 			}
 		}
-		// emissive nodes: mostly-transparent textures (torches) average
-		// to near-black, making their glow black x bright = invisible.
-		// Force a warm emitter color.
-		if (f.light_source > 0) {
-			col.setRed(255);
-			col.setGreen(std::max((u32)col.getGreen(), 200u));
-			col.setBlue(std::max((u32)col.getBlue(), 120u));
-		}
+		// ADR-0009 #3: authored color SURVIVES for full-cube emitters —
+		// rho and Le come from the node's real average color, or albedo
+		// variants cannot exist (the warm-force pinned every emissive
+		// cell to r=255,g>=200,b>=120 and the furnace rho carried only
+		// in blue). The transparent-texture problem the force was built
+		// for (torches averaging near-black) lives in the POINT-light
+		// branch below, which sets its own warm color explicitly.
 		occ[i * 4 + 0] = col.getRed();
 		occ[i * 4 + 1] = col.getGreen();
 		occ[i * 4 + 2] = col.getBlue();
