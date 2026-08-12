@@ -124,17 +124,20 @@ struct ClaudeVolume
 	// as belt-and-braces over the FBO clear.
 	float radiance_frame = 0.0f;
 	int radiance_reset = 2;
-	// far cascade (claude_lod Phase 1): the 8 m level, live. Textures are
-	// allocated at the FULL 5-slab layout from day one (levels are data,
-	// not layout — see luanti-lod-clipmap-plan.md); only slab 0 is filled.
+	// far cascades (claude_lod Phase 2): detail degrades in OCTAVES —
+	// 2 m to +/-128 m, 4 m to +/-256 m, 8 m to +/-512 m — so the eye
+	// never jumps more than one resolution doubling at a seam. Slabs
+	// 0/1/2 of the 5-slab textures (levels are data, not layout).
 	u32 cascades_tex = 0;        // 128x128x640 RGBA8, unit 8
 	u32 cascades_coarse_tex = 0; // 32x32x160 R8, unit 9
-	v3s16 cascade8_origin;       // WORLD node coords of cell (0,0,0)
-	bool cascade8_valid = false;
-	u64 cascade8_version = 0;    // summary contentVersion at last build
-	u64 cascade8_build_ms = 0;
-	u32 cascade8_solid = 0;
-	float cascade8_ms = 0.0f;    // last build+upload cost (stats)
+	struct CascLevel {
+		v3s16 origin;            // WORLD node coords of cell (0,0,0)
+		bool valid = false;
+		u64 version = 0;         // summary contentVersion at last build
+		u64 build_time = 0;
+		u32 solid = 0;
+		float ms = 0.0f;         // last build+upload cost (stats)
+	} casc[3];                   // [0]=2m [1]=4m [2]=8m
 };
 static ClaudeVolume g_claude_volume;
 
@@ -195,8 +198,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_sampler_pixel{"claudeCascades"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_coarse_sampler_pixel{"claudeCascadeCoarse"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade0_origin_pixel{"cascade0Origin"};
-	CachedPixelShaderSetting<float, 1, false> m_cascade0_cell_pixel{"cascade0Cell"};
-	CachedPixelShaderSetting<float, 1, false> m_cascade_count_pixel{"claudeCascadeCount"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade1_origin_pixel{"cascade1Origin"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade2_origin_pixel{"cascade2Origin"};
+	CachedPixelShaderSetting<float, 3, false> m_cascade_valid_pixel{"cascadeValid"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
@@ -699,21 +703,25 @@ public:
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
 				m_cascades_coarse_sampler_pixel.set(&casccl, services);
-				// cascade origin handed to the shader VOLUME-LOCAL (cascade
-				// world origin minus volume world origin), so the shader
-				// converts a volume-local point to cascade cells with one
-				// subtract and a divide
-				v3f corg = v3f((float)(g_claude_volume.cascade8_origin.X
-							- g_claude_volume.origin.X),
-						(float)(g_claude_volume.cascade8_origin.Y
-							- g_claude_volume.origin.Y),
-						(float)(g_claude_volume.cascade8_origin.Z
-							- g_claude_volume.origin.Z));
-				m_cascade0_origin_pixel.set(corg, services);
-				float ccell = 8.0f;
-				m_cascade0_cell_pixel.set(&ccell, services);
-				float ccount = g_claude_volume.cascade8_valid ? 1.0f : 0.0f;
-				m_cascade_count_pixel.set(&ccount, services);
+				// cascade origins handed to the shader VOLUME-LOCAL
+				// (cascade world origin minus volume world origin), so the
+				// shader converts a volume-local point to cascade cells
+				// with one subtract and a divide
+				CachedPixelShaderSetting<float, 3, false> *corg_pixels[3] = {
+					&m_cascade0_origin_pixel, &m_cascade1_origin_pixel,
+					&m_cascade2_origin_pixel };
+				float cvalid[3];
+				for (int lv = 0; lv < 3; lv++) {
+					v3f corg = v3f((float)(g_claude_volume.casc[lv].origin.X
+								- g_claude_volume.origin.X),
+							(float)(g_claude_volume.casc[lv].origin.Y
+								- g_claude_volume.origin.Y),
+							(float)(g_claude_volume.casc[lv].origin.Z
+								- g_claude_volume.origin.Z));
+					corg_pixels[lv]->set(corg, services);
+					cvalid[lv] = g_claude_volume.casc[lv].valid ? 1.0f : 0.0f;
+				}
+				m_cascade_valid_pixel.set(cvalid, services);
 			}
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
 				v3f vorg((float)g_claude_volume.origin.X,
@@ -1745,10 +1753,16 @@ static void claudeWriteStats(f32 dtime)
 					+ g_claude_volume.prev_light_col.Y
 					+ g_claude_volume.prev_light_col.Z) / 3.0f
 			<< ", \"still_frames\": " << g_claude_volume.still_frames
-			<< ", \"cascade8_valid\": " << (g_claude_volume.cascade8_valid ? 1 : 0)
-			<< ", \"cascade8_solid\": " << g_claude_volume.cascade8_solid
-			<< ", \"cascade8_ms\": " << g_claude_volume.cascade8_ms
-			<< ", \"summary_blocks\": " << claude_lod::summaryCount()
+			<< ", \"casc_valid\": [" << (g_claude_volume.casc[0].valid ? 1 : 0)
+			<< "," << (g_claude_volume.casc[1].valid ? 1 : 0)
+			<< "," << (g_claude_volume.casc[2].valid ? 1 : 0)
+			<< "], \"casc_solid\": [" << g_claude_volume.casc[0].solid
+			<< "," << g_claude_volume.casc[1].solid
+			<< "," << g_claude_volume.casc[2].solid
+			<< "], \"casc_ms\": [" << g_claude_volume.casc[0].ms
+			<< "," << g_claude_volume.casc[1].ms
+			<< "," << g_claude_volume.casc[2].ms
+			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
 			<< "}\n";
 	std::ofstream f(porting::path_user + "/claude_stats.json",
 			std::ios::trunc);
@@ -1756,89 +1770,96 @@ static void claudeWriteStats(f32 dtime)
 	window = 0.0f; frames = 0; worst = 0.0f; best = 1e9f; total = 0.0f;
 }
 
-// claude_lod Phase 1: (re)build and upload the 8 m cascade when it's
-// stale or the camera has strayed. Runs from the 1 Hz settings poll, so
-// worst case one build+upload (~a few ms) per second — never per frame.
+// claude_lod Phase 2: (re)build and upload cascade levels when stale or
+// strayed. Runs from the 1 Hz settings poll and builds AT MOST ONE level
+// per invocation, so the worst frame eats one build (2 m is the big one,
+// tens of ms walking 16M nodes) per second — never more.
 static void claudeCascadeUpdate(Client *client)
 {
 	if (!g_settings->exists("claude_cascades")
 			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f)
 		return;
-	constexpr int N = 128, CELL = 8;
-	constexpr int HALF = N * CELL / 2; // 512 nodes
+	static const int CELL[3] = {2, 4, 8};
+	static const u64 CADENCE[3] = {8000, 6000, 4000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
 	u64 ver = claude_lod::contentVersion();
-	bool need = !g_claude_volume.cascade8_valid;
-	if (!need) {
-		v3s16 c0 = g_claude_volume.cascade8_origin
-				+ v3s16(HALF, HALF, HALF);
-		v3s16 d = center - c0;
-		if (std::abs(d.X) > 128 || std::abs(d.Y) > 128 || std::abs(d.Z) > 128)
-			need = true; // strayed: recenter (full rebuild is ~2 MB, fine)
-		else if (ver != g_claude_volume.cascade8_version
-				&& porting::getTimeMs() - g_claude_volume.cascade8_build_ms
-						> 4000)
-			need = true; // world changed: refresh at 4 s cadence
-	}
-	if (!need)
-		return;
-	u64 t0 = porting::getTimeMs();
-	v3s16 origin = center - v3s16(HALF, HALF, HALF);
-	// snap to 32 nodes (one coarse brick = 4 cells) so cell identity is
-	// stable in world space across recenters
-	origin.X &= ~31; origin.Y &= ~31; origin.Z &= ~31;
-	static std::vector<u8> rgba, coarse;
-	u32 solid = claude_lod::buildCascade8(origin, rgba, coarse);
-	actionstream << "[claude_lod] build origin=(" << origin.X << ","
-			<< origin.Y << "," << origin.Z << ") solid=" << solid
-			<< " summaries=" << claude_lod::summaryCount() << std::endl;
-	if (solid == 0 && !g_claude_volume.cascade8_valid)
-		return; // no summaries yet: nothing worth uploading
 
-	GLint prev_active_unit = GL_TEXTURE0;
-	glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
-	bool fresh_alloc = !g_claude_volume.cascades_tex;
-	if (fresh_alloc) {
-		glGenTextures(1, &g_claude_volume.cascades_tex);
-		glGenTextures(1, &g_claude_volume.cascades_coarse_tex);
-	}
-	glActiveTexture(GL_TEXTURE8);
-	glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
-	if (fresh_alloc) {
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-		glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 128, 128, 640, 0, GL_RGBA,
-				GL_UNSIGNED_BYTE, nullptr);
-	}
-	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 128, 128, 128, GL_RGBA,
-			GL_UNSIGNED_BYTE, rgba.data());
-	glActiveTexture(GL_TEXTURE9);
-	glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
-	if (fresh_alloc) {
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-		glTexImage3D(GL_TEXTURE_3D, 0,
-				claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 32, 32, 160, 0,
+	for (int lv = 0; lv < 3; lv++) {
+		auto &L = g_claude_volume.casc[lv];
+		const int half = 128 * CELL[lv] / 2;
+		const int stray = 16 * CELL[lv]; // 32 / 64 / 128 nodes
+		bool need = !L.valid;
+		if (!need) {
+			v3s16 c0 = L.origin + v3s16(half, half, half);
+			v3s16 d = center - c0;
+			if (std::abs(d.X) > stray || std::abs(d.Y) > stray
+					|| std::abs(d.Z) > stray)
+				need = true;
+			else if (ver != L.version
+					&& porting::getTimeMs() - L.build_time > CADENCE[lv])
+				need = true;
+		}
+		if (!need)
+			continue;
+		u64 t0 = porting::getTimeMs();
+		v3s16 origin = center - v3s16(half, half, half);
+		// snap to 32 nodes: one coarse brick at the finest level, and
+		// stable world-space cell identity across recenters everywhere
+		origin.X &= ~31; origin.Y &= ~31; origin.Z &= ~31;
+		static std::vector<u8> rgba, coarse;
+		u32 solid = lv == 0
+				? claude_lod::buildCascade2(client, origin, rgba, coarse)
+				: claude_lod::buildCascadeSummary(origin, CELL[lv],
+						rgba, coarse);
+		if (solid == 0 && !L.valid)
+			return; // no data yet; retry next poll (and skip coarser too)
+
+		GLint prev_active_unit = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_active_unit);
+		bool fresh_alloc = !g_claude_volume.cascades_tex;
+		if (fresh_alloc) {
+			glGenTextures(1, &g_claude_volume.cascades_tex);
+			glGenTextures(1, &g_claude_volume.cascades_coarse_tex);
+		}
+		glActiveTexture(GL_TEXTURE8);
+		glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
+		if (fresh_alloc) {
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+			glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, 128, 128, 640, 0,
+					GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+		}
+		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
+				GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+		glActiveTexture(GL_TEXTURE9);
+		glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
+		if (fresh_alloc) {
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+			glTexImage3D(GL_TEXTURE_3D, 0,
+					claudeUseR8() ? GL_R8 : GL_LUMINANCE8, 32, 32, 160, 0,
+					claudeUseR8() ? GL_RED : GL_LUMINANCE,
+					GL_UNSIGNED_BYTE, nullptr);
+		}
+		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, lv * 32, 32, 32, 32,
 				claudeUseR8() ? GL_RED : GL_LUMINANCE,
-				GL_UNSIGNED_BYTE, nullptr);
-	}
-	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 32, 32, 32,
-			claudeUseR8() ? GL_RED : GL_LUMINANCE,
-			GL_UNSIGNED_BYTE, coarse.data());
-	glActiveTexture(prev_active_unit);
+				GL_UNSIGNED_BYTE, coarse.data());
+		glActiveTexture(prev_active_unit);
 
-	g_claude_volume.cascade8_origin = origin;
-	g_claude_volume.cascade8_valid = true;
-	g_claude_volume.cascade8_version = ver;
-	g_claude_volume.cascade8_build_ms = porting::getTimeMs();
-	g_claude_volume.cascade8_solid = solid;
-	g_claude_volume.cascade8_ms = (float)(porting::getTimeMs() - t0);
+		L.origin = origin;
+		L.valid = true;
+		L.version = ver;
+		L.build_time = porting::getTimeMs();
+		L.solid = solid;
+		L.ms = (float)(porting::getTimeMs() - t0);
+		break; // one level per poll: bounded hitch
+	}
 }
 
 static void pollSettingsPatch(f32 dtime, Client *client)
@@ -2947,6 +2968,8 @@ void Game::processKeyInput()
 		toggleFog();
 	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_TRACE)) {
 		toggleClaudeTrace();
+	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_BOUNCE)) {
+		toggleClaudeBounce();
 	} else if (wasKeyDown(KeyType::TOGGLE_UPDATE_CAMERA)) {
 		toggleUpdateCamera();
 	} else if (wasKeyPressed(KeyType::CAMERA_MODE)) {
@@ -3253,6 +3276,19 @@ void Game::toggleClaudeTrace()
 		m_game_ui->showTranslatedStatusText("Ray tracing ON");
 	else
 		m_game_ui->showTranslatedStatusText("Ray tracing OFF (vanilla)");
+}
+
+// G: flip the multi-bounce radiance cache for instant A/B — the tell is
+// the wall a torch cannot directly see. (B was taken: hotbar_previous.)
+void Game::toggleClaudeBounce()
+{
+	float cur = g_settings->getFloat("claude_radiance", 0.0f, 1.0f);
+	bool to_on = cur < 0.5f;
+	g_settings->set("claude_radiance", to_on ? "1.0" : "0");
+	if (to_on)
+		m_game_ui->showTranslatedStatusText("Multi-bounce ON");
+	else
+		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
 }
 
 void Game::toggleFog()

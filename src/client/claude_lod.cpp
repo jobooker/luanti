@@ -2,6 +2,8 @@
 #include "claude_lod.h"
 
 #include "client/client.h"
+#include "client/clientenvironment.h"
+#include "map.h"
 #include "mapblock.h"
 #include "mapnode.h"
 #include "nodedef.h"
@@ -84,11 +86,12 @@ size_t summaryCount()
 	return g_summaries.size();
 }
 
-u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
-		std::vector<u8> &coarse)
+u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
+		std::vector<u8> &rgba, std::vector<u8> &coarse)
 {
-	constexpr int N = 128;    // cells per axis
-	constexpr int CELL = 8;   // nodes per cell
+	constexpr int N = 128; // cells per axis
+	const int CELL = cell_nodes;
+	const int SUBS = CELL / 4; // subcells (4 nodes) per cell per axis: 1 or 2
 	rgba.assign((size_t)N * N * N * 4, 0);
 	coarse.assign(32 * 32 * 32, 0);
 	u32 solid_cells = 0;
@@ -97,9 +100,10 @@ u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
 	if (g_summaries.empty())
 		return 0;
 
-	// An 8-node cell at 8-node alignment always lies inside ONE MapBlock
-	// (16 nodes), spanning exactly 2^3 of its 4-node subcells — so each
-	// cell is one map lookup plus eight array reads.
+	// A CELL-node cell at CELL-node alignment always lies inside ONE
+	// MapBlock (16 nodes) for CELL in {4, 8} — one map lookup plus a few
+	// array reads per cell.
+	const u32 half = (u32)(CELL * CELL * CELL) / 2; // 50% occupancy
 	size_t i = 0;
 	const BlockSummary *cached = nullptr;
 	v3s16 cached_pos(32767, 32767, 32767);
@@ -118,9 +122,9 @@ u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
 		int sx = (base.X & 15) / 4, sy = (base.Y & 15) / 4,
 			sz = (base.Z & 15) / 4;
 		u32 occ = 0, water = 0, r = 0, g = 0, b = 0;
-		for (int oz = 0; oz < 2; oz++)
-		for (int oy = 0; oy < 2; oy++)
-		for (int ox = 0; ox < 2; ox++) {
+		for (int oz = 0; oz < SUBS; oz++)
+		for (int oy = 0; oy < SUBS; oy++)
+		for (int ox = 0; ox < SUBS; ox++) {
 			int sub = (sz + oz) * 16 + (sy + oy) * 4 + (sx + ox);
 			occ += cached->occ[sub];
 			water += cached->water[sub];
@@ -131,12 +135,12 @@ u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
 		u32 counted = occ + water;
 		if (counted == 0)
 			continue;
-		// >= 50% of the cell's 512 nodes occupied => solid; water wins
-		// only when it outnumbers solid matter (a lake surface cell)
+		// >= 50% of the cell's nodes occupied => solid; water wins only
+		// when it outnumbers solid matter (a lake surface cell)
 		u8 cls = 0;
-		if (occ >= 256)
+		if (occ >= half)
 			cls = 255;
-		else if (water >= 256 && water > occ)
+		else if (water >= half && water > occ)
 			cls = 100;
 		else
 			continue; // sparse: air at this resolution
@@ -146,6 +150,111 @@ u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
 		coarse[((cz / 4) * 32 + (cy / 4)) * 32 + (cx / 4)] = 255;
+	}
+	return solid_cells;
+}
+
+// per-content classification LUT so the 2 m walk never touches the
+// NodeDefManager in its inner loop. 0 = unknown (resolve), 1 = air/skip,
+// 2 = solid, 3 = water. Color packed 0xRRGGBB alongside.
+static std::vector<u8> g_cls_lut;
+static std::vector<u32> g_col_lut;
+
+static inline u8 classify(const NodeDefManager *ndef, content_t c)
+{
+	if (c >= g_cls_lut.size()) {
+		g_cls_lut.resize(c + 256, 0);
+		g_col_lut.resize(c + 256, 0xB4B4B4);
+	}
+	u8 cls = g_cls_lut[c];
+	if (cls)
+		return cls;
+	const ContentFeatures &f = ndef->get(c);
+	cls = 2;
+	if (c == CONTENT_AIR || c == CONTENT_IGNORE)
+		cls = 1;
+	else if (f.light_source == 0
+			&& (f.drawtype == NDT_PLANTLIKE
+				|| f.drawtype == NDT_PLANTLIKE_ROOTED
+				|| f.drawtype == NDT_FIRELIKE
+				|| f.drawtype == NDT_SIGNLIKE
+				|| f.drawtype == NDT_RAILLIKE
+				|| f.drawtype == NDT_TORCHLIKE))
+		cls = 1;
+	else if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
+		cls = 1;
+	else if (f.isLiquid())
+		cls = 3;
+	if (cls != 1 && f.visuals && f.visuals->minimap_color.getAlpha() > 0) {
+		video::SColor col = f.visuals->minimap_color;
+		g_col_lut[c] = (col.getRed() << 16) | (col.getGreen() << 8)
+				| col.getBlue();
+	}
+	g_cls_lut[c] = cls;
+	return cls;
+}
+
+u32 buildCascade2(Client *client, v3s16 origin_nodes,
+		std::vector<u8> &rgba, std::vector<u8> &coarse)
+{
+	constexpr int N = 128, CELL = 2;
+	rgba.assign((size_t)N * N * N * 4, 0);
+	coarse.assign(32 * 32 * 32, 0);
+	u32 solid_cells = 0;
+	Map &map = client->getEnv().getMap();
+	const NodeDefManager *ndef = client->getNodeDefManager();
+
+	// walk whole loaded MapBlocks (16^3 = 8^3 cells each); origin is
+	// 32-node snapped so blocks tile the box exactly
+	constexpr int BLOCKS = N * CELL / 16; // 16 across
+	for (int bz = 0; bz < BLOCKS; bz++)
+	for (int by = 0; by < BLOCKS; by++)
+	for (int bx = 0; bx < BLOCKS; bx++) {
+		v3s16 bpos((origin_nodes.X >> 4) + bx, (origin_nodes.Y >> 4) + by,
+				(origin_nodes.Z >> 4) + bz);
+		MapBlock *block = map.getBlockNoCreateNoEx(bpos);
+		if (!block)
+			continue; // not loaded: air
+		// cell base within the level: 8 cells per axis per block
+		int cbx = bx * 8, cby = by * 8, cbz = bz * 8;
+		for (int cz = 0; cz < 8; cz++)
+		for (int cy = 0; cy < 8; cy++)
+		for (int cx = 0; cx < 8; cx++) {
+			u32 occ = 0, water = 0, r = 0, g = 0, b = 0;
+			for (int oz = 0; oz < 2; oz++)
+			for (int oy = 0; oy < 2; oy++)
+			for (int ox = 0; ox < 2; ox++) {
+				MapNode n = block->getNodeNoCheck(cx * 2 + ox,
+						cy * 2 + oy, cz * 2 + oz);
+				u8 cls = classify(ndef, n.getContent());
+				if (cls == 1)
+					continue;
+				u32 col = g_col_lut[n.getContent()];
+				if (cls == 3) water++; else occ++;
+				r += (col >> 16) & 0xFF;
+				g += (col >> 8) & 0xFF;
+				b += col & 0xFF;
+			}
+			u32 counted = occ + water;
+			if (counted == 0)
+				continue;
+			u8 cls = 0;
+			if (occ >= 4)
+				cls = 255;
+			else if (water >= 4 && water > occ)
+				cls = 100;
+			else
+				continue;
+			size_t i = ((size_t)(cbz + cz) * N + (cby + cy)) * N
+					+ (cbx + cx);
+			rgba[i * 4 + 0] = (u8)(r / counted);
+			rgba[i * 4 + 1] = (u8)(g / counted);
+			rgba[i * 4 + 2] = (u8)(b / counted);
+			rgba[i * 4 + 3] = cls;
+			solid_cells++;
+			coarse[(((cbz + cz) / 4) * 32 + ((cby + cy) / 4)) * 32
+					+ ((cbx + cx) / 4)] = 255;
+		}
 	}
 	return solid_cells;
 }

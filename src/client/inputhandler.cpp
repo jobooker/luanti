@@ -53,6 +53,7 @@ void MyEventReceiver::reloadKeybindings()
 	keybindings[KeyType::TOGGLE_CHAT] = getKeySetting("keymap_toggle_chat");
 	keybindings[KeyType::TOGGLE_FOG] = getKeySetting("keymap_toggle_fog");
 	keybindings[KeyType::TOGGLE_CLAUDE_TRACE] = getKeySetting("keymap_toggle_claude_trace");
+	keybindings[KeyType::TOGGLE_CLAUDE_BOUNCE] = getKeySetting("keymap_toggle_claude_bounce");
 	keybindings[KeyType::TOGGLE_UPDATE_CAMERA] = getKeySetting("keymap_toggle_update_camera");
 	keybindings[KeyType::TOGGLE_DEBUG] = getKeySetting("keymap_toggle_debug");
 	keybindings[KeyType::TOGGLE_PROFILER] = getKeySetting("keymap_toggle_profiler");

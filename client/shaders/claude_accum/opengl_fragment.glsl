@@ -299,36 +299,39 @@ void microNeighbours(vec3 cell, out vec3 nbNeg, out vec3 nbPos)
 		texture3D(claudeVolume, (cell + vec3(0.5, 0.5, 1.5)) / S).a > 0.9 ? 1.0 : 0.0);
 }
 
-// ---- far cascade (claude_lod Phase 1): one 8 m level to +/-512 m ----
-// Full CONCENTRIC volume, not an annulus: it covers the near field too
-// (coarsely), so promoted rays are always correct-but-coarse and never
-// need demotion. Slab 0 of a 5-slab texture (later levels are data, not
-// layout). All positions here are VOLUME-LOCAL node coords; cascade
-// cells are (p - cascade0Origin) / cascade0Cell.
+// ---- far cascades (claude_lod Phase 2): 2 m / 4 m / 8 m octaves ----
+// Detail halves per level so no seam ever jumps more than one octave:
+// near volume 1 m to +/-64, then 2 m to +/-128, 4 m to +/-256, 8 m to
+// +/-512. Each level is a full CONCENTRIC volume (covers the near field
+// coarsely too), so promoted rays are always correct-but-coarse and
+// never need demotion. Slabs 0/1/2 of a 5-slab texture. All positions
+// are VOLUME-LOCAL node coords; level cells are (p - origin) / cell.
 uniform sampler3D claudeCascades;      // 128x128x640 RGBA8
 uniform sampler3D claudeCascadeCoarse; // 32x32x160 R8 any-solid bricks
-uniform vec3 cascade0Origin;  // cascade cell (0,0,0), volume-local nodes
-uniform float cascade0Cell;   // nodes per cell (8)
-uniform float claudeCascadeCount; // 0 = off / not built yet
+uniform vec3 cascade0Origin;  // 2 m level origin, volume-local nodes
+uniform vec3 cascade1Origin;  // 4 m
+uniform vec3 cascade2Origin;  // 8 m
+uniform vec3 cascadeValid;    // per-level 0/1
 
-vec4 cascadeSample(vec3 c)
+vec4 cascadeSample(float slab, vec3 c)
 {
 	return texture3D(claudeCascades,
-			vec3((c.xy + 0.5) / 128.0, (c.z + 0.5) / 640.0));
+			vec3((c.xy + 0.5) / 128.0, (slab * 128.0 + c.z + 0.5) / 640.0));
 }
 
-// Binary sun occlusion marched in 8 m cells from a volume-local point:
-// this is what lets a mountain 400 nodes west dim the camp at sunset.
-// Start is biased 1.2 cells along the ray — the launch point sits on
-// (or exits near) real terrain whose own coarse cell is >50% solid, and
-// sampling it would self-shadow everything near any slope. The bias
-// trades that for a slight light leak at terrain-scale silhouettes,
-// invisible at 8 m frequency.
+// Binary sun occlusion marched in 8 m cells (the coarsest level ONLY:
+// an 8 m occluder test is indistinguishable from a 2 m one at terrain
+// distance, at a third the cost) — this is what lets a mountain 400
+// nodes west dim the camp at sunset. Start is biased 1.2 cells along
+// the ray — the launch point sits on (or exits near) real terrain whose
+// own coarse cell is >50% solid, and sampling it would self-shadow
+// everything near any slope. The bias trades that for a slight light
+// leak at terrain-scale silhouettes, invisible at 8 m frequency.
 float farShadow(vec3 pvol, vec3 sd)
 {
-	if (claudeCascadeCount < 0.5)
+	if (cascadeValid.z < 0.5)
 		return 1.0;
-	vec3 pc = (pvol - cascade0Origin) / cascade0Cell + sd * 1.2;
+	vec3 pc = (pvol - cascade2Origin) / 8.0 + sd * 1.2;
 	vec3 cell = floor(pc);
 	vec3 stepDir = sign(sd);
 	vec3 invRd = 1.0 / max(abs(sd), vec3(1e-6));
@@ -345,8 +348,8 @@ float farShadow(vec3 pvol, vec3 sd)
 				|| any(greaterThanEqual(cell, vec3(128.0))))
 			return 1.0;
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCascadeCoarse,
-				vec3((cc.xy + 0.5) / 32.0, (cc.z + 0.5) / 160.0)).r < 0.5) {
+		if (texture3D(claudeCascadeCoarse, vec3((cc.xy + 0.5) / 32.0,
+				(2.0 * 32.0 + cc.z + 0.5) / 160.0)).r < 0.5) {
 			vec3 bb = cc * 4.0 + step(vec3(0.0), sd) * 4.0;
 			vec3 rdg = (step(vec3(0.0), sd) * 2.0 - 1.0)
 					* max(abs(sd), vec3(1e-6));
@@ -358,29 +361,30 @@ float farShadow(vec3 pvol, vec3 sd)
 					+ stepDir * 0.5 + 0.5) * invRd;
 			continue;
 		}
-		if (cascadeSample(cell).a > 0.9)
+		if (cascadeSample(2.0, cell).a > 0.9)
 			return 0.0;
 	}
 	return 1.0;
 }
 
-// Eye/bounce continuation into the cascade after the near volume is
-// exhausted. t is WORLD-NODE units along rd from ro (same t the caller
-// tracks), so depth stays continuous across the promotion. Returns rgb
-// + hit t in w (w < 0 = escaped to sky).
-vec4 farTrace(vec3 ro, vec3 rd, float t0)
+// March ONE cascade level from world-node t0 along rd. Returns rgb +
+// hit t in w on a hit; on box exit returns w = -(exitT + 1.0) so the
+// caller resumes the NEXT level exactly where this one left off — one
+// continuous t across every octave, no cracks, no double hits.
+vec4 farTraceL(float slab, vec3 corigin, float csz, vec3 tint,
+		vec3 ro, vec3 rd, float t0)
 {
-	if (claudeCascadeCount < 0.5)
-		return vec4(0.0, 0.0, 0.0, -1.0);
-	vec3 p0 = ro + rd * (t0 + 1e-2);
-	vec3 pc = (p0 - cascade0Origin) / cascade0Cell;
+	vec3 p0 = ro + rd * (t0 + 0.01 * csz);
+	vec3 pc = (p0 - corigin) / csz;
+	if (any(lessThan(pc, vec3(0.0))) || any(greaterThanEqual(pc, vec3(128.0))))
+		return vec4(0.0, 0.0, 0.0, -(t0 + 1.0)); // outside: hand onward
 	vec3 cell = floor(pc);
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
 	vec3 sideDist = (stepDir * (cell - pc) + stepDir * 0.5 + 0.5) * invRd;
 	float tc = 0.0;
 	int axis = -1;
-	for (int i = 0; i < 224; i++) {
+	for (int i = 0; i < 192; i++) {
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
 			tc = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
 		} else if (sideDist.y < sideDist.z) {
@@ -390,10 +394,10 @@ vec4 farTrace(vec3 ro, vec3 rd, float t0)
 		}
 		if (any(lessThan(cell, vec3(0.0)))
 				|| any(greaterThanEqual(cell, vec3(128.0))))
-			return vec4(0.0, 0.0, 0.0, -1.0);
+			return vec4(0.0, 0.0, 0.0, -(t0 + tc * csz + 1.0));
 		vec3 cc = floor(cell / 4.0);
-		if (texture3D(claudeCascadeCoarse,
-				vec3((cc.xy + 0.5) / 32.0, (cc.z + 0.5) / 160.0)).r < 0.5) {
+		if (texture3D(claudeCascadeCoarse, vec3((cc.xy + 0.5) / 32.0,
+				(slab * 32.0 + cc.z + 0.5) / 160.0)).r < 0.5) {
 			vec3 bb = cc * 4.0 + step(vec3(0.0), rd) * 4.0;
 			vec3 rdg = (step(vec3(0.0), rd) * 2.0 - 1.0)
 					* max(abs(rd), vec3(1e-6));
@@ -409,38 +413,68 @@ vec4 farTrace(vec3 ro, vec3 rd, float t0)
 					+ stepDir * 0.5 + 0.5) * invRd;
 			continue;
 		}
-		vec4 s = cascadeSample(cell);
+		vec4 s = cascadeSample(slab, cell);
 		if (s.a > 0.35 && axis >= 0) {
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
 			else if (axis == 1) n.y = -stepDir.y;
 			else n.z = -stepDir.z;
-			float tw = t0 + tc * cascade0Cell;
+			float tw = t0 + tc * csz;
 			vec3 hpv = ro + rd * tw;
 			// reduced far shading: albedo x (sun + sky), per-cell jitter
 			// so distant fields aren't flat. No micro, atlas, emitters,
 			// or bounce — invisible at this angular size.
 			vec3 albedo = pathAlbedo(s.rgb);
-			float jh = fract(sin(dot(cell,
+			float jh = fract(sin(dot(cell + slab * 17.0,
 					vec3(12.9898, 78.233, 37.719))) * 43758.5453);
 			albedo *= 0.9 + 0.2 * jh;
 			float ndl = max(dot(n, volumeSunDir), 0.0);
 			vec3 direct = ndl > 0.0
 					? volumeLightCol * (ndl
-						* farShadow(hpv + n * cascade0Cell, volumeSunDir))
+						* farShadow(hpv + n * csz, volumeSunDir))
 					: vec3(0.0);
 			vec3 c = albedo * (direct + pathSkyRadiance(n) * SKY_BOUNCE);
 			if (s.a < 0.6) // far water: flat sky mirror
 				c = mix(c, pathSkyRadiance(
 						reflect(rd, vec3(0.0, 1.0, 0.0))), 0.6);
-			// debug 5: paint the cascade's contribution red
+			// debug 5: per-level tint (2m red, 4m orange, 8m yellow)
 			if (volumeDebug > 4.5)
-				c = vec3(0.9, 0.15, 0.15) * (0.4 + 0.6 * ndl);
+				c = tint * (0.4 + 0.6 * ndl);
 			// aerial perspective: the beauty term, and the concealer for
 			// the data frontier (unseen terrain fades into atmosphere)
 			c = mix(c, pathSkyRadiance(rd), 1.0 - exp(-tw / 900.0));
 			return vec4(c, tw);
 		}
+	}
+	return vec4(0.0, 0.0, 0.0, -(t0 + tc * csz + 1.0));
+}
+
+// Chain the octaves: 2 m -> 4 m -> 8 m, each resuming at the previous
+// level's exit t. An invalid level is skipped (the next one covers its
+// box anyway, just coarser).
+vec4 farTrace(vec3 ro, vec3 rd, float t0)
+{
+	float tcur = t0;
+	vec4 r;
+	if (cascadeValid.x > 0.5) {
+		r = farTraceL(0.0, cascade0Origin, 2.0,
+				vec3(0.9, 0.15, 0.15), ro, rd, tcur);
+		if (r.w > 0.0)
+			return r;
+		tcur = -r.w - 1.0;
+	}
+	if (cascadeValid.y > 0.5) {
+		r = farTraceL(1.0, cascade1Origin, 4.0,
+				vec3(0.9, 0.55, 0.1), ro, rd, tcur);
+		if (r.w > 0.0)
+			return r;
+		tcur = -r.w - 1.0;
+	}
+	if (cascadeValid.z > 0.5) {
+		r = farTraceL(2.0, cascade2Origin, 8.0,
+				vec3(0.9, 0.9, 0.15), ro, rd, tcur);
+		if (r.w > 0.0)
+			return r;
 	}
 	return vec4(0.0, 0.0, 0.0, -1.0);
 }

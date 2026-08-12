@@ -160,6 +160,7 @@ protected:
 	void toggleMinimap(bool shift_pressed);
 	void toggleFog();
 	void toggleClaudeTrace();
+	void toggleClaudeBounce();
 	void toggleDebug();
 	void toggleUpdateCamera();
 

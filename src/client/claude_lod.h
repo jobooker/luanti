@@ -21,13 +21,19 @@ namespace claude_lod
 // warm-scan thread can feed it too.
 void summarizeBlock(Client *client, MapBlock *block);
 
-// Build the 8 m cascade: 128^3 cells covering +/-512 m around
-// origin_nodes (the cascade's cell (0,0,0), snapped to 32 nodes by the
-// caller). rgba: 128^3 * 4 (rgb = occupancy-weighted average color,
-// a = class: 0 air, 100 water, 255 solid). coarse: 32^3 any-solid.
-// Returns the number of solid cells (0 => nothing to upload yet).
-u32 buildCascade8(v3s16 origin_nodes, std::vector<u8> &rgba,
-		std::vector<u8> &coarse);
+// Build a summary-fed cascade level: 128^3 cells of cell_nodes (4 or 8)
+// covering origin_nodes + 128*cell_nodes. rgba: 128^3 * 4 (rgb =
+// occupancy-weighted average color, a = class: 0 air, 100 water, 255
+// solid). coarse: 32^3 any-solid. Returns the number of solid cells.
+u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
+		std::vector<u8> &rgba, std::vector<u8> &coarse);
+
+// Build the 2 m level: FINER than the summaries, so it walks loaded
+// MapBlocks directly (getNodeNoCheck + a per-content classification LUT
+// — no per-node NodeDefManager lookups). Unloaded blocks read as air.
+// ~16M node reads; tens of ms, so the caller schedules it sparsely.
+u32 buildCascade2(Client *client, v3s16 origin_nodes,
+		std::vector<u8> &rgba, std::vector<u8> &coarse);
 
 // Bumped whenever a block summary changes; cheap staleness gate for
 // the cascade rebuild schedule.

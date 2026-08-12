@@ -168,6 +168,7 @@ void set_default_settings()
 	settings->setDefault("keymap_toggle_chat", "SYSTEM_SCANCODE_59"); // KEY_F2
 	settings->setDefault("keymap_toggle_fog", "SYSTEM_SCANCODE_60"); // KEY_F3
 	settings->setDefault("keymap_toggle_claude_trace", "SYSTEM_SCANCODE_18"); // KEY_KEY_O
+	settings->setDefault("keymap_toggle_claude_bounce", "SYSTEM_SCANCODE_10"); // KEY_KEY_G (B is hotbar_previous)
 #ifndef NDEBUG
 	settings->setDefault("keymap_toggle_update_camera", "SYSTEM_SCANCODE_61"); // KEY_F4
 #else
