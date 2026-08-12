@@ -78,6 +78,11 @@ uniform lowp float claudeFarGrain;
 // 1 = aerial-perspective haze on far terrain; 0 = pure tracing (John:
 // "zero in on just the ray tracing — volumetric stuff not yet")
 uniform lowp float claudeFarFog;
+// REAL SUB-VOXEL BITS (round-8): per-node 16^3 bitmasks for the ring
+// at volume-local [48,80)^3, baked once per snapshot from the same
+// carve law. 1 (default) = one-fetch microSolid; 0 = trace-time carve.
+uniform lowp float claudeSubvox;
+uniform usampler3D claudeSubvoxTex;
 uniform lowp float claudeSkyAz;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
@@ -329,8 +334,21 @@ vec2 faceUV(vec2 t, float h, float horiz)
 // lattice John saw. Here an interface face is never carved at all, so
 // neighbours meet flush, and every visible face shows its own projection.
 // nbNeg/nbPos: 1 where that neighbour cell is solid.
-bool microSolid(float slot, vec3 sc, float rot, vec3 nbNeg, vec3 nbPos)
+bool microSolid(vec3 node, float slot, vec3 sc, float rot,
+		vec3 nbNeg, vec3 nbPos)
 {
+	if (claudeSubvox > 0.5) {
+		vec3 rl = node - vec3(48.0);
+		if (all(greaterThanEqual(rl, vec3(0.0)))
+				&& all(lessThan(rl, vec3(32.0)))) {
+			ivec3 svc = ivec3(rl) * 16
+					+ ivec3(clamp(sc, vec3(0.0), vec3(15.0)));
+			uint w = texelFetch(claudeSubvoxTex,
+					ivec3(svc.x >> 5, svc.y, svc.z), 0).r;
+			return ((w >> uint(svc.x & 31)) & 1u) == 1u;
+		}
+		return true; // beyond the ring: plain cube (near-only detail)
+	}
 	float C = max(1.0, floor(MICRO_CARVE * microStrength + 0.5));
 	if (nbPos.y < 0.5 && sc.y > 15.0 - C
 			&& 15.0 - sc.y < faceCarve(slot, faceUV(vec2(sc.x, sc.z), rot, 1.0), C))
@@ -353,7 +371,7 @@ bool microSolid(float slot, vec3 sc, float rot, vec3 nbNeg, vec3 nbPos)
 	return true;
 }
 
-bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
+bool microDDA(vec3 node, vec3 lo, vec3 rd, float slot, float rot,
 		vec3 nbNeg, vec3 nbPos, out vec3 hitLocal, out vec3 hitNormal)
 {
 	vec3 p = clamp(lo, 0.0, 0.99999) * 16.0;
@@ -369,7 +387,7 @@ bool microDDA(vec3 lo, vec3 rd, float slot, float rot,
 	for (int i = 0; i < 48; i++) {
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThan(cell, vec3(15.0))))
 			return false;                      // left the cell: real gap
-		if (microSolid(slot, cell, rot, nbNeg, nbPos)) {
+		if (microSolid(node, slot, cell, rot, nbNeg, nbPos)) {
 			hitLocal = (p + rd * t) / 16.0;
 			hitNormal = vec3(0.0);
 			if (axis == 0) hitNormal.x = -stepDir.x;
@@ -874,7 +892,7 @@ float lightVis(vec3 ro, vec3 sd)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbN1, nbP1;
 			microNeighbours(cell, nbN1, nbP1);
-			if (mslot > 0.5 && microDDA(clamp(lentry, 0.0, 1.0), sd,
+			if (mslot > 0.5 && microDDA(cell, clamp(lentry, 0.0, 1.0), sd,
 					floor(mslot + 0.5), rot1, nbN1, nbP1, mh, mn))
 				return 0.0;
 			continue;
@@ -1221,7 +1239,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbNb, nbPb;
 			microNeighbours(cell, nbNb, nbPb);
-			if (ms > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0), rd,
+			if (ms > 0.5 && microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0), rd,
 					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn)) {
 				float fallm = 1.0 - t / 160.0;
 				vec3 hpm = cell + mh + mn * 0.03125;
@@ -1373,14 +1391,14 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbN0, nbP0;
 			microNeighbours(cell, nbN0, nbP0);
-			if (m0 > 0.5 && microDDA(clamp(ro - cell, 0.0, 1.0), ld,
+			if (m0 > 0.5 && microDDA(cell, clamp(ro - cell, 0.0, 1.0), ld,
 					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0)) {
 				// rim clip passes regardless of ray direction (see loop);
 				// sample behind the hit face (boundary coin-flip fix)
 				vec3 scA0 = floor((mh0 - mn0 * 0.03125) * 16.0)
 						+ vec3(0.0, 1.0, 0.0);
 				if (abs(mn0.y) < 0.5 && (scA0.y > 15.5
-						|| !microSolid(floor(m0 + 0.5), scA0, r0, nbN0, nbP0))) {
+						|| !microSolid(cell, floor(m0 + 0.5), scA0, r0, nbN0, nbP0))) {
 					g_evisCause = max(g_evisCause, 1.0);
 				} else {
 					g_evisCause = 2.0;
@@ -1445,7 +1463,7 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbNe, nbPe;
 			microNeighbours(cell, nbNe, nbPe);
-			if (mslot > 0.5 && microDDA(clamp(ro + ld * t - cell, 0.0, 1.0), ld,
+			if (mslot > 0.5 && microDDA(cell, clamp(ro + ld * t - cell, 0.0, 1.0), ld,
 					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn)) {
 				// RIM CLIP, shadow-march side (2026-08-12: after the
 				// eye-normal fix the circle became HARD and block-
@@ -1462,7 +1480,7 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 				vec3 scAe = floor((mh - mn * 0.03125) * 16.0)
 						+ vec3(0.0, 1.0, 0.0);
 				if (abs(mn.y) < 0.5 && (scAe.y > 15.5
-						|| !microSolid(floor(mslot + 0.5), scAe, rotE, nbNe, nbPe))) {
+						|| !microSolid(cell, floor(mslot + 0.5), scAe, rotE, nbNe, nbPe))) {
 					g_evisCause = max(g_evisCause, 1.0);
 				} else {
 					g_evisCause = 3.0;
@@ -1692,7 +1710,7 @@ void main(void)
 						vec3(41.3, 289.1, 77.7))) * 21311.7);
 				vec3 nbN0, nbP0;
 				microNeighbours(cell, nbN0, nbP0);
-				if (mid0 > 0.5 && microDDA(clamp(ro + rd * t - cell, 0.0, 1.0),
+				if (mid0 > 0.5 && microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0),
 						rd, floor(mid0 + 0.5), rot0, nbN0, nbP0, hl, hn)) {
 					// Bias by HALF A SUB-VOXEL (1/32 node), not the 0.01 used
 					// for 1 m faces. A sub-voxel is 6.25 cm, so a 1 cm bias is
@@ -1726,8 +1744,8 @@ void main(void)
 						// the surface; what's ABOVE the entry decides:
 						// open above = top (shade up), buried = wall.
 						vec3 scA2 = floor(hl * 16.0) + vec3(0.0, 1.0, 0.0);
-						if (scA2.y > 15.5 || !microSolid(floor(mid0 + 0.5),
-								scA2, rot0, nbN0, nbP0))
+						if (scA2.y > 15.5 || !microSolid(cell,
+								floor(mid0 + 0.5), scA2, rot0, nbN0, nbP0))
 							hn = vec3(0.0, 1.0, 0.0);
 						else
 							hn = nn0;
@@ -1739,8 +1757,8 @@ void main(void)
 						// whole blocks flipped dark on rounding luck
 						vec3 scAbove = floor((hl - hn * 0.03125) * 16.0)
 								+ vec3(0.0, 1.0, 0.0);
-						if (scAbove.y > 15.5 || !microSolid(floor(mid0 + 0.5),
-								scAbove, rot0, nbN0, nbP0))
+						if (scAbove.y > 15.5 || !microSolid(cell,
+								floor(mid0 + 0.5), scAbove, rot0, nbN0, nbP0))
 							hn = vec3(0.0, 1.0, 0.0);
 					}
 					vec3 hp2 = cell + hl + hn * 0.03125;

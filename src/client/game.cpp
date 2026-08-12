@@ -47,7 +47,13 @@
 // GLSL 120), where the mt_opengl loader isn't initialized.
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl.h>
-#include "client/render/pipeline.h" // ClaudeGpuProf (per-pass GPU times)
+#include "client/render/pipeline.h"
+#ifndef GL_R32UI
+#define GL_R32UI 0x8236
+#endif
+#ifndef GL_RED_INTEGER
+#define GL_RED_INTEGER 0x8D94
+#endif // ClaudeGpuProf (per-pass GPU times)
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
@@ -110,6 +116,11 @@ struct ClaudeVolume
 	// block whose carve is empty; no branch switch, no wasted marches)
 	bool micro_flat[256] = {};
 	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
+	// REAL SUB-VOXEL BITS (round-8): 16^3 bits per node for the 32^3
+	// ring at volume-local [48,80)^3 — the carve law baked per NODE at
+	// snapshot; the shader's microSolid is one fetch. R32UI 16x512x512.
+	u32 subvox_tex = 0;
+	std::vector<u32> subvox;
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
@@ -274,6 +285,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_far_fog_pixel{"claudeFarFog"};
 	float m_sky_az = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_sky_az_pixel{"claudeSkyAz"};
+	float m_subvox = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_subvox_pixel{"claudeSubvox"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -316,7 +330,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 37> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 38> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -354,6 +368,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_far_grain",
 		"claude_far_fog",
 		"claude_sky_azimuth",
+		"claude_subvox",
 	};
 
 	static float readGoldenHourStrength()
@@ -635,6 +650,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_sky_azimuth", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = real per-node sub-voxel bits; 0 = trace-time carve
+	static float readSubvox()
+	{
+		if (!g_settings->exists("claude_subvox"))
+			return 1.0f;
+		return g_settings->getFloat("claude_subvox", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -728,6 +751,8 @@ public:
 			m_far_fog = readFarFog();
 		if (name == "claude_sky_azimuth")
 			m_sky_az = readSkyAz();
+		if (name == "claude_subvox")
+			m_subvox = readSubvox();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -781,6 +806,7 @@ public:
 		m_far_grain = readFarGrain();
 		m_far_fog = readFarFog();
 		m_sky_az = readSkyAz();
+		m_subvox = readSubvox();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -981,6 +1007,10 @@ public:
 					glActiveTexture(GL_TEXTURE15);
 					glBindTexture(GL_TEXTURE_2D, g_claude_volume.matparams_tex);
 				}
+				if (g_claude_volume.subvox_tex) {
+					glActiveTexture(GL_TEXTURE7);
+					glBindTexture(GL_TEXTURE_3D, g_claude_volume.subvox_tex);
+				}
 				if (g_claude_volume.cascades_tex) {
 					glActiveTexture(GL_TEXTURE8);
 					glBindTexture(GL_TEXTURE_3D, g_claude_volume.cascades_tex);
@@ -1002,6 +1032,9 @@ public:
 				m_micro_sampler_pixel.set(&mlayer2, services);
 				SamplerLayer_t player = 15;
 				m_matparams_sampler_pixel.set(&player, services);
+				SamplerLayer_t svlayer = 7;
+				m_subvox_sampler_pixel.set(&svlayer, services);
+				m_subvox_pixel.set(&m_subvox, services);
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
@@ -1876,6 +1909,110 @@ static void claudeVolumeSnapshot(Client *client)
 	// exactly; the claude_pyramid dial lets marchers CLIMB to 8/16/32-
 	// cell leaps through deep emptiness. ~2.4 MB total.
 	{
+
+	// ---- REAL SUB-VOXEL BITS (round-8 goal: fix carving, don't do
+	// carving). The trace-time carve law (microSolid: per-face atlas
+	// heights, neighbour-gated, aligned mapping) is evaluated ONCE PER
+	// NODE here for the ring [48,80)^3 (volume-local; the volume itself
+	// follows the camera). Non-micro solids fast-path to all-ones; only
+	// micro-class nodes (a=250) evaluate the 4096-bit carve. The
+	// per-material stamps are BAKE INPUT ONLY (ADR-0007: template is
+	// generator, never runtime). Rebaked every snapshot.
+	{
+		auto &sv = g_claude_volume.subvox;
+		if (sv.empty())
+			sv.assign((size_t)16 * 512 * 512, 0u);
+		std::fill(sv.begin(), sv.end(), 0u);
+		const float mstr = g_settings->exists("claude_micro")
+				? g_settings->getFloat("claude_micro", 0.0f, 2.0f) : 1.0f;
+		const int C = std::max(1, (int)std::floor(2.0f * mstr + 0.5f));
+		const int R0 = 48, RN = 32;
+		auto solidAt = [&](int vx, int vy, int vz) {
+			if (vx < 0 || vy < 0 || vz < 0 || vx >= S || vy >= S || vz >= S)
+				return true;
+			return occ[((size_t)(vz * S + vy) * S + vx) * 4 + 3] > 230;
+		};
+		auto carveH = [&](u8 slot, int tx, int ty) {
+			int mox = (slot % 16) * 16, moy = (slot / 16) * 16;
+			int px = std::min(std::max(tx, 0), 15);
+			int py = std::min(std::max(ty, 0), 15);
+			u8 h = g_claude_volume.atlas[((size_t)(moy + py) * 256
+					+ mox + px) * 4 + 3];
+			return (int)std::floor((1.0f - h / 255.0f) * C + 0.5f);
+		};
+		for (int rz = 0; rz < RN; rz++)
+		for (int ry = 0; ry < RN; ry++)
+		for (int rx = 0; rx < RN; rx++) {
+			int vx = R0 + rx, vy = R0 + ry, vz = R0 + rz;
+			size_t vi = (size_t)(vz * S + vy) * S + vx;
+			u8 a = occ[vi * 4 + 3];
+			if (a <= 230)
+				continue; // air / water / glass / nub: no bits
+			if (a != 250) {
+				// plain solid: 16 consecutive x-bits per (y,z) row
+				u32 m = 0xFFFFu << ((rx & 1) * 16);
+				size_t wx = (size_t)(rx >> 1);
+				for (int s2 = 0; s2 < 16; s2++)
+				for (int t2 = 0; t2 < 16; t2++)
+					sv[((size_t)(rz * 16 + s2) * 512
+							+ (ry * 16 + t2)) * 16 + wx] |= m;
+				continue;
+			}
+			u8 slot = mids[vi];
+			bool nxp = solidAt(vx + 1, vy, vz), nxn = solidAt(vx - 1, vy, vz);
+			bool nyp = solidAt(vx, vy + 1, vz), nyn = solidAt(vx, vy - 1, vz);
+			bool nzp = solidAt(vx, vy, vz + 1), nzn = solidAt(vx, vy, vz - 1);
+			for (int sz2 = 0; sz2 < 16; sz2++)
+			for (int sy2 = 0; sy2 < 16; sy2++)
+			for (int sx2 = 0; sx2 < 16; sx2++) {
+				bool sol = true;
+				if (!nyp && sy2 > 15 - C
+						&& 15 - sy2 < carveH(slot, sx2, sz2))
+					sol = false;
+				else if (!nyn && sy2 < C
+						&& sy2 < carveH(slot, sx2, 15 - sz2))
+					sol = false;
+				else if (!nxp && sx2 > 15 - C
+						&& 15 - sx2 < carveH(slot, sz2, 15 - sy2))
+					sol = false;
+				else if (!nxn && sx2 < C
+						&& sx2 < carveH(slot, 15 - sz2, 15 - sy2))
+					sol = false;
+				else if (!nzp && sz2 > 15 - C
+						&& 15 - sz2 < carveH(slot, 15 - sx2, 15 - sy2))
+					sol = false;
+				else if (!nzn && sz2 < C
+						&& sz2 < carveH(slot, sx2, 15 - sy2))
+					sol = false;
+				if (sol) {
+					int gx = rx * 16 + sx2;
+					sv[((size_t)(rz * 16 + sz2) * 512
+							+ (ry * 16 + sy2)) * 16 + (gx >> 5)]
+							|= (1u << (gx & 31));
+				}
+			}
+		}
+		GLint prev_au = GL_TEXTURE0;
+		glGetIntegerv(GL_ACTIVE_TEXTURE, &prev_au);
+		bool fresh_sv = !g_claude_volume.subvox_tex;
+		if (fresh_sv)
+			glGenTextures(1, &g_claude_volume.subvox_tex);
+		glActiveTexture(GL_TEXTURE7);
+		glBindTexture(GL_TEXTURE_3D, g_claude_volume.subvox_tex);
+		if (fresh_sv) {
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+			glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI, 16, 512, 512, 0,
+					GL_RED_INTEGER, GL_UNSIGNED_INT, nullptr);
+		}
+		glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 16, 512, 512,
+				GL_RED_INTEGER, GL_UNSIGNED_INT, sv.data());
+		glActiveTexture(prev_au);
+	}
+
 		static std::vector<u8> pyr0(S * S * S), pyr1(64 * 64 * 64),
 				pyr2(32 * 32 * 32), pyr3(16 * 16 * 16),
 				pyr4(8 * 8 * 8), pyr5(4 * 4 * 4);
