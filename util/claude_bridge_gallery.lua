@@ -81,6 +81,14 @@ function OPS.cornell(p)
     local mz = o.z + 1 + math.floor((s - 1) / 2)
     box({ x = mid - 1, y = o.y + e, z = mz - 1 },
         { x = mid + 1, y = o.y + e, z = mz + 1 }, "claude_bridge:white_lit")
+    -- two gray occluders (John, hand-placed on the first walkthrough,
+    -- ratified 2026-08-13): the deep-shadow generators every classic
+    -- Cornell render has — the region beside each block is lit only by
+    -- bleed. Positions preserved exactly as placed.
+    core.set_node({ x = o.x + 3, y = o.y + 1, z = o.z + 4 },
+            { name = "claude_bridge:gray186" })
+    core.set_node({ x = o.x + 6, y = o.y + 1, z = o.z + 6 },
+            { name = "claude_bridge:gray186" })
     box({ x = mid, y = o.y + 1, z = o.z },
         { x = mid, y = o.y + 2, z = o.z }, "air")
     return { door = { x = mid, y = o.y + 1, z = o.z } }
