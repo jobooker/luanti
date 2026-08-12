@@ -303,6 +303,26 @@ public:
 	virtual void run(PipelineContext &context) = 0;
 };
 
+// claude GPU pass profiler: GL_TIME_ELAPSED per top-level pipeline step,
+// double-buffered (frame N reads frame N-1's queries). game.cpp dumps the
+// EMA'd per-step milliseconds into claude_stats.json as "pass_ms" so
+// external tooling can see WHERE the frame goes (John, 2026-08-12:
+// "can you see where we spend our frames?").
+struct ClaudeGpuProf
+{
+	static const int MAXQ = 48;
+	unsigned int q[2][MAXQ] = {};
+	int count[2] = {0, 0};
+	int cur = 0;           // buffer being written this frame
+	bool inited = false;
+	bool timing = false;   // a query is open (no-nesting guard)
+	int depth = 0;         // pipeline nesting depth
+	int cursor = 0;        // next slot this frame
+	float ms[MAXQ] = {};   // EMA per step index
+	int n = 0;             // steps in the last completed frame
+};
+extern ClaudeGpuProf g_claude_gpuprof;
+
 /**
  * Provides default empty implementation of supporting methods in a rendering step.
  */

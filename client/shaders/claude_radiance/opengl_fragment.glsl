@@ -53,6 +53,7 @@ uniform vec4 claudeEmitter7;
 uniform lowp float claudeEmitterCount;
 uniform vec4 claudeHeldEmitter; // wielded light: own slot, never in emitters[]
 uniform lowp float claudePyramid; // occupancy-pyramid leap climb dial
+uniform lowp float claudeFaceDirect; // faces feed bounces: lattice is dead
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -313,8 +314,11 @@ void main(void)
 		gl_FragColor = vec4(0.0);
 		return;
 	}
-	// off or not in traced mode: keep the cache empty, near-zero cost
-	if (volumeDebug < 2.5 || radianceStrength <= 0.0) {
+	// off or not in traced mode: keep the cache empty, near-zero cost.
+	// Also dead when face-direct is on (bounce rays read the FACE cache;
+	// nothing consumes this lattice) — skip the whole update.
+	if (volumeDebug < 2.5 || radianceStrength <= 0.0
+			|| claudeFaceDirect > 0.5) {
 		gl_FragColor = vec4(0.0);
 		return;
 	}

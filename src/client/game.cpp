@@ -47,6 +47,7 @@
 // GLSL 120), where the mt_opengl loader isn't initialized.
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl.h>
+#include "client/render/pipeline.h" // ClaudeGpuProf (per-pass GPU times)
 #include "profiler.h"
 #include "raycast.h"
 #include "server.h"
@@ -239,6 +240,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_bisect_pixel{"claudeBisect"};
 	float m_pyramid = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_pyramid_pixel{"claudePyramid"};
+	float m_nee_gate = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_nee_gate_pixel{"claudeNeeGate"};
+	float m_cost = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_cost_pixel{"claudeCost"};
+	float m_face_direct = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_face_direct_pixel{"claudeFaceDirect"};
 	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
@@ -278,7 +285,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 24> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 27> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -303,6 +310,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_cache_sky",
 		"claude_bisect",
 		"claude_pyramid",
+		"claude_nee_gate",
+		"claude_cost",
+		"claude_face_direct",
 	};
 
 	static float readGoldenHourStrength()
@@ -480,6 +490,27 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_pyramid", 0.0f, 1.0f);
 	}
 
+	static float readNeeGate()
+	{
+		if (!g_settings->exists("claude_nee_gate"))
+			return 0.0f;
+		return g_settings->getFloat("claude_nee_gate", 0.0f, 0.1f);
+	}
+
+	static float readCost()
+	{
+		if (!g_settings->exists("claude_cost"))
+			return 0.0f;
+		return g_settings->getFloat("claude_cost", 0.0f, 4.0f);
+	}
+
+	static float readFaceDirect()
+	{
+		if (!g_settings->exists("claude_face_direct"))
+			return 0.0f;
+		return g_settings->getFloat("claude_face_direct", 0.0f, 1.0f);
+	}
+
 
 	static float readMicro()
 	{
@@ -547,6 +578,12 @@ public:
 			m_bisect = readBisect();
 		if (name == "claude_pyramid")
 			m_pyramid = readPyramid();
+		if (name == "claude_nee_gate")
+			m_nee_gate = readNeeGate();
+		if (name == "claude_cost")
+			m_cost = readCost();
+		if (name == "claude_face_direct")
+			m_face_direct = readFaceDirect();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -587,6 +624,9 @@ public:
 		m_cache_sky = readCacheSky();
 		m_bisect = readBisect();
 		m_pyramid = readPyramid();
+		m_nee_gate = readNeeGate();
+		m_cost = readCost();
+		m_face_direct = readFaceDirect();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -710,6 +750,9 @@ public:
 			m_cache_sky_pixel.set(&m_cache_sky, services);
 			m_bisect_pixel.set(&m_bisect, services);
 			m_pyramid_pixel.set(&m_pyramid, services);
+			m_nee_gate_pixel.set(&m_nee_gate, services);
+			m_cost_pixel.set(&m_cost, services);
+			m_face_direct_pixel.set(&m_face_direct, services);
 			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
 					services);
 			float rreset = g_claude_volume.radiance_reset > 0 ? 1.0f : 0.0f;
@@ -1896,7 +1939,7 @@ static void claudeUpdateAccum(Client *client)
 // claude_stats: when enabled, write rolling frame statistics to
 // <path_user>/claude_stats.json once per second so external tooling can
 // measure performance without reading the debug overlay off a screenshot.
-static void claudeWriteStats(f32 dtime)
+static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 {
 	if (!g_settings->exists("claude_stats")
 			|| g_settings->getFloat("claude_stats", 0.0f, 1.0f) < 0.5f)
@@ -1906,9 +1949,13 @@ static void claudeWriteStats(f32 dtime)
 	static f32 worst = 0.0f;
 	static f32 best = 1e9f;
 	static f32 total = 0.0f;
+	static f32 busy_total = 0.0f;
+	static f32 draw_total = 0.0f;
 	window += dtime;
 	frames++;
 	total += dtime;
+	busy_total += busy_us;
+	draw_total += draw_us;
 	worst = std::max(worst, dtime);
 	best = std::min(best, dtime);
 	if (window < 1.0f)
@@ -1943,12 +1990,18 @@ static void claudeWriteStats(f32 dtime)
 			<< "," << g_claude_volume.casc[2].ms
 			<< "," << g_claude_volume.casc[3].ms
 			<< "," << g_claude_volume.casc[4].ms
-			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
-			<< "}\n";
+			<< "], \"summary_blocks\": " << claude_lod::summaryCount();
+	os << ", \"draw_ms\": " << (draw_total / frames / 1000.0f)
+			<< ", \"busy_ms\": " << (busy_total / frames / 1000.0f);
+	os << ", \"pass_ms\": [";
+	for (int i = 0; i < g_claude_gpuprof.n; i++)
+		os << (i ? "," : "") << g_claude_gpuprof.ms[i];
+	os << "]}\n";
 	std::ofstream f(porting::path_user + "/claude_stats.json",
 			std::ios::trunc);
 	f << os.str();
 	window = 0.0f; frames = 0; worst = 0.0f; best = 1e9f; total = 0.0f;
+	busy_total = 0.0f; draw_total = 0.0f;
 }
 
 // claude_lod Phase 2: (re)build and upload cascade levels when stale or
@@ -2174,7 +2227,7 @@ void Game::run()
 
 		pollSettingsPatch(dtime, client);
 		claudeUpdateAccum(client);
-		claudeWriteStats(dtime);
+		claudeWriteStats(dtime, draw_times.busy_time, stats.drawtime);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
 		if (!current_dynamic_info.equal(client_display_info)) {

@@ -5,6 +5,9 @@
 #include "pipeline.h"
 #include "client/client.h"
 #include "client/hud.h"
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+#include <algorithm>
 #include "gettext.h"
 #include "IRenderTarget.h"
 #include "SColor.h"
@@ -291,6 +294,8 @@ RenderTarget *RenderPipeline::getOutput()
 	return &m_output;
 }
 
+ClaudeGpuProf g_claude_gpuprof;
+
 void RenderPipeline::run(PipelineContext &context)
 {
 	v2u32 original_size = context.target_size;
@@ -299,8 +304,53 @@ void RenderPipeline::run(PipelineContext &context)
 	for (auto &object : m_objects)
 		object->reset(context);
 
-	for (auto &step: m_pipeline)
+	// GPU timing. The top-level pipeline is coarse (its first step
+	// contains the whole world+secondstage as ONE nested pipeline), so
+	// we time the steps of NESTED pipelines (depth >= 1), guarded so a
+	// timed step never contains another timed step (nested
+	// GL_TIME_ELAPSED is illegal — deeper pipelines lump into their
+	// parent step). Frame N reads frame N-1's query results. Slot
+	// order = execution order of depth-1 steps across the frame.
+	ClaudeGpuProf &P = g_claude_gpuprof;
+	int mydepth = P.depth++;
+	if (mydepth == 0) {
+		if (!P.inited) {
+			glGenQueries(ClaudeGpuProf::MAXQ, P.q[0]);
+			glGenQueries(ClaudeGpuProf::MAXQ, P.q[1]);
+			P.inited = true;
+		}
+		int prev = 1 - P.cur;
+		for (int i = 0; i < P.count[prev]; i++) {
+			GLuint64 ns = 0;
+			glGetQueryObjectui64v(P.q[prev][i], GL_QUERY_RESULT, &ns);
+			float msv = (float)(ns * 1e-6);
+			P.ms[i] = P.ms[i] * 0.9f + msv * 0.1f;
+		}
+		P.n = P.count[prev];
+		P.cursor = 0;
+	}
+
+	for (auto &step: m_pipeline) {
+		bool timed = mydepth >= 1 && !P.timing
+				&& P.cursor < ClaudeGpuProf::MAXQ;
+		int slot = -1;
+		if (timed) {
+			slot = P.cursor++;
+			P.timing = true;
+			glBeginQuery(GL_TIME_ELAPSED, P.q[P.cur][slot]);
+		}
 		step->run(context);
+		if (timed) {
+			glEndQuery(GL_TIME_ELAPSED);
+			P.timing = false;
+		}
+	}
+
+	if (mydepth == 0) {
+		P.count[P.cur] = std::min(P.cursor, (int)ClaudeGpuProf::MAXQ);
+		P.cur = 1 - P.cur;
+	}
+	P.depth--;
 
 	context.target_size = original_size;
 }

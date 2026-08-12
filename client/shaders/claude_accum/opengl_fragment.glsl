@@ -33,6 +33,17 @@ uniform lowp float claudeBisect;
 // occupancy pyramid dial: 0 = classic 4-cell brick leap (exact old
 // behavior), 1 = climb mips for 8/16/32-cell leaps through emptiness
 uniform lowp float claudePyramid;
+// contribution gate threshold for aimed emitter rays (0 = off)
+uniform lowp float claudeNeeGate;
+// accum-internal cost attribution (profiler night): 0 = full;
+// 1 = skip emitter rays; 2 = skip sun rays; 3 = skip bounce rays;
+// 4 = skip all three (primary visibility only)
+uniform lowp float claudeCost;
+// THE BOUNCE-RAY CLIFF (profiler: bounce = 33.5 of accum's 45 ms):
+// 1 = replace the per-pixel bounce ray with a direct read of the
+// face cache at the eye hit — the ADR-0006 endgame, previewed with
+// v1's flat faces. All light still comes from real traced gathers.
+uniform lowp float claudeFaceDirect;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
 uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
@@ -1306,6 +1317,14 @@ vec3 emitterLightSpec(vec3 hp, vec3 n, vec3 v, float gloss, inout vec3 specAcc,
 		float ndl = max((dot(n, ld) + 0.35) / 1.35, 0.0);
 		if (ndl <= 0.0)
 			continue;
+		// CONTRIBUTION GATE (profiler night: accum = 67% of the frame;
+		// aimed emitter rays a top cost inside it): if this light's
+		// maximum possible contribution is sub-visible, skip the
+		// visibility trace entirely. The bound uses already-known
+		// distance and cosine — no rays spent deciding.
+		if (claudeNeeGate > 0.0
+				&& em.w * em.w * 10.0 * ndl / max(d2, 1.0) < claudeNeeGate)
+			continue;
 		// standoff 0.25 (was 0.9, a relic of torches-as-glowing-blocks:
 		// bodiless point lights need no self-occlusion guard, and 0.9
 		// left a shadowless bubble around every flame)
@@ -1563,20 +1582,31 @@ void main(void)
 					}
 					vec3 sd2 = normalize(volumeSunDir + (rnd2 - 0.5) * sunAngle);
 					float ndl2 = max(dot(bnS, sd2), 0.0);
-					vec3 dir2 = ndl2 > 0.0
+					bool skipSun2 = claudeCost > 1.5 && claudeCost < 2.5
+							|| claudeCost > 3.5;
+					vec3 dir2 = (ndl2 > 0.0 && !skipSun2)
 							? vec3(ndl2 * lightVis(bpos, sd2)) * volumeLightCol
 							: vec3(0.0);
 					vec3 sp2 = normalize(rnd * 2.0 - 1.0);
 					vec3 ad2 = normalize(bnB + sp2);
 					if (dot(ad2, bnB) < 0.0) ad2 = normalize(ad2 - 2.0 * dot(ad2, bnB) * bnB);
-					vec3 amb2 = bounceRay(bpos, ad2, sd2) * 1.15;
+					vec3 amb2 = vec3(0.0);
+					if (claudeCost < 2.5) {
+						if (claudeFaceDirect > 0.5 && radianceStrength > 0.0)
+							amb2 = faceCache(cell, bnB) * radianceStrength * 1.15;
+						else
+							amb2 = bounceRay(bpos, ad2, sd2) * 1.15;
+					}
 					// origin biased ~1.5 sub-voxels off the surface: with
 					// uniform own-cell tracing, shadow features must stand
 					// taller than a sub-voxel to cast (quantization floor).
 					// Specular rides the same visibility as the cube branch.
 					vec3 specAcc2 = vec3(0.0);
 					float glossOn2 = mSpecStr * mSpecMask;
-					vec3 em2 = emitterLightSpec(bpos + bnT * 0.0625, bnT, -rd,
+					bool skipE2 = claudeCost > 0.5 && claudeCost < 1.5
+							|| claudeCost > 3.5;
+					vec3 em2 = skipE2 ? vec3(0.0)
+							: emitterLightSpec(bpos + bnT * 0.0625, bnT, -rd,
 							glossOn2 > 0.005 ? mSpecGloss : 0.0, specAcc2, 8);
 					fresh = alb * (dir2 + amb2 + em2);
 					if (glossOn2 > 0.005) {
@@ -1781,7 +1811,9 @@ void main(void)
 				float ndl = max(dot(n, sd), 0.0);
 				vec3 direct = vec3(0.0);
 				float sunVis = 0.0;
-				if (ndl > 0.0) {
+				bool skipSun = claudeCost > 1.5 && claudeCost < 2.5
+						|| claudeCost > 3.5;
+				if (ndl > 0.0 && !skipSun) {
 					sunVis = lightVis(hp, sd);
 					direct = vec3(ndl * sunVis) * volumeLightCol;
 				}
@@ -1795,13 +1827,22 @@ void main(void)
 				ad = normalize(ad);
 				if (dot(ad, n) < 0.0)
 					ad = normalize(ad - 2.0 * dot(ad, n) * n);
-				vec3 amb = bounceRay(hp, ad, sd) * 1.15;
+				bool skipB = claudeCost > 2.5;
+				vec3 amb = vec3(0.0);
+				if (!skipB) {
+					if (claudeFaceDirect > 0.5 && radianceStrength > 0.0)
+						amb = faceCache(cell, n) * radianceStrength * 1.15;
+					else
+						amb = bounceRay(hp, ad, sd) * 1.15;
+				}
 
 				// Specular rides the same visibility as diffuse — the
 				// glint appears only where the light already lands.
 				vec3 specAcc = vec3(0.0);
 				float glossOn = specStr * specMask;
-				vec3 emDiff = emitterLightSpec(hp, n, -rd,
+				bool skipE = claudeCost > 0.5 && claudeCost < 1.5
+						|| claudeCost > 3.5;
+				vec3 emDiff = skipE ? vec3(0.0) : emitterLightSpec(hp, n, -rd,
 						glossOn > 0.005 ? specGloss : 0.0, specAcc, 8);
 				fresh = albedo * (direct + amb + emDiff);
 				if (glossOn > 0.005) {
