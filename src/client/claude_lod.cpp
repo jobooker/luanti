@@ -10,8 +10,14 @@
 #include "client/node_visuals.h" // minimap_color
 #include "util/numeric.h"
 
+#include "filesys.h"
+#include "porting.h"
+
+#include <json/json.h>
+#include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace claude_lod
 {
@@ -87,6 +93,90 @@ void summarizeBlock(Client *client, MapBlock *block)
 		g_summaries[block->getPos()] = s;
 		g_version++;
 	}
+}
+
+// ---- far-data feed: JSON dropped by tooling (server bridge sample ->
+// scp) becomes synthetic summaries. File format, one object per file:
+// {"blocks":[{"p":[bx,by,bz],"sub":[[idx,occ,water,"node:name",p2],..]},..]}
+static std::unordered_set<std::string> g_far_loaded;
+
+size_t ingestFarDir(Client *client)
+{
+	std::string dir = porting::path_user + DIR_DELIM + "claude_far";
+	if (!fs::PathExists(dir))
+		return 0;
+	const NodeDefManager *ndef = client->getNodeDefManager();
+	size_t added = 0;
+	for (const auto &e : fs::GetDirListing(dir)) {
+		if (e.dir || e.name.size() < 6
+				|| e.name.substr(e.name.size() - 5) != ".json")
+			continue;
+		if (g_far_loaded.count(e.name))
+			continue;
+		g_far_loaded.insert(e.name);
+		std::ifstream f(dir + DIR_DELIM + e.name);
+		Json::Value root;
+		try {
+			f >> root;
+		} catch (...) {
+			continue;
+		}
+		for (const Json::Value &b : root["blocks"]) {
+			if (!b["p"].isArray() || b["p"].size() != 3)
+				continue;
+			v3s16 bp(b["p"][0].asInt(), b["p"][1].asInt(),
+					b["p"][2].asInt());
+			BlockSummary s = {};
+			for (const Json::Value &sc : b["sub"]) {
+				if (!sc.isArray() || sc.size() < 5)
+					continue;
+				int idx = sc[0].asInt();
+				if (idx < 0 || idx >= 64)
+					continue;
+				int occ = std::min(sc[1].asInt(), 64);
+				int water = std::min(sc[2].asInt(), 64);
+				content_t c = ndef->getId(sc[3].asString());
+				video::SColor col(255, 180, 180, 180);
+				if (c != CONTENT_IGNORE) {
+					const ContentFeatures &cf = ndef->get(c);
+					if (cf.visuals
+							&& cf.visuals->minimap_color.getAlpha() > 0)
+						col = cf.visuals->minimap_color;
+					if (cf.visuals) {
+						video::SColor tint(255, 255, 255, 255);
+						cf.visuals->getColor((u8)sc[4].asInt(), &tint);
+						if (tint.getRed() != 255 || tint.getGreen() != 255
+								|| tint.getBlue() != 255) {
+							col.setRed(col.getRed() * tint.getRed() / 255);
+							col.setGreen(col.getGreen()
+									* tint.getGreen() / 255);
+							col.setBlue(col.getBlue()
+									* tint.getBlue() / 255);
+						}
+					}
+				}
+				s.occ[idx] = (u8)occ;
+				s.water[idx] = (u8)water;
+				int cnt = occ + water;
+				s.rsum[idx] = (u16)(col.getRed() * cnt);
+				s.gsum[idx] = (u16)(col.getGreen() * cnt);
+				s.bsum[idx] = (u16)(col.getBlue() * cnt);
+			}
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				// real received blocks win: only fill holes
+				if (!g_summaries.count(bp)) {
+					g_summaries[bp] = s;
+					added++;
+				}
+			}
+		}
+	}
+	if (added) {
+		std::lock_guard<std::mutex> lock(g_mutex);
+		g_version++;
+	}
+	return added;
 }
 
 u64 contentVersion()

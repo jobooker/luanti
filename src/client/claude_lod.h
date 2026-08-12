@@ -35,6 +35,14 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 u32 buildCascade2(Client *client, v3s16 origin_nodes,
 		std::vector<u8> &rgba, std::vector<u8> &coarse);
 
+// Far-data feed (2026-08-12): ingest server-sampled terrain summaries
+// from <path_user>/claude_far/*.json — synthetic BlockSummaries for
+// terrain the client has never visited, entering the SAME summary map
+// the cascade builder folds (real received blocks overwrite by key).
+// Returns blocks added; bumps contentVersion when nonzero. Each file
+// is read once per session (name-keyed).
+size_t ingestFarDir(Client *client);
+
 // Bumped whenever a block summary changes; cheap staleness gate for
 // the cascade rebuild schedule.
 u64 contentVersion();
