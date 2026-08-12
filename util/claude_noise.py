@@ -24,8 +24,11 @@ import numpy as np
 from PIL import Image
 
 # Luanti user dir. Override with CLAUDE_MT_DIR when the client is not on
-# this machine's macOS default — e.g. the Windows box (%APPDATA%\Minetest)
-# when renders move off the M4.
+# this machine's macOS default — e.g. the Shadow PC when renders move off
+# the M4. NOT %APPDATA%\Minetest there: that build is RUN_IN_PLACE, so
+# porting.cpp sets path_user to the source tree itself, and every claude_*
+# channel (stats, settings patch, screenshots, claude_far) lands there.
+# Verified 2026-08-12: CLAUDE_MT_DIR=C:\Users\Shadow\code\luanti.
 MTDIR = os.environ.get("CLAUDE_MT_DIR") or os.path.expanduser(
     "~/Library/Application Support/minetest")
 SHOTS = os.path.join(MTDIR, "screenshots")
