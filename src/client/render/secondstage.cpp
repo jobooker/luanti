@@ -407,8 +407,15 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	// edge-aware spatial denoise on the display path only — history
 	// accumulates raw, so the filter never compounds
+	// MUST be float like the accum buffers it carries: this is the LAST
+	// stop before claude_present's tonemap, and allocating it normalized
+	// clamped every displayed radiance to 1.0 — the furnace referee's
+	// first conviction (2026-08-13: both rho variants displayed exactly
+	// vec3(1.0); magma's channel pattern (231,231,158) was the clamp's
+	// fingerprint). History stayed honest; only the DISPLAYED/captured
+	// image clipped, so it looked like a bright sun instead of a bug.
 	static const u8 TEXTURE_DENOISED = 33;
-	buffer->setTexture(TEXTURE_DENOISED, scale * trace_scale, "claude_denoised", color_format);
+	buffer->setTexture(TEXTURE_DENOISED, scale * trace_scale, "claude_denoised", accum_format);
 	shader_id = client->getShaderSource()->getShaderRaw("claude_denoise");
 	PostProcessingStep *denoise = pipeline->addStep<PostProcessingStep>(shader_id,
 			std::vector<u8> { TEXTURE_ACCUM_2 });
