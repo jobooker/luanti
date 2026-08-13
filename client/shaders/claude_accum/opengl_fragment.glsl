@@ -121,7 +121,6 @@ uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
 uniform lowp float parallaxStrength; // march INTO the height field (0..1)
 uniform lowp float jitterStrength;   // per-block colour variation (Teardown)
-uniform lowp float microStrength;    // real micro-geometry depth (0..1)
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
@@ -936,7 +935,7 @@ float lightVis(vec3 ro, vec3 sd)
 			continue;
 		}
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && tcur < 20.0) {
+		if (a > 0.97 && a < 0.99 && claudeSubvox > 0.5 && tcur < 20.0) {
 			// micro cell: shadow only if the sub-grid is actually hit
 			vec3 mh, mn, mcd1;
 			vec3 lentry = ro + sd * tcur - cell;
@@ -1282,7 +1281,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 		// the near stone around a recess. Past a few metres the bounce is
 		// low-frequency fill and cube-vs-carved is invisible, while the cost
 		// is not: ungated at 20 m this cost 43 -> 17 fps on its own.
-		if (s.a > 0.97 && s.a < 0.99 && microStrength > 0.0 && t < 6.0) {
+		if (s.a > 0.97 && s.a < 0.99 && claudeSubvox > 0.5 && t < 6.0) {
 			vec3 mh, mn, mcb;
 			if (microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0), rd,
 					mh, mn, mcb)) {
@@ -1595,7 +1594,7 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 	// clamping an above-the-cell origin onto the grid top started the
 	// march INSIDE the flush top slab — descending rays self-blocked
 	// instantly (elevated blocks black in mode 10, immune to rim rules)
-	if (microStrength > 0.0
+	if (claudeSubvox > 0.5
 			&& (claudeBisect < 0.5 || claudeBisect > 4.5)
 			&& all(greaterThanEqual(lo0, vec3(0.0)))
 			&& all(lessThan(lo0, vec3(1.0)))) {
@@ -1666,7 +1665,7 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 		float a = texture3D(claudeVolume, (cell + 0.5) / S).a;
 		// carved cells: march the sub-grid, binary, same rule as the
 		// origin cell above — sub-voxels ARE voxels, no special cases
-		if (a > 0.97 && a < 0.99 && microStrength > 0.0 && t < 20.0
+		if (a > 0.97 && a < 0.99 && claudeSubvox > 0.5 && t < 20.0
 				&& (claudeBisect < 0.5 || claudeBisect > 4.5)) {
 			vec3 mh, mn, mcd3;
 			if (microDDA(cell, clamp(ro + ld * t - cell, 0.0, 1.0), ld,
@@ -1904,7 +1903,7 @@ void main(void)
 			}
 			// micro-geometry cell: march the material's sub-voxel grid
 			bool microMiss = false;
-			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && microStrength > 0.0
+			if (s.a > 0.97 && s.a < 0.99 && axis >= 0 && claudeSubvox > 0.5
 					&& t < 32.0) {
 				vec3 nn0 = vec3(0.0);
 				if (axis == 0) nn0.x = -stepDir.x;

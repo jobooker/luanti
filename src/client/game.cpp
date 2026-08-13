@@ -270,14 +270,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_parallax_pixel{"parallaxStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_jitter_pixel{"jitterStrength"};
-	CachedPixelShaderSetting<float, 1, false> m_micro_pixel{"microStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_skybounce_pixel{"skyBounce"};
 	CachedPixelShaderSetting<float, 1, false> m_sunangle_pixel{"sunAngle"};
 	CachedPixelShaderSetting<float, 1, false> m_nightsky_pixel{"nightSkyGain"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_pixel{"radianceStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_frame_pixel{"claudeRadianceFrame"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
-	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter, m_micro;
+	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
 	float m_bounce2 = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
@@ -380,7 +379,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_relief",
 		"claude_parallax",
 		"claude_jitter",
-		"claude_micro",
 		"claude_skybounce",
 		"claude_sun_angle",
 		"claude_night_sky",
@@ -712,13 +710,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	}
 
 
-	static float readMicro()
-	{
-		if (!g_settings->exists("claude_micro"))
-			return 0.0f;
-		return g_settings->getFloat("claude_micro", 0.0f, 1.0f);
-	}
-
 	static float readClay()
 	{
 		if (!g_settings->exists("claude_clay"))
@@ -758,8 +749,6 @@ public:
 			m_parallax = readParallax();
 		if (name == "claude_jitter")
 			m_jitter = readJitter();
-		if (name == "claude_micro")
-			m_micro = readMicro();
 		if (name == "claude_skybounce")
 			m_skybounce = readSkyBounce();
 		if (name == "claude_sun_angle")
@@ -840,7 +829,6 @@ public:
 		m_relief = readRelief();
 		m_parallax = readParallax();
 		m_jitter = readJitter();
-		m_micro = readMicro();
 		m_skybounce = readSkyBounce();
 		m_sunangle = readSunAngle();
 		m_nightsky = readNightSky();
@@ -1142,7 +1130,6 @@ public:
 				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
 				m_jitter_pixel.set(&m_jitter, services);
-				m_micro_pixel.set(&m_micro, services);
 				m_skybounce_pixel.set(&m_skybounce, services);
 				float sun_rad = m_sunangle * 0.0174532925f;
 				m_sunangle_pixel.set(&sun_rad, services);
@@ -3712,8 +3699,6 @@ void Game::processKeyInput()
 		toggleClaudeTrace();
 	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_BOUNCE)) {
 		toggleClaudeBounce();
-	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_CARVE)) {
-		toggleClaudeCarve();
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_BACK)) {
 		claudeTimeNudge(-1);
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_FWD)) {
@@ -4037,20 +4022,6 @@ void Game::toggleClaudeBounce()
 		m_game_ui->showTranslatedStatusText("Multi-bounce ON");
 	else
 		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
-}
-
-// V: flip the sub-voxel carve live — the standing suspect from the
-// circular-shadow night ("we know turning on the carving fucks it
-// up"), now one keypress to A/B.
-void Game::toggleClaudeCarve()
-{
-	float cur = g_settings->getFloat("claude_micro", 0.0f, 1.0f);
-	bool to_on = cur < 0.5f;
-	g_settings->set("claude_micro", to_on ? "1.0" : "0");
-	if (to_on)
-		m_game_ui->showTranslatedStatusText("Carving ON");
-	else
-		m_game_ui->showTranslatedStatusText("Carving OFF (flat blocks)");
 }
 
 // P: tap = start/stop time, hold (>0.4s) = fast-forward while held,

@@ -161,7 +161,6 @@ protected:
 	void toggleFog();
 	void toggleClaudeTrace();
 	void toggleClaudeBounce();
-	void toggleClaudeCarve();
 	void claudeTimeNudge(int dir);
 	void claudeTimeKey(bool down, f32 dtime);
 	float m_claude_time_held = 0.0f;
