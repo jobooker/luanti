@@ -107,6 +107,13 @@ struct ClaudeVolume
 	u64 content_hash = 0;
 	// nearest emissive cells (volume cell coords + intensity), for NEE
 	float emitters[8][4] = {};
+	// Measured flame size (cell units): RMS spread of the model's
+	// emissive voxels about the glow centroid, x1.6, computed in the
+	// loader. NOT consumed by any shader — the jittered-target NEE that
+	// briefly used it was REVERTED (John, 2026-08-13: sub-voxel mutual
+	// lighting gets weird with randomized targets; proper emissive-voxel
+	// transport first). Kept as model data for the future NEE+MIS block.
+	float emitter_rad[8] = {};
 	int emitter_count = 0;      // static (snapshot) emitters
 	int emitter_runtime = 0;    // static + held light this frame
 	// Held (wielded) light lives in its OWN slot, never in emitters[]:
@@ -148,7 +155,7 @@ struct ClaudeVolume
 	// the voxels render the visible fire.
 	std::vector<std::array<std::vector<u8>, 4>> model_vox;
 	std::vector<std::vector<u8>> model_pal;      // 256*4 RGBA each
-	std::vector<std::array<std::array<float, 4>, 4>> model_glow;
+	std::vector<std::array<std::array<float, 5>, 4>> model_glow; // xyz,int,radius
 	u32 model_ids_tex = 0, model_atlas_tex = 0, model_pal_tex = 0;
 	bool model_tex_dirty = false;
 	std::unordered_map<content_t, u8> palette;
@@ -364,7 +371,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 40> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 39> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -1698,12 +1705,13 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 		}
 		std::array<std::vector<u8>, 4> rots;
 		std::array<std::vector<u8>, 4> vrots;
-		std::array<std::array<float, 4>, 4> glow;
+		std::array<std::array<float, 5>, 4> glow;
 		for (int r = 0; r < 4; r++) {
 			rots[r].assign(512, 0);
 			vrots[r].assign(4096, 0);
-			glow[r] = {0, 0, 0, 0};
+			glow[r] = {0, 0, 0, 0, 0};
 		}
+		double glow_sq = 0.0; // rotation-invariant spread accumulator
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
@@ -1723,6 +1731,10 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 					glow[r][1] += y + 0.5f;
 					glow[r][2] += rz + 0.5f;
 					glow[r][3] += 1.0f;
+					if (r == 0)
+						glow_sq += (rx + 0.5) * (rx + 0.5)
+								+ (y + 0.5) * (y + 0.5)
+								+ (rz + 0.5) * (rz + 0.5);
 				}
 				int nx = 15 - rz, nz = rx; // 90 deg about +y
 				rx = nx; rz = nz;
@@ -1739,9 +1751,23 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 		}
 		for (int r = 0; r < 4; r++) {
 			if (glow[r][3] > 0) {
-				glow[r][0] /= glow[r][3] * 16.0f; // cell-local 0..1
-				glow[r][1] /= glow[r][3] * 16.0f;
-				glow[r][2] /= glow[r][3] * 16.0f;
+				float n = glow[r][3];
+				glow[r][0] /= n * 16.0f; // cell-local 0..1
+				glow[r][1] /= n * 16.0f;
+				glow[r][2] /= n * 16.0f;
+				if (r == 0) {
+					// RMS spread of glow voxels about the centroid, in
+					// cell units — the flame's physical size. x1.6 turns
+					// RMS into an effective extent (a uniform blob's rim).
+					double mx = glow[r][0] * 16.0, my = glow[r][1] * 16.0,
+							mz = glow[r][2] * 16.0;
+					double var = glow_sq / n
+							- (mx * mx + my * my + mz * mz);
+					float rad = (float)(1.6 * std::sqrt(std::max(var, 0.0))
+							/ 16.0);
+					glow[0][4] = glow[1][4] = glow[2][4] = glow[3][4] =
+							std::clamp(rad, 0.03f, 0.45f);
+				}
 				glow[r][3] = glowmax / 14.0f;     // NEE intensity
 			}
 		}
@@ -1797,7 +1823,7 @@ static void claudeVolumeSnapshot(Client *client)
 	u32 solid = 0;
 	u64 hash = 14695981039346656037ULL ^ (u64)origin.X
 			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
-	std::vector<std::array<float, 4>> emitters;
+	std::vector<std::array<float, 5>> emitters; // xyz, intensity, radius
 	std::vector<u8> mids(S * S * S, 0);
 	claudeLoadModels(ndef);
 	g_claude_volume.modelids.assign((size_t)S * S * S, 0);
@@ -1897,7 +1923,7 @@ static void claudeVolumeSnapshot(Client *client)
 						emitters.push_back({x + gl[0], y + gl[1],
 								z + gl[2],
 								std::min<int>(f.light_source, 14)
-									/ 14.0f});
+									/ 14.0f, gl[4]});
 					occ[i * 4 + 0] = col.getRed();
 					occ[i * 4 + 1] = col.getGreen();
 					occ[i * 4 + 2] = col.getBlue();
@@ -1922,7 +1948,8 @@ static void claudeVolumeSnapshot(Client *client)
 			// so it still cannot occlude or re-radiate its own light.
 			emitters.push_back({(float)x + 0.5f, (float)y + 0.65f,
 					(float)z + 0.5f,
-					std::min<int>(f.light_source, 14) / 14.0f});
+					std::min<int>(f.light_source, 14) / 14.0f,
+					0.08f}); // nub: assume a small flame
 			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
 			occ[i * 4 + 3] = 165;
 			coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
@@ -1968,7 +1995,7 @@ static void claudeVolumeSnapshot(Client *client)
 						.model_glow[mit->second - 1][rot];
 				if (gl[3] > 0.0f)
 					emitters.push_back({x + gl[0], y + gl[1],
-							z + gl[2], gl[3]});
+							z + gl[2], gl[3], gl[4]});
 			}
 		}
 		occ[i * 4 + 3] = acls;
@@ -2255,18 +2282,21 @@ static void claudeVolumeSnapshot(Client *client)
 	GL.ActiveTexture(prev_active_unit);
 	// nearest-8 emitters to the camera (= volume center) for NEE
 	std::sort(emitters.begin(), emitters.end(),
-			[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
-				auto d2 = [](const std::array<float, 4> &e) {
+			[](const std::array<float, 5> &a, const std::array<float, 5> &b) {
+				auto d2 = [](const std::array<float, 5> &e) {
 					float dx = e[0] - 64.f, dy = e[1] - 64.f, dz = e[2] - 64.f;
 					return dx * dx + dy * dy + dz * dz;
 				};
 				return d2(a) < d2(b);
 			});
 	g_claude_volume.emitter_count = std::min<size_t>(emitters.size(), 8);
-	for (int e = 0; e < 8; e++)
+	for (int e = 0; e < 8; e++) {
 		for (int k = 0; k < 4; k++)
 			g_claude_volume.emitters[e][k] =
 					e < g_claude_volume.emitter_count ? emitters[e][k] : 0.0f;
+		g_claude_volume.emitter_rad[e] =
+				e < g_claude_volume.emitter_count ? emitters[e][4] : 0.0f;
+	}
 
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
