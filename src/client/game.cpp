@@ -37,6 +37,7 @@
 #include "particles.h"
 #include "porting.h"
 #include <fstream>
+#include <json/json.h> // claude_models manifest (phase 4.5)
 #include <sstream>
 #include <array>
 #include <algorithm>
@@ -134,6 +135,15 @@ struct ClaudeVolume
 	// sampler with floor/mod extraction.
 	u32 subvox_tex = 0;
 	std::vector<u8> subvox;
+	// AUTHORED MODELS (phase 4.5, ADR-0005/0010): 16^3 occupancy masks
+	// loaded from <path_user>/util/claude_models/*.json per the
+	// manifest, pre-rotated to the four facedir yaws (512 bytes each,
+	// bit = (z*16+y)*16+x). modelids tags snapshot cells: idx<<2 | rot,
+	// 0 = no model. The bake substitutes these bits for the carve law.
+	std::vector<std::array<std::vector<u8>, 4>> models;
+	std::unordered_map<content_t, u8> model_of; // content -> 1-based idx
+	bool models_loaded = false;
+	std::vector<u8> modelids;
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
@@ -1770,6 +1780,65 @@ static bool claudeUseR8()
 // texture on unit 4. One-shot: the volume does not follow the camera
 // afterwards (streaming updates are a later patch). Unloaded map (IGNORE)
 // reads as air, so rays pass through it and miss. Runs on the main thread
+// Authored-model loader (phase 4.5 v1: occupancy shapes only). Reads
+// <path_user>/util/claude_models/manifest.json + model JSONs once per
+// run; masks are pre-rotated to the four facedir yaws. Emission and
+// per-voxel color are v2 (the furnace mouth still renders as an
+// uncarved glowing cube until then).
+static void claudeLoadModels(const NodeDefManager *ndef)
+{
+	auto &V = g_claude_volume;
+	if (V.models_loaded)
+		return;
+	V.models_loaded = true; // one attempt; missing files = no models
+	std::string dir = porting::path_user + "/util/claude_models";
+	Json::Value manifest;
+	{
+		std::ifstream f(dir + "/manifest.json");
+		if (!f.good())
+			return;
+		try { f >> manifest; } catch (...) { return; }
+	}
+	const Json::Value &nodes = manifest["nodes"];
+	for (const auto &mname : nodes.getMemberNames()) {
+		std::ifstream mf(dir + "/" + mname + ".json");
+		if (!mf.good())
+			continue;
+		Json::Value md;
+		try { mf >> md; } catch (...) { continue; }
+		const Json::Value &vox = md["voxels"];
+		if (vox.size() != 16)
+			continue;
+		std::array<std::vector<u8>, 4> rots;
+		for (int r = 0; r < 4; r++)
+			rots[r].assign(512, 0);
+		for (int z = 0; z < 16; z++)
+		for (int y = 0; y < 16; y++)
+		for (int x = 0; x < 16; x++) {
+			if (vox[z][y][x].asInt() == 0)
+				continue;
+			int rx = x, rz = z;
+			for (int r = 0; r < 4; r++) {
+				rots[r][(size_t)(rz * 16 + y) * 2 + (rx >> 3)]
+						|= (u8)(1 << (rx & 7));
+				int nx = 15 - rz, nz = rx; // 90 deg about +y
+				rx = nx; rz = nz;
+			}
+		}
+		V.models.push_back(rots);
+		u8 idx = (u8)V.models.size(); // 1-based
+		for (const auto &nn : nodes[mname]) {
+			content_t cid = ndef->getId(nn.asString());
+			if (cid != CONTENT_IGNORE)
+				V.model_of[cid] = idx;
+		}
+		if (V.models.size() >= 63)
+			break; // idx<<2 | rot must fit one byte
+	}
+	infostream << "[claude_models] " << V.models.size() << " models, "
+			<< V.model_of.size() << " node bindings" << std::endl;
+}
+
 // with the GL context current; the ~2 MB walk causes a brief hitch, which
 // is acceptable for a manually-triggered debug snapshot.
 static void claudeVolumeSnapshot(Client *client)
@@ -1790,6 +1859,8 @@ static void claudeVolumeSnapshot(Client *client)
 			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
 	std::vector<std::array<float, 4>> emitters;
 	std::vector<u8> mids(S * S * S, 0);
+	claudeLoadModels(ndef);
+	g_claude_volume.modelids.assign((size_t)S * S * S, 0);
 	size_t i = 0;
 	for (s16 z = 0; z < S; z++)
 	for (s16 y = 0; y < S; y++)
@@ -1901,6 +1972,19 @@ static void claudeVolumeSnapshot(Client *client)
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED_OPTIONAL)
 			acls = 145;
+		// authored model (phase 4.5 v1): tag the cell and join the
+		// micro class so the eye path carves it. Solid cells only —
+		// emissive nodes keep their class until per-voxel emission
+		// (v2) exists.
+		if (acls >= 250 && !g_claude_volume.model_of.empty()) {
+			auto mit = g_claude_volume.model_of.find(c);
+			if (mit != g_claude_volume.model_of.end()) {
+				acls = 250;
+				g_claude_volume.modelids[i] =
+						(u8)((mit->second << 2)
+							| (n.getParam2() & 3));
+			}
+		}
 		occ[i * 4 + 3] = acls;
 		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
@@ -1989,6 +2073,20 @@ static void claudeVolumeSnapshot(Client *client)
 			u8 a = occ[vi * 4 + 3];
 			if (a <= 230)
 				continue; // air / water / glass / nub: no bits
+			u8 mtag = g_claude_volume.modelids[vi];
+			if (mtag >> 2) {
+				// authored model: its pre-rotated mask IS the cell
+				const auto &mm = g_claude_volume
+						.models[(mtag >> 2) - 1][mtag & 3];
+				for (int sz2 = 0; sz2 < 16; sz2++)
+				for (int sy2 = 0; sy2 < 16; sy2++) {
+					size_t row = ((size_t)(rz * 16 + sz2) * 512
+							+ (ry * 16 + sy2)) * 64 + (size_t)rx * 2;
+					sv[row] = mm[(size_t)(sz2 * 16 + sy2) * 2];
+					sv[row + 1] = mm[(size_t)(sz2 * 16 + sy2) * 2 + 1];
+				}
+				continue;
+			}
 			if (a != 250) {
 				// plain solid: two full bytes per (y,z) row
 				size_t bx = (size_t)rx * 2;
