@@ -440,7 +440,8 @@ vec4 modelVoxel(vec3 cell, vec3 sc)
 }
 
 bool microDDA(vec3 node, vec3 lo, vec3 rd, float slot, float rot,
-		vec3 nbNeg, vec3 nbPos, out vec3 hitLocal, out vec3 hitNormal)
+		vec3 nbNeg, vec3 nbPos, out vec3 hitLocal, out vec3 hitNormal,
+		out vec3 hitCell)
 {
 	vec3 p = clamp(lo, 0.0, 0.99999) * 16.0;
 	vec3 cell = floor(p);
@@ -457,6 +458,13 @@ bool microDDA(vec3 node, vec3 lo, vec3 rd, float slot, float rot,
 			return false;                      // left the cell: real gap
 		if (microSolid(node, slot, cell, rot, nbNeg, nbPos)) {
 			hitLocal = (p + rd * t) / 16.0;
+			// the ACTUAL hit voxel — consumers must use this for
+			// per-voxel color, never reconstruct from hitLocal: the
+			// axis==-1 fallback normal is view-dependent and made
+			// palette colors SWIM against the geometry as the camera
+			// moved (John, 2026-08-13: "colors don't match up with
+			// the voxels... then I move over and the columns align")
+			hitCell = cell;
 			hitNormal = vec3(0.0);
 			if (axis == 0) hitNormal.x = -stepDir.x;
 			else if (axis == 1) hitNormal.y = -stepDir.y;
@@ -1007,8 +1015,9 @@ float lightVis(vec3 ro, vec3 sd)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbN1, nbP1;
 			microNeighbours(cell, nbN1, nbP1);
+			vec3 mcd1;
 			if (mslot > 0.5 && microDDA(cell, clamp(lentry, 0.0, 1.0), sd,
-					floor(mslot + 0.5), rot1, nbN1, nbP1, mh, mn))
+					floor(mslot + 0.5), rot1, nbN1, nbP1, mh, mn, mcd1))
 				return 0.0;
 			continue;
 		}
@@ -1357,8 +1366,9 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbNb, nbPb;
 			microNeighbours(cell, nbNb, nbPb);
+			vec3 mcb;
 			if (ms > 0.5 && microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0), rd,
-					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn)) {
+					floor(ms + 0.5), rb, nbNb, nbPb, mh, mn, mcb)) {
 				float fallm = 1.0 - t / 160.0;
 				vec3 hpm = cell + mh + mn * 0.03125;
 				vec3 litm = pathSkyRadiance(mn) * lightVisCheap(hpm, mn) * SKY_BOUNCE;
@@ -1374,8 +1384,7 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				litm += emitterLightCheap(hpm, mn);
 				vec3 albM = pathAlbedo(s.rgb);
 				vec3 glowM = vec3(0.0);
-				vec4 mvB = modelVoxel(cell,
-						floor(clamp(mh, 0.0, 0.99999) * 16.0 - mn * 0.5));
+				vec4 mvB = modelVoxel(cell, mcb);
 				if (mvB.a >= 0.0) {
 					albM = pathAlbedo(mvB.rgb);
 					if (mvB.a > 0.01)
@@ -1536,13 +1545,13 @@ int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
 			microNeighbours(cell, nbN, nbP);
 			float msl = texture3D(claudeMaterials,
 					(cell + 0.5) / S).r * 255.0;
+			vec3 mcp;
 			if (microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0), rd,
-					floor(msl + 0.5), 0.0, nbN, nbP, mh, mn)) {
+					floor(msl + 0.5), 0.0, nbN, nbP, mh, mn, mcp)) {
 				n = mn;
 				hp = cell + mh + mn * 0.03125;
 				alb = pathAlbedo(s.rgb);
-				vec4 mvP = modelVoxel(cell,
-						floor(clamp(mh, 0.0, 0.99999) * 16.0 - mn * 0.5));
+				vec4 mvP = modelVoxel(cell, mcp);
 				if (mvP.a >= 0.0) {
 					alb = pathAlbedo(mvP.rgb);
 					if (mvP.a > 0.01) {
@@ -1685,8 +1694,9 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbN0, nbP0;
 			microNeighbours(cell, nbN0, nbP0);
+			vec3 mcd2;
 			if (m0 > 0.5 && microDDA(cell, clamp(ro - cell, 0.0, 1.0), ld,
-					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0)) {
+					floor(m0 + 0.5), r0, nbN0, nbP0, mh0, mn0, mcd2)) {
 				// rim clip passes regardless of ray direction (see loop);
 				// sample behind the hit face (boundary coin-flip fix)
 				vec3 scA0 = floor((mh0 - mn0 * 0.03125) * 16.0)
@@ -1757,8 +1767,9 @@ float emitterVis(vec3 ro, vec3 ld, float maxT)
 					vec3(41.3, 289.1, 77.7))) * 21311.7);
 			vec3 nbNe, nbPe;
 			microNeighbours(cell, nbNe, nbPe);
+			vec3 mcd3;
 			if (mslot > 0.5 && microDDA(cell, clamp(ro + ld * t - cell, 0.0, 1.0), ld,
-					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn)) {
+					floor(mslot + 0.5), rotE, nbNe, nbPe, mh, mn, mcd3)) {
 				// RIM CLIP, shadow-march side (2026-08-12: after the
 				// eye-normal fix the circle became HARD and block-
 				// aligned; mode-10 heatmap showed whole ELEVATED blocks
@@ -2004,8 +2015,9 @@ void main(void)
 						vec3(41.3, 289.1, 77.7))) * 21311.7);
 				vec3 nbN0, nbP0;
 				microNeighbours(cell, nbN0, nbP0);
+				vec3 mch;
 				if (mid0 > 0.5 && microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0),
-						rd, floor(mid0 + 0.5), rot0, nbN0, nbP0, hl, hn)) {
+						rd, floor(mid0 + 0.5), rot0, nbN0, nbP0, hl, hn, mch)) {
 					// Bias by HALF A SUB-VOXEL (1/32 node), not the 0.01 used
 					// for 1 m faces. A sub-voxel is 6.25 cm, so a 1 cm bias is
 					// 16% of one: a shadow ray leaving a carved stone at a
@@ -2072,8 +2084,7 @@ void main(void)
 					// emission (palette-indexed) — the red blanket is red,
 					// the fire voxels glow (added to fresh below).
 					vec3 mGlow = vec3(0.0);
-					vec4 mvE = modelVoxel(cell,
-							floor(clamp(hl, 0.0, 0.99999) * 16.0 - hn * 0.5));
+					vec4 mvE = modelVoxel(cell, mch);
 					if (mvE.a >= 0.0) {
 						alb = pathAlbedo(mvE.rgb);
 						if (mvE.a > 0.01)
