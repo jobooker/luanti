@@ -62,6 +62,18 @@ cache for a 1-byte question.
   samples. Needs heightfield-over-known-receiver — voxel water over voxel
   floor is exactly that. Dappled riverbeds; pairs with Riverflow.
 
+## Far cells: decouple geometry rung from color rung (John, 2026-08-13)
+
+"Far mountain = 16 m block with 1 m texels" — correct, and nearly free.
+Don't store per-face textures (16x16/face over a 32^3 level = 144 MB;
+4x4 = 9 MB). Instead: geometry/occlusion from level L, albedo sampled
+from level L-1 (or L-2) at the hit point — colors the fold already
+computes. 0 new bytes, +1 fetch per HIT. Folded albedo carries no
+painted shading, so the §3 detail-over-average guarantee holds at scale
+(mean 1.0 → can't fight traced light). The unifying rule, both ends of
+the distance axis: bigger-than-a-pixel = geometry, smaller = averaged
+color. Near converts texture→geometry; far converts geometry→texture.
+
 ## API verdicts — so we don't re-derive them
 
 - API switch alone ≈ 0–20%. The 2–5× lives in representation (above).
