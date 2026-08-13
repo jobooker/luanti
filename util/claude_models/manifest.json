@@ -36,6 +36,18 @@
   ],
   "flowerpot_poppy": [
    "mcl_flowerpots:flower_pot"
+  ],
+  "planks_oak_baked": [
+   "mcl_trees:wood_oak"
+  ],
+  "planks_spruce_baked": [
+   "mcl_trees:wood_spruce"
+  ],
+  "log_oak_baked": [
+   "mcl_trees:tree_oak"
+  ],
+  "cobble_baked": [
+   "mcl_core:cobble"
   ]
  }
 }

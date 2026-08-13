@@ -205,6 +205,37 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
         lum = img @ np.array([0.2126, 0.7152, 0.0722])
         lo, hi = lum.min(), max(lum.max(), lum.min() + 1.0)
         med = float(np.median(lum))
+        # STEP rule + STRUCTURE constraints (John's eyes, 2026-08-13:
+        # "some of the geometry doesn't seem realistically possible").
+        # A dark texel is only CARVED if it belongs to a connected dark
+        # feature of >= 3 texels (kills lone pits and floating studs —
+        # a knot is dark, not deep), and depth-1 grain never carves the
+        # outer ring (kills undercut slivers where two faces chew the
+        # same cube edge). Deep carves (the near-black mouth band) are
+        # trusted as-is: they are designed features, not noise.
+        deep = ((lum - lo) / (hi - lo)) < 0.18
+        grain = lum < (med - 0.10 * (hi - lo))
+        # despeckle grain: 4-connected component size >= 3
+        keep = np.zeros((N, N), dtype=bool)
+        seen = np.zeros((N, N), dtype=bool)
+        for sv0 in range(N):
+            for su0 in range(N):
+                if not grain[sv0, su0] or seen[sv0, su0]:
+                    continue
+                comp = [(sv0, su0)]
+                seen[sv0, su0] = True
+                qi = 0
+                while qi < len(comp):
+                    cv, cu = comp[qi]; qi += 1
+                    for dv, du in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nv, nu = cv + dv, cu + du
+                        if 0 <= nv < N and 0 <= nu < N \
+                                and grain[nv, nu] and not seen[nv, nu]:
+                            seen[nv, nu] = True
+                            comp.append((nv, nu))
+                if len(comp) >= 3:
+                    for cv, cu in comp:
+                        keep[cv, cu] = True
         for vv in range(N):
             for u in range(N):
                 r, g, b = img[vv, u]
@@ -212,18 +243,12 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                            and r > 1.5 * b and g > 40.0)
                 if is_fire:
                     d = maxdepth  # fire sits at the back of its recess
+                elif deep[vv, u]:
+                    d = maxdepth
+                elif keep[vv, u] and 0 < vv < N - 1 and 0 < u < N - 1:
+                    d = 1
                 else:
-                    # STEP rule, not linear: a noisy stone texture must
-                    # stay a solid block with 1-voxel grain — only
-                    # near-black features (the mouth) carve deep. The
-                    # linear heightfield swiss-cheesed the furnace.
-                    t = (lum[vv, u] - lo) / (hi - lo)
-                    if t < 0.18:
-                        d = maxdepth
-                    elif lum[vv, u] < med - 0.10 * (hi - lo):
-                        d = 1
-                    else:
-                        d = 0
+                    d = 0
                 for dd in range(d):
                     x, y, z = _face_map(face, u, vv, dd)
                     v[z, y, x] = 0
@@ -393,6 +418,41 @@ def model_flowerpot():
     return "flowerpot_poppy", pal, v
 
 
+def _mcl(*parts):
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "games", "mineclonia", "mods", *parts)
+
+
+def model_planks_oak():
+    t = _mcl("ITEMS", "mcl_core", "textures", "default_wood.png")
+    return bake_from_tiles("planks_oak_baked",
+                           dict(side=t, top=t, bottom=t), maxdepth=1)
+
+
+def model_planks_spruce():
+    t = _mcl("ITEMS", "mcl_core", "textures", "mcl_core_planks_spruce.png")
+    return bake_from_tiles("planks_spruce_baked",
+                           dict(side=t, top=t, bottom=t), maxdepth=1)
+
+
+def model_log_oak():
+    return bake_from_tiles(
+        "log_oak_baked",
+        dict(side=_mcl("ITEMS", "mcl_core", "textures",
+                       "default_tree.png"),
+             top=_mcl("ITEMS", "mcl_core", "textures",
+                      "default_tree_top.png"),
+             bottom=_mcl("ITEMS", "mcl_core", "textures",
+                         "default_tree_top.png")),
+        maxdepth=1)
+
+
+def model_cobble():
+    t = _mcl("ITEMS", "mcl_core", "textures", "default_cobble.png")
+    return bake_from_tiles("cobble_baked",
+                           dict(side=t, top=t, bottom=t), maxdepth=1)
+
+
 def extrude_cutout(name, path, thick=2, emit_level=12):
     """Torch-class bake: a mostly-transparent 16x16 tile extruded into
     a `thick`-voxel standing model centered in the cell. Bright warm
@@ -520,6 +580,10 @@ MANIFEST = {
     "campfire_lit": ["mcl_campfires:campfire_lit"],
     "carpet_white": ["mcl_wool:white_carpet"],
     "flowerpot_poppy": ["mcl_flowerpots:flower_pot"],
+    "planks_oak_baked": ["mcl_trees:wood_oak"],
+    "planks_spruce_baked": ["mcl_trees:wood_spruce"],
+    "log_oak_baked": ["mcl_trees:tree_oak"],
+    "cobble_baked": ["mcl_core:cobble"],
 }
 
 
@@ -536,7 +600,8 @@ def main():
                model_torch_baked, model_bookshelf_baked,
                lambda: model_bed("foot"), lambda: model_bed("head"),
                model_lantern, model_campfire, model_carpet,
-               model_flowerpot):
+               model_flowerpot, model_planks_oak, model_planks_spruce,
+               model_log_oak, model_cobble):
         name, pal, v = fn()
         data = dict(name=name,
                     palette=[None] + [dict(rgb=list(p["rgb"]),
