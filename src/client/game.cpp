@@ -2017,14 +2017,13 @@ static void claudeVolumeSnapshot(Client *client)
 			continue;
 
 		u8 acls = 255;
-		// Micro-geometry prototype: cobblestone gets class 250 — the
-		// tracer carves its cell with the tile's height field, so grooves
-		// become real gaps rather than painted ones.
-		// Micro-geometry for every carved solid: the 16^3 grids are baked
-		// from each tile, so this is the whole world in sub-voxels.
-		if (!f.isLiquid() && f.light_source == 0
-				&& f.drawtype == NDT_NORMAL)
-			acls = 250;
+		// THE VOXEL LAW (John, 2026-08-13): "we render voxels. some
+		// voxels are 1/16m, some are 1m. period." A 1m voxel is never
+		// carved at runtime. Class 250 (sub-voxel geometry) is granted
+		// ONLY by the authored-model branch below; every other solid is
+		// an honest 1m cube. The per-tile heightfield carve that used to
+		// run here survives solely as a bake-time generator in the model
+		// shop (util/claude_models.py).
 		// Small emitters (torches) are thin sticks inside their cell.
 		// Class 165 renders them as a sub-voxel nub instead of a full
 		// glowing cube that looks like it replaced a block.
@@ -2135,10 +2134,6 @@ static void claudeVolumeSnapshot(Client *client)
 			claudeAtlasAdd(client, mid, f, col);
 			mids[i] = mid;
 		}
-		// carve removed nothing for this material: plain solid cube,
-		// carving must not touch it in any way (class 255, cube branch)
-		if (acls == 250 && mids[i] && g_claude_volume.micro_flat[mids[i]])
-			occ[i * 4 + 3] = 255;
 		solid++;
 	}
 	// world unchanged since the last snapshot: skip the upload and — key
@@ -2172,36 +2167,19 @@ static void claudeVolumeSnapshot(Client *client)
 	// cell leaps through deep emptiness. ~2.4 MB total.
 	{
 
-	// ---- REAL SUB-VOXEL BITS (round-8 goal: fix carving, don't do
-	// carving). The trace-time carve law (microSolid: per-face atlas
-	// heights, neighbour-gated, aligned mapping) is evaluated ONCE PER
-	// NODE here for the ring [48,80)^3 (volume-local; the volume itself
-	// follows the camera). Non-micro solids fast-path to all-ones; only
-	// micro-class nodes (a=250) evaluate the 4096-bit carve. The
-	// per-material stamps are BAKE INPUT ONLY (ADR-0007: template is
-	// generator, never runtime). Rebaked every snapshot.
+	// ---- REAL SUB-VOXEL BITS: the ring [48,80)^3 (volume-local; the
+	// volume follows the camera) holds one bit per 1/16 m voxel — the
+	// ONLY sub-voxel occupancy the renderer ever sees. Modeled cells
+	// take their authored 16^3 mask; every other solid is 4096 ones, a
+	// plain 1m voxel. No runtime carving (John, 2026-08-13: "true 1m
+	// voxels no longer get carved unless they have a 1/16 higher res
+	// model"). Rebaked every snapshot.
 	{
 		auto &sv = g_claude_volume.subvox;
 		if (sv.empty())
 			sv.assign((size_t)64 * 512 * 512, 0);
 		std::fill(sv.begin(), sv.end(), 0);
-		const float mstr = g_settings->exists("claude_micro")
-				? g_settings->getFloat("claude_micro", 0.0f, 2.0f) : 1.0f;
-		const int C = std::max(1, (int)std::floor(2.0f * mstr + 0.5f));
 		const int R0 = 48, RN = 32;
-		auto solidAt = [&](int vx, int vy, int vz) {
-			if (vx < 0 || vy < 0 || vz < 0 || vx >= S || vy >= S || vz >= S)
-				return true;
-			return occ[((size_t)(vz * S + vy) * S + vx) * 4 + 3] > 230;
-		};
-		auto carveH = [&](u8 slot, int tx, int ty) {
-			int mox = (slot % 16) * 16, moy = (slot / 16) * 16;
-			int px = std::min(std::max(tx, 0), 15);
-			int py = std::min(std::max(ty, 0), 15);
-			u8 h = g_claude_volume.atlas[((size_t)(moy + py) * 256
-					+ mox + px) * 4 + 3];
-			return (int)std::floor((1.0f - h / 255.0f) * C + 0.5f);
-		};
 		for (int rz = 0; rz < RN; rz++)
 		for (int ry = 0; ry < RN; ry++)
 		for (int rx = 0; rx < RN; rx++) {
@@ -2224,50 +2202,14 @@ static void claudeVolumeSnapshot(Client *client)
 				}
 				continue;
 			}
-			if (a != 250) {
-				// plain solid: two full bytes per (y,z) row
-				size_t bx = (size_t)rx * 2;
-				for (int s2 = 0; s2 < 16; s2++)
-				for (int t2 = 0; t2 < 16; t2++) {
-					size_t row = ((size_t)(rz * 16 + s2) * 512
-							+ (ry * 16 + t2)) * 64 + bx;
-					sv[row] = 0xFF;
-					sv[row + 1] = 0xFF;
-				}
-				continue;
-			}
-			u8 slot = mids[vi];
-			bool nxp = solidAt(vx + 1, vy, vz), nxn = solidAt(vx - 1, vy, vz);
-			bool nyp = solidAt(vx, vy + 1, vz), nyn = solidAt(vx, vy - 1, vz);
-			bool nzp = solidAt(vx, vy, vz + 1), nzn = solidAt(vx, vy, vz - 1);
-			for (int sz2 = 0; sz2 < 16; sz2++)
-			for (int sy2 = 0; sy2 < 16; sy2++)
-			for (int sx2 = 0; sx2 < 16; sx2++) {
-				bool sol = true;
-				if (!nyp && sy2 > 15 - C
-						&& 15 - sy2 < carveH(slot, sx2, sz2))
-					sol = false;
-				else if (!nyn && sy2 < C
-						&& sy2 < carveH(slot, sx2, 15 - sz2))
-					sol = false;
-				else if (!nxp && sx2 > 15 - C
-						&& 15 - sx2 < carveH(slot, sz2, 15 - sy2))
-					sol = false;
-				else if (!nxn && sx2 < C
-						&& sx2 < carveH(slot, 15 - sz2, 15 - sy2))
-					sol = false;
-				else if (!nzp && sz2 > 15 - C
-						&& 15 - sz2 < carveH(slot, 15 - sx2, 15 - sy2))
-					sol = false;
-				else if (!nzn && sz2 < C
-						&& sz2 < carveH(slot, sx2, 15 - sy2))
-					sol = false;
-				if (sol) {
-					int gx = rx * 16 + sx2;
-					sv[((size_t)(rz * 16 + sz2) * 512
-							+ (ry * 16 + sy2)) * 64 + (gx >> 3)]
-							|= (u8)(1 << (gx & 7));
-				}
+			// plain 1m voxel: two full bytes per (y,z) row
+			size_t bx = (size_t)rx * 2;
+			for (int s2 = 0; s2 < 16; s2++)
+			for (int t2 = 0; t2 < 16; t2++) {
+				size_t row = ((size_t)(rz * 16 + s2) * 512
+						+ (ry * 16 + t2)) * 64 + bx;
+				sv[row] = 0xFF;
+				sv[row + 1] = 0xFF;
 			}
 		}
 		GLint prev_au = GL.TEXTURE0;
