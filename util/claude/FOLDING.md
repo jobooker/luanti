@@ -8,6 +8,24 @@ channel (flat single-color coarse cells; faceted far shading). Canonical
 design lives in the vault (`projects/luanti-renderer-design.md` §6g);
 this file is the fork-side working contract + bug bank + instruments.*
 
+## Why folding works — the aliasing frame (John, 2026-08-13)
+
+Aliasing IS information loss: sampling detail smaller than a pixel returns
+noise instead of signal (the measured ~0.8% converged-pixel flicker). The
+folded channels are anti-aliasing applied to each quantity — coverage is
+anti-aliased occupancy, folded albedo is anti-aliased color, the folded
+normal is anti-aliased *shading*. One law, all channels: **when detail
+drops below the pixel, keep its average or lose it entirely.**
+
+The mirror holds near the camera: up close, cubeness IS the information —
+hard facets at resolvable scale are fidelity, not loss. Facets are signal
+when the eye can resolve them, noise when it can't; the pixel is the
+dividing line. So the `claude_far_normals` dial is not "facets vs smooth"
+— it is "at what distance do I admit the eye can no longer resolve the
+truth." A taste number, found on screen (see `fold_normals_ab.png`:
+axis-aligned far shading collapses rolling hills to three brightness
+values — shape deleted, not style).
+
 ## The contract
 
 A fold maps a group of children (2³ or 4³ cells) to one parent cell,
