@@ -2030,6 +2030,37 @@ static void claudeVolumeSnapshot(Client *client)
 		// glowing cube that looks like it replaced a block.
 		if (f.light_source > 0 && !f.isLiquid()
 				&& f.drawtype != NDT_NORMAL) {
+			// AUTHORED MODEL for a point-light node (torch, lantern,
+			// campfire — John: "where are my real torches!"): the
+			// model renders as real sub-voxel geometry with its own
+			// palette (flame voxels glow via the atlas) and the LIGHT
+			// stays a point at the model's glow centroid — same law
+			// as the modeled furnace.
+			{
+				auto mit = g_claude_volume.model_of.find(c);
+				if (mit != g_claude_volume.model_of.end()) {
+					u8 rot = n.getParam2() & 3;
+					g_claude_volume.modelids[i] =
+							(u8)((mit->second << 2) | rot);
+					const auto &gl = g_claude_volume
+							.model_glow[mit->second - 1][rot];
+					if (gl[3] > 0.0f)
+						emitters.push_back({x + gl[0], y + gl[1],
+								z + gl[2],
+								std::min<int>(f.light_source, 14)
+									/ 14.0f});
+					occ[i * 4 + 0] = col.getRed();
+					occ[i * 4 + 1] = col.getGreen();
+					occ[i * 4 + 2] = col.getBlue();
+					occ[i * 4 + 3] = 250;
+					coarse[(z / 4) * 32 * 32 + (y / 4) * 32
+							+ (x / 4)] = 255;
+					hash = hash * 1099511628211ULL
+							+ (u64)i * 7919 + 250;
+					solid++;
+					continue;
+				}
+			}
 			// Any sub-block light model (Mineclonia torches are MESH,
 			// not torchlike; also lanterns, plants, fire): pure point.
 			// Only full-cube glowing blocks (glowstone, lamps,
