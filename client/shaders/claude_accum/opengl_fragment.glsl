@@ -1486,6 +1486,27 @@ int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
 				return 3;
 			continue;
 		}
+		// ADR-0010 clause 2: photo mode traces the SAME carved geometry
+		// the eye does. Its ambient used to march the cube world, so a
+		// groove shaded like a flat face and a recess inherited a
+		// phantom neighbour's occlusion (John, 2026-08-13: "it's the
+		// way it's rendered") — the light didn't believe the carving.
+		// Ring cells resolve through microDDA; carved-through = real
+		// gap, keep marching.
+		if (claudeSubvox > 0.5 && s.a > 0.97 && s.a < 0.99) {
+			vec3 nbN, nbP, mh, mn;
+			microNeighbours(cell, nbN, nbP);
+			float msl = texture3D(claudeMaterials,
+					(cell + 0.5) / S).r * 255.0;
+			if (microDDA(cell, clamp(ro + rd * t - cell, 0.0, 1.0), rd,
+					floor(msl + 0.5), 0.0, nbN, nbP, mh, mn)) {
+				n = mn;
+				hp = cell + mh + mn * 0.03125;
+				alb = pathAlbedo(s.rgb);
+				return 1;
+			}
+			continue; // carved away here: the ray really passes through
+		}
 		n = vec3(0.0);
 		if (axis == 0) n.x = -stepDir.x;
 		else if (axis == 1) n.y = -stepDir.y;
