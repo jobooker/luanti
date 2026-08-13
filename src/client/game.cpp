@@ -2035,7 +2035,13 @@ static void claudeVolumeSnapshot(Client *client)
 			// palette (flame voxels glow via the atlas) and the LIGHT
 			// stays a point at the model's glow centroid — same law
 			// as the modeled furnace.
-			{
+			// Ring-gated: outside the subvox ring [48,80)^3 a class-250
+			// cell has no bits to express and would render as a 1m cube
+			// in the node's near-black average color (John's "black
+			// cube"). Distant point lights keep the 165 nub until the
+			// ladder rework gives models real far rungs.
+			if (x >= 48 && x < 80 && y >= 48 && y < 80
+					&& z >= 48 && z < 80) {
 				auto mit = g_claude_volume.model_of.find(c);
 				if (mit != g_claude_volume.model_of.end()) {
 					u8 rot = n.getParam2() & 3;
