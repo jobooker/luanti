@@ -411,6 +411,34 @@ bool microSolid(vec3 node, float slot, vec3 sc, float rot,
 	return true;
 }
 
+// v2 authored-model voxels: palette color + emission per sub-voxel
+// (ADR-0009 units, palette-indexed — "not really a map"). Returns
+// rgba: rgb = palette color (raw sRGB bytes), a = emit level 0..1
+// scaled /15; a < 0 means the cell has no model or the voxel is
+// palette 0 (shouldn't happen on a microDDA hit).
+uniform sampler3D claudeModelIds;
+uniform sampler3D claudeModelAtlas;
+uniform sampler2D claudeModelPal;
+
+vec4 modelVoxel(vec3 cell, vec3 sc)
+{
+	float tag = floor(texture3D(claudeModelIds,
+			(cell + 0.5) / 128.0).r * 255.0 + 0.5);
+	if (tag < 4.0)
+		return vec4(-1.0);
+	float rot = mod(tag, 4.0);
+	float idx0 = floor(tag / 4.0) - 1.0;
+	vec3 scc = clamp(sc, vec3(0.0), vec3(15.0));
+	float layer = (idx0 * 4.0 + rot) * 16.0 + scc.z;
+	float pi = floor(texture3D(claudeModelAtlas,
+			(vec3(scc.x, scc.y, layer) + 0.5)
+				/ vec3(16.0, 16.0, 1024.0)).r * 255.0 + 0.5);
+	if (pi < 0.5)
+		return vec4(-1.0);
+	return texture2D(claudeModelPal,
+			(vec2(pi, idx0) + 0.5) / vec2(256.0, 64.0));
+}
+
 bool microDDA(vec3 node, vec3 lo, vec3 rd, float slot, float rot,
 		vec3 nbNeg, vec3 nbPos, out vec3 hitLocal, out vec3 hitNormal)
 {
@@ -1344,7 +1372,17 @@ vec3 bounceRay(vec3 ro, vec3 rd, vec3 sd)
 				// surfaces it faces (2026-08-12 — the missing second-bounce
 				// term behind the "circular shadow" saga)
 				litm += emitterLightCheap(hpm, mn);
-				return pathAlbedo(s.rgb) * litm * fallm * trans;
+				vec3 albM = pathAlbedo(s.rgb);
+				vec3 glowM = vec3(0.0);
+				vec4 mvB = modelVoxel(cell,
+						floor(clamp(mh, 0.0, 0.99999) * 16.0 - mn * 0.5));
+				if (mvB.a >= 0.0) {
+					albM = pathAlbedo(mvB.rgb);
+					if (mvB.a > 0.01)
+						glowM = albM * emitStrength(
+								clamp(mvB.a * 15.0 / 14.0, 0.0, 1.0));
+				}
+				return (albM * litm + glowM) * fallm * trans;
 			}
 			continue;   // carved away here: the ray really does pass through
 		}
@@ -1503,6 +1541,18 @@ int photoMarch(vec3 ro, vec3 rd, inout vec3 tp,
 				n = mn;
 				hp = cell + mh + mn * 0.03125;
 				alb = pathAlbedo(s.rgb);
+				vec4 mvP = modelVoxel(cell,
+						floor(clamp(mh, 0.0, 0.99999) * 16.0 - mn * 0.5));
+				if (mvP.a >= 0.0) {
+					alb = pathAlbedo(mvP.rgb);
+					if (mvP.a > 0.01) {
+						// glowing voxel: photo paths collect its Le and
+						// bounce off it — the furnace mouth LIGHTS
+						g_photoGlow = alb * emitStrength(
+								clamp(mvP.a * 15.0 / 14.0, 0.0, 1.0));
+						return 4;
+					}
+				}
 				return 1;
 			}
 			continue; // carved away here: the ray really passes through
@@ -2018,6 +2068,18 @@ void main(void)
 						bpos = ro + rd * t + nn0 * 0.01;
 					}
 					vec3 alb = pathAlbedo(s.rgb);
+					// v2 authored models: the sub-voxel OWNS its color and
+					// emission (palette-indexed) — the red blanket is red,
+					// the fire voxels glow (added to fresh below).
+					vec3 mGlow = vec3(0.0);
+					vec4 mvE = modelVoxel(cell,
+							floor(clamp(hl, 0.0, 0.99999) * 16.0 - hn * 0.5));
+					if (mvE.a >= 0.0) {
+						alb = pathAlbedo(mvE.rgb);
+						if (mvE.a > 0.01)
+							mGlow = alb * emitStrength(
+									clamp(mvE.a * 15.0 / 14.0, 0.0, 1.0));
+					}
 					// Texture the SUB-VOXEL, not just the block. Carved
 					// surfaces previously took the cell's average colour and
 					// never touched the atlas, so the atlas drove the carve
@@ -2093,7 +2155,7 @@ void main(void)
 					vec3 em2 = skipE2 ? vec3(0.0)
 							: emitterLightSpec(bpos + bnT * 0.0625, bnT, -rd,
 							glossOn2 > 0.005 ? mSpecGloss : 0.0, specAcc2, 8);
-					fresh = alb * (dir2 + amb2 + em2);
+					fresh = alb * (dir2 + amb2 + em2) + mGlow;
 					if (glossOn2 > 0.005) {
 						if (ndl2 > 0.0 && dir2.r + dir2.g + dir2.b > 0.0) {
 							float nh2 = max(dot(bnrm, normalize(sd2 - rd)), 0.0);

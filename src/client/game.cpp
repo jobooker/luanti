@@ -144,6 +144,18 @@ struct ClaudeVolume
 	std::unordered_map<content_t, u8> model_of; // content -> 1-based idx
 	bool models_loaded = false;
 	std::vector<u8> modelids;
+	// v2: per-voxel COLOR + EMISSION. Palette-indexed (the plan's "not
+	// really a map" answer): each model ships 4 pre-rotated 16^3 index
+	// grids into a 16x16x1024 R8 atlas (layer = (idx0*4+rot)*16+sz) and
+	// a 256x64 RGBA palette row (rgb + emit/15 in alpha). Emissive
+	// models also carry a per-rot glow centroid so the snapshot can
+	// stand a point light at the mouth (the small-emitter law) while
+	// the voxels render the visible fire.
+	std::vector<std::array<std::vector<u8>, 4>> model_vox;
+	std::vector<std::vector<u8>> model_pal;      // 256*4 RGBA each
+	std::vector<std::array<std::array<float, 4>, 4>> model_glow;
+	u32 model_ids_tex = 0, model_atlas_tex = 0, model_pal_tex = 0;
+	bool model_tex_dirty = false;
 	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
@@ -315,6 +327,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_denoise = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_denoise_pixel{"claudeDenoise"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -1062,6 +1077,17 @@ public:
 					GL.ActiveTexture(GL.TEXTURE7);
 					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.subvox_tex);
 				}
+				if (g_claude_volume.model_ids_tex) {
+					GL.ActiveTexture(GL.TEXTURE0 + 16);
+					GL.BindTexture(GL.TEXTURE_3D,
+							g_claude_volume.model_ids_tex);
+					GL.ActiveTexture(GL.TEXTURE0 + 17);
+					GL.BindTexture(GL.TEXTURE_3D,
+							g_claude_volume.model_atlas_tex);
+					GL.ActiveTexture(GL.TEXTURE0 + 18);
+					GL.BindTexture(GL.TEXTURE_2D,
+							g_claude_volume.model_pal_tex);
+				}
 				if (g_claude_volume.cascades_tex) {
 					GL.ActiveTexture(GL.TEXTURE8);
 					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_tex);
@@ -1085,6 +1111,10 @@ public:
 				m_matparams_sampler_pixel.set(&player, services);
 				SamplerLayer_t svlayer = 7;
 				m_subvox_sampler_pixel.set(&svlayer, services);
+				SamplerLayer_t midl = 16, matl = 17, mpal = 18;
+				m_modelids_sampler_pixel.set(&midl, services);
+				m_modelatlas_sampler_pixel.set(&matl, services);
+				m_modelpal_sampler_pixel.set(&mpal, services);
 				m_subvox_pixel.set(&m_subvox, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
@@ -1809,23 +1839,73 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 		const Json::Value &vox = md["voxels"];
 		if (vox.size() != 16)
 			continue;
+		const Json::Value &pal = md["palette"];
+		std::vector<u8> palrgba(256 * 4, 0);
+		int npal = std::min((int)pal.size(), 256);
+		for (int p = 1; p < npal; p++) {
+			if (pal[p].isNull())
+				continue;
+			const Json::Value &rgb = pal[p]["rgb"];
+			palrgba[p * 4 + 0] = (u8)rgb[0].asInt();
+			palrgba[p * 4 + 1] = (u8)rgb[1].asInt();
+			palrgba[p * 4 + 2] = (u8)rgb[2].asInt();
+			int emit = pal[p]["emit"].asInt();
+			palrgba[p * 4 + 3] = (u8)(std::min(emit, 15) * 255 / 15);
+		}
 		std::array<std::vector<u8>, 4> rots;
-		for (int r = 0; r < 4; r++)
+		std::array<std::vector<u8>, 4> vrots;
+		std::array<std::array<float, 4>, 4> glow;
+		for (int r = 0; r < 4; r++) {
 			rots[r].assign(512, 0);
+			vrots[r].assign(4096, 0);
+			glow[r] = {0, 0, 0, 0};
+		}
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
-			if (vox[z][y][x].asInt() == 0)
+			int pi = vox[z][y][x].asInt();
+			if (pi == 0)
 				continue;
+			int emit = (pi < npal && !pal[pi].isNull())
+					? pal[pi]["emit"].asInt() : 0;
 			int rx = x, rz = z;
 			for (int r = 0; r < 4; r++) {
 				rots[r][(size_t)(rz * 16 + y) * 2 + (rx >> 3)]
 						|= (u8)(1 << (rx & 7));
+				vrots[r][(size_t)(rz * 16 + y) * 16 + rx] =
+						(u8)std::min(pi, 255);
+				if (emit > 0) {
+					glow[r][0] += rx + 0.5f;
+					glow[r][1] += y + 0.5f;
+					glow[r][2] += rz + 0.5f;
+					glow[r][3] += 1.0f;
+				}
 				int nx = 15 - rz, nz = rx; // 90 deg about +y
 				rx = nx; rz = nz;
 			}
 		}
+		float glowmax = 0.0f;
+		for (int z = 0; z < 16 && glow[0][3] > 0; z++)
+		for (int y = 0; y < 16; y++)
+		for (int x = 0; x < 16; x++) {
+			int pi = vox[z][y][x].asInt();
+			if (pi > 0 && pi < npal && !pal[pi].isNull())
+				glowmax = std::max(glowmax,
+						(float)pal[pi]["emit"].asInt());
+		}
+		for (int r = 0; r < 4; r++) {
+			if (glow[r][3] > 0) {
+				glow[r][0] /= glow[r][3] * 16.0f; // cell-local 0..1
+				glow[r][1] /= glow[r][3] * 16.0f;
+				glow[r][2] /= glow[r][3] * 16.0f;
+				glow[r][3] = glowmax / 14.0f;     // NEE intensity
+			}
+		}
 		V.models.push_back(rots);
+		V.model_vox.push_back(vrots);
+		V.model_pal.push_back(palrgba);
+		V.model_glow.push_back(glow);
+		V.model_tex_dirty = true;
 		u8 idx = (u8)V.models.size(); // 1-based
 		for (const auto &nn : nodes[mname]) {
 			content_t cid = ndef->getId(nn.asString());
@@ -1847,6 +1927,22 @@ static void claudeVolumeSnapshot(Client *client)
 	u64 t0 = porting::getTimeMs();
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
 	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
+	// ORIGIN DEADBAND (John, 2026-08-13: "things shift when I move
+	// around"): the detail ring rides volume-local coords, so an
+	// origin that re-quantizes with every camera step sweeps the
+	// carve/cube boundary through the world at walking pace. Keep the
+	// previous origin while the camera stays within +/-6 m of the
+	// volume center — walking around a room then shifts NOTHING, and
+	// a genuine relocation costs one rebase instead of a pop per step.
+	{
+		v3s16 prev_center = g_claude_volume.prev_origin
+				+ v3s16(S / 2, S / 2, S / 2);
+		v3s16 d = center - prev_center;
+		if (g_claude_volume.valid
+				&& std::abs(d.X) <= 6 && std::abs(d.Y) <= 6
+				&& std::abs(d.Z) <= 6)
+			origin = g_claude_volume.prev_origin;
+	}
 	Map &map = client->getEnv().getMap();
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	// RGBA per cell: rgb = the node type's average color (same one the
@@ -1972,17 +2068,27 @@ static void claudeVolumeSnapshot(Client *client)
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED_OPTIONAL)
 			acls = 145;
-		// authored model (phase 4.5 v1): tag the cell and join the
-		// micro class so the eye path carves it. Solid cells only —
-		// emissive nodes keep their class until per-voxel emission
-		// (v2) exists.
-		if (acls >= 250 && !g_claude_volume.model_of.empty()) {
+		// authored model: tag the cell and join the micro class so
+		// every path carves it. v2: emissive full-cube nodes (the lit
+		// furnace) join too — their fire voxels render via the palette
+		// and CAST via a point light at the glow centroid (the
+		// small-emitter law; honest until the NEE+MIS area block).
+		// Sub-cube point lights (torch/lantern/campfire, class 165)
+		// keep their existing nub+NEE treatment.
+		if (!g_claude_volume.model_of.empty()
+				&& (acls >= 250 || (f.light_source > 0
+					&& f.drawtype == NDT_NORMAL))) {
 			auto mit = g_claude_volume.model_of.find(c);
 			if (mit != g_claude_volume.model_of.end()) {
 				acls = 250;
+				u8 rot = n.getParam2() & 3;
 				g_claude_volume.modelids[i] =
-						(u8)((mit->second << 2)
-							| (n.getParam2() & 3));
+						(u8)((mit->second << 2) | rot);
+				const auto &gl = g_claude_volume
+						.model_glow[mit->second - 1][rot];
+				if (gl[3] > 0.0f)
+					emitters.push_back({x + gl[0], y + gl[1],
+							z + gl[2], gl[3]});
 			}
 		}
 		occ[i * 4 + 3] = acls;
@@ -2154,6 +2260,83 @@ static void claudeVolumeSnapshot(Client *client)
 		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
 				GL.UNSIGNED_BYTE, sv.data());
+
+		// v2 model textures: per-cell tag ring (128^3 R8, per
+		// snapshot), voxel-palette atlas + palettes (static, on load)
+		auto texParams3D = []() {
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+		};
+		bool fresh_ids = !g_claude_volume.model_ids_tex;
+		if (fresh_ids)
+			GL.GenTextures(1, &g_claude_volume.model_ids_tex);
+		GL.ActiveTexture(GL.TEXTURE0 + 16);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.model_ids_tex);
+		if (fresh_ids) {
+			texParams3D();
+			GL.TexImage3D(GL.TEXTURE_3D, 0,
+					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, S, S, S, 0,
+					claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, nullptr);
+		}
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, S, S, S,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, g_claude_volume.modelids.data());
+		if (g_claude_volume.model_tex_dirty) {
+			g_claude_volume.model_tex_dirty = false;
+			// atlas 16x16x1024: layer = (idx0*4+rot)*16+sz, 16 models max
+			std::vector<u8> atlas((size_t)16 * 16 * 1024, 0);
+			std::vector<u8> pals((size_t)256 * 64 * 4, 0);
+			size_t nm = std::min<size_t>(g_claude_volume.model_vox.size(), 16);
+			for (size_t m = 0; m < nm; m++) {
+				for (int r = 0; r < 4; r++) {
+					const auto &vr = g_claude_volume.model_vox[m][r];
+					for (int sz2 = 0; sz2 < 16; sz2++) {
+						size_t layer = ((m * 4 + r) * 16 + sz2);
+						for (int sy2 = 0; sy2 < 16; sy2++)
+						for (int sx2 = 0; sx2 < 16; sx2++)
+							atlas[(layer * 16 + sy2) * 16 + sx2] =
+									vr[(size_t)(sz2 * 16 + sy2) * 16 + sx2];
+					}
+				}
+				memcpy(&pals[m * 256 * 4],
+						g_claude_volume.model_pal[m].data(), 256 * 4);
+			}
+			bool fresh_ma = !g_claude_volume.model_atlas_tex;
+			if (fresh_ma)
+				GL.GenTextures(1, &g_claude_volume.model_atlas_tex);
+			GL.ActiveTexture(GL.TEXTURE0 + 17);
+			GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.model_atlas_tex);
+			if (fresh_ma) {
+				texParams3D();
+				GL.TexImage3D(GL.TEXTURE_3D, 0,
+						claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
+						16, 16, 1024, 0,
+						claudeUseR8() ? GL.RED : GL_LUMINANCE,
+						GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 16, 16, 1024,
+					claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, atlas.data());
+			bool fresh_mp = !g_claude_volume.model_pal_tex;
+			if (fresh_mp)
+				GL.GenTextures(1, &g_claude_volume.model_pal_tex);
+			GL.ActiveTexture(GL.TEXTURE0 + 18);
+			GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.model_pal_tex);
+			if (fresh_mp) {
+				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+				GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 64, 0,
+						GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 64,
+					GL.RGBA, GL.UNSIGNED_BYTE, pals.data());
+		}
 		GL.ActiveTexture(prev_au);
 	}
 
