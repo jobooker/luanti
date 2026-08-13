@@ -117,6 +117,7 @@ uniform lowp float nightSkyGain;   // gain on the night dome
 #define SKY_BOUNCE skyBounce
 uniform vec3 volumeOrigin;         // volume cell (0,0,0) in world nodes
 uniform lowp float textureAmount;  // 0 clay .. 1 full texture
+uniform lowp float grayWorld;      // 1 = neutral-gray albedo (clay render)
 uniform lowp float bevelStrength;  // analytic edge rounding (0..1)
 uniform lowp float reliefStrength; // texture-derived micro relief (0..1)
 uniform lowp float parallaxStrength; // march INTO the height field (0..1)
@@ -228,7 +229,12 @@ vec3 pathAlbedo(vec3 raw)
 	// to compensate. With sky bounce and emitters working, the prop only
 	// destroys contrast — dark stone could not be dark, and night became a
 	// grey wash. The tiny floor that remains is numerical, not aesthetic.
-	return max(pow(raw, vec3(2.2)), vec3(0.005));
+	// clay render (claude_gray): every material becomes the same
+	// mid-gray so the image is pure light transport. One chokepoint —
+	// every path type (eye, bounce, photo, emissive Le) flows through
+	// here, so the gray world stays energy-consistent by construction.
+	return mix(max(pow(raw, vec3(2.2)), vec3(0.005)), vec3(0.32),
+			grayWorld);
 }
 
 // ADR-0009 #1: ONE emission strength. Le = pathAlbedo(cellColor) *

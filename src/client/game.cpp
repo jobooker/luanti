@@ -273,6 +273,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
+	CachedPixelShaderSetting<float, 1, false> m_gray_pixel{"grayWorld"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_parallax_pixel{"parallaxStrength"};
@@ -283,7 +284,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_radiance_pixel{"radianceStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_frame_pixel{"claudeRadianceFrame"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
-	float m_texture_amount, m_bevel, m_relief, m_parallax, m_jitter;
+	float m_texture_amount, m_gray, m_bevel, m_relief, m_parallax, m_jitter;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
 	float m_bounce2 = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
@@ -371,7 +372,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 39> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 40> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -382,6 +383,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_gi_split",
 		"claude_clay",
 		"claude_texture",
+		"claude_gray",
 		"claude_bevel",
 		"claude_relief",
 		"claude_parallax",
@@ -469,6 +471,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			return 0.0f;
 		// 1 = relight only the right half of the screen (A/B seam)
 		return g_settings->getFloat("claude_gi_split", 0.0f, 1.0f);
+	}
+
+	// clay render: 1 = neutral-gray albedo everywhere in the traced
+	// pipeline - pure light transport, no material color (John,
+	// 2026-08-13: "clay style, no color"). Grays emissive Le too (the
+	// NEE warm tint survives); a diagnostic look, not a ship look.
+	static float readGray()
+	{
+		if (!g_settings->exists("claude_gray"))
+			return 0.0f;
+		return g_settings->getFloat("claude_gray", 0.0f, 1.0f);
 	}
 
 	static float readTextureAmount()
@@ -748,6 +761,8 @@ public:
 			m_clay = readClay();
 		if (name == "claude_texture")
 			m_texture_amount = readTextureAmount();
+		if (name == "claude_gray")
+			m_gray = readGray();
 		if (name == "claude_bevel")
 			m_bevel = readBevel();
 		if (name == "claude_relief")
@@ -832,6 +847,7 @@ public:
 		m_gi_split = readGiSplit();
 		m_clay = readClay();
 		m_texture_amount = readTextureAmount();
+		m_gray = readGray();
 		m_bevel = readBevel();
 		m_relief = readRelief();
 		m_parallax = readParallax();
@@ -1133,6 +1149,7 @@ public:
 						(float)g_claude_volume.origin.Z);
 				m_volume_origin_pixel.set(vorg, services);
 				m_texture_amount_pixel.set(&m_texture_amount, services);
+				m_gray_pixel.set(&m_gray, services);
 				m_bevel_pixel.set(&m_bevel, services);
 				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
