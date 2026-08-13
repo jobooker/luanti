@@ -120,19 +120,14 @@ struct ClaudeVolume
 	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
 	u32 material_tex = 0;
 	u32 atlas_tex = 0;
-	u32 micro_tex = 0;          // 256x256x16: 16x16 materials of 16^3 grids
-	// per-material: true when the carve removed ZERO sub-voxels — such
-	// materials are classified plain solid (255), never micro (John,
-	// 2026-08-12: "carving shouldn't be doing anything at all" to a
-	// block whose carve is empty; no branch switch, no wasted marches)
-	bool micro_flat[256] = {};
 	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
-	// REAL SUB-VOXEL BITS (round-8): 16^3 bits per node for the 32^3
-	// ring at volume-local [48,80)^3 — the carve law baked per NODE at
-	// snapshot; the shader's microSolid is one fetch. R8 64x512x512
-	// (one byte = 8 x-subvoxels): integer samplers silently kill the
-	// Irrlicht material (the flat-blue outage), so bits ride a float
-	// sampler with floor/mod extraction.
+	// REAL SUB-VOXEL BITS: 16^3 bits per node for the 32^3 ring at
+	// volume-local [48,80)^3 — model masks or full-solid, baked per
+	// snapshot (ADR-0011: the ONLY sub-voxel occupancy); the shader's
+	// microSolid is one fetch. R8 64x512x512 (one byte = 8 x-subvoxels):
+	// integer samplers silently kill the Irrlicht material (the
+	// flat-blue outage), so bits ride a float sampler with floor/mod
+	// extraction.
 	u32 subvox_tex = 0;
 	std::vector<u8> subvox;
 	// AUTHORED MODELS (phase 4.5, ADR-0005/0010): 16^3 occupancy masks
@@ -156,7 +151,6 @@ struct ClaudeVolume
 	std::vector<std::array<std::array<float, 4>, 4>> model_glow;
 	u32 model_ids_tex = 0, model_atlas_tex = 0, model_pal_tex = 0;
 	bool model_tex_dirty = false;
-	std::vector<u8> micro;      // occupancy, 255 = solid
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
 	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
@@ -260,7 +254,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
-	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_micro_sampler_pixel{"claudeMicro"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matparams_sampler_pixel{"claudeMatParams"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_sampler_pixel{"claudeCascades"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_coarse_sampler_pixel{"claudeCascadeCoarse"};
@@ -1065,10 +1058,6 @@ public:
 					GL.ActiveTexture(GL.TEXTURE13);
 					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.atlas_tex);
 				}
-				if (g_claude_volume.micro_tex) {
-					GL.ActiveTexture(GL.TEXTURE14);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.micro_tex);
-				}
 				if (g_claude_volume.matparams_tex) {
 					GL.ActiveTexture(GL.TEXTURE15);
 					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.matparams_tex);
@@ -1105,8 +1094,6 @@ public:
 				m_materials_sampler_pixel.set(&mlayer, services);
 				SamplerLayer_t alayer = 13;
 				m_atlas_sampler_pixel.set(&alayer, services);
-				SamplerLayer_t mlayer2 = 14;
-				m_micro_sampler_pixel.set(&mlayer2, services);
 				SamplerLayer_t player = 15;
 				m_matparams_sampler_pixel.set(&player, services);
 				SamplerLayer_t svlayer = 7;
@@ -1652,139 +1639,9 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			for (int px = 0; px < 16; px++)
 				dst[(ay + py) * 256 + ax + px] = 0xFF808080u;
 	}
-	// Bake this material's 16^3 sub-voxel grid: start solid, then carve
-	// each of the six faces by that face's height field. Real 3D shape —
-	// the same data structure as the world, one scale down.
-	if (g_claude_volume.micro.empty())
-		g_claude_volume.micro.assign(256 * 256 * 16, 0);
-	{
-		float h[16][16];
-		u32 buf2[16 * 16];
-		bool have = false;
-		if (!tname.empty()) {
-			video::IImage *img2 = client->tsrc()->claudeGetImage(tname);
-			if (img2) {
-				img2->copyToScaling(buf2, 16, 16, video::ECF_A8R8G8B8);
-				img2->drop();
-				have = true;
-			}
-		}
-		for (int y = 0; y < 16; y++)
-			for (int x = 0; x < 16; x++) {
-				if (!have) { h[y][x] = 1.0f; continue; }
-				u32 t2 = buf2[y * 16 + x];
-				float l = (((t2 >> 16) & 0xFF) * 0.30f + ((t2 >> 8) & 0xFF) * 0.59f
-						+ (t2 & 0xFF) * 0.11f) / 255.0f;
-				h[y][x] = l;
-			}
-		// Normalise so the tile's brightest texels sit FLUSH with the cell
-		// boundary and only darker ones recede. Without this, a mid-tone
-		// tile carves every face inward and the block reads as a small
-		// stone floating inside an invisible 1 m shell.
-		if (have) {
-			float hmax = 0.0f, hmin = 1.0f;
-			for (int y = 0; y < 16; y++)
-				for (int x = 0; x < 16; x++) {
-					hmax = std::max(hmax, h[y][x]);
-					hmin = std::min(hmin, h[y][x]);
-				}
-			float span = std::max(hmax - hmin, 0.05f);
-			for (int y = 0; y < 16; y++)
-				for (int x = 0; x < 16; x++)
-					h[y][x] = std::clamp((h[y][x] - hmin) / span, 0.0f, 1.0f);
-			// Border texels are dark in most tiles (mortar drawn at the
-			// edge), so every block carved a groove exactly at its
-			// boundary and the grooves lined up into a mortar LATTICE
-			// across whole walls. Lift each border texel to at least its
-			// inward neighbour so blocks meet flush; interior relief is
-			// untouched.
-			for (int i2 = 0; i2 < 16; i2++) {
-				h[0][i2] = std::max(h[0][i2], h[1][i2]);
-				h[15][i2] = std::max(h[15][i2], h[14][i2]);
-				h[i2][0] = std::max(h[i2][0], h[i2][1]);
-				h[i2][15] = std::max(h[i2][15], h[i2][14]);
-			}
-			if (is_ore) {
-				// same color-distance rule as the atlas height: stone
-				// recedes, ore bits stand proud (see comment there)
-				double mr = 0, mg = 0, mb = 0;
-				for (int k = 0; k < 256; k++) {
-					mr += (buf2[k] >> 16) & 0xFF;
-					mg += (buf2[k] >> 8) & 0xFF;
-					mb += buf2[k] & 0xFF;
-				}
-				mr /= 256.0; mg /= 256.0; mb /= 256.0;
-				double dist[256], dmax = 1.0;
-				for (int k = 0; k < 256; k++) {
-					double dr = (double)((buf2[k] >> 16) & 0xFF) - mr;
-					double dg = (double)((buf2[k] >> 8) & 0xFF) - mg;
-					double db = (double)(buf2[k] & 0xFF) - mb;
-					dist[k] = std::sqrt(dr * dr + dg * dg + db * db);
-					dmax = std::max(dmax, dist[k]);
-				}
-				for (int y = 0; y < 16; y++)
-					for (int x = 0; x < 16; x++) {
-						double nd = std::pow(std::clamp(
-								dist[y * 16 + x] / dmax, 0.0, 1.0), 1.5);
-						h[y][x] = (float)(0.65 + 0.35 * nd);
-					}
-			}
-		}
-		// Max sub-voxels removed from a face. 1 (was 2) per John's carve
-		// experiment (2026-08-12): one-deep relief keeps visible texture
-		// but sits under the emitter shadow-bias floor, so the carve
-		// cannot self-shadow against low point lights — the artifact
-		// family from the circular-shadow night is structurally excluded
-		// at this depth.
-		const int CARVE = 1;
-		// CARVE DOWN, NEVER UP (John, 2026-08-12: the old absolute rule
-		// carved the MAJORITY surface down and left bright texels flush
-		// at the 1 m plane — which read as pips RAISED above the block).
-		// Normalize per tile: the typical texel sits flush at 1 m, and
-		// only texels distinctly darker than the tile's own mean get cut
-		// one sub-voxel down. Features are recesses, not towers.
-		float hmean = 0.0f;
-		for (int y = 0; y < 16; y++)
-			for (int x = 0; x < 16; x++)
-				hmean += h[y][x];
-		hmean /= 256.0f;
-		bool cmask[16][16];
-		bool force_inset = (f.name == "mcl_core:stone_smooth");
-		for (int y = 0; y < 16; y++)
-			for (int x = 0; x < 16; x++)
-				cmask[y][x] = force_inset || h[y][x] < hmean - 0.12f;
-		int removed = 0;
-		for (int z = 0; z < 16; z++)
-		for (int y = 0; y < 16; y++)
-		for (int x = 0; x < 16; x++) {
-			bool solid = true;
-			// +Y / -Y faces use (x,z); +X/-X use (z,y); +Z/-Z use (x,y)
-			int dTop = cmask[z][x] ? CARVE : 0;
-			if (15 - y < dTop) solid = false;
-			int dBot = cmask[15 - z][x] ? CARVE : 0;
-			if (y < dBot) solid = false;
-			int dPX = cmask[15 - y][z] ? CARVE : 0;
-			if (15 - x < dPX) solid = false;
-			int dNX = cmask[15 - y][15 - z] ? CARVE : 0;
-			if (x < dNX) solid = false;
-			int dPZ = cmask[15 - y][x] ? CARVE : 0;
-			if (15 - z < dPZ) solid = false;
-			int dNZ = cmask[15 - y][15 - x] ? CARVE : 0;
-			if (z < dNZ) solid = false;
-			// NOTE: no baked chamfer. Carving the 12 cube edges put a
-			// perfectly straight groove at every block boundary — a
-			// machined line no stone crosses, which reads as a seam
-			// (John). Exposed-edge chamfering, if wanted, must happen at
-			// trace time where neighbours are known.
-
-			int ax2 = (mid % 16) * 16 + x;
-			int ay2 = (mid / 16) * 16 + y;
-			g_claude_volume.micro[(z * 256 + ay2) * 256 + ax2] = solid ? 255 : 0;
-			if (!solid)
-				removed++;
-		}
-		g_claude_volume.micro_flat[mid] = (removed == 0);
-	}
+	// (The per-material 16^3 stamp bake that lived here is gone with the
+	// runtime carve, ADR-0011 — sub-voxel shape comes from the model
+	// shop's authored 16^3 models, nowhere else.)
 	(void)fallback;
 	g_claude_volume.atlas_dirty = true;
 }
@@ -2393,19 +2250,6 @@ static void claudeVolumeSnapshot(Client *client)
 		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
 		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 256, 0, GL.BGRA,
 				GL.UNSIGNED_BYTE, g_claude_volume.atlas.data());
-		if (!g_claude_volume.micro_tex)
-			GL.GenTextures(1, &g_claude_volume.micro_tex);
-		GL.ActiveTexture(GL.TEXTURE14);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.micro_tex);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-		GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
-				256, 256, 16, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
-				GL.UNSIGNED_BYTE, g_claude_volume.micro.data());
-
 		// per-material response params (256x1 RGBA), unit 15
 		if (!g_claude_volume.matparams_tex)
 			GL.GenTextures(1, &g_claude_volume.matparams_tex);
