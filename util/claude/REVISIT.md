@@ -32,6 +32,16 @@ cache for a 1-byte question.
    keys (voxel-ID + face instead of fuzzy depth) — already on the vault
    open-problems list, reaffirmed.
 
+4. **Recursive 64-tree (John, 2026-08-13):** the bitmask brick generalizes —
+   4³ = 64 voxels = one uint64, and 64 *bricks* = one uint64 one level up,
+   recursively (the 16³ micro-grids are already two rungs: root mask + 64
+   leaf masks, 520 B). Same primitive every level → the §6g "one code path,
+   choose level, march" pyramid with its storage answer. Bit pyramid above
+   128³ leaves: 4 KB + 62 B + 1 B — the whole skeleton ~260 KB. Caveats:
+   bits are traversal only (color mips stay a parallel pyramid for the §6g
+   merged-shading rule); descent costs steps, so likely flat+one-brick-level
+   near, deep tree far; GLSL has no recursion — fixed-depth loop.
+
 ## Water — three liftable pieces from madebyevan.com/webgl-water/
 
 - **Animated water normals** (highest vibe-per-effort): perturb the flat top
