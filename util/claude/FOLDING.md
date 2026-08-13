@@ -76,10 +76,13 @@ channel by channel. Every fold MUST be:
 
 ## Instruments
 
-- `fold_normals_ab.py` → `fold_normals_ab.png`: offline A/B of the normals
-  channel — same blocky terrain, axis-aligned vs folded shading. Knobs at
-  the top (BLOCK, sun, pitch). Runs with `~/.venvs/voice/bin/python` (any
-  python with numpy+PIL).
+- `fold_normals_ab.py` → `fold_normals_ab.png`: three panels from ONE real
+  1-unit voxel grid — FINE (the truth), A (folded 8-unit blocks, face
+  normals), B (same fold, normals = area-weighted average of the fine
+  terrain's actual exposed cube faces). The fold is genuine: coarse
+  occupancy from the mean of fine columns, folded normal from summed face
+  areas — a worked example of this file's per-channel rules. Runs with
+  `~/.venvs/voice/bin/python` (any python with numpy+PIL).
 - TODO golden fold tests: hand-build a tiny scene (known slab/layer/plant
   mix), fold it, assert coverage and albedo sums analytically. Cheap, and
   would have caught the snow-layer bug before it reached the screen.
