@@ -34,7 +34,7 @@ def rolling(x, z):
             + 3.0 * np.sin(x * 0.09 + z * 0.07)
             + 0.012 * z)
 
-X0, Z0 = -620.0, -60.0
+X0, Z0 = -624.0, -64.0   # multiples of BC: geometry walls must align with the face-classification grid
 NX, NZ = 1240, 1520                      # fine grid, 1 unit
 fx = X0 + np.arange(NX) + 0.5
 fz = Z0 + np.arange(NZ) + 0.5
