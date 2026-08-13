@@ -1,5 +1,7 @@
 # Tricks worth revisiting (parked, not planned)
 
+*Folding now has its own rulebook + instruments: see [FOLDING.md](FOLDING.md).*
+
 *Captured 2026-08-13 from a design conversation (Evan Wallace's webgl demos,
 graphics-API comparison, memory-layout audit of claude_accum). Standing design
 docs live in the vault — `projects/luanti-renderer-design.md` is canonical;
