@@ -100,3 +100,11 @@ at each step. Known magnitudes: coarse leap alone 59→35 ms; ungated
 micro-march once cost 6×. Photo accuracy should come from temporal
 accumulation while stationary (converges to the same image), not from paying
 full cost every frame.
+
+**Folded far normals — taste dial, decide LATER:** averaging fine normals
+into coarse cells makes far terrain shade as slopes instead of facets.
+Half taste (faceted may be MORE on-brand — §6h at landscape scale; Teardown
+stays blocky at all distances), half correctness (fixes shading pops at rung
+hand-offs, if they occur). Not evaluable until far irradiance cache + color
+rung exist; then ship as `claude_far_normals` dial, judge on Everest scene
+at golden hour.
