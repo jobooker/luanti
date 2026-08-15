@@ -158,9 +158,12 @@ function OPS.cozy(p)
     local cobble = R("mcl_core:cobble", "default:cobble")
     local stair = R("mcl_stairs:stair_oak", "mcl_stairs:stair_wood_oak",
             "stairs:stair_wood") or planks
-    local furnace = R("mcl_furnaces:furnace_active", "mcl_furnaces:furnace",
-            "default:furnace")
-    local campfire = R("mcl_campfires:campfire_lit")
+    -- INERT variants on purpose (2026-08-15): the active furnace and lit
+    -- campfire churn node metadata every 30-60s, and every churn resets
+    -- the render accumulator — the cozy room could never converge
+    -- (measured.md, convergence hazards). Lab rooms hold still.
+    local furnace = R("mcl_furnaces:furnace", "default:furnace")
+    local campfire = R("mcl_campfires:campfire")
     local lantern = R("mcl_lanterns:lantern_floor", "default:meselamp")
     local torch_w = R("mcl_torches:torch_wall", "default:torch_wall")
     local chest = R("mcl_chests:chest_small", "mcl_chests:chest",
@@ -211,6 +214,14 @@ function OPS.cozy(p)
         end
     end
     for x = 0, W - 1 do set(x, 9, 4, planks) end
+
+    -- 3x3 emissive panel at the vault opening (John, 2026-08-15): the
+    -- room's one real light under the one-emission-law renderer — same
+    -- 9-block flux as the Cornell panel. Floats at local y=5 over the
+    -- room's centre; z 3..5 is open vault at that level.
+    for px = 4, 6 do for pz = 3, 5 do
+        set(px, 5, pz, "claude_bridge:white_lit")
+    end end
 
     -- hearth zone (west): stone pad, campfire, lit furnace facing east
     for x = 1, 3 do for z = 3, 5 do set(x, 0, z, cobble) end end
