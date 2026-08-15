@@ -9,16 +9,23 @@ Subcommands:
   stats                      read the client's rolling frame stats
   shot NAME [--settle S]     capture one screenshot, print its path
   set K=V [K=V ...]          write doorway settings (live, ~1 s)
+  freeze                     time_speed 0 + prove the accumulator deepens
   vantage NAME               teleport + aim at a saved vantage
   tour [--set NAME]          visit saved vantages, capture each
   compare A B                RMS difference between two screenshots
+
+Every `shot` also writes <shot>.capture.json beside the PNG: build sha,
+branch, the conf's claude_* dials, the live settings-patch lines from
+debug.txt, the frame stats, and time_speed. Evidence expires per build
+AND per config — a golden without its config record is not evidence
+(2026-08-14: a whole session judged frames with no config record at all).
 
 Vantages live in util/claude_vantages.json (same shape as the beelink
 vantages.json, plus optional "time" applied before the shot).
 Env: CLAUDE_MT_DIR (user dir; defaults to the repo root — RUN_IN_PLACE),
      CLAUDE_WORLD (world dir; defaults to <repo>/worlds/gallery).
 """
-import argparse, json, os, sys, time, glob
+import argparse, json, os, subprocess, sys, time, glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -27,6 +34,8 @@ WORLD = os.environ.get("CLAUDE_WORLD") or os.path.join(REPO, "worlds", "gallery"
 PATCH = os.path.join(MT, "claude_settings_patch.conf")
 SHOTS = os.path.join(MT, "screenshots")
 STATS = os.path.join(MT, "claude_stats.json")
+CONF = os.path.join(MT, "minetest.conf")
+DEBUG = os.path.join(MT, "debug.txt")
 VANTAGES = os.path.join(HERE, "claude_vantages.json")
 
 
@@ -64,7 +73,7 @@ def newest_shot():
     return max(files, key=os.path.getmtime) if files else None
 
 
-def shot(token=None, settle=2.5):
+def shot(token=None, settle=2.5, record=True):
     before = newest_shot()
     time.sleep(settle)
     doorway(claude_screenshot=token or ("t%d" % int(time.time())))
@@ -72,9 +81,109 @@ def shot(token=None, settle=2.5):
         cur = newest_shot()
         if cur and cur != before:
             time.sleep(0.4)  # let the write finish
-            return cur
+            return (write_capture_record(cur) or cur) if record else cur
         time.sleep(0.5)
     raise RuntimeError("no screenshot appeared (client running? mode on?)")
+
+
+# ---------------------------------------------------------------- evidence
+
+def _git(*a):
+    try:
+        return subprocess.run(("git",) + a, cwd=REPO, capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except Exception:
+        return None
+
+
+def conf_dials(path=CONF):
+    """The claude_* lines of a conf file, as a dict."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("claude_") and "=" in line:
+                    k, _, v = line.partition("=")
+                    out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def patch_log(limit=60):
+    """Live dial overrides, from the client's own [claude_settings_patch]
+    log. That log is ground truth: doorway() truncates the patch file, so
+    the file shows only the LAST write while g_settings keeps them all."""
+    try:
+        with open(DEBUG, errors="replace") as f:
+            lines = [l.strip() for l in f if "[claude_settings_patch]" in l]
+        return lines[-limit:]
+    except Exception:
+        return []
+
+
+def read_stats():
+    try:
+        return json.load(open(STATS))
+    except Exception:
+        return None
+
+
+def get_time_speed():
+    """Ask the server for time_speed. A runtime /set shadows the conf, so
+    the conf value is not evidence — the server's is."""
+    try:
+        r = rpc("cmd", command="set", param="time_speed")
+        return (r or {}).get("msg")
+    except Exception:
+        return None
+
+
+def capture_record():
+    st = read_stats()
+    return {
+        "shot_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "sha": _git("rev-parse", "--short", "HEAD"),
+        "dirty": bool(_git("status", "--porcelain")),
+        "binary_mtime": (time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(os.path.getmtime(os.path.join(REPO, "bin", "luanti"))))
+            if os.path.exists(os.path.join(REPO, "bin", "luanti")) else None),
+        "conf_dials": conf_dials(),
+        "patch_log": patch_log(),
+        "stats": st,
+        "time_speed": get_time_speed(),
+        "frozen": _frozen_verdict(st),
+    }
+
+
+def _frozen_verdict(st):
+    """still_frames == 1 means the accumulator is being reset every frame
+    (a moving sun does it), so the frame is #1 repeated, not converged."""
+    if not st:
+        return "unknown (no stats)"
+    sf = st.get("still_frames")
+    al = st.get("accum_alpha")
+    if sf is None:
+        return "unknown"
+    if sf <= 2:
+        return "NOT CONVERGED (still_frames %s) — freeze time" % sf
+    if al is not None and al > 0.08:
+        return "converging (still_frames %s, alpha %s)" % (sf, al)
+    return "converged (still_frames %s, alpha %s)" % (sf, al)
+
+
+def write_capture_record(png):
+    """Write <shot>.capture.json beside a PNG. Never fails a capture."""
+    try:
+        rec = capture_record()
+        with open(os.path.splitext(png)[0] + ".capture.json", "w") as f:
+            json.dump(rec, f, indent=2)
+    except Exception as e:
+        print("WARNING: capture record failed: %s" % e, file=sys.stderr)
+    return png
 
 
 def rms_diff(a, b, crop_hud=True):
@@ -127,7 +236,43 @@ def cmd_stats(args):
 
 
 def cmd_shot(args):
-    print(shot(args.name, settle=args.settle))
+    p = shot(args.name, settle=args.settle)
+    print(p)
+    rec = os.path.splitext(p)[0] + ".capture.json"
+    if os.path.exists(rec):
+        r = json.load(open(rec))
+        print("  %s@%s  time_speed=%s  %s"
+              % (r.get("branch"), r.get("sha"), r.get("time_speed"),
+                 r.get("frozen")))
+
+
+def cmd_freeze(args):
+    """LAB RULE #1: freeze time before judging anything. A sun that moves
+    zeroes still_frames every frame, so the accumulator never deepens and
+    photo mode never engages — every capture is frame 1, repeated."""
+    rpc("cmd", command="set", param="time_speed 0")
+    print("set: %s" % get_time_speed())
+    doorway(claude_stats=1)
+    time.sleep(1.5)
+    a = read_stats()
+    if a is None:
+        print("NO STATS: is claude_stats enabled and the client running?")
+        sys.exit(2)
+    print("still_frames %s, accum_alpha %s -> waiting %.0fs"
+          % (a.get("still_frames"), a.get("accum_alpha"), args.wait))
+    time.sleep(args.wait)
+    doorway(claude_stats=1)
+    time.sleep(1.5)
+    b = read_stats() or {}
+    sa, sb = a.get("still_frames", 0), b.get("still_frames", 0)
+    print("still_frames %s -> %s, accum_alpha %s -> %s"
+          % (sa, sb, a.get("accum_alpha"), b.get("accum_alpha")))
+    if sb <= sa:
+        print("FAIL: the accumulator is NOT deepening. Something is still "
+              "invalidating it (sun? camera? scene churn?). Do not judge "
+              "any capture until this climbs.")
+        sys.exit(1)
+    print("OK: accumulator deepening.")
 
 
 def cmd_set(args):
@@ -175,6 +320,8 @@ def main():
     p.set_defaults(func=cmd_shot)
     p = sub.add_parser("set"); p.add_argument("kv", nargs="+")
     p.set_defaults(func=cmd_set)
+    p = sub.add_parser("freeze"); p.add_argument("--wait", type=float,
+        default=6.0); p.set_defaults(func=cmd_freeze)
     p = sub.add_parser("vantage"); p.add_argument("name")
     p.set_defaults(func=cmd_vantage)
     p = sub.add_parser("tour"); p.add_argument("--set")
