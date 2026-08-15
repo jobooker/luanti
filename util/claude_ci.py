@@ -89,11 +89,44 @@ CANONICAL_DIALS = {"claude_view": 0, "claude_bounces": 24}
 PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                "fullscreen": "false", "window_maximized": "false",
                "autosave_screensize": "false",
-               "fps_max": "200", "fps_max_unfocused": "200"}
+               "fps_max": "200", "fps_max_unfocused": "200",
+               # Without this key the console->client dial channel is
+               # SILENTLY DEAD: pollSettingsPatch reads claude_dial_file,
+               # an empty path means "off", and /dial then writes its
+               # file and reports success from the SERVER while the
+               # client never reads it (found 2026-08-15 during the NEE
+               # eyeball — the same shape as the /set trap: the
+               # confirmation renders on the client's screen and proves
+               # nothing). It was in claude_seat_conf.ref all along, but
+               # nothing installs that file.
+               "claude_dial_file": SEAT_WORLD + "/claude_dial.conf"}
+
+# The dial file is a HUMAN's channel and it persists in the world dir
+# across sessions, so a leftover /dial from yesterday would be applied
+# to a fresh seat on its first poll — and applied AFTER the patch file
+# in the same tick, i.e. it wins. Wiring the channel (above) without
+# clearing it would hand every CI run a stale shadow dial.
+DIAL_HEADER = ("# claude_dial.conf: console-set client dials (/dial),\n"
+               "# merged in by the client's claude_dial_file poll (~1 Hz)\n"
+               "# CLEARED at seat start by claude_ci.pin_conf.\n")
+
+
+def clear_dial_file():
+    """Empty the /dial channel so a human's leftover dial cannot shadow a
+    run's own dials. See DIAL_HEADER for why this is not optional."""
+    path = os.path.join(REPO, SEAT_WORLD, "claude_dial.conf")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(DIAL_HEADER)
+    except Exception as e:
+        print("WARNING: could not clear the dial file: %s" % e)
 
 
 def pin_conf():
-    """Force PINNED_CONF keys into minetest.conf (idempotent)."""
+    """Force PINNED_CONF keys into minetest.conf (idempotent), and clear
+    the /dial channel. Both are seat hygiene: a key missing here is a
+    channel silently off, and a dial left there is a setting silently on."""
+    clear_dial_file()
     path = os.path.join(REPO, "minetest.conf")
     lines = open(path).read().splitlines() if os.path.exists(path) else []
     keys = set(PINNED_CONF)
