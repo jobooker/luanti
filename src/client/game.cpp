@@ -2932,8 +2932,20 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 	// consumer (ghost view or water reflections) is enabled, keep a volume
 	// alive around the camera — bootstrap one if none exists (e.g. right
 	// after a restart), and re-snapshot when the camera strays >24 nodes
-	// from the current center. The ~15 ms walk lands at most once per
-	// second. claude_volume_follow = 0 restores the frozen-bubble behavior.
+	// from the current center. claude_volume_follow = 0 restores the
+	// frozen-bubble behavior.
+	//
+	// KNOWN DEFECT (measured 2026-08-15, spec/measured.md "The 3-second
+	// hitch"): the periodic "every 2 s" re-snap below costs ~295 ms on
+	// the lab scene (not the ~15 ms this comment once claimed) and the
+	// 1 Hz poll quantizes it to a hitch every 3 s. The fix has two
+	// halves and needs both: (1) event-driven — snap on received block
+	// change, not a timer (BLOCKDATA arrives ~once/30 s in a static
+	// scene vs this timer's 10); (2) incremental — re-walk only the
+	// changed blocks and upload only that dirty region, so one edit is
+	// a 16^3 walk, not a full-volume rebuild. Event-driven alone still
+	// hitches ~295 ms per edit; a longer timer fixes nothing. First
+	// step: attribute the 295 ms (CPU walk vs GL upload) — unmeasured.
 	{
 		auto setting_on = [](const char *name) {
 			return g_settings->exists(name)
