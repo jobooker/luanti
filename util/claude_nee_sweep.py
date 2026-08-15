@@ -42,14 +42,13 @@ WHY the sweep is shaped like this, not simpler:
     measures a sleep instead of a renderer (environment-laws, and the
     2026-08-15 handoff that finally scripted the pin).
 
-  - Accumulation is reset by TURNING, never by moving. game.cpp resets
-    still_frames on `moved > 0.05f || turned > 1e-4f` — a body that is
-    not at the vantage's exact rest position after a teleport can
-    physics-slide for up to ~a minute (the cozy-ci landmine recorded
-    in claude_vantages.json), resetting accumulation the whole time.
-    reset_accumulation() therefore yaws 90 degrees in place and comes
-    straight back — same position, so nothing slides — rather than
-    teleporting away and back.
+  - Accumulation is reset by PARKING in another room and returning to
+    the vantage's stored REST position. Turning in place looked safer
+    (no position change, so no physics slide) but MEASURED 2026-08-15 a
+    server-side yaw does not reset anything: rpc("tp", yaw=...) sets the
+    PLAYER's yaw and the client owns its own camera. A >20 node move
+    forces the hard reset, and landing on the rest position means the
+    body is already where it rests, so nothing slides.
 
   - measure_cost distrusts its own inputs. pass_ms is an EMA with
     alpha 0.1 (pipeline.cpp), so a mode flip needs ~40 frames before
@@ -238,41 +237,47 @@ def clock_for(target):
 
 # ---------------------------------------------------------------- accumulation
 
-def reset_accumulation(vantage):
-    """Reset still_frames to 0 WITHOUT moving the player's body.
+# Where the camera parks for a moment to force an accumulator reset.
+# It must be a position the player can STAND at — landing anywhere else
+# starts a physics slide that resets accumulation every frame for up to
+# a minute (the cozy-ci landmine in claude_vantages.json), which looks
+# exactly like a reset that will not take.
+PARK_ROOM = "cornell"
+PARK_ALT = "furnace-050"
 
-    game.cpp resets the accumulator on `moved > 0.05f || turned > 1e-4f`
-    (the same guard that protects a still camera from resetting on
-    sub-pixel jitter). A position teleport risks the cozy room's
-    physics-slide landmine: a body not landed at its exact rest position
-    slides for up to ~a minute, resetting accumulation the whole way
-    (recorded against cozy-ci in claude_vantages.json, CI run 4). So we
-    TURN instead of move — yaw kicks `turned` over the reset threshold
-    with zero position delta — then use lab.goto() to land back on the
-    vantage's exact recorded yaw/pitch.
 
-    Returns None on success, or a string describing the failure (never
-    raises — a bad reset is data, not a crash).
+def reset_accumulation(vantage, park):
+    """Reset still_frames to 0 by teleporting AWAY and back.
+
+    game.cpp resets the accumulator on `moved > 0.05f || turned > 1e-4f`,
+    computed from the CAMERA. Turning in place looked like the gentle
+    option — no position change, so no physics slide — but MEASURED
+    2026-08-15 it does not reset at all: rpc("tp", yaw=...) sets the
+    PLAYER's yaw server-side, and the client owns its own camera, so
+    still_frames climbed straight through it (0/44/0/55 parked, then
+    36/116/196/277 after the yaw kick — no drop). A position change of
+    >20 nodes forces the hard reset (accum_alpha = 1.0), and returning
+    to the vantage's stored REST position lands the body where it
+    already rests, so nothing slides. Verified in cozy-ci, the room the
+    slide was discovered in: 0 -> 61 -> 98 -> 136 -> 174, twice.
+
+    Returns None on success, or a string describing the failure.
     """
-    yaw = vantage["yaw"]
-    pitch = vantage["pitch"]
-    pos = dict(x=vantage["pos"][0], y=vantage["pos"][1], z=vantage["pos"][2])
     st0 = lab.read_stats() or {}
     before = st0.get("still_frames")
     try:
-        lab.rpc("tp", pos=pos, yaw=(yaw + RESET_TURN_DEG) % 360, pitch=pitch)
+        lab.goto(park)
         time.sleep(RESET_SETTLE)
         lab.goto(vantage)
     except Exception as e:
         return "reset rpc failed: %s" % e
 
-    # Proving the reset is harder than doing it: claude_stats.json is
-    # rewritten once per >=1 s window, so at a free-running clock the
-    # window where still_frames <= 3 lasts about 50 ms and is essentially
-    # unobservable — the pilot reported "reset failed" for resets that had
-    # plainly worked. So accept EITHER a small absolute value (the slow
-    # clock, where it is genuinely observable) or a large DROP from what
-    # was there before (any clock). A drop is what a reset IS.
+    # Proving it is harder than doing it. claude_stats.json is rewritten
+    # once per >=1 s window, so at a free-running clock the moment where
+    # still_frames <= 3 lasts ~20 ms and is unobservable — the first
+    # pilot called resets "failed" that had plainly worked. Accept a
+    # small absolute value (the graded clock's low end, where it IS
+    # observable) OR a value below what was there before (any clock).
     deadline = time.time() + RESET_POLL_TIMEOUT
     last = None
     while time.time() < deadline:
@@ -281,11 +286,11 @@ def reset_accumulation(vantage):
         if last is not None:
             if last <= RESET_STILL_FRAMES_MAX:
                 return None
-            if before is not None and last < before / 2.0:
+            if before is not None and last < before:
                 return None
         time.sleep(RESET_POLL_INTERVAL)
-    return ("still_frames never dropped after reset (was %s, last seen "
-            "%s) — accumulation may not have been reset" % (before, last))
+    return ("still_frames never dropped after reset (was %s, last seen %s)"
+            % (before, last))
 
 
 def request_shot(token):
@@ -337,7 +342,7 @@ def _await_complete(path):
 
 # ---------------------------------------------------------------- curves
 
-def capture_curve(room, vantage, mode, targets, golden_png, outdir,
+def capture_curve(room, vantage, park, mode, targets, golden_png, outdir,
                   clock=None):
     """One accumulation run, MANY checkpoints. Resets ONCE up front, then
     shoots as N climbs past each target in turn — re-resetting for every
@@ -356,7 +361,7 @@ def capture_curve(room, vantage, mode, targets, golden_png, outdir,
     # slow, so the frames that elapse while we work are few.
     ordered = sorted(targets)
     set_caps(clock if clock is not None else clock_for(ordered[0]))
-    err = reset_accumulation(vantage)
+    err = reset_accumulation(vantage, park)
     if err:
         return [{"room": room, "mode": mode, "target_n": None,
                  "error": "reset failed: %s" % err}]
@@ -515,7 +520,8 @@ def capture_golden(rooms, vantages, outdir):
         lab.goto(v)
         lab.doorway(claude_volume_snapshot="golden_%s_%d" % (room, time.time_ns()))
         lab.doorway(claude_volume_follow=0)
-        err = reset_accumulation(v)
+        err = reset_accumulation(v, vantages[PARK_ROOM if room != PARK_ROOM
+                                                 else PARK_ALT])
         if err:
             rec["error"] = err
             out["rooms"][room] = rec
@@ -553,7 +559,7 @@ def capture_golden(rooms, vantages, outdir):
 
 # ---------------------------------------------------------------- arms
 
-def arm(room, mode, vantage, golden_png, outdir):
+def arm(room, mode, vantage, park, golden_png, outdir):
     """One (room, mode): apply dials, prove the flip, measure cost on the
     free-running clock, then walk the whole ladder once on the graded
     clock and re-walk OVERLAP_N free-running as the instrument's own
@@ -580,13 +586,13 @@ def arm(room, mode, vantage, golden_png, outdir):
     os.makedirs(outdir_arm, exist_ok=True)
 
     result["curve"] = []
-    result["curve"] += capture_curve(room, vantage, mode, CHECKPOINTS,
+    result["curve"] += capture_curve(room, vantage, park, mode, CHECKPOINTS,
                                      golden_png, outdir_arm)
     # The instrument checks itself: re-walk the overlap checkpoint on the
     # free-running clock. Same N, same room, same mode — if the RMS does
     # not agree with the graded pass, the clock is changing the image and
     # every other point on this curve is suspect.
-    result["curve"] += capture_curve(room, vantage, mode, OVERLAP_N,
+    result["curve"] += capture_curve(room, vantage, park, mode, OVERLAP_N,
                                      golden_png, outdir_arm, clock=FAST_FPS)
     slow_clock(False)
     return result
@@ -897,7 +903,8 @@ def main(argv=None):
             for mode in order:
                 print("=== arm: room=%s mode=%s ===" % (room, mode))
                 try:
-                    result = arm(room, mode, vantage, golden_png, rundir)
+                    park = vs[PARK_ROOM if room != PARK_ROOM else PARK_ALT]
+                    result = arm(room, mode, vantage, park, golden_png, rundir)
                 except Exception as e:
                     result = {"room": room, "mode": mode, "error": str(e)}
                     print("%-14s mode=%s ARM FAILED: %s" % (room, mode, e))
