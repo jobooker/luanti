@@ -164,3 +164,54 @@ function OPS.probe(p)
     end
     return { y = false, name = "all air or unloaded" }
 end
+
+-- Room integrity scan (2026-08-15, after a referee room was found dug
+-- open). A referee room is only a referee while it is SEALED: one
+-- missing node at (47,11,8) leaked daylight into the Cornell box for an
+-- unknown period and invalidated a day of numbers before the strange
+-- values gave it away. OPS.probe answers about a COLUMN; this answers
+-- about a BOX, which is what a room is.
+--
+-- Returns every node name in the inclusive box, in a fixed x->y->z
+-- order, so the caller can diff it against the builder's own spec and
+-- name the exact offending positions; plus a cheap order-dependent
+-- hash of that sequence, which is the room's identity as one number
+-- (the formal room hash is roadmap 1b; this is its ancestor).
+-- "unloaded" is reported as such and is never silently air.
+function OPS.scan(p)
+    local a, b = p.p1, p.p2
+    local x0, x1 = math.min(a.x, b.x), math.max(a.x, b.x)
+    local y0, y1 = math.min(a.y, b.y), math.max(a.y, b.y)
+    local z0, z1 = math.min(a.z, b.z), math.max(a.z, b.z)
+    local n = (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1)
+    if n > 20000 then error("scan too large: " .. n) end
+    local names, counts, h = {}, {}, 2166136261
+    for x = x0, x1 do for y = y0, y1 do for z = z0, z1 do
+        local node = core.get_node_or_nil({ x = x, y = y, z = z })
+        local name = node and node.name or "unloaded"
+        names[#names + 1] = name
+        counts[name] = (counts[name] or 0) + 1
+        for i = 1, #name do
+            h = (h + name:byte(i)) * 16777619 % 4294967296
+        end
+    end end end
+    return { p1 = { x = x0, y = y0, z = z0 }, p2 = { x = x1, y = y1, z = z1 },
+             total = n, counts = counts, hash = string.format("%08x", h),
+             names = names }
+end
+
+-- Camera drift guard (2026-08-15). Turning the camera does NOT reset
+-- the accumulator, so one stray mouse-look inside a 60 s settle blends
+-- two views into one "converged" frame with a perfectly clean dial
+-- state and nothing anywhere says so. OPS.player_state reports yaw but
+-- not pitch; this reports BOTH plus position, so a capture can prove
+-- the camera it was taken from. Degrees, and pitch is +up to match
+-- OPS.tp / OPS.look and claude_vantages.json.
+function OPS.aim(p)
+    local pl = core.get_player_by_name(p.player or ADMIN)
+    if not pl then error("not online: " .. tostring(p.player or ADMIN)) end
+    local pos = pl:get_pos()
+    return { pos = pos,
+             yaw = math.deg(pl:get_look_horizontal()) % 360,
+             pitch = -math.deg(pl:get_look_vertical()) }
+end

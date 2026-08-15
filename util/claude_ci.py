@@ -57,6 +57,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import claude_lab as lab  # noqa: E402  (same dir; shares the file-RPC channel)
 import claude_cornell_check as cornell  # noqa: E402  (the region referee)
+import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
 
 # ---------------------------------------------------------------- constants
 # Nothing below this line is allowed to hide in the body of the script.
@@ -95,6 +96,11 @@ SEAT_PATTERNS = ["bin/luantiserver --world " + SEAT_WORLD,
 CANONICAL_DIALS = {
     "claude_view": 0,           # photo; 6 (clay) was left in the conf once
     "claude_bounces": 24,
+    # The traced pipeline master switch (0 = raster pass-through, 3 =
+    # traced). Pushed EXPLICITLY: it lived only in minetest.conf, and a
+    # conf that lost the line would have had CI silently photographing
+    # the raster renderer and calling it a golden.
+    "claude_volume_debug": 3,
     "claude_nee": 0,            # PHOTO MODE IS THE TRUTH (§6). The
                                 # estimator gets its own arm below.
     "claude_stats": 1,
@@ -117,7 +123,8 @@ CANONICAL_DIALS = {
 }
 # The dials proven per capture. The rest are pushed but not asserted;
 # these three are the ones that have silently invalidated measurements.
-PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces")
+PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
+                "claude_volume_debug")
 
 # Pinned capture resolution AND frame pacing. Luanti SAVES its window
 # size back into minetest.conf on exit, so one manual resize silently
@@ -222,15 +229,14 @@ CI_DOORS = [{"pos": {"x": 20, "y": 9, "z": 0}, "name": None},   # furnace-050
             {"pos": {"x": 47, "y": 9, "z": 0},
              "name": "claude_bridge:gray221"}]                  # cornell
 
-# Referee-room integrity: nodes that must be solid for a room to BE a
-# referee. One dug node at (47,11,8) leaked daylight into Cornell for an
-# unknown period and invalidated a day of numbers before anyone noticed
-# (measured.md "The hole in Cornell"). Checked through the bridge before
-# the vantage loop; a hole is RED, not a warning.
-ROOM_INTEGRITY = [
-    {"room": "cornell", "pos": {"x": 47, "y": 11, "z": 8},
-     "want": "claude_bridge:gray221", "note": "the 2026-08-15 sky hole"},
-]
+# Referee-room integrity. A room is a referee only while it is SEALED
+# and made of exactly the nodes its builder laid down: one dug node at
+# (47,11,8) leaked daylight into Cornell for an unknown period and
+# invalidated a day of numbers, and on 2026-08-15 the same room was
+# found missing four front-wall nodes AND one of its two shadow
+# occluders. Every run now walks all three referee rooms node by node
+# (claude_rooms_check, through OPS.scan) and asserts zero off-spec
+# nodes; the room hash goes in run.json. Off-spec is RED, not a warning.
 
 # Furnace referee measurement patch. None = the referee's own default, a
 # 200x200 block at (w//4 +/- 100, h//2 +/- 100) — resolution-independent.
@@ -408,18 +414,17 @@ def set_doors(shut):
 
 
 def check_room_integrity():
-    """One dug node turns a referee room into a lamp. Ask the world."""
+    """One dug node turns a referee room into a lamp. Ask the world, all
+    three rooms, every node — not one spot check."""
     out = []
-    for item in ROOM_INTEGRITY:
-        rec = dict(item)
+    for room in rooms.ROOMS:
         try:
-            got = lab.rpc("probe", x=item["pos"]["x"], z=item["pos"]["z"],
-                          ytop=item["pos"]["y"], ybot=item["pos"]["y"])
-            rec["got"] = (got or {}).get("name")
+            c = rooms.check(room)
         except Exception as e:
-            rec["got"] = "probe failed: %s" % e
-        rec["ok"] = rec["got"] == item["want"]
-        out.append(rec)
+            c = {"room": room["name"], "error": str(e), "off_spec": [None],
+                 "hash": None}
+        c.pop("counts", None)
+        out.append(c)
     return out
 
 
@@ -546,18 +551,112 @@ def dial_state(png, expect, marker):
     return out
 
 
+VOLUME_TIMEOUT = 25.0      # s to wait for a snapshot to become valid
+VOLUME_POLL = 1.0
+# How far the camera may sit from the vantage at the shutter. Turning
+# does NOT reset the accumulator (measured), so one stray mouse-look
+# inside a 60 s settle blends two views into a frame that looks
+# converged and carries a perfectly clean dial state — 2026-08-15, a
+# hand on the mouse mid-run. The aim is read again just before the
+# shutter and compared with the vantage; drift is RED.
+AIM_TOL_DEG = 1.0
+AIM_TOL_NODES = 0.05
+# The stored vantage y is where the teleport AIMS; the body then rests
+# on the floor surface half a node lower, which is not drift.
+AIM_REST_DROP = 0.6
+
+
+def read_aim():
+    try:
+        return lab.rpc("aim")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _dang(a, b):
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def aim_ok(start, now, vantage):
+    """(ok, detail). Two claims: the camera points where the VANTAGE
+    says, and it has not moved between the teleport and the shutter.
+    The second is the one that catches a hand on the mouse mid-settle,
+    which does not reset the accumulator and so leaves no other trace."""
+    if not start or start.get("error") or not now or now.get("error"):
+        return False, "aim rpc failed: %s" % ((start or {}).get("error")
+                                              or (now or {}).get("error"))
+    dyaw = _dang(now["yaw"], vantage["yaw"])
+    dpitch = abs(now["pitch"] - vantage["pitch"])
+    p, q = now["pos"], start["pos"]
+    dmove = max(abs(p[k] - q[k]) for k in "xyz")
+    dturn = max(_dang(now["yaw"], start["yaw"]),
+                abs(now["pitch"] - start["pitch"]))
+    dpos = max(abs(p["x"] - vantage["pos"][0]), abs(p["z"] - vantage["pos"][2]))
+    ok = (dyaw <= AIM_TOL_DEG and dpitch <= AIM_TOL_DEG
+          and dpos <= AIM_TOL_NODES and dmove <= AIM_TOL_NODES
+          and dturn <= AIM_TOL_DEG
+          and -AIM_REST_DROP <= p["y"] - vantage["pos"][1] <= AIM_TOL_NODES)
+    return ok, ("yaw %.2f/%.2f pitch %.2f/%.2f pos (%.2f,%.2f,%.2f) | "
+                "vs vantage: %.2f deg, %.2f deg, %.2f nodes | moved since "
+                "teleport: %.3f nodes, %.2f deg"
+                % (now["yaw"], vantage["yaw"], now["pitch"], vantage["pitch"],
+                   p["x"], p["y"], p["z"], dyaw, dpitch, dpos, dmove, dturn))
+
+
+def await_volume(marker, block, tries=3):
+    """Prove the tracer has something to trace BEFORE the settle starts.
+
+    claude_volume_follow = 0 freezes the bubble, which is what a
+    measurement wants — but it also means NOTHING bootstraps a volume:
+    an idle seat sits at volume_valid = 0 with the traced pipeline on,
+    marching an empty bubble, and the frame looks like the tracer is
+    off (John, from the screen, 2026-08-15 — and he was right). Each
+    capture therefore triggers its own snapshot after the teleport, and
+    this waits for the client to say it took. A snapshot fired before
+    the map arrived at the new vantage snaps an EMPTY bubble, so
+    area_total is checked too, not just validity.
+    """
+    for attempt in range(tries):
+        deadline = time.time() + VOLUME_TIMEOUT
+        while time.time() < deadline:
+            st = lab.read_stats() or {}
+            if st.get("volume_valid") == 1 and (st.get("area_total") or 0) > 0:
+                return {"ok": True, "attempts": attempt + 1,
+                        "volume_valid": st.get("volume_valid"),
+                        "area_emitters": st.get("area_emitters"),
+                        "area_total": st.get("area_total"),
+                        "emitters": st.get("emitters")}
+            time.sleep(VOLUME_POLL)
+        if attempt + 1 < tries:      # re-trigger with a fresh token
+            push_dials(block, "%s_retry%d" % (marker, attempt))
+    st = lab.read_stats() or {}
+    return {"ok": False, "attempts": tries,
+            "volume_valid": st.get("volume_valid"),
+            "area_emitters": st.get("area_emitters"),
+            "area_total": st.get("area_total"),
+            "error": "no volume after %d snapshot requests: volume_valid=%s "
+                     "area_total=%s — the tracer would be marching an empty "
+                     "bubble" % (tries, st.get("volume_valid"),
+                                 st.get("area_total"))}
+
+
 def capture(shot, vantage, park, dials, rundir, settle):
     """park -> vantage (proven reset) -> snapshot -> dials -> settle ->
     shutter -> N read BEFORE the PNG write -> file it under the arm name."""
     name = shot["name"]
     info = {}
     info["reset_error"] = reset_accumulation(vantage, park)
+    info["aim_at_start"] = read_aim()
     # with claude_volume_follow = 0 the bubble never re-centres on its
     # own, so take one snapshot here — before the settle, since it
     # clamps still_frames — and re-assert the dials after it.
     marker = "%s_%d" % (name, time.time_ns())
     block = dict(dials, claude_volume_snapshot=marker)
     info["dials_pushed"] = push_dials(block, marker)
+    # the settle clock starts only once the volume is proven present:
+    # a snapshot also clamps still_frames, so waiting here costs nothing
+    # and a capture over an empty bubble costs everything.
+    info["volume"] = await_volume(marker, block)
     time.sleep(settle)
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
@@ -565,9 +664,15 @@ def capture(shot, vantage, park, dials, rundir, settle):
     # frames late. This one is up to 1 s stale in the other direction —
     # the stats file is rewritten once per second — so it UNDER-reports,
     # which is the safe side for a convergence floor.
+    ok, detail = aim_ok(info.get("aim_at_start"), read_aim(), vantage)
+    info["aim_at_shutter"] = {"ok": ok, "detail": detail}
     before = lab.newest_shot()
     st = lab.read_stats() or {}
     info["still_frames_at_shutter"] = st.get("still_frames")
+    info["stats_at_shutter"] = {k: st.get(k) for k in
+                                ("volume_valid", "area_emitters", "area_total",
+                                 "emitters", "frame_ms_avg", "busy_ms",
+                                 "pass_ms", "accum_alpha")}
     with open(lab.PATCH, "w") as f:
         f.write("claude_screenshot = %s\n" % marker)
     png = None
@@ -1017,10 +1122,14 @@ def cmd_run(args):
     run["doors_shut"] = set_doors(True)
     run["room_integrity"] = check_room_integrity()
     for item in run["room_integrity"]:
-        A.add("room-%s-sealed" % item["room"], item["ok"],
-              "%s at (%d,%d,%d) is %s (%s)"
-              % (item["want"], item["pos"]["x"], item["pos"]["y"],
-                 item["pos"]["z"], item["got"], item["note"]))
+        bad = item.get("off_spec") or []
+        A.add("room-%s-onspec" % item["room"], not bad,
+              item.get("error") or "hash %s, %d off-spec node(s)%s"
+              % (item.get("hash"), len(bad),
+                 "" if not bad else ": " + ", ".join(
+                     "(%d,%d,%d) want %s got %s"
+                     % (b["pos"][0], b["pos"][1], b["pos"][2], b["want"],
+                        b["got"]) for b in bad[:6])))
     gold_png = golden_png()
     try:
         prev, gold = previous_run(run_id), read_golden()
@@ -1056,6 +1165,15 @@ def cmd_run(args):
             A.add("%s-dials" % name, ds.get("ok"),
                   ds.get("error") or "view=%s nee=%s bounces=%s"
                   % tuple(ds.get("seen", {}).get(k) for k in PROVEN_DIALS))
+            aim = cap.get("aim_at_shutter") or {}
+            A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
+            vol = cap.get("volume") or {}
+            A.add("%s-volume" % name, vol.get("ok"),
+                  vol.get("error") or "volume_valid=%s area_emitters=%s/%s "
+                  "(snapshot attempt %s)"
+                  % (vol.get("volume_valid"), vol.get("area_emitters"),
+                     vol.get("area_total"), vol.get("attempts")))
+            st = (cap.get("stats_at_shutter") or {})
             sf = cap.get("still_frames_at_shutter")
             A.add("%s-converged" % name, (sf or 0) >= CONVERGED_MIN,
                   "still_frames at shutter %s (min %d)" % (sf, CONVERGED_MIN))
