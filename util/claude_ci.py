@@ -452,9 +452,14 @@ def cmd_run(args):
     os.makedirs(rundir, exist_ok=True)
     print("run dir: %s" % rundir)
 
+    # per-run dial state: canonical photo dials plus the estimator switch
+    # (claude_nee). §8 clause 5: the dial state is recorded with the run,
+    # because "nee=1 agrees with the nee=0 golden" is only evidence if
+    # both runs say which they were.
+    dials = dict(CANONICAL_DIALS, claude_nee=args.nee)
     run = dict(git, run_id=run_id, settle=args.settle,
                started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               dials=CANONICAL_DIALS, shots={})
+               dials=dials, shots={})
 
     if args.skip_build:
         run["build"] = {"ran": False}
@@ -483,8 +488,8 @@ def cmd_run(args):
     if not run["freeze"].get("deepening"):
         print("!! FREEZE FAILED: the accumulator is not deepening. Every shot "
               "below is suspect — read its convergence line.")
-    lab.doorway(**CANONICAL_DIALS)
-    print("dials: %s" % CANONICAL_DIALS)
+    lab.doorway(**dials)
+    print("dials: %s" % dials)
 
     vs = lab.load_vantages()
     run["doors_shut"] = set_doors(True)
@@ -566,6 +571,9 @@ def main():
                    help="seconds of stillness before each shot (default %(default)s)")
     p.add_argument("--skip-build", action="store_true",
                    help="capture with the binaries already in ./bin")
+    p.add_argument("--nee", type=int, default=1, choices=(0, 1),
+                   help="claude_nee for this run: 1 = NEE+MIS estimator "
+                        "(default), 0 = pure photo path (golden mode)")
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("golden", help="pin/show the run all diffs measure against")
     p.add_argument("run_dir", nargs="?", help="a run dir name under screenshots/ci/")
