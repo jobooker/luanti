@@ -55,3 +55,13 @@ claude_cost = 0
 claude_bounce2 = 0
 claude_bounce_stride = 1
 claude_nee_gate = 0
+
+# --- lab resolution, PINNED (2026-08-15) ---------------------------------
+# Luanti saves the window size back to the conf on exit; one manual
+# resize breaks pixel comparison against every golden. claude_ci.py
+# forces these before each run; keep them here so manual seats match.
+screen_w = 1920
+screen_h = 1080
+fullscreen = false
+window_maximized = false
+autosave_screensize = false

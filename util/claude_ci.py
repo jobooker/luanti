@@ -70,6 +70,27 @@ SEAT_PATTERNS = ["bin/luantiserver --world " + SEAT_WORLD,
 # Canonical photo state. Every capture is taken with exactly these dials.
 CANONICAL_DIALS = {"claude_view": 0, "claude_bounces": 24}
 
+# Pinned capture resolution. Luanti SAVES its window size back into
+# minetest.conf on exit, so one manual resize silently changes every
+# future capture and breaks pixel comparison against the golden
+# (discovered run #3: 2880x1576 vs the golden's 1920x1080). These keys
+# are forced into minetest.conf before every seat start;
+# autosave_screensize=false stops the exit-save from undoing it.
+PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
+               "fullscreen": "false", "window_maximized": "false",
+               "autosave_screensize": "false"}
+
+
+def pin_conf():
+    """Force PINNED_CONF keys into minetest.conf (idempotent)."""
+    path = os.path.join(REPO, "minetest.conf")
+    lines = open(path).read().splitlines() if os.path.exists(path) else []
+    keys = set(PINNED_CONF)
+    kept = [l for l in lines
+            if l.split("=")[0].strip() not in keys]
+    kept += ["%s = %s" % (k, v) for k, v in sorted(PINNED_CONF.items())]
+    open(path, "w").write("\n".join(kept) + "\n")
+
 CI_DIR = os.path.join(REPO, "screenshots", "ci")
 # The pinned golden: one line, a run dir name. Comparing only to the
 # previous run lets quality drift by inches, one invisible step per commit.
@@ -475,6 +496,8 @@ def cmd_run(args):
 
     print("seat: stopping any running luanti...")
     run["seat_clean_stop"] = stop_seat()
+    pin_conf()
+    run["pinned_conf"] = PINNED_CONF
     print("seat: starting server + client on port %d" % SEAT_PORT)
     start_seat(rundir)
     if not wait_for_client():
