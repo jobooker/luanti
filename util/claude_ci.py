@@ -497,6 +497,36 @@ def reset_accumulation(vantage, park):
             % (before, last))
 
 
+# The traced present path stamps a 12x12 pure-green square in the
+# BOTTOM-LEFT of every frame it draws (client/shaders/claude_present,
+# `gl_FragCoord.x < 12 && gl_FragCoord.y < 12`). The raster
+# pass-through cannot draw it. It is therefore the one proof of "the
+# tracer produced these pixels" that lives IN the pixels rather than in
+# a stats file — and it answers, per capture and after the fact, the
+# question a human asks from the screen ("is ray tracing off?").
+TRACE_MARKER_PX = 12
+
+
+def trace_marker(png):
+    """(ok, detail) — did the traced present path draw this frame?"""
+    try:
+        from PIL import Image
+        import numpy as np
+        im = np.asarray(Image.open(png).convert("RGB"))
+        h = im.shape[0]
+        q = im[h - TRACE_MARKER_PX:h, 0:TRACE_MARKER_PX].reshape(-1, 3)
+        mean = q.mean(axis=0)
+        ok = bool((q[:, 0] < 8).all() and (q[:, 1] > 247).all()
+                  and (q[:, 2] < 8).all())
+        return ok, ("bottom-left %dpx marker mean RGB %s%s"
+                    % (TRACE_MARKER_PX, mean.round(1),
+                       "" if ok else " — NOT the traced present path: this "
+                       "frame is the raster pass-through, or the volume was "
+                       "empty"))
+    except Exception as e:
+        return False, "marker check failed: %s" % e
+
+
 def await_complete(path):
     """Return path once the PNG is fully written and decodable, else None.
 
@@ -1191,6 +1221,8 @@ def cmd_run(args):
                       "%s=%s" % (k.replace("claude_", ""),
                                  ds.get("seen", {}).get(k))
                       for k in PROVEN_DIALS))
+            ok, detail = trace_marker(png)
+            A.add("%s-traced" % name, ok, detail)
             aim = cap.get("aim_at_shutter") or {}
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
             vol = cap.get("volume") or {}
