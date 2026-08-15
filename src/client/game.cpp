@@ -117,6 +117,29 @@ struct ClaudeVolume
 	float emitter_rad[8] = {};
 	int emitter_count = 0;      // static (snapshot) emitters
 	int emitter_runtime = 0;    // static + held light this frame
+	// AREA EMITTERS (rung 2, next-event estimation). A SECOND list, and
+	// deliberately not a reuse of emitters[] above, which cannot serve:
+	// that one holds POINT lights (torch flames, model glow centroids)
+	// with a scalar intensity, and it explicitly EXCLUDES the emissive
+	// cells (ADR-0009 #4) that are the only thing claude_trace's
+	// cellEmission() answers for. §4 forbids the reuse anyway — "a light
+	// is not a point", and a point has no area to sample.
+	//
+	// One entry per emissive CELL, class 170..240:
+	//   xyz = integer volume-cell coords (the DDA's own cell space)
+	//   w   = air-exposed face mask; bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z,
+	//         5 -Z. A face whose neighbour is non-air is dropped: in
+	//         rung 1 every non-air class is opaque, so that is a face no
+	//         ray can reach, and dropping it keeps the light-sampling pdf
+	//         identical on both sides of the MIS weight.
+	// NO RADIANCE IS STORED HERE, on purpose. THE LAW is one Le (§4): the
+	// shader re-reads the cell out of claudeVolume and runs the same
+	// cellAlbedo()/cellEmission() the eye ray runs. A CPU-side copy of Le
+	// would be exactly the second emission formula the contract forbids.
+	static constexpr int AREA_CAP = 16;
+	float area[AREA_CAP][4] = {};
+	int area_count = 0;         // live slots, <= AREA_CAP
+	int area_total = 0;         // emissive cells the snapshot actually found
 	// Held (wielded) light lives in its OWN slot, never in emitters[]:
 	// writing it into emitters[7] STOMPED the 8th-nearest real torch in
 	// place, and the content-hash snapshot gate preserved the corruption
@@ -342,6 +365,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// switch — no extra view modes needed for it.
 	float m_bounces = 24.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounces_pixel{"claudeBounces"};
+	// claude_trace transport mode: 0 = the pure photo path (§6 truth
+	// mode — no next-event estimation at all, byte-identical to rung 1),
+	// 1 = next-event estimation with MIS. THE A/B SWITCH: the two must
+	// agree in expectation at a parked camera, and a disagreement is a
+	// bug in the estimator, never a reason to retune the truth (§6).
+	float m_nee = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_nee_pixel{"claudeNee"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
@@ -373,6 +403,19 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		{"claudeEmitter6"}, {"claudeEmitter7"}};
 	CachedPixelShaderSetting<float> m_emitter_count_pixel{"claudeEmitterCount"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
+	// AREA emitters for NEE — ONE UNIFORM PER SLOT, exactly the shape
+	// claudeEmitter0..7 has always had. Not a `uniform vec4 a[16]`: GL
+	// reports an array uniform's name as "a[0]" on some drivers and "a"
+	// on others, and COpenGLSLMaterialRenderer::getPixelShaderConstantID
+	// does a literal string compare against whatever glGetActiveUniform
+	// handed back — so an array would resolve on one driver and silently
+	// no-op on the next. Sixteen scalars resolve everywhere.
+	CachedPixelShaderSetting<float, 4, false> m_area_pixel[ClaudeVolume::AREA_CAP] = {
+		{"claudeArea0"}, {"claudeArea1"}, {"claudeArea2"}, {"claudeArea3"},
+		{"claudeArea4"}, {"claudeArea5"}, {"claudeArea6"}, {"claudeArea7"},
+		{"claudeArea8"}, {"claudeArea9"}, {"claudeArea10"}, {"claudeArea11"},
+		{"claudeArea12"}, {"claudeArea13"}, {"claudeArea14"}, {"claudeArea15"}};
+	CachedPixelShaderSetting<float> m_area_count_pixel{"claudeAreaCount"};
 	float m_volume_debug;
 	float m_water_reflections;
 	float m_gi_strength;
@@ -388,7 +431,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 43> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 44> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -432,6 +475,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_denoise",
 		"claude_view",
 		"claude_bounces",
+		"claude_nee",
 	};
 
 	static float readGoldenHourStrength()
@@ -775,6 +819,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_bounces", 0.0f, 24.0f);
 	}
 
+	// claude_trace transport mode, 0/1. 1 (default) = next-event
+	// estimation + MIS. 0 = the pure photo path of rung 1, unchanged
+	// down to the RNG draw order — the truth mode a referee is run
+	// against, and the other half of the A/B (§6).
+	static float readNee()
+	{
+		if (!g_settings->exists("claude_nee"))
+			return 1.0f;
+		return g_settings->getFloat("claude_nee", 0.0f, 1.0f);
+	}
+
 
 	static float readClay()
 	{
@@ -873,6 +928,8 @@ public:
 			m_view = readView();
 		if (name == "claude_bounces")
 			m_bounces = readBounces();
+		if (name == "claude_nee")
+			m_nee = readNee();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -932,6 +989,7 @@ public:
 		m_denoise = readDenoise();
 		m_view = readView();
 		m_bounces = readBounces();
+		m_nee = readNee();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -1043,6 +1101,17 @@ public:
 			float ecount = (float)g_claude_volume.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
 			m_held_emitter_pixel.set(g_claude_volume.held_emitter, services);
+			// AREA emitters (claude_trace NEE). Sent whether or not the
+			// volume is valid: an invalid volume leaves area_count at 0,
+			// and a count of 0 is exactly "no light sampling", which the
+			// estimator handles by handing every BSDF-found emitter the
+			// full balance weight — i.e. it degrades to the photo path
+			// rather than to a wrong image.
+			for (int e = 0; e < ClaudeVolume::AREA_CAP; e++)
+				m_area_pixel[e].set(g_claude_volume.area[e], services);
+			float acount = g_claude_volume.valid
+					? (float)g_claude_volume.area_count : 0.0f;
+			m_area_count_pixel.set(&acount, services);
 			// Radiance cache controls: delivered UNCONDITIONALLY (like the
 			// samplers below) because the claude_radiance update pass runs
 			// every frame regardless of mode and must be able to early-out
@@ -1171,13 +1240,14 @@ public:
 				m_subvox_pixel.set(&m_subvox, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
-				// claude_trace's two dials. Delivered here, next to the
+				// claude_trace's three dials. Delivered here, next to the
 				// samplers, because claude_present consumes claudeView
 				// too and both programs run every frame regardless of
 				// mode — a value only set when a consumer is on would
 				// leave one of them reading stale state after a toggle.
 				m_view_pixel.set(&m_view, services);
 				m_bounces_pixel.set(&m_bounces, services);
+				m_nee_pixel.set(&m_nee, services);
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
@@ -2378,6 +2448,93 @@ static void claudeVolumeSnapshot(Client *client)
 				e < g_claude_volume.emitter_count ? emitters[e][4] : 0.0f;
 	}
 
+	// ---- AREA EMITTERS: the list claude_trace's NEE samples -------------
+	// A second pass over the finished occupancy, not a push during the
+	// fill loop, for two reasons: the face mask needs neighbours the fill
+	// loop has not written yet, and the class byte is not final until the
+	// authored-model branch has had its say (an emissive full cube that
+	// gets a model becomes class 250, which cellEmission() does NOT
+	// answer for — it must not appear here, or the light sampler would
+	// aim at a cell with no Le and the MIS weights would disagree with
+	// the transport).
+	//
+	// The band is exactly the shader's: CLASS_EMIT_LO/HI bracket 170..240
+	// at the half-byte midpoints, so 170..240 inclusive here is the same
+	// set of cells, with no 8-bit round-trip on either side.
+	{
+		std::vector<std::array<float, 4>> areas;
+		auto is_air = [&](s16 ax, s16 ay, s16 az) {
+			// Out of the volume counts as NOT air: the outward faces of a
+			// boundary cell can only be seen from outside the 128^3, and
+			// no ray ever starts there. Calling them exposed would put
+			// area in the pdf that no BSDF sample can ever reach.
+			if (ax < 0 || ay < 0 || az < 0 || ax >= S || ay >= S || az >= S)
+				return false;
+			size_t j = (((size_t)az * S + ay) * S + ax) * 4 + 3;
+			return occ[j] == 0;
+		};
+		for (s16 z = 0; z < S; z++)
+		for (s16 y = 0; y < S; y++)
+		for (s16 x = 0; x < S; x++) {
+			u8 cls = occ[((((size_t)z * S + y) * S + x)) * 4 + 3];
+			if (cls < 170 || cls > 240)
+				continue;
+			int mask = 0;
+			if (is_air(x + 1, y, z)) mask |= 1;
+			if (is_air(x - 1, y, z)) mask |= 2;
+			if (is_air(x, y + 1, z)) mask |= 4;
+			if (is_air(x, y - 1, z)) mask |= 8;
+			if (is_air(x, y, z + 1)) mask |= 16;
+			if (is_air(x, y, z - 1)) mask |= 32;
+			// Sealed inside solid: every face is unreachable, so it can
+			// contribute nothing and would only inflate the 1/N selection
+			// probability of the emitters that CAN be reached.
+			if (mask == 0)
+				continue;
+			areas.push_back({(float)x, (float)y, (float)z, (float)mask});
+		}
+		// nearest to the camera (= volume centre) first, the same key the
+		// point-emitter list uses
+		std::sort(areas.begin(), areas.end(),
+				[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
+					auto d2 = [](const std::array<float, 4> &e) {
+						float dx = e[0] - 64.f, dy = e[1] - 64.f, dz = e[2] - 64.f;
+						return dx * dx + dy * dy + dz * dz;
+					};
+					return d2(a) < d2(b);
+				});
+		g_claude_volume.area_total = (int)areas.size();
+		g_claude_volume.area_count =
+				(int)std::min<size_t>(areas.size(), ClaudeVolume::AREA_CAP);
+		for (int e = 0; e < ClaudeVolume::AREA_CAP; e++)
+			for (int k = 0; k < 4; k++)
+				g_claude_volume.area[e][k] =
+						e < g_claude_volume.area_count ? areas[e][k] : 0.0f;
+		// NO SILENT TRUNCATION. Overflow is not a correctness failure —
+		// the shader's light-sampling pdf is zero for an unlisted cell, so
+		// the balance heuristic hands those emitters' full radiance to the
+		// BSDF sample and the image still converges to photo mode — but it
+		// IS a variance failure, and it must be visible in the log when a
+		// room looks noisier than it should.
+		if (g_claude_volume.area_total > g_claude_volume.area_count) {
+			const auto &first_drop = areas[g_claude_volume.area_count];
+			warningstream << "[claude_volume] area emitters "
+					<< g_claude_volume.area_total << " > cap "
+					<< ClaudeVolume::AREA_CAP << ": dropping "
+					<< (g_claude_volume.area_total - g_claude_volume.area_count)
+					<< " from next-event sampling, farthest first; nearest"
+					   " dropped cell is (" << (int)first_drop[0] << ","
+					<< (int)first_drop[1] << "," << (int)first_drop[2]
+					<< ") at " << std::sqrt(
+							(first_drop[0] - 64.f) * (first_drop[0] - 64.f)
+							+ (first_drop[1] - 64.f) * (first_drop[1] - 64.f)
+							+ (first_drop[2] - 64.f) * (first_drop[2] - 64.f))
+					<< " cells. Dropped emitters still light the scene"
+					   " through BSDF sampling (MIS weight 1), so the image"
+					   " stays correct and gets noisier." << std::endl;
+		}
+	}
+
 	g_claude_volume.origin = origin;
 	g_claude_volume.valid = true;
 	g_claude_volume.last_snap_ms = porting::getTimeMs();
@@ -2387,8 +2544,10 @@ static void claudeVolumeSnapshot(Client *client)
 		g_claude_volume.still_frames = 10.0f;
 	actionstream << "[claude_volume] snapshot origin=(" << origin.X << ","
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
-			<< (S * S * S) << " in " << (porting::getTimeMs() - t0)
-			<< " ms" << std::endl;
+			<< (S * S * S) << " area_emitters="
+			<< g_claude_volume.area_count << "/"
+			<< g_claude_volume.area_total << " in "
+			<< (porting::getTimeMs() - t0) << " ms" << std::endl;
 }
 
 // Once per frame: decide how strongly this frame's traced sample should
@@ -2544,6 +2703,10 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"frames\": " << frames
 			<< ", \"volume_valid\": " << (g_claude_volume.valid ? 1 : 0)
 			<< ", \"emitters\": " << g_claude_volume.emitter_count
+			// the two numbers that explain a noisy room: how many area
+			// emitters NEE can aim at, and how many exist
+			<< ", \"area_emitters\": " << g_claude_volume.area_count
+			<< ", \"area_total\": " << g_claude_volume.area_total
 			<< ", \"accum_alpha\": " << g_claude_volume.accum_alpha
 			<< ", \"light_body\": " << g_claude_volume.light_body
 			<< ", \"light_y\": " << g_claude_volume.prev_light_dir.Y

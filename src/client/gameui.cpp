@@ -159,7 +159,13 @@ void GameUI::update(const RunStats &stats, Client *client, MapDrawControl *draw_
 				<< " | alpha " << accum_alpha
 				<< std::setprecision(0)
 				<< " | view " << g_settings->getFloat("claude_view", 0.0f, 5.0f)
-				<< " | bounces " << g_settings->getFloat("claude_bounces", 0.0f, 24.0f);
+				<< " | bounces " << g_settings->getFloat("claude_bounces", 0.0f, 24.0f)
+				// transport mode: 0 = the pure photo path (§6 truth),
+				// 1 = next-event estimation + MIS. An absent key reads as
+				// the shipped default, 1 — the same fallback readNee() uses,
+				// so the line never claims a mode the shader is not in.
+				<< " | nee " << (g_settings->exists("claude_nee")
+						? g_settings->getFloat("claude_nee", 0.0f, 1.0f) : 1.0f);
 		}
 
 		m_guitext2->setRelativePosition(core::rect<s32>(5, 5 + minimal_debug_height,
