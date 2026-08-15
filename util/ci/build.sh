@@ -8,4 +8,4 @@ cmake -B build \
 	-DBUILD_SERVER=${CMAKE_BUILD_SERVER:-TRUE} \
 	${CMAKE_FLAGS}
 
-cmake --build build --parallel $(($(nproc) + 1))
+cmake --build build --parallel $(( $(nproc 2>/dev/null || sysctl -n hw.logicalcpu) + 1 ))
