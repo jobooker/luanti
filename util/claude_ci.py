@@ -323,6 +323,47 @@ PLANTED_DEFECTS = [
 
 # ---------------------------------------------------------------- helpers
 
+# One run owns the seat. claude_lab's bridge lock is per RPC, so two
+# claude_ci processes do NOT collide on a call — they politely take
+# turns teleporting the player out of each other's settle, kill each
+# other's client with stop_seat, and produce two run dirs full of
+# frames neither of them can account for. Demonstrated 2026-08-15 by
+# launching a second run by accident (a shell heredoc swallowed the
+# launch line): both processes were alive on one seat for four minutes.
+# A run-level lock is the missing half of the single-slot channel.
+RUN_LOCK = os.path.join(REPO, "screenshots", "ci", ".run.lock")
+RUN_LOCK_STALE = 3600.0    # s; a crashed run must not wedge the seat
+
+
+def run_lock_acquire():
+    try:
+        os.makedirs(os.path.dirname(RUN_LOCK), exist_ok=True)
+        fd = os.open(RUN_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, ("%d %f\n" % (os.getpid(), time.time())).encode())
+        os.close(fd)
+        return None
+    except FileExistsError:
+        try:
+            age = time.time() - os.path.getmtime(RUN_LOCK)
+            holder = open(RUN_LOCK).read().strip()
+        except Exception:
+            age, holder = 0.0, "?"
+        if age > RUN_LOCK_STALE:
+            os.unlink(RUN_LOCK)
+            return run_lock_acquire()
+        return ("another claude_ci run owns this seat: %s, %.0fs old. Two "
+                "runs on one seat interleave teleports and kill each "
+                "other's client — wait for it, or remove %s if you are "
+                "sure it is dead." % (holder, age, RUN_LOCK))
+
+
+def run_lock_release():
+    try:
+        os.unlink(RUN_LOCK)
+    except OSError:
+        pass
+
+
 def sh(cmd, **kw):
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, **kw)
 
@@ -1412,6 +1453,19 @@ def cmd_regions(args):
     return 0
 
 
+def with_run_lock(fn):
+    def wrapped(args):
+        held = run_lock_acquire()
+        if held:
+            print("REFUSING: %s" % held)
+            return 1
+        try:
+            return fn(args)
+        finally:
+            run_lock_release()
+    return wrapped
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1433,10 +1487,10 @@ def main():
         return p
 
     p = common(sub.add_parser("run", help="build, seat, capture, referee, judge"))
-    p.set_defaults(func=cmd_run)
+    p.set_defaults(func=with_run_lock(cmd_run))
     p = common(sub.add_parser("calibrate",
                               help="plant a defect; every referee must FAIL"))
-    p.set_defaults(func=cmd_calibrate)
+    p.set_defaults(func=with_run_lock(cmd_calibrate))
     p = sub.add_parser("golden", help="pin/show the run all diffs measure against")
     p.add_argument("run_dir", nargs="?", help="a run dir name under screenshots/ci/")
     p.set_defaults(func=cmd_golden)
