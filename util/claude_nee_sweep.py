@@ -154,7 +154,22 @@ COST_SETTLE = 12.0   # s parked before the cost samples are believed —
 # Dials pushed explicitly on EVERY arm. An unset dial is not a default —
 # it is a silent zero, and this sweep must not measure one by accident.
 SWEEP_DIALS = {"claude_view": 0, "claude_bounces": 24, "claude_stats": 1,
-               "claude_volume_follow": 0}
+               "claude_volume_follow": 0,
+               # --- HUD suppression, and it is not cosmetic ------------
+               # The RMS referee compares PIXELS, so anything drawn over
+               # the frame is measured as if it were the renderer. Two
+               # overlays wrecked the first pilot, both found by LOOKING
+               # at a capture rather than by reading its number:
+               #  * every screenshot makes the client announce "Saved
+               #    screenshot to ..." in chat, and the default
+               #    recent_chat_messages is 6 — so eleven captures per arm
+               #    stacked six lines of white text DOWN THROUGH the
+               #    compared region, and RMS rose with sample count
+               #    because it was counting accumulated chat, not noise.
+               #  * node_highlighting draws a box on the pointed-at node,
+               #    dead centre of frame, where no crop can dodge it.
+               "recent_chat_messages": 0,
+               "node_highlighting": "none"}
 
 RESET_TURN_DEG = 90       # yaw kick used to force a still_frames reset
                           # in place (see reset_accumulation)
@@ -166,6 +181,7 @@ RESET_STILL_FRAMES_MAX = 3  # still_frames must fall to <= this to call
 
 SHOT_TIMEOUT = 20.0        # s to wait for request_shot()'s new png
 SHOT_POLL_INTERVAL = 0.4   # s between newest_shot() polls
+SHOT_SETTLE_INTERVAL = 0.25  # s between size checks while a PNG is written
 
 CHECKPOINT_TIMEOUT = 180.0  # s to wait for one checkpoint before giving up
                             # on it and recording a timeout rather than
@@ -241,6 +257,8 @@ def reset_accumulation(vantage):
     yaw = vantage["yaw"]
     pitch = vantage["pitch"]
     pos = dict(x=vantage["pos"][0], y=vantage["pos"][1], z=vantage["pos"][2])
+    st0 = lab.read_stats() or {}
+    before = st0.get("still_frames")
     try:
         lab.rpc("tp", pos=pos, yaw=(yaw + RESET_TURN_DEG) % 360, pitch=pitch)
         time.sleep(RESET_SETTLE)
@@ -248,17 +266,26 @@ def reset_accumulation(vantage):
     except Exception as e:
         return "reset rpc failed: %s" % e
 
+    # Proving the reset is harder than doing it: claude_stats.json is
+    # rewritten once per >=1 s window, so at a free-running clock the
+    # window where still_frames <= 3 lasts about 50 ms and is essentially
+    # unobservable — the pilot reported "reset failed" for resets that had
+    # plainly worked. So accept EITHER a small absolute value (the slow
+    # clock, where it is genuinely observable) or a large DROP from what
+    # was there before (any clock). A drop is what a reset IS.
     deadline = time.time() + RESET_POLL_TIMEOUT
     last = None
     while time.time() < deadline:
         st = lab.read_stats()
         last = st.get("still_frames") if st else None
-        if last is not None and last <= RESET_STILL_FRAMES_MAX:
-            return None
+        if last is not None:
+            if last <= RESET_STILL_FRAMES_MAX:
+                return None
+            if before is not None and last < before / 2.0:
+                return None
         time.sleep(RESET_POLL_INTERVAL)
-    return ("still_frames never dropped to <= %d after reset (last seen "
-            "%s) — accumulation may not have been reset"
-            % (RESET_STILL_FRAMES_MAX, last))
+    return ("still_frames never dropped after reset (was %s, last seen "
+            "%s) — accumulation may not have been reset" % (before, last))
 
 
 def request_shot(token):
@@ -275,8 +302,36 @@ def request_shot(token):
     while time.time() < deadline:
         cur = lab.newest_shot()
         if cur and cur != before:
-            return cur
+            # The file APPEARING is not the file being WRITTEN. A 1080p PNG
+            # is ~3 MB and the client writes it synchronously from the
+            # render thread; reading at first sight got 7 of 10 captures
+            # truncated in the first pilot, and PIL failed on them AFTER
+            # the run rather than during it. Wait for the size to stop
+            # moving, then make PIL prove it can decode the whole thing.
+            return _await_complete(cur)
         time.sleep(SHOT_POLL_INTERVAL)
+    return None
+
+
+def _await_complete(path):
+    """Return path once the PNG is fully written and decodable, else None."""
+    deadline = time.time() + SHOT_TIMEOUT
+    last = -1
+    while time.time() < deadline:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        if size > 0 and size == last:
+            try:
+                from PIL import Image
+                with Image.open(path) as im:
+                    im.load()          # decodes; raises on a truncated file
+                return path
+            except Exception:
+                pass                   # still being written — keep waiting
+        last = size
+        time.sleep(SHOT_SETTLE_INTERVAL)
     return None
 
 
@@ -293,13 +348,24 @@ def capture_curve(room, vantage, mode, targets, golden_png, outdir,
     `clock` pins it — the overlap pass pins FAST_FPS so the graded and
     free-running clocks can be compared at the same N."""
     points = []
+    # THE CLOCK GOES FIRST. set_caps() sleeps ~1.4 s waiting for the
+    # client's 1 Hz poll, and at the free-running clock that is ~85 frames
+    # of accumulation — so grading the clock AFTER the reset burned
+    # straight past the whole low end of the ladder (pilot run: every
+    # "N=1" landed at N=66). Reset only once the frame clock is already
+    # slow, so the frames that elapse while we work are few.
+    ordered = sorted(targets)
+    set_caps(clock if clock is not None else clock_for(ordered[0]))
     err = reset_accumulation(vantage)
     if err:
         return [{"room": room, "mode": mode, "target_n": None,
                  "error": "reset failed: %s" % err}]
 
-    for target in sorted(targets):
+    for target in ordered:
         fps = clock if clock is not None else clock_for(target)
+        # Re-grade UPWARD only, and never below the clock the reset ran
+        # at: raising the clock mid-run is safe (N is already large by
+        # then), lowering it would re-open the same window this fix shut.
         set_caps(fps)
         deadline = time.time() + CHECKPOINT_TIMEOUT
         point = {"room": room, "mode": mode, "target_n": target,
@@ -415,6 +481,74 @@ def measure_cost(room, mode):
         volume_valid=last.get("volume_valid"),
     )
     return row
+
+
+# ---------------------------------------------------------------- golden
+
+GOLDEN_N = 2000        # still_frames for a fresh golden. The 2026-08-15
+                       # CI golden was ~537 samples because a Debug binary
+                       # made anything deeper cost minutes; on Release the
+                       # same room runs ~4.5x faster, so a far quieter
+                       # truth is simply affordable now.
+GOLDEN_TIMEOUT = 300.0
+
+
+def capture_golden(rooms, vantages, outdir):
+    """Shoot a fresh photo-mode golden per room, UNDER SWEEP CONDITIONS.
+
+    Why not just use the pinned CI golden (20260815-174334_7ec19dc8d):
+    it was captured on a DEBUG binary, with the F5 overlay on, a
+    different item in the player's hand, and no HUD suppression. Every
+    one of those differences lands inside the compared crop and is
+    indistinguishable from renderer noise in an RMS number. A referee
+    has to differ from the thing it judges in ONE way — the sample
+    count — and that one did not. The old golden stays on disk as the
+    historical record; it is not a valid ruler for this measurement.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    out = {"n_target": GOLDEN_N, "rooms": {}}
+    for room in rooms:
+        v = vantages[room]
+        rec = {"room": room}
+        lab.doorway(claude_nee=0, **SWEEP_DIALS)   # nee=0 IS photo mode (§6)
+        set_caps(FAST_FPS)
+        lab.goto(v)
+        lab.doorway(claude_volume_snapshot="golden_%s_%d" % (room, time.time_ns()))
+        lab.doorway(claude_volume_follow=0)
+        err = reset_accumulation(v)
+        if err:
+            rec["error"] = err
+            out["rooms"][room] = rec
+            print("%-14s golden reset failed: %s" % (room, err))
+            continue
+        deadline = time.time() + GOLDEN_TIMEOUT
+        n = 0
+        while time.time() < deadline:
+            st = lab.read_stats() or {}
+            n = st.get("still_frames") or 0
+            if n >= GOLDEN_N:
+                break
+            time.sleep(1.0)
+        png = request_shot("golden_%s_%d" % (room, time.time_ns()))
+        if png is None:
+            rec["error"] = "screenshot timed out"
+            out["rooms"][room] = rec
+            continue
+        dst = os.path.join(outdir, room + ".png")
+        shutil.copy2(png, dst)
+        lab.write_capture_record(png)
+        side = os.path.splitext(png)[0] + ".capture.json"
+        if os.path.exists(side):
+            shutil.copy2(side, os.path.join(outdir, room + ".capture.json"))
+        st = lab.read_stats() or {}
+        rec.update(png=room + ".png", still_frames=st.get("still_frames"),
+                   accum_alpha=st.get("accum_alpha"),
+                   area_emitters=st.get("area_emitters"),
+                   area_total=st.get("area_total"))
+        out["rooms"][room] = rec
+        print("%-14s golden at N=%s -> %s" % (room, rec.get("still_frames"), dst))
+    json.dump(out, open(os.path.join(outdir, "golden.json"), "w"), indent=2)
+    return out
 
 
 # ---------------------------------------------------------------- arms
@@ -635,6 +769,17 @@ def main(argv=None):
     ap.add_argument("--golden", default=None,
                     help="run-dir name under screenshots/ci/ to diff "
                          "against (default: ci.read_golden())")
+    ap.add_argument("--golden-dir", default=None,
+                    help="directory of <room>.png to diff against, instead "
+                         "of a screenshots/ci run dir")
+    ap.add_argument("--make-golden", action="store_true",
+                    help="shoot a fresh photo-mode golden per room UNDER "
+                         "SWEEP CONDITIONS first, and use it. Required "
+                         "whenever the build, HUD state or wielded item "
+                         "differ from the pinned CI golden — all of which "
+                         "land inside the compared crop.")
+    ap.add_argument("--golden-only", action="store_true",
+                    help="shoot the fresh golden and stop")
     ap.add_argument("--no-seat", action="store_true",
                     help="use the client already running instead of "
                          "restarting the seat")
@@ -709,12 +854,33 @@ def main(argv=None):
         return 1
 
     vs = lab.load_vantages()
-    golden_run = args.golden or ci.read_golden()
-    print("golden: %s" % golden_run)
+    missing = [r for r in rooms if r not in vs]
+    for r in missing:
+        print("%-14s MISSING from claude_vantages.json — skipped" % r)
+    rooms = [r for r in rooms if r in vs]
+
+    golden_made = None
+    if args.make_golden or args.golden_only:
+        golden_dir = os.path.join(SWEEP_ROOT, "golden_%s" % git["tag"])
+        print("shooting a fresh golden under sweep conditions -> %s" % golden_dir)
+        golden_made = capture_golden(rooms, vs, golden_dir)
+        if args.golden_only:
+            print("golden only: done")
+            return 0
+    elif args.golden_dir:
+        golden_dir = args.golden_dir
+    else:
+        golden_run = args.golden or ci.read_golden()
+        golden_dir = os.path.join(ci.CI_DIR, golden_run) if golden_run else None
+        print("!! using the pinned CI golden (%s). If this build, its HUD "
+              "state or the wielded item differ from that capture, the "
+              "difference is INSIDE the crop and reads as renderer noise. "
+              "--make-golden is the honest option." % golden_run)
+    print("golden dir: %s" % golden_dir)
 
     data = {"run_id": run_id, "git": git, "rooms": rooms, "order": args.order,
-            "fps_caps": caps, "build_type": btype,
-            "freeze": freeze, "golden_run": golden_run,
+            "fps_caps": caps, "build_type": btype, "golden_made": golden_made,
+            "freeze": freeze, "golden_dir": golden_dir,
             "sweep_dials": SWEEP_DIALS, "checkpoints": CHECKPOINTS,
             "arms": []}
 
@@ -722,12 +888,9 @@ def main(argv=None):
     data["doors_shut"] = doors
     try:
         for room in rooms:
-            if room not in vs:
-                print("%-14s MISSING from claude_vantages.json — skipped" % room)
-                continue
             vantage = vs[room]
-            golden_png = os.path.join(ci.CI_DIR, golden_run, room + ".png") \
-                if golden_run else None
+            golden_png = os.path.join(golden_dir, room + ".png") \
+                if golden_dir else None
             if not golden_png or not os.path.exists(golden_png):
                 print("%-14s no golden png at %s — RMS will error per point"
                      % (room, golden_png))
