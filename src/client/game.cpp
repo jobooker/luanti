@@ -2546,7 +2546,12 @@ static void claudeVolumeSnapshot(Client *client)
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
 			<< (S * S * S) << " area_emitters="
 			<< g_claude_volume.area_count << "/"
-			<< g_claude_volume.area_total << " in "
+			<< g_claude_volume.area_total
+			// palette caps at 254 and never evicts: past the cap new
+			// materials render UNTEXTURED and nothing said so until now
+			// (spec/measured.md "Owed to the harness")
+			<< " palette=" << g_claude_volume.palette.size() << "/254"
+			<< " in "
 			<< (porting::getTimeMs() - t0) << " ms" << std::endl;
 }
 
@@ -2882,21 +2887,24 @@ static void claudeCascadeUpdate(Client *client)
 // timer). Otherwise parses it as a Settings block and applies every
 // line, honoring the same screenshot/re-snapshot pseudo-keys either
 // source file may use.
-static void claudeApplyPatchFile(const std::string &path,
+// Returns true when this call actually applied a NEW patch, so the
+// caller can do the once-per-change work (see the GameUI flags below)
+// without fighting a keypress on every 1 Hz tick.
+static bool claudeApplyPatchFile(const std::string &path,
 		std::string &last_applied, Client *client)
 {
 	std::ifstream f(path);
 	if (!f.good())
-		return;
+		return false;
 	std::string content((std::istreambuf_iterator<char>(f)),
 			std::istreambuf_iterator<char>());
 	if (content.empty() || content == last_applied)
-		return;
+		return false;
 	last_applied = content;
 	Settings patch;
 	std::istringstream is(content);
 	if (!patch.parseConfigLines(is))
-		return;
+		return false;
 	for (const std::string &name : patch.getNames()) {
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
@@ -2916,9 +2924,10 @@ static void claudeApplyPatchFile(const std::string &path,
 		actionstream << "[claude_settings_patch] " << name << " = "
 				<< patch.get(name) << std::endl;
 	}
+	return true;
 }
 
-static void pollSettingsPatch(f32 dtime, Client *client)
+static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 {
 	static f32 timer = 0.0f;
 	static std::string last_applied;
@@ -2974,7 +2983,8 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 			claudeCascadeUpdate(client);
 	}
 
-	claudeApplyPatchFile(porting::path_user + "/claude_settings_patch.conf",
+	bool applied = claudeApplyPatchFile(
+			porting::path_user + "/claude_settings_patch.conf",
 			last_applied, client);
 
 	// claude_dial_file: a SECOND, optional patch file, named by this
@@ -2990,8 +3000,19 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 		std::string dial_path = fs::IsPathAbsolute(dial_file)
 				? dial_file
 				: porting::path_user + DIR_DELIM + dial_file;
-		claudeApplyPatchFile(dial_path, last_applied_dial, client);
+		applied |= claudeApplyPatchFile(dial_path, last_applied_dial,
+				client);
 	}
+
+	// claude_show_hud / claude_show_chat: the HUD and the chat backlog
+	// are the only two client dials that lived exclusively on the F1/F2
+	// keybinds, which a headless capture seat cannot press. They are
+	// PIXELS inside measured crops (the Cornell floor box is drawn over
+	// by the hotbar), so a referee frame taken with them on is a
+	// contaminated referee. Applied only when a patch actually changed,
+	// so a human's F1 still works between writes.
+	if (applied && game_ui)
+		game_ui->applyClaudeFlagSettings();
 }
 
 void Game::run()
@@ -3046,7 +3067,7 @@ void Game::run()
 
 		g_fontengine->handleReload();
 
-		pollSettingsPatch(dtime, client);
+		pollSettingsPatch(dtime, client, m_game_ui.get());
 		claudeUpdateAccum(client);
 		claudeWriteStats(dtime, draw_times.busy_time, stats.drawtime);
 

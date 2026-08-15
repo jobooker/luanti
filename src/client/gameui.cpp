@@ -203,6 +203,29 @@ void GameUI::initFlags()
 	m_flags = GameUI::Flags();
 }
 
+// claude_show_hud / claude_show_chat: reach the two runtime-only flags
+// from the settings channel.
+//
+// show_hud and show_chat live in m_flags and were reachable ONLY from
+// the F1/F2 keybinds, so a headless capture seat could not turn them
+// off — every CI frame carried hearts, a hotbar, a held item and up to
+// six lines of "Saved screenshot to ..." chat. Region means compare
+// PIXELS, and the Cornell floor box sits exactly where the hotbar is
+// drawn, so that overlay is a measured contamination of a referee, not
+// cosmetics (spec/measured.md "Owed to the harness").
+//
+// An ABSENT key means "leave the runtime flag alone", so F1/F2 keep
+// working on a human's client; the caller applies this only when a
+// patch file actually changed, so a set dial does not fight a keypress
+// once a second.
+void GameUI::applyClaudeFlagSettings()
+{
+	if (g_settings->exists("claude_show_hud"))
+		m_flags.show_hud = g_settings->getFloat("claude_show_hud", 0.0f, 1.0f) > 0.5f;
+	if (g_settings->exists("claude_show_chat"))
+		m_flags.show_chat = g_settings->getFloat("claude_show_chat", 0.0f, 1.0f) > 0.5f;
+}
+
 void GameUI::showTranslatedStatusText(const char *str)
 {
 	showStatusText(wstrgettext(str));

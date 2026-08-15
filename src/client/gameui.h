@@ -54,6 +54,10 @@ public:
 			const GUIChatConsole *chat_console, float dtime);
 
 	void initFlags();
+	// claude_show_hud / claude_show_chat -> m_flags (see gameui.cpp):
+	// the two runtime-only flags, reachable from the settings channel so
+	// a headless capture seat can take an uncontaminated frame.
+	void applyClaudeFlagSettings();
 	const Flags &getFlags() const { return m_flags; }
 
 	inline void setInfoText(const std::wstring &str) { m_infotext = str; }
