@@ -330,8 +330,20 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// or raise it to 16 and drag the whole raster pipeline onto a float target
 	// — which broke alpha blending for the sky's sun and moon quads on this
 	// legacy GL driver and drew them as opaque SQUARES.
+	// The history MUST be 32F, not 16F. With the true-1/N average the
+	// blend weight reaches ~3e-4 after a minute parked; at fp16 the
+	// per-frame correction then rounds to nothing and the "average"
+	// silently sheds exactly the rare-large-sample tail that carries
+	// deep-bounce energy. MEASURED 2026-08-15, furnace-073: 6.09 at
+	// ~150 frames -> 4.755 at ~4500 frames on a 16F target (ratio to
+	// analytic 0.94 -> 0.73). The old 0.02 alpha floor had been hiding
+	// this by never letting accumulation get deep. referee: furnace-073
+	// at deep settle.
 	video::ECOLOR_FORMAT accum_format = color_format;
-	if (driver->queryTextureFormat(video::ECF_A16B16G16R16F)
+	if (driver->queryTextureFormat(video::ECF_A32B32G32R32F)
+			&& driver->queryFeature(video::EVDF_RENDER_TO_FLOAT_TEXTURE))
+		accum_format = video::ECF_A32B32G32R32F;
+	else if (driver->queryTextureFormat(video::ECF_A16B16G16R16F)
 			&& driver->queryFeature(video::EVDF_RENDER_TO_FLOAT_TEXTURE))
 		accum_format = video::ECF_A16B16G16R16F;
 	buffer->setTexture(TEXTURE_ACCUM_1, scale * trace_scale, "claude_accum_1", accum_format);

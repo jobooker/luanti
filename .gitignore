@@ -139,3 +139,8 @@ lib/irrlichtmt
 
 # Generated mod storage database
 client/mod_storage.sqlite
+claude_settings_patch.conf
+claude_stats.json
+claude_dial.conf
+debug.prev.txt
+__pycache__/
