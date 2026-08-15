@@ -12,6 +12,10 @@ uniform sampler2D merged;
 uniform sampler2D accum;
 uniform sampler2D depthmap;
 uniform lowp float volumeDebug;
+// claude_view: 0 = photo, 1-5 = claude_trace's diagnostic views. Only
+// used to choose the display transform below; the photo path is
+// untouched.
+uniform float claudeView;
 uniform vec2 texelSize0;       // full-res texel (from merged)
 uniform vec2 volumeDepthRange; // camera near/far, world BS units
 
@@ -94,6 +98,18 @@ void main(void)
 		wsum += w;
 	}
 	vec3 c = sum / wsum;
+
+	// DIAGNOSTIC VIEWS (claude_view != 0) present LINEARLY. Their values
+	// are the message: a 6-step gray normal ladder, a linear Le, a
+	// log-scaled distance. ACES would compress the top of that ladder
+	// into indistinguishable near-whites and the gamma would bend the
+	// steps, so a wrong normal would stop reading as a wrong brightness.
+	// The claude_view == 0 path below is unchanged, byte for byte — the
+	// furnace and Cornell referees invert exactly that transform.
+	if (claudeView > 0.5) {
+		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+		return;
+	}
 
 	// accum is LINEAR radiance now; the display transform is the ONE
 	// art knob (energy audit): ACES filmic fit (Narkowicz), then gamma
