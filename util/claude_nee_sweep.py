@@ -293,6 +293,30 @@ def reset_accumulation(vantage, park):
             % (before, last))
 
 
+def _dial_state(png, mode):
+    """Read the dials the CLIENT actually had at this capture, out of the
+    sidecar's patch log, and say whether the point is admissible."""
+    out = {"view_at_shot": None, "nee_at_shot": None, "dial_ok": None}
+    try:
+        rec = json.load(open(os.path.splitext(png)[0] + ".capture.json"))
+    except Exception:
+        return out
+    for line in rec.get("patch_log", []):
+        if "claude_view" in line:
+            out["view_at_shot"] = line.rsplit("=", 1)[-1].strip()
+        elif "claude_nee" in line:
+            out["nee_at_shot"] = line.rsplit("=", 1)[-1].strip()
+    bad = []
+    if out["view_at_shot"] not in (None, "0"):
+        bad.append("claude_view = %s (not photo)" % out["view_at_shot"])
+    if out["nee_at_shot"] not in (None, str(mode)):
+        bad.append("claude_nee = %s, expected %d" % (out["nee_at_shot"], mode))
+    out["dial_ok"] = not bad
+    if bad:
+        out["dial_error"] = "; ".join(bad)
+    return out
+
+
 def request_shot(token):
     """Write ONLY claude_screenshot into the patch file and poll for a NEW
     png. Deliberately does NOT use lab.shot(): its fixed settle sleep
@@ -426,6 +450,15 @@ def capture_curve(room, vantage, park, mode, targets, golden_png, outdir,
             # that, so it is checked here rather than asserted.
             point["busy_ms_at_checkpoint"] = st_after.get("busy_ms")
             point["frame_ms_avg_at_checkpoint"] = st_after.get("frame_ms_avg")
+            # PER-SHOT dial proof, not per-arm. The arm pushes its dials
+            # once at the start, but the dial file is a SECOND channel a
+            # human can write at any moment, and pollSettingsPatch applies
+            # it AFTER the patch file in the same tick — so it wins.
+            # 2026-08-15: /dial view 6 (clay) mid-run silently turned two
+            # cozy arms into uniform-albedo renders whose RMS sat flat at
+            # ~99 forever. The arm-level proof said nothing, because it
+            # was true when it was taken. Evidence has to be per capture.
+            point.update(_dial_state(png, mode))
             shot_taken = True
             break
         if not shot_taken and "error" not in point:
@@ -688,72 +721,140 @@ def print_tables(data):
 
 # ---------------------------------------------------------------- plot
 
+# Curve styling. John is colourblind, so mode is carried by BRIGHTNESS,
+# DASH and MARKER SHAPE — never hue. Both curves stay legible in a
+# greyscale print, which is the actual test.
+STYLE = {0: {"stroke": "#000000", "dash": "none", "marker": "circle",
+             "fill": "#000000", "label": "nee 0"},
+         1: {"stroke": "#8c8c8c", "dash": "7,5", "marker": "square",
+             "fill": "none", "label": "nee 1"}}
+
+PLOT_W, PLOT_H = 430, 330      # per-room panel, px
+PLOT_PAD = {"l": 62, "r": 74, "t": 46, "b": 52}
+
+
+def _curve_points(data, room, mode, xkey):
+    """(x, y) for one room+mode, dropping anything inadmissible. A point
+    whose dials were wrong at the shutter is not a noisy point, it is a
+    different measurement — it must leave the plot, not distort it."""
+    cost = next((a.get("cost") or {} for a in data["arms"]
+                 if a["room"] == room and a["mode"] == mode), {})
+    fms = cost.get("frame_ms_avg")
+    out = []
+    for a in data["arms"]:
+        if a["room"] != room or a["mode"] != mode:
+            continue
+        for pt in a.get("curve", []):
+            if pt.get("clock") != "graded" or pt.get("dial_ok") is False:
+                continue
+            n, rms = pt.get("n"), pt.get("rms")
+            if not n or not rms or n <= 0 or rms <= 0:
+                continue
+            x = n if xkey == "n" else (n * fms if fms else None)
+            if x:
+                out.append((x, rms))
+    return sorted(out)
+
+
+def _svg_panel(room, series, xlabel, ox):
+    """One log-log panel as a list of SVG fragments."""
+    import math
+    xs = [x for s in series.values() for x, _ in s]
+    ys = [y for s in series.values() for _, y in s]
+    if not xs:
+        return ['<text x="%d" y="%d" font-size="12" fill="#888">%s: no '
+                'admissible points</text>' % (ox + PLOT_PAD["l"], 90, room)]
+    lx0, lx1 = math.log10(min(xs)), math.log10(max(xs))
+    ly0, ly1 = math.log10(min(ys)), math.log10(max(ys))
+    lx1 = lx1 + 0.02 if lx1 > lx0 else lx0 + 1
+    ly1 = ly1 + 0.02 if ly1 > ly0 else ly0 + 1
+    iw = PLOT_W - PLOT_PAD["l"] - PLOT_PAD["r"]
+    ih = PLOT_H - PLOT_PAD["t"] - PLOT_PAD["b"]
+
+    def X(v):
+        return ox + PLOT_PAD["l"] + (math.log10(v) - lx0) / (lx1 - lx0) * iw
+
+    def Y(v):
+        return PLOT_PAD["t"] + ih - (math.log10(v) - ly0) / (ly1 - ly0) * ih
+
+    o = ['<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" fill="none" '
+         'stroke="#bbb"/>' % (ox + PLOT_PAD["l"], PLOT_PAD["t"], iw, ih)]
+    for d in range(int(math.floor(lx0)), int(math.ceil(lx1)) + 1):
+        for m in (1, 2, 5):
+            v = m * 10 ** d
+            if not (min(xs) <= v <= max(xs)):
+                continue
+            o.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                     'stroke="#e6e6e6"/>' % (X(v), PLOT_PAD["t"], X(v),
+                                             PLOT_PAD["t"] + ih))
+            o.append('<text x="%.1f" y="%.1f" font-size="10" fill="#555" '
+                     'text-anchor="middle">%g</text>'
+                     % (X(v), PLOT_PAD["t"] + ih + 15, v))
+    for d in range(int(math.floor(ly0)), int(math.ceil(ly1)) + 1):
+        for m in (1, 2, 5):
+            v = m * 10 ** d
+            if not (min(ys) <= v <= max(ys)):
+                continue
+            o.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                     'stroke="#e6e6e6"/>' % (ox + PLOT_PAD["l"], Y(v),
+                                             ox + PLOT_PAD["l"] + iw, Y(v)))
+            o.append('<text x="%.1f" y="%.1f" font-size="10" fill="#555" '
+                     'text-anchor="end">%g</text>'
+                     % (ox + PLOT_PAD["l"] - 6, Y(v) + 3, v))
+    for mode, pts in series.items():
+        if not pts:
+            continue
+        st = STYLE[mode]
+        d = " ".join(("M" if i == 0 else "L") + "%.1f %.1f" % (X(x), Y(y))
+                     for i, (x, y) in enumerate(pts))
+        o.append('<path d="%s" fill="none" stroke="%s" stroke-width="2.2" '
+                 'stroke-dasharray="%s"/>' % (d, st["stroke"], st["dash"]))
+        for x, y in pts:
+            if st["marker"] == "circle":
+                o.append('<circle cx="%.1f" cy="%.1f" r="3.6" fill="%s" '
+                         'stroke="%s" stroke-width="1.6"/>'
+                         % (X(x), Y(y), st["fill"], st["stroke"]))
+            else:
+                o.append('<rect x="%.1f" y="%.1f" width="7" height="7" '
+                         'fill="%s" stroke="%s" stroke-width="1.6"/>'
+                         % (X(x) - 3.5, Y(y) - 3.5, st["fill"], st["stroke"]))
+        lx, ly = pts[-1]
+        o.append('<text x="%.1f" y="%.1f" font-size="12" fill="%s" '
+                 'font-weight="600">%s</text>'
+                 % (X(lx) + 9, Y(ly) + 4, st["stroke"], st["label"]))
+    o.append('<text x="%.1f" y="%.1f" font-size="13" font-weight="700" '
+             'text-anchor="middle">%s</text>'
+             % (ox + PLOT_W / 2, PLOT_PAD["t"] - 16, room))
+    o.append('<text x="%.1f" y="%.1f" font-size="11" fill="#333" '
+             'text-anchor="middle">%s</text>'
+             % (ox + PLOT_W / 2, PLOT_H - 8, xlabel))
+    return o
+
+
 def plot(rundir, data):
-    """rms_vs_n.png and rms_vs_ms.png. John is colorblind: mode is
-    encoded in BRIGHTNESS and SHAPE, never hue — nee=0 is solid black
-    with filled circles, nee=1 is mid-grey dashed with hollow squares."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available — skipping rms_vs_n.png / rms_vs_ms.png")
-        return
-
-    STYLE = {
-        0: dict(color="black", linestyle="-", marker="o",
-                markerfacecolor="black", linewidth=2, label="nee 0"),
-        1: dict(color="0.55", linestyle="--", marker="s",
-                markerfacecolor="none", linewidth=2, label="nee 1"),
-    }
-
-    for xkey, fname, xlabel in (("n", "rms_vs_n.png", "N samples"),
-                                 ("wall_ms", "rms_vs_ms.png", "wall ms (n * frame_ms_avg)")):
+    """Write rms_vs_n.svg and rms_vs_ms.svg. Hand-rolled SVG on purpose:
+    matplotlib is not installed and this machine's Python is externally
+    managed (PEP 668), so a plot that needs a pip install is a plot that
+    does not get drawn."""
+    for xkey, fname, xlabel in (
+            ("n", "rms_vs_n.svg", "N (still_frames, log)"),
+            ("wall_ms", "rms_vs_ms.svg", "wall ms = N x frame_ms_avg (log)")):
         rooms = data["rooms"]
-        fig, axes = plt.subplots(1, len(rooms), figsize=(5 * len(rooms), 5),
-                                  squeeze=False)
+        W = PLOT_W * len(rooms)
+        body = []
         for i, room in enumerate(rooms):
-            ax = axes[0][i]
-            for mode in MODES:
-                cost = next((a["cost"] for a in data["arms"]
-                            if a["room"] == room and a["mode"] == mode), {})
-                frame_ms_avg = cost.get("frame_ms_avg")
-                xs, ys = [], []
-                for a in data["arms"]:
-                    if a["room"] != room or a["mode"] != mode:
-                        continue
-                    for pt in a.get("curve", []):
-                        n = pt.get("n")
-                        rms = pt.get("rms")
-                        if n is None or rms is None:
-                            continue
-                        x = n if xkey == "n" else (
-                            n * frame_ms_avg if frame_ms_avg else None)
-                        if x is None or x <= 0 or rms <= 0:
-                            continue
-                        xs.append(x)
-                        ys.append(rms)
-                if not xs:
-                    continue
-                pairs = sorted(zip(xs, ys))
-                xs, ys = zip(*pairs)
-                st = STYLE[mode]
-                ax.plot(xs, ys, color=st["color"], linestyle=st["linestyle"],
-                        marker=st["marker"], markerfacecolor=st["markerfacecolor"],
-                        markeredgecolor=st["color"], linewidth=st["linewidth"])
-                ax.annotate(st["label"], xy=(xs[-1], ys[-1]),
-                            xytext=(6, 0), textcoords="offset points",
-                            color=st["color"], fontsize=9, va="center")
-            ax.set_xscale("log")
-            ax.set_yscale("log")
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("RMS vs pinned photo golden")
-            ax.set_title("%s\n%s@%s  referee: pinned photo golden"
-                         % (room, data["git"].get("branch"), data["git"].get("sha")))
-        fig.tight_layout()
+            series = {m: _curve_points(data, room, m, xkey) for m in MODES}
+            body += _svg_panel(room, series, xlabel, i * PLOT_W)
+        head = ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" '
+                'height="%d" viewBox="0 0 %d %d" font-family="Helvetica,'
+                'Arial,sans-serif"><rect width="100%%" height="100%%" '
+                'fill="#ffffff"/>' % (W, PLOT_H + 30, W, PLOT_H + 30))
+        foot = ('<text x="8" y="%d" font-size="11" fill="#444">RMS vs the '
+                'photo golden (nee 0, N~2100). %s@%s. Mode by brightness '
+                'and shape, not colour.</text></svg>'
+                % (PLOT_H + 22, data["git"].get("branch"), data["git"].get("sha")))
         out = os.path.join(rundir, fname)
-        fig.savefig(out, dpi=110)
-        plt.close(fig)
+        open(out, "w").write(head + "".join(body) + foot)
         print("wrote %s" % out)
 
 
