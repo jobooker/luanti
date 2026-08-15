@@ -110,6 +110,23 @@ uniform sampler3D claudeSubvoxTex; // R8: one byte = 8 x-subvoxels
 // is deep in its still-frames running average, spend extra bounce rays
 // per pixel — ground-truth AO crisps in exactly when fps is free.
 uniform lowp float claudeRefine;
+// PURE PHOTO MODE (claude_pure): photo mode uses ONE lighting system.
+// photoPath currently adds BOTH the emission it collects when a path
+// lands on an emissive voxel AND a next-event-estimation term aimed at
+// the point-light emitter slots — with no MIS weight and no exclusion,
+// so the same campfire is counted twice, through two paths that use
+// different emission constants (the scattered furnace-referee ratios).
+// The point-light model is also why every shadow is hard: an emitter is
+// a vec4 (position + strength), and a mathematical point casts no
+// penumbra, no matter how good the tracing is.
+// 1 = drop NEE from photoPath: lights are emissive VOXELS and nothing
+// else (the Evan-Wallace/erichlof model). Penumbra then comes from the
+// campfire's real 26 cm of glowing geometry via real transport, which
+// is John's charter ("emitter blocks... even if it's a 1/16 voxel").
+// Costs convergence speed — that is what NEE was buying — so it is a
+// PHOTO-mode change only; motion mode keeps NEE as declared variance
+// reduction, measured against this.
+uniform lowp float purePhoto;
 uniform lowp float claudeSkyAz;
 uniform vec3 claudeNearOrigin;
 uniform lowp float sunAngle;       // sun/moon angular DIAMETER, radians
@@ -1526,7 +1543,8 @@ vec3 photoPath(vec3 p0, vec3 rd0, vec3 sd, vec3 seed)
 		if (ndl > 0.0)
 			L += tp * alb * volumeLightCol * ndl
 					* (b == 0 ? lightVis(hp, sd) : lightVisCheap(hp, sd));
-		L += tp * alb * emitterLightCheap(hp, n);
+		if (purePhoto < 0.5)
+			L += tp * alb * emitterLightCheap(hp, n);
 		tp *= alb;
 		vec3 h = vec3(
 			fract(sin(dot(hp + seed + float(b) * 0.617,
@@ -2315,8 +2333,14 @@ void main(void)
 				// glint appears only where the light already lands.
 				vec3 specAcc = vec3(0.0);
 				float glossOn = specStr * specMask;
+				// purePhoto also drops the PRIMARY-hit emitter term: it is
+				// the second NEE call site, and leaving it in was why
+				// gating photoPath alone did not soften the shadows. With
+				// both gone the campfire reaches a visible surface only by
+				// being HIT — 26 cm of glowing voxels, so the penumbra is
+				// real transport instead of an aim point.
 				bool skipE = claudeCost > 0.5 && claudeCost < 1.5
-						|| claudeCost > 3.5;
+						|| claudeCost > 3.5 || purePhoto > 0.5;
 				vec3 emDiff = skipE ? vec3(0.0) : emitterLightSpec(hp, n, -rd,
 						glossOn > 0.005 ? specGloss : 0.0, specAcc, 8);
 				fresh = albedo * (direct + amb + emDiff) + selfGlow;

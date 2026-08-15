@@ -274,6 +274,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_gray_pixel{"grayWorld"};
+	CachedPixelShaderSetting<float, 1, false> m_pure_pixel{"purePhoto"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_parallax_pixel{"parallaxStrength"};
@@ -285,6 +286,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_radiance_frame_pixel{"claudeRadianceFrame"};
 	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
 	float m_texture_amount, m_gray, m_bevel, m_relief, m_parallax, m_jitter;
+	float m_pure = 0.0f;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
 	float m_bounce2 = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
@@ -372,7 +374,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 40> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 41> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -384,6 +386,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_clay",
 		"claude_texture",
 		"claude_gray",
+		"claude_pure",
 		"claude_bevel",
 		"claude_relief",
 		"claude_parallax",
@@ -482,6 +485,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_gray"))
 			return 0.0f;
 		return g_settings->getFloat("claude_gray", 0.0f, 1.0f);
+	}
+
+	// claude_pure: photo mode runs ONE lighting system (emissive voxels
+	// only, no point-light NEE) — see purePhoto in claude_accum.
+	static float readPure()
+	{
+		if (!g_settings->exists("claude_pure"))
+			return 0.0f;
+		return g_settings->getFloat("claude_pure", 0.0f, 1.0f);
 	}
 
 	static float readTextureAmount()
@@ -763,6 +775,8 @@ public:
 			m_texture_amount = readTextureAmount();
 		if (name == "claude_gray")
 			m_gray = readGray();
+		if (name == "claude_pure")
+			m_pure = readPure();
 		if (name == "claude_bevel")
 			m_bevel = readBevel();
 		if (name == "claude_relief")
@@ -848,6 +862,7 @@ public:
 		m_clay = readClay();
 		m_texture_amount = readTextureAmount();
 		m_gray = readGray();
+		m_pure = readPure();
 		m_bevel = readBevel();
 		m_relief = readRelief();
 		m_parallax = readParallax();
@@ -1150,6 +1165,7 @@ public:
 				m_volume_origin_pixel.set(vorg, services);
 				m_texture_amount_pixel.set(&m_texture_amount, services);
 				m_gray_pixel.set(&m_gray, services);
+				m_pure_pixel.set(&m_pure, services);
 				m_bevel_pixel.set(&m_bevel, services);
 				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
