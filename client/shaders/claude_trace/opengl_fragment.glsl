@@ -104,6 +104,10 @@ uniform lowp float accumAlpha; // CPU: 1.0 hard reset, 0.5 moving,
 // stay the truth renderer — no debug term is evaluated inside the path
 // loop, the views only read facts the loop already recorded.
 //   0 photo | 1 normal ladder | 2 albedo | 3 Le | 4 distance | 5 bounces
+//   6 clay: the photo path with every reflectance clamped to CLAY_RHO —
+//   uniform albedo shows pure transport (the ray-traced "wireframe").
+//   Emission keeps its true Le; only rho is clamped. Accumulates and
+//   tonemaps exactly like view 0.
 // Views are GRAY LADDERS, not RGB: John is colorblind, and cardinal
 // normals mean there are only six possible normals, so a wrong normal
 // reads as a wrong BRIGHTNESS patch. See VIEW_N_* below for the ladder.
@@ -275,6 +279,12 @@ vec3 cellAlbedo(vec3 raw)
 	return max(pow(raw, vec3(2.2)), vec3(ALBEDO_FLOOR));
 }
 
+// Clay mode (view 6): the one reflectance every surface gets. Mid-gray,
+// chosen to match the gray186 lab material (rho 0.5) so clay frames are
+// directly comparable to the furnace-050 room. Applied AFTER emission is
+// derived, so lights keep their true Le.
+const vec3 CLAY_RHO = vec3(0.5);
+
 // THE EMISSION LAW. An emissive voxel is a surface with BOTH Le and rho
 // (§4) — the caller adds this and then continues the path with rho,
 // which is what makes L = Le/(1-rho) expressible in a sealed room.
@@ -395,7 +405,7 @@ void main(void)
 	float j0 = rnd1();
 	float j1 = rnd1();
 	vec2 jit = (vec2(j0, j1) - 0.5) * texelSize0;
-	if (view != 0)
+	if (view != 0 && view != 6)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -426,6 +436,11 @@ void main(void)
 		float tHit;
 		if (!march(p, dir, hp, n, alb, le, tHit))
 			break; // escaped the volume: nothing to add
+
+		// clay: march computed le from the TRUE albedo above; clamping
+		// rho afterward changes reflectance only, never the lights
+		if (view == 6)
+			alb = CLAY_RHO;
 
 		if (seg == 0) {
 			primaryHit = true;
@@ -468,8 +483,9 @@ void main(void)
 	// --- diagnostic views --------------------------------------------
 	// Deterministic and un-accumulated (1-4); view 5 averages, because a
 	// MEAN bounce count is the meaningful quantity. claude_present
-	// passes all of these through linearly — no ACES, no gamma.
-	if (view != 0) {
+	// passes 1-5 through linearly — no ACES, no gamma. View 6 (clay) is
+	// lit radiance: it skips this block and accumulates/tonemaps as photo.
+	if (view != 0 && view != 6) {
 		vec3 dbg = vec3(0.0);
 		if (view == 1) {
 			float g = 0.0;

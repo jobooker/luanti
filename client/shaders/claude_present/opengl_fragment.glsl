@@ -99,14 +99,16 @@ void main(void)
 	}
 	vec3 c = sum / wsum;
 
-	// DIAGNOSTIC VIEWS (claude_view != 0) present LINEARLY. Their values
+	// DIAGNOSTIC VIEWS (claude_view 1-5) present LINEARLY. Their values
 	// are the message: a 6-step gray normal ladder, a linear Le, a
 	// log-scaled distance. ACES would compress the top of that ladder
 	// into indistinguishable near-whites and the gamma would bend the
 	// steps, so a wrong normal would stop reading as a wrong brightness.
-	// The claude_view == 0 path below is unchanged, byte for byte — the
-	// furnace and Cornell referees invert exactly that transform.
-	if (claudeView > 0.5) {
+	// View 6 (clay) is lit radiance and falls through to the photo
+	// transform. The claude_view == 0 path below is unchanged, byte for
+	// byte — the furnace and Cornell referees invert exactly that
+	// transform.
+	if (claudeView > 0.5 && claudeView < 5.5) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}

@@ -757,13 +757,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
 	}
 
-	// claude_trace diagnostic view selector, 0..5. 0 (default) = photo:
-	// the truth renderer, untouched by any debug branch.
+	// claude_trace diagnostic view selector, 0..6. 0 (default) = photo:
+	// the truth renderer, untouched by any debug branch. 6 = clay:
+	// photo transport with reflectance clamped to CLAY_RHO.
 	static float readView()
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 5.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 6.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -2450,8 +2451,13 @@ static void claudeUpdateAccum(Client *client)
 		g_claude_volume.still_frames = 0.0f;
 	} else {
 		g_claude_volume.still_frames += 1.0f;
+		// True 1/N running average, NO floor. The old renderer floored
+		// this at 0.02, which silently turns the average into an EMA
+		// whose noise never drops below ~10% of per-sample sigma — the
+		// "never stops bubbling" defect. A parked camera must actually
+		// converge; motion and teleports reset above.
 		g_claude_volume.accum_alpha =
-				std::max(0.02f, 1.0f / (2.0f + g_claude_volume.still_frames));
+				1.0f / (2.0f + g_claude_volume.still_frames);
 	}
 
 	// Held light: if the wielded item is a light-emitting node, place an
