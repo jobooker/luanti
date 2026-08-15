@@ -164,11 +164,64 @@ def _face_map(face, u, v, d):
     raise ValueError(face)
 
 
+LUMW = np.array([0.2126, 0.7152, 0.0722])
+
+# Physical mean albedo per material family, LINEAR (what pathAlbedo
+# produces). Game textures are painted to be DISPLAYED, not to be used
+# as reflectance: raw oak planks linearize to 0.136, about 3x darker
+# than real wood, and interiors are bounce-dominated so that error
+# compounds once per bounce (a 3-bounce corner keeps ~6% of its light).
+ALBEDO_TARGET = {
+    "wood": 0.35, "log": 0.30, "stone": 0.25, "cobble": 0.22,
+    "wool": 0.60, "book": 0.30, "default": 0.32,
+}
+
+
+def _delight(img, carved, delight=1.0, target=None):
+    """Turn a painted texture into a physical albedo map.
+
+    Two corrections, both bake-time (template is generator, never
+    runtime — the circle-postmortem law):
+
+    1. DELIGHT. A groove is dark in the texture because the artist
+       PAINTED a shadow there. We then carve that same texel into a
+       real recess, which the tracer shadows for real -- so the
+       darkness lands twice. Where we carve, lift the texel back to
+       the unshadowed material tone and let geometry produce the
+       shadow. (The carve DEPTH still comes from the original
+       luminance; only the stored colour changes.)
+    2. RENORMALIZE. Scale the face so its mean linear albedo is a
+       physical value for the material.
+
+    Emissive texels are excluded by the caller: their brightness is
+    real, not painted shading.
+    """
+    out = img.astype(np.float32).copy()
+    if delight > 0.0 and carved.any() and (~carved).any():
+        base = out[~carved].mean(axis=0)          # unshadowed tone
+        baselum = max(float(base @ LUMW), 1.0)
+        cur = out[carved]
+        curlum = np.maximum(cur @ LUMW, 1.0)
+        lifted = np.clip(cur * (baselum / curlum)[:, None], 0.0, 255.0)
+        out[carved] = cur * (1.0 - delight) + lifted * delight
+    if target:
+        lin = (out / 255.0) ** 2.2
+        m = float(lin.mean())
+        if m > 1e-6:
+            lin = np.clip(lin * (target / m), 0.0, 1.0)
+            out = (lin ** (1.0 / 2.2)) * 255.0
+    return out
+
+
 def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
-                    emit_level=13):
+                    emit_level=13, delight=1.0, albedo=None):
     """tiles: {face: png path}. Returns (name, palette, voxels) in the
     same shape the authored models use. Palette grows per unique
-    (rgb, emit) — texel-true colors, no quantization."""
+    (rgb, emit) — texel-true colors, no quantization.
+
+    delight/albedo drive _delight(): see there for why a raw game
+    texture is not an albedo map. delight=0, albedo=None reproduces
+    the original texel-verbatim bake."""
     imgs = {}
     for face, path in tiles.items():
         imgs[face] = np.asarray(
@@ -236,11 +289,25 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                 if len(comp) >= 3:
                     for cv, cu in comp:
                         keep[cv, cu] = True
+        # Which texels become recessed geometry — computed from the
+        # ORIGINAL luminance (the artist's shading is a good depth
+        # signal), then handed to _delight so their painted-in shadow
+        # can be removed before the colour is stored.
+        interior = np.zeros((N, N), dtype=bool)
+        interior[1:N - 1, 1:N - 1] = True
+        fire = np.zeros((N, N), dtype=bool)
+        if face in emissive_faces:
+            fire = ((img[:, :, 0] > 140.0)
+                    & (img[:, :, 0] > 1.5 * img[:, :, 2])
+                    & (img[:, :, 1] > 40.0))
+        carved = (deep | (keep & interior)) & ~fire
+        alb = _delight(img, carved, delight=delight, target=albedo)
+        alb[fire] = img[fire]   # emissive brightness is real, not paint
+
         for vv in range(N):
             for u in range(N):
-                r, g, b = img[vv, u]
-                is_fire = (face in emissive_faces and r > 140.0
-                           and r > 1.5 * b and g > 40.0)
+                r, g, b = alb[vv, u]
+                is_fire = bool(fire[vv, u])
                 if is_fire:
                     d = maxdepth  # fire sits at the back of its recess
                 elif deep[vv, u]:
@@ -268,7 +335,8 @@ def model_furnace_baked():
              side=os.path.join(tdir, "default_furnace_side.png"),
              top=os.path.join(tdir, "default_furnace_top.png"),
              bottom=os.path.join(tdir, "default_furnace_bottom.png")),
-        maxdepth=3, emissive_faces=("front",), emit_level=13)
+        maxdepth=3, emissive_faces=("front",), emit_level=13,
+        albedo=ALBEDO_TARGET["stone"])
 
 
 def model_crafting_baked():
@@ -280,7 +348,7 @@ def model_crafting_baked():
         dict(front=os.path.join(tdir, "crafting_workbench_front.png"),
              side=os.path.join(tdir, "crafting_workbench_side.png"),
              top=os.path.join(tdir, "crafting_workbench_top.png")),
-        maxdepth=2)
+        maxdepth=2, albedo=ALBEDO_TARGET["wood"])
 
 
 def model_bookshelf_baked():
@@ -426,13 +494,15 @@ def _mcl(*parts):
 def model_planks_oak():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_wood.png")
     return bake_from_tiles("planks_oak_baked",
-                           dict(side=t, top=t, bottom=t), maxdepth=1)
+                           dict(side=t, top=t, bottom=t), maxdepth=1,
+                           albedo=ALBEDO_TARGET["wood"])
 
 
 def model_planks_spruce():
     t = _mcl("ITEMS", "mcl_core", "textures", "mcl_core_planks_spruce.png")
     return bake_from_tiles("planks_spruce_baked",
-                           dict(side=t, top=t, bottom=t), maxdepth=1)
+                           dict(side=t, top=t, bottom=t), maxdepth=1,
+                           albedo=ALBEDO_TARGET["wood"])
 
 
 def model_log_oak():
@@ -444,13 +514,14 @@ def model_log_oak():
                       "default_tree_top.png"),
              bottom=_mcl("ITEMS", "mcl_core", "textures",
                          "default_tree_top.png")),
-        maxdepth=1)
+        maxdepth=1, albedo=ALBEDO_TARGET["log"])
 
 
 def model_cobble():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_cobble.png")
     return bake_from_tiles("cobble_baked",
-                           dict(side=t, top=t, bottom=t), maxdepth=1)
+                           dict(side=t, top=t, bottom=t), maxdepth=1,
+                           albedo=ALBEDO_TARGET["cobble"])
 
 
 def extrude_cutout(name, path, thick=2, emit_level=12):
