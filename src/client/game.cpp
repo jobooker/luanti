@@ -17,6 +17,7 @@
 #include "clientmedia.h" // For clientMediaUpdateCacheCopy
 #include "config.h"
 #include "content_cao.h"
+#include "filesys.h" // claude_dial_file: resolve relative paths against path_user
 #include "content/subgames.h"
 #include "client/event_manager.h"
 #include "fontengine.h"
@@ -2573,6 +2574,15 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 	busy_total = 0.0f; draw_total = 0.0f;
 }
 
+// Exposes trace accumulation state to the F5 debug overlay (gameui.cpp),
+// which lives outside this translation unit and so can't reach the
+// file-local g_claude_volume directly.
+void claudeGetTraceStats(float *still_frames, float *accum_alpha)
+{
+	*still_frames = g_claude_volume.still_frames;
+	*accum_alpha = g_claude_volume.accum_alpha;
+}
+
 // claude_lod Phase 2: (re)build and upload cascade levels when stale or
 // strayed. Runs from the 1 Hz settings poll and builds AT MOST ONE level
 // per invocation, so the worst frame eats one build (2 m is the big one,
@@ -2696,10 +2706,54 @@ static void claudeCascadeUpdate(Client *client)
 	}
 }
 
+// Shared parse/diff/apply for a "key = value" patch file: no-op if the
+// file is unreadable, empty, or byte-identical to the caller's cache
+// (last_applied — one per source file, so the settings patch and the
+// /dial console channel never re-trigger each other off a shared
+// timer). Otherwise parses it as a Settings block and applies every
+// line, honoring the same screenshot/re-snapshot pseudo-keys either
+// source file may use.
+static void claudeApplyPatchFile(const std::string &path,
+		std::string &last_applied, Client *client)
+{
+	std::ifstream f(path);
+	if (!f.good())
+		return;
+	std::string content((std::istreambuf_iterator<char>(f)),
+			std::istreambuf_iterator<char>());
+	if (content.empty() || content == last_applied)
+		return;
+	last_applied = content;
+	Settings patch;
+	std::istringstream is(content);
+	if (!patch.parseConfigLines(is))
+		return;
+	for (const std::string &name : patch.getNames()) {
+		// Pseudo-key: any value change triggers a screenshot (same call as
+		// the F12 keybind), saved to the usual screenshots directory.
+		if (name == "claude_screenshot") {
+			client->makeScreenshot();
+			actionstream << "[claude_settings_patch] screenshot taken"
+					<< std::endl;
+			continue;
+		}
+		// Pseudo-key: any value change re-snapshots the volume around the
+		// current camera position.
+		if (name == "claude_volume_snapshot") {
+			claudeVolumeSnapshot(client);
+			continue;
+		}
+		g_settings->set(name, patch.get(name));
+		actionstream << "[claude_settings_patch] " << name << " = "
+				<< patch.get(name) << std::endl;
+	}
+}
+
 static void pollSettingsPatch(f32 dtime, Client *client)
 {
 	static f32 timer = 0.0f;
 	static std::string last_applied;
+	static std::string last_applied_dial;
 	timer += dtime;
 	if (timer < 1.0f)
 		return;
@@ -2739,36 +2793,23 @@ static void pollSettingsPatch(f32 dtime, Client *client)
 			claudeCascadeUpdate(client);
 	}
 
-	std::ifstream f(porting::path_user + "/claude_settings_patch.conf");
-	if (!f.good())
-		return;
-	std::string content((std::istreambuf_iterator<char>(f)),
-			std::istreambuf_iterator<char>());
-	if (content.empty() || content == last_applied)
-		return;
-	last_applied = content;
-	Settings patch;
-	std::istringstream is(content);
-	if (!patch.parseConfigLines(is))
-		return;
-	for (const std::string &name : patch.getNames()) {
-		// Pseudo-key: any value change triggers a screenshot (same call as
-		// the F12 keybind), saved to the usual screenshots directory.
-		if (name == "claude_screenshot") {
-			client->makeScreenshot();
-			actionstream << "[claude_settings_patch] screenshot taken"
-					<< std::endl;
-			continue;
-		}
-		// Pseudo-key: any value change re-snapshots the volume around the
-		// current camera position.
-		if (name == "claude_volume_snapshot") {
-			claudeVolumeSnapshot(client);
-			continue;
-		}
-		g_settings->set(name, patch.get(name));
-		actionstream << "[claude_settings_patch] " << name << " = "
-				<< patch.get(name) << std::endl;
+	claudeApplyPatchFile(porting::path_user + "/claude_settings_patch.conf",
+			last_applied, client);
+
+	// claude_dial_file: a SECOND, optional patch file, named by this
+	// client setting, polled on the same 1 Hz tick through the identical
+	// apply path above. It exists so the server-side /dial chatcommand
+	// (mods/claude_bridge) — which can only read/write inside the running
+	// world's directory, not path_user — has a channel to reach the
+	// client: /dial writes claude_dial.conf into the world dir, and the
+	// dial file setting just needs to point there. Empty path = off.
+	std::string dial_file = g_settings->exists("claude_dial_file")
+			? g_settings->get("claude_dial_file") : "";
+	if (!dial_file.empty()) {
+		std::string dial_path = fs::IsPathAbsolute(dial_file)
+				? dial_file
+				: porting::path_user + DIR_DELIM + dial_file;
+		claudeApplyPatchFile(dial_path, last_applied_dial, client);
 	}
 }
 

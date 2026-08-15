@@ -43,3 +43,7 @@ void the_game(volatile std::sig_atomic_t *kill,
 		std::string &error_message,
 		ChatBackend &chat_backend,
 		bool *reconnect_requested);
+
+// Trace accumulation stats for the F5 debug overlay (gameui.cpp); the
+// backing state (g_claude_volume) is file-local to game.cpp.
+void claudeGetTraceStats(float *still_frames, float *accum_alpha);

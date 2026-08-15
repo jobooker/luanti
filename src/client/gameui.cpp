@@ -147,6 +147,21 @@ void GameUI::update(const RunStats &stats, Client *client, MapDrawControl *draw_
 			}
 		}
 
+		// claude_trace: only while the traced pipeline is actually driving
+		// the frame (same >= 2.5 threshold Game::toggleClaudeTrace uses to
+		// flip claude_volume_debug between 0/pass-through and 3/traced).
+		if (g_settings->getFloat("claude_volume_debug", 0.0f, 12.0f) >= 2.5f) {
+			float still_frames = 0.0f, accum_alpha = 0.0f;
+			claudeGetTraceStats(&still_frames, &accum_alpha);
+			os << std::setprecision(0)
+				<< "\ntrace: " << still_frames << " samples"
+				<< std::setprecision(3)
+				<< " | alpha " << accum_alpha
+				<< std::setprecision(0)
+				<< " | view " << g_settings->getFloat("claude_view", 0.0f, 5.0f)
+				<< " | bounces " << g_settings->getFloat("claude_bounces", 0.0f, 24.0f);
+		}
+
 		m_guitext2->setRelativePosition(core::rect<s32>(5, 5 + minimal_debug_height,
 				screensize.X, screensize.Y));
 
