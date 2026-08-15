@@ -118,6 +118,13 @@ CANONICAL_DIALS = {
     # F1/F2-only until 629368367 made them settings.
     "claude_show_hud": 0,
     "claude_show_chat": 0,
+    # A measurement seat is not drivable by hand: mouse-look and
+    # movement are ignored while this is set (game.cpp
+    # claudeInputLocked). Turning does not reset the accumulator, so a
+    # stray hand blends two views into one "converged" frame and leaves
+    # no other trace — the aim guard catches it after the fact, this
+    # stops it happening.
+    "claude_input_lock": 1,
     "recent_chat_messages": 0,
     "node_highlighting": "none",
 }

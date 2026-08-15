@@ -2927,6 +2927,21 @@ static bool claudeApplyPatchFile(const std::string &path,
 	return true;
 }
 
+// claude_input_lock: a measurement seat must not be drivable by hand.
+// Turning the camera does NOT reset the accumulator, so one stray
+// mouse-look inside a 60 s settle blends two views into a frame that
+// looks converged and carries a perfectly clean dial state — it
+// happened on 2026-08-15 and nothing in the capture record could have
+// shown it. With this set, mouse/keyboard look and movement are
+// ignored; the harness still drives the player through the server
+// (teleports arrive as player_force_move and are applied), and F1/F2
+// and the menu still work, so a human can watch without steering.
+static bool claudeInputLocked()
+{
+	return g_settings->exists("claude_input_lock")
+			&& g_settings->getFloat("claude_input_lock", 0.0f, 1.0f) > 0.5f;
+}
+
 static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 {
 	static f32 timer = 0.0f;
@@ -4587,7 +4602,7 @@ void Game::updateCameraDirection(CameraOrientation *cam, float dtime)
 
 			input->setMousePos(driver->getScreenSize().Width / 2,
 				driver->getScreenSize().Height / 2);
-		} else {
+		} else if (!claudeInputLocked()) {
 			updateCameraOrientation(cam, dtime);
 		}
 
@@ -4703,6 +4718,15 @@ void Game::updatePlayerControl(const CameraOrientation &cam)
 		input->getJoystickDirection()
 	);
 	control.setMovementFromKeys();
+
+	// claude_input_lock: drop every key/joystick input, keep the look
+	// angles the camera already has (a locked seat still turns when the
+	// SERVER moves it, e.g. a harness teleport).
+	if (claudeInputLocked()) {
+		control = PlayerControl();
+		control.pitch = cam.camera_pitch;
+		control.yaw = cam.camera_yaw;
+	}
 
 	// autoforward if set: move at maximum speed
 	if (player->getPlayerSettings().continuous_forward &&
