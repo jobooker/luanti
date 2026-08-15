@@ -1163,8 +1163,10 @@ def cmd_run(args):
 
             ds = cap.get("dial_state") or {}
             A.add("%s-dials" % name, ds.get("ok"),
-                  ds.get("error") or "view=%s nee=%s bounces=%s"
-                  % tuple(ds.get("seen", {}).get(k) for k in PROVEN_DIALS))
+                  ds.get("error") or " ".join(
+                      "%s=%s" % (k.replace("claude_", ""),
+                                 ds.get("seen", {}).get(k))
+                      for k in PROVEN_DIALS))
             aim = cap.get("aim_at_shutter") or {}
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
             vol = cap.get("volume") or {}
