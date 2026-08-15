@@ -39,14 +39,15 @@
     "set": "gallery",
     "ci": true,
     "pos": [
-      5,
-      9,
-      1
+      5.0,
+      8.56,
+      2.5
     ],
     "yaw": 0,
     "pitch": 15,
     "time": 0.5,
-    "notes": "CI: feet just inside the south door (x=5,z=0), facing +Z up the room like cornell does; pitch +15 puts the y=13 x4-6 z=4 emissive bar high in frame (eye y~10.6, dz 3, dy 2.4 -> 38 deg up) while the floor to the back wall stays in shot"
+    "notes": "CI: feet just inside the south door (x=5,z=0), facing +Z up the room like cornell does; pitch +15 puts the y=13 x4-6 z=4 emissive bar high in frame (eye y~10.6, dz 3, dy 2.4 -> 38 deg up) while the floor to the back wall stays in shot",
+    "note": "feet at the PHYSICS REST position mid-aisle: teleporting to (5,9,1) landed the player against the door threshold and physics slid them ~1.7 nodes over ~50s, resetting accumulation the whole way (CI run 4, 84-sample capture). Teleport to where the body already rests and nothing moves."
   },
   "furnace-050": {
     "set": "gallery",
