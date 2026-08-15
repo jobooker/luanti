@@ -65,3 +65,18 @@ screen_h = 1080
 fullscreen = false
 window_maximized = false
 autosave_screensize = false
+
+# --- fps cap, PINNED (2026-08-15) ----------------------------------------
+# environment-laws "Measurement traps": FpsControl::limit sleeps to
+# fps_max when the window is focused and fps_max_unfocused when it is
+# not (renderingengine.cpp) — and BOTH have hidden defaults (60 / 10,
+# defaultsettings.cpp), so a conf with no line here is a conf with a cap.
+# The sleep lands in dtime and therefore in frame_ms_avg, so a capped
+# run reads as a slower RENDERER; this has twice been mistaken for a
+# performance collapse. Neither key was pinned anywhere until today —
+# the seat conf of record and claude_ci.pin_conf both omitted them, so
+# every headless run inherited whatever the client last saved (10).
+# 200 is above anything this renderer reaches, i.e. no sleep at all.
+# The lab seat pins both; John's own client may keep a low cap.
+fps_max = 200
+fps_max_unfocused = 200

@@ -70,15 +70,26 @@ SEAT_PATTERNS = ["bin/luantiserver --world " + SEAT_WORLD,
 # Canonical photo state. Every capture is taken with exactly these dials.
 CANONICAL_DIALS = {"claude_view": 0, "claude_bounces": 24}
 
-# Pinned capture resolution. Luanti SAVES its window size back into
-# minetest.conf on exit, so one manual resize silently changes every
-# future capture and breaks pixel comparison against the golden
-# (discovered run #3: 2880x1576 vs the golden's 1920x1080). These keys
-# are forced into minetest.conf before every seat start;
+# Pinned capture resolution AND frame pacing. Luanti SAVES its window
+# size back into minetest.conf on exit, so one manual resize silently
+# changes every future capture and breaks pixel comparison against the
+# golden (discovered run #3: 2880x1576 vs the golden's 1920x1080).
+#
+# fps_max / fps_max_unfocused are here for the same reason and were
+# MISSING until 2026-08-15: FpsControl::limit sleeps to fps_max when the
+# window is focused and fps_max_unfocused when it is not, and both have
+# hidden defaults (60 / 10). A CI seat's window is never focused, so
+# every headless run before today slept to 100 ms frames and reported
+# them as frame_ms_avg — a sleeping client reading as a slow renderer.
+# 200 is above anything this renderer reaches, so no sleep is taken.
+# Keep this list identical to the fps block in claude_seat_conf.ref.
+#
+# These keys are forced into minetest.conf before every seat start;
 # autosave_screensize=false stops the exit-save from undoing it.
 PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                "fullscreen": "false", "window_maximized": "false",
-               "autosave_screensize": "false"}
+               "autosave_screensize": "false",
+               "fps_max": "200", "fps_max_unfocused": "200"}
 
 
 def pin_conf():

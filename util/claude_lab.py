@@ -13,6 +13,7 @@ Subcommands:
   vantage NAME               teleport + aim at a saved vantage
   tour [--set NAME]          visit saved vantages, capture each
   compare A B                RMS difference between two screenshots
+  caps                       prove frame_ms is render, not fps-cap sleep
 
 Every `shot` also writes <shot>.capture.json beside the PNG: build sha,
 branch, the conf's claude_* dials, the live settings-patch lines from
@@ -111,6 +112,86 @@ def conf_dials(path=CONF):
     return out
 
 
+# ------------------------------------------------------- the fps cap
+# environment-laws "Measurement traps", scripted at last (2026-08-15).
+# FpsControl::limit (renderingengine.cpp) sleeps to fps_max when the
+# window is focused and fps_max_unfocused when it is not, and BOTH have
+# hidden defaults (60 / 10, defaultsettings.cpp). The sleep lands in
+# dtime and therefore in frame_ms_avg, so a capped client reads as a
+# slow RENDERER — twice mistaken for a performance collapse, once the
+# basis of a real architectural decision. A CI window is never focused.
+#
+# busy_ms is the honest half. limit() measures busy_time BEFORE it
+# sleeps and dtime AFTER, so by construction
+#
+#     frame_ms_avg = busy_ms + sleep_ms
+#
+# and the contamination can be read straight off a stats file without
+# knowing what the cap was set to. cap_artifact() does exactly that, and
+# ALSO names the cap when frame_ms clusters at 1000/cap — a run that
+# trips either check is not evidence about a renderer.
+FPS_CAP_KEYS = ("fps_max", "fps_max_unfocused")
+FPS_CAP_PINNED = 200.0
+CAP_SLEEP_FRAC = 0.05   # >5% of the frame spent asleep = contaminated
+
+
+def conf_keys(names, path=CONF):
+    """Named keys of a conf file, as a dict (missing keys omitted)."""
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() in names:
+                    out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def fps_caps(path=CONF):
+    """The cap as the conf states it, plus whether it is the pinned value.
+    A key that is ABSENT is the dangerous case, so say so by name rather
+    than leaving it out — that absence IS the 2026-08-15 finding."""
+    got = conf_keys(FPS_CAP_KEYS, path)
+    out = {k: got.get(k) for k in FPS_CAP_KEYS}   # None == hidden default
+    out["pinned"] = all(
+        got.get(k) is not None and abs(float(got[k]) - FPS_CAP_PINNED) < 1e-6
+        for k in FPS_CAP_KEYS)
+    return out
+
+
+def cap_artifact(stats, caps=None):
+    """None if this stats sample is honest about the renderer; otherwise a
+    sentence saying why it is not. Two independent checks, because the
+    first needs no knowledge of the cap and the second names it."""
+    if not stats:
+        return "no stats to judge"
+    frame = stats.get("frame_ms_avg")
+    busy = stats.get("busy_ms")
+    if frame is None or busy is None:
+        return "stats lack frame_ms_avg/busy_ms — cannot separate sleep"
+    sleep = frame - busy
+    if frame > 0 and sleep > CAP_SLEEP_FRAC * frame:
+        return ("frame_ms_avg %.1f but busy_ms %.1f: %.1f ms/frame (%.0f%%) "
+                "is fps-cap SLEEP, not render. This measures a cap."
+                % (frame, busy, sleep, 100.0 * sleep / frame))
+    caps = fps_caps() if caps is None else caps
+    for k in FPS_CAP_KEYS:
+        v = caps.get(k)
+        if v is None:
+            return ("%s is ABSENT from the conf, so the client took its "
+                    "hidden default. Pin it (200) before measuring." % k)
+        period = 1000.0 / max(float(v), 1e-6)
+        if abs(frame - period) <= max(0.02 * period, 0.5):
+            return ("frame_ms_avg %.1f sits on 1000/%s = %.1f ms: this is "
+                    "the cap's period, not the renderer's." % (frame, k, period))
+    return None
+
+
 def patch_log(limit=60):
     """Live dial overrides, from the client's own [claude_settings_patch]
     log. That log is ground truth: doorway() truncates the patch file, so
@@ -152,6 +233,10 @@ def capture_record():
             time.gmtime(os.path.getmtime(os.path.join(REPO, "bin", "luanti"))))
             if os.path.exists(os.path.join(REPO, "bin", "luanti")) else None),
         "conf_dials": conf_dials(),
+        # the cap is evidence, not trivia: without it frame_ms_avg cannot
+        # be read as a renderer cost at all (environment-laws).
+        "fps_caps": fps_caps(),
+        "cap_artifact": cap_artifact(st),
         "patch_log": patch_log(),
         "stats": st,
         "time_speed": get_time_speed(),
@@ -308,6 +393,26 @@ def cmd_compare(args):
     print(json.dumps(rms_diff(args.a, args.b), indent=2))
 
 
+def cmd_caps(args):
+    """Is this seat's frame_ms about the renderer, or about a sleep?"""
+    caps = fps_caps()
+    print("conf: fps_max=%s fps_max_unfocused=%s -> %s"
+          % (caps["fps_max"], caps["fps_max_unfocused"],
+             "PINNED" if caps["pinned"] else "NOT PINNED (hidden default!)"))
+    st = read_stats()
+    if not st:
+        print("no claude_stats.json — start the client with claude_stats = 1")
+        sys.exit(2)
+    print("stats: frame_ms_avg %.2f  busy_ms %.2f  worst %.2f  fps %.2f"
+          % (st.get("frame_ms_avg", -1), st.get("busy_ms", -1),
+             st.get("frame_ms_worst", -1), st.get("fps", -1)))
+    bad = cap_artifact(st, caps)
+    if bad:
+        print("REFUSED: %s" % bad)
+        sys.exit(1)
+    print("OK: frame_ms is render, not sleep.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
             formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -329,6 +434,8 @@ def main():
     p.set_defaults(func=cmd_tour)
     p = sub.add_parser("compare"); p.add_argument("a"); p.add_argument("b")
     p.set_defaults(func=cmd_compare)
+    sub.add_parser("caps", help="prove frame_ms is render, not fps-cap sleep"
+                   ).set_defaults(func=cmd_caps)
     args = ap.parse_args()
     args.func(args)
 
