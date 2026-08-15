@@ -297,10 +297,19 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 			&& g_settings->getFloat("claude_bypass", 0.0f, 1.0f) > 0.5f)
 		return effect;
 
-	// claude traced-mode chain: the final merge now lands in a texture;
-	// a half-res path-traced sample accumulates into a persistent
-	// ping-pong history; a present step picks accum (traced modes) or
-	// the merged raster frame, and becomes the pipeline's returned tail.
+	// claude traced-mode chain — RUNG 1, ONE PASS.
+	// The final merge lands in a texture; claude_trace path-traces one
+	// sample per pixel per frame into a persistent ping-pong history; a
+	// present step picks the trace output (traced modes) or the merged
+	// raster frame, and becomes the pipeline's returned tail.
+	//
+	// The five-pass chain that used to live here (claude_radiance ->
+	// claude_faces -> claude_nfaces -> claude_accum -> claude_denoise)
+	// and its four cache textures (RCACHE/FCACHE/NCACHE ping-pongs,
+	// DENOISED) are GONE. physics-contract.md §6: photo mode is pure
+	// path tracing with no next-event estimation, no caches and no
+	// temporal tricks. Everything deleted here was an estimator; the
+	// estimators come back one at a time, each measured against this.
 	static const u8 TEXTURE_ACCUM_1 = 30;
 	static const u8 TEXTURE_ACCUM_2 = 31;
 	static const u8 TEXTURE_MERGED = 32;
@@ -331,108 +340,28 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
-	// claude_radiance: world-space radiance cache, updated on the GPU as a
-	// fragment pass. GL 4.1 has no image store and cannot FBO-attach every
-	// layer of a 3D texture at once, so the 64^3 cache (2-node cells, same
-	// 128-node footprint as the volume) is FLATTENED: 512x512 = an 8x8 grid
-	// of 64x64 tiles, one per z-slice, addressed manually in the shaders.
-	// Ping-pong pair, fixed size (not screen-scaled), float so torch-level
-	// HDR values survive; clear:true so the first frames read zeros, not
-	// uninitialized memory. Update order per frame: radiance pass reads
-	// RCACHE_1 -> writes RCACHE_2; accum reads the fresh RCACHE_2; the swap
-	// at the pipeline tail renames it to RCACHE_1 for next frame.
-	// The pass early-outs (writes zeros) while claude_radiance is 0, so its
-	// standing cost when off is a 512x512 fill — negligible.
-	static const u8 TEXTURE_RCACHE_1 = 34;
-	static const u8 TEXTURE_RCACHE_2 = 35;
-	buffer->setTexture(TEXTURE_RCACHE_1, core::dimension2du(512, 512),
-			"claude_rcache_1", accum_format, /*clear:*/ true);
-	buffer->setTexture(TEXTURE_RCACHE_2, core::dimension2du(512, 512),
-			"claude_rcache_2", accum_format, /*clear:*/ true);
+	// claude_trace: THE truth renderer (client/shaders/claude_trace).
+	// Reads the previous frame's history (ACCUM_1) plus the volume
+	// samplers game.cpp binds outside the material system, writes the
+	// fresh running average to ACCUM_2. The tail swap renames ACCUM_2 to
+	// ACCUM_1 for next frame, exactly as before.
+	shader_id = client->getShaderSource()->getShaderRaw("claude_trace");
+	PostProcessingStep *trace = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_ACCUM_1 });
+	trace->setRenderSource(buffer);
+	trace->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
 
-	shader_id = client->getShaderSource()->getShaderRaw("claude_radiance");
-	PostProcessingStep *radiance = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_RCACHE_1 });
-	radiance->setRenderSource(buffer);
-	radiance->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_RCACHE_2));
-
-	// claude_faces: per-FACE irradiance cache (ADR-0006 v1), successor to
-	// the 2-node lattice above. 128^3 nodes x 6 faces flattened to
-	// 4096x3072 (one 128x128 tile per face/z-slice, 32 tiles per row).
-	// Same ping-pong + reset discipline as the lattice; the accum pass
-	// reads faces for its multi-bounce term, the lattice stays as the
-	// feed for anything not yet migrated and as the one-line revert path.
-	static const u8 TEXTURE_FCACHE_1 = 36;
-	static const u8 TEXTURE_FCACHE_2 = 37;
-	buffer->setTexture(TEXTURE_FCACHE_1, core::dimension2du(4096, 3072),
-			"claude_fcache_1", accum_format, /*clear:*/ true);
-	buffer->setTexture(TEXTURE_FCACHE_2, core::dimension2du(4096, 3072),
-			"claude_fcache_2", accum_format, /*clear:*/ true);
-
-	shader_id = client->getShaderSource()->getShaderRaw("claude_faces");
-	PostProcessingStep *faces = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_FCACHE_1 });
-	faces->setRenderSource(buffer);
-	faces->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_FCACHE_2));
-
-	// claude_nfaces: NEAR-RING sub-face atlas (ADR-0006 v2) — 4x4 texels
-	// per face for the 32^3 cells around the camera, 0.25m ambient
-	// resolution where the coarse cache's 1m quilt is visible. Reads its
-	// own ping-pong (remap across ring shifts) + the fresh coarse cache
-	// for gather-hit self-feed. Idle (cheap zero fill) unless
-	// claude_face_texels >= 2.
-	// 2048x1536 near-ring region + a 2048x1280 LIGHT-LADDER strip below
-	// it (ADR-0008 v1): rungs 1-5 store one irradiance value per 2x
-	// geometry cell — 64^3 light cells per cascade level, 320 z-slice
-	// tiles of 64px in a 16x20 grid (1024 wide). One pass, one texture,
-	// every rung — no special caching at different boundary limits.
-	static const u8 TEXTURE_NCACHE_1 = 38;
-	static const u8 TEXTURE_NCACHE_2 = 39;
-	buffer->setTexture(TEXTURE_NCACHE_1, core::dimension2du(2048, 2816),
-			"claude_ncache_1", accum_format, /*clear:*/ true);
-	buffer->setTexture(TEXTURE_NCACHE_2, core::dimension2du(2048, 2816),
-			"claude_ncache_2", accum_format, /*clear:*/ true);
-
-	shader_id = client->getShaderSource()->getShaderRaw("claude_nfaces");
-	PostProcessingStep *nfaces = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_NCACHE_1, TEXTURE_FCACHE_2 });
-	nfaces->setRenderSource(buffer);
-	nfaces->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_NCACHE_2));
-
-	shader_id = client->getShaderSource()->getShaderRaw("claude_accum");
-	PostProcessingStep *accum = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_RCACHE_2, TEXTURE_FCACHE_2, TEXTURE_NCACHE_2 });
-	accum->setRenderSource(buffer);
-	accum->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
-
-	// edge-aware spatial denoise on the display path only — history
-	// accumulates raw, so the filter never compounds
-	// MUST be float like the accum buffers it carries: this is the LAST
-	// stop before claude_present's tonemap, and allocating it normalized
-	// clamped every displayed radiance to 1.0 — the furnace referee's
-	// first conviction (2026-08-13: both rho variants displayed exactly
-	// vec3(1.0); magma's channel pattern (231,231,158) was the clamp's
-	// fingerprint). History stayed honest; only the DISPLAYED/captured
-	// image clipped, so it looked like a bright sun instead of a bug.
-	static const u8 TEXTURE_DENOISED = 33;
-	buffer->setTexture(TEXTURE_DENOISED, scale * trace_scale, "claude_denoised", accum_format);
-	shader_id = client->getShaderSource()->getShaderRaw("claude_denoise");
-	PostProcessingStep *denoise = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_2 });
-	denoise->setRenderSource(buffer);
-	denoise->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_DENOISED));
-
+	// claude_present is UNCHANGED in its slots: texture 1 is the traced
+	// lighting it upsamples and tonemaps. It used to be the denoiser's
+	// output; it is now the tracer's own, straight out of ACCUM_2.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DENOISED, TEXTURE_DEPTH });
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2, TEXTURE_DEPTH });
 	pipeline->addStep(present);
 	// joint-bilateral upsample does its own tap weighting: keep NEAREST
 	present->setRenderSource(buffer);
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
-	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_RCACHE_1, TEXTURE_RCACHE_2);
-	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_FCACHE_1, TEXTURE_FCACHE_2);
-	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_NCACHE_1, TEXTURE_NCACHE_2);
 
 	return present;
 }

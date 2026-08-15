@@ -328,6 +328,19 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_refine_pixel{"claudeRefine"};
 	float m_denoise = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_denoise_pixel{"claudeDenoise"};
+	// claude_trace diagnostic view: 0 = photo (the truth renderer, and
+	// the only mode a referee may be run against), 1 = first-hit normal
+	// as a six-step GRAY ladder, 2 = albedo, 3 = Le, 4 = distance,
+	// 5 = bounce count. Gray, not RGB: there are exactly six cardinal
+	// normals, so a wrong one reads as a wrong brightness patch.
+	float m_view = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_view_pixel{"claudeView"};
+	// claude_trace path-depth cap: 0 = primary emission only (you see
+	// only what emits), 1 = direct light only, 24 = full transport with
+	// the Russian-roulette schedule. The direct/indirect separation
+	// switch — no extra view modes needed for it.
+	float m_bounces = 24.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bounces_pixel{"claudeBounces"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
@@ -374,7 +387,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 41> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 43> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -416,6 +429,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_subvox",
 		"claude_refine",
 		"claude_denoise",
+		"claude_view",
+		"claude_bounces",
 	};
 
 	static float readGoldenHourStrength()
@@ -741,6 +756,23 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
 	}
 
+	// claude_trace diagnostic view selector, 0..5. 0 (default) = photo:
+	// the truth renderer, untouched by any debug branch.
+	static float readView()
+	{
+		if (!g_settings->exists("claude_view"))
+			return 0.0f;
+		return g_settings->getFloat("claude_view", 0.0f, 5.0f);
+	}
+
+	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
+	static float readBounces()
+	{
+		if (!g_settings->exists("claude_bounces"))
+			return 24.0f;
+		return g_settings->getFloat("claude_bounces", 0.0f, 24.0f);
+	}
+
 
 	static float readClay()
 	{
@@ -835,6 +867,10 @@ public:
 			m_refine = readRefine();
 		if (name == "claude_denoise")
 			m_denoise = readDenoise();
+		if (name == "claude_view")
+			m_view = readView();
+		if (name == "claude_bounces")
+			m_bounces = readBounces();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -892,6 +928,8 @@ public:
 		m_subvox = readSubvox();
 		m_refine = readRefine();
 		m_denoise = readDenoise();
+		m_view = readView();
+		m_bounces = readBounces();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -1131,6 +1169,13 @@ public:
 				m_subvox_pixel.set(&m_subvox, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
+				// claude_trace's two dials. Delivered here, next to the
+				// samplers, because claude_present consumes claudeView
+				// too and both programs run every frame regardless of
+				// mode — a value only set when a consumer is on would
+				// leave one of them reading stale state after a toggle.
+				m_view_pixel.set(&m_view, services);
+				m_bounces_pixel.set(&m_bounces, services);
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
