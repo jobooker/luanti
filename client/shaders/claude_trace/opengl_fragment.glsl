@@ -27,15 +27,105 @@
 // so a parked camera converges by 1/N to the reference image.
 //
 // ---------------------------------------------------------------------
+// RUNG 2 — NEXT-EVENT ESTIMATION WITH MIS (claudeNee)
+// ---------------------------------------------------------------------
+// claudeNee = 0 is the rung-1 path above, unchanged: no light sampling,
+// no MIS weight, not one extra RNG draw. That is photo mode, it is the
+// definition of correct (§6), and it is the A/B partner of everything
+// below. claudeNee = 1 turns on the estimator described here, which must
+// agree with it IN EXPECTATION at a parked camera. A disagreement is a
+// bug in this block, never a reason to retune the pure path (§6).
+//
+// THE INTEGRAL. At a vertex x with normal n_x and Lambertian BRDF
+// f_r = rho/PI, outgoing radiance is
+//
+//     L(x) = Le(x) + INT_H f_r * L(x,wi) * cos_x dwi
+//
+// Rung 1 estimates the integral with one strategy: sample wi from the
+// cosine hemisphere and recurse. Rung 2 adds a second: pick a point y on
+// an emissive surface and connect. Both estimate the SAME integral, so
+// adding them at full strength would double the direct light — the
+// classic bug, and the one the old renderer's claude_pure comment was
+// written in the blood of.
+//
+// THE TWO PDFs, both expressed in SOLID ANGLE about x so they can be
+// compared:
+//
+//   BSDF sampling   p_b(wi) = cos_x / PI            [cosineHemisphere()]
+//   light sampling  p_l(wi) = p_A(y) * d^2 / cos_y  [area -> solid angle]
+//
+// where d = |y - x| and cos_y = dot(n_y, -wi) at the light. The light
+// sampler is UNIFORM OVER AREA (§4: "a light is not a point" — extent is
+// what makes penumbra, and a point light casts no soft shadow at any
+// quality setting):
+//
+//   p_A(y) = 1 / (N * k)
+//
+// N = claudeAreaCount emissive cells in the list; k = the number of
+// faces of the chosen cell that are BOTH air-exposed (game.cpp's mask)
+// AND turned toward x. Each face is a unit square, so its area is 1 and
+// the area density on a chosen face is 1. Choosing among only the faces
+// that face x is not an optimisation with a hidden cost: it is a change
+// of p_A, and neePdfSa() below computes the identical quantity for the
+// BSDF side, which is what keeps the two consistent.
+//
+// THE WEIGHTS — balance heuristic, one sample per strategy:
+//
+//   w_l = p_l / (p_l + p_b)        added at the vertex, by neeDirect()
+//   w_b = p_b / (p_b + p_l)        added at the NEXT vertex's Le
+//
+// w_l + w_b = 1 for every direction both strategies can produce, so the
+// sum is exactly one copy of the direct term. Where only one strategy
+// can produce a direction the other's pdf is 0 and that strategy's
+// weight is 1, which is what makes the following all correct rather than
+// merely tolerable:
+//
+//  * AN EMITTER NOT IN THE LIST (the 16-slot cap overflowed, or the cell
+//    is sealed inside solid). p_l = 0 there, so w_b = 1 and its full
+//    radiance arrives through BSDF sampling. Truncating the list costs
+//    variance, never energy.
+//  * N = 0, or claudeNee = 0. p_l = 0 everywhere, w_b = 1 everywhere:
+//    the estimator collapses back onto the pure path, exactly.
+//  * A UNIFORM-EMISSIVE FURNACE. Every surface emits, so nearly every
+//    BSDF bounce lands on an emitter and both strategies fire on the
+//    same Watt every time. This is the case that punishes a missing
+//    weight hardest and the reason the analytic L = Le/(1-rho) referee
+//    is the sharpest instrument here.
+//
+// AT AN E-SURFACE. An emissive voxel emits AND reflects (§4), so its Le
+// is collected at every vertex that lands on it, and the surface then
+// scatters with the same rho as any other. The only difference rung 2
+// makes is the weight on that Le:
+//   - seg 0 (the camera ray): weight 1, ALWAYS. A camera ray is not a
+//     sampling strategy the light sampler competes with — nothing did or
+//     could aim at that surface on the eye's behalf. Both modes add it
+//     identically, which is why claudeBounces = 0 is byte-identical
+//     under either dial.
+//   - seg > 0: weight w_b, using the pdfs of the ray that arrived.
+// Le itself is never recomputed: the shadow ray's own march() hit
+// carries it, through the same cellEmission() the eye ray runs. There is
+// one Le in this file and NEE does not add a second (§4).
+//
+// WHAT NEE DOES NOT CHANGE. Russian roulette still runs after the NEE
+// term (survivors carry 1/q, so E[BSDF half] is untouched). The depth
+// cap still truncates both halves at the same vertex, so claudeBounces
+// means the same thing in both modes. Views 1-5 are untouched; view 6
+// (clay) runs whichever transport the dial says, and clay+nee is a legal
+// and useful combination — uniform rho makes a bad MIS weight glaring.
+//
+// ---------------------------------------------------------------------
 // THE PUNT LIST — documented absences, not quiet hacks (§3)
 // ---------------------------------------------------------------------
 //  * sun/sky: DOCUMENTED PUNT, RUNG 1. A ray that leaves the 128^3
 //    volume returns black. There is no sun, no sky dome, no ambient.
 //    Rung 1's target scenes are a SEALED Cornell box and a SEALED
 //    furnace room, where no ray escapes; outdoors this renders night.
-//  * next-event estimation: absent by design (§6 forbids it in truth
-//    mode). Emitters are lit by being HIT. Penumbra therefore comes
-//    from an emitter's real extent (§4: "a light is not a point").
+//  * NEE beyond 16 area emitters: the uniform list is capped (game.cpp
+//    ClaudeVolume::AREA_CAP). Past that, emitters are lit by being HIT,
+//    which is correct and noisier — see the weights above.
+//  * NEE for the point-light list (claudeEmitter0..7): NOT connected.
+//    Those are class 165/250 cells, which cellEmission() gives no Le, so
+//    there is nothing to sample and nothing to double-count.
 //  * irradiance caches, face caches, radiance lattice: deleted.
 //  * spatial denoising: deleted. Noise is resolved by convergence only.
 //  * reprojection: not done. History is read at the SAME uv. Camera
@@ -81,6 +171,20 @@
 // used. texture3D is not covered by that header, so it is defined below
 // exactly as claude_accum defined it. GL 4.1 core: no image store, no
 // compute, no layout(location=) on fragment outputs — none used here.
+//
+// The rung-2 block uses integer bitwise ops (>>, &) on the face mask.
+// Those are core GLSL since 1.30, so 150 has them; they are the only
+// construct in this file newer than what rung 1 used.
+//
+// NO ARRAY UNIFORMS AND NO DYNAMIC INDEXING. claudeArea0..15 are sixteen
+// separate vec4 uniforms read through an explicit if-chain, exactly the
+// shape claudeEmitter0..7 has always had. `uniform vec4 a[16]` would be
+// legal GLSL 150 to index dynamically, but the ENGINE side is the
+// problem: getPixelShaderConstantID() string-compares against the name
+// glGetActiveUniform returns, and drivers disagree on whether that is
+// "a" or "a[0]" — so the array would resolve on one machine and
+// silently deliver nothing on the next, which for a light list means an
+// image that is quietly noisier rather than an error.
 // =====================================================================
 
 #define history texture0
@@ -116,6 +220,35 @@ uniform float claudeView;
 // 1 = direct light only, 24 = full transport. The direct/indirect
 // separation switch — no extra view modes needed.
 uniform float claudeBounces;
+// Transport mode. 0 = the pure photo path (§6 truth mode: no light
+// sampling, no MIS weight, not one extra RNG draw). 1 = next-event
+// estimation with multiple importance sampling. See the rung-2 header.
+uniform float claudeNee;
+
+// AREA-EMITTER LIST for next-event estimation (game.cpp
+// claudeVolumeSnapshot, ClaudeVolume::area). One emissive CELL per slot:
+//   xyz = integer volume-cell coords, the DDA's own cell space
+//   w   = air-exposed face mask, bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z
+// NO RADIANCE RIDES ALONG, on purpose: THE LAW is one Le (§4), so the
+// shadow ray's own march() hit supplies it via cellEmission(). A second
+// copy of Le on the CPU is the divergence the contract forbids.
+uniform float claudeAreaCount; // live slots, 0..AREA_CAP; 0 = no NEE
+uniform vec4 claudeArea0;
+uniform vec4 claudeArea1;
+uniform vec4 claudeArea2;
+uniform vec4 claudeArea3;
+uniform vec4 claudeArea4;
+uniform vec4 claudeArea5;
+uniform vec4 claudeArea6;
+uniform vec4 claudeArea7;
+uniform vec4 claudeArea8;
+uniform vec4 claudeArea9;
+uniform vec4 claudeArea10;
+uniform vec4 claudeArea11;
+uniform vec4 claudeArea12;
+uniform vec4 claudeArea13;
+uniform vec4 claudeArea14;
+uniform vec4 claudeArea15;
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
 
@@ -208,7 +341,31 @@ const float SURFACE_EPS = 0.01;
 // Guard against a division blowing up on an axis-aligned ray.
 const float DDA_MIN_ABS = 1e-6;
 
+const float PI = 3.14159265358979323846;
 const float PI2 = 6.28318530717958647692;
+
+// Slots in the area-emitter list. MUST equal ClaudeVolume::AREA_CAP in
+// game.cpp: the shader trusts claudeAreaCount as the size of the set it
+// samples uniformly, and a mismatch would make the 1/N in the pdf a
+// different N from the one the selection actually used — which is not a
+// dimmer image, it is a WRONGLY SCALED one.
+const int AREA_CAP = 16;
+
+// A sampled light point sits exactly on a face plane, so the shadow
+// ray's own hit lands in the emitter cell and the test is "is the first
+// opaque cell the target cell", not a distance compare with a tuned
+// epsilon. This is the only tolerance in that test: cell indices are
+// integers, so half a cell separates any two of them.
+const float CELL_MATCH_EPS = 0.5;
+
+// Grazing floor on cos_y at the light. p_l carries a 1/cos_y, so a face
+// seen exactly edge-on drives it to infinity and inf/inf is a NaN in the
+// balance weight. Declining those directions costs NO energy, because
+// BOTH sides of the weight use this same threshold: neeDirect() returns
+// black there and neePdfSa() returns 0, which hands the BSDF sample the
+// full weight instead. The contribution the light sampler gives up is
+// proportional to 1/p_l, i.e. it was heading to zero anyway.
+const float NEE_COS_MIN = 1e-6;
 
 // --- diagnostic view constants ---------------------------------------
 // Six cardinal normals, six gray steps. Read the image as brightness:
@@ -303,18 +460,26 @@ vec3 cellEmission(float cls, vec3 albedo)
 // the reference, its scenes are two small sealed rooms, and "slow is
 // fine". One traversal, no second code path to keep in agreement.
 //
-// Returns true on an opaque hit and fills hp / n / alb / le / tHit.
-// False = the ray left the volume (or ran out of steps, which the
-// MARCH_STEPS bound makes unreachable inside a 128^3 grid).
+// Returns true on an opaque hit and fills hp / n / alb / le / tHit /
+// cellOut. False = the ray left the volume (or ran out of steps, which
+// the MARCH_STEPS bound makes unreachable inside a 128^3 grid).
+//
+// SHADOW RAYS USE THIS FUNCTION, not a lighter copy of it. §2 lists "a
+// voxel that exists for eye rays but not for shadow, bounce, or emitter
+// rays" as a contract violation, and the cheapest way to never commit it
+// is to have exactly one traversal. cellOut exists for those rays: a
+// visibility test that compares the first opaque CELL against the
+// emitter cell needs no epsilon and cannot self-shadow the light.
 
 bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
-		out vec3 le, out float tHit)
+		out vec3 le, out float tHit, out vec3 cellOut)
 {
 	hp = ro;
 	n = vec3(0.0, 1.0, 0.0);
 	alb = vec3(0.0);
 	le = vec3(0.0);
 	tHit = DEPTH_MISS;
+	cellOut = vec3(-1.0);
 
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(rd);
@@ -356,6 +521,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		alb = cellAlbedo(s.rgb);
 		le = cellEmission(s.a, alb);
 		tHit = t;
+		cellOut = cell;
 		return true;
 	}
 	return false;
@@ -380,6 +546,205 @@ vec3 cosineHemisphere(vec3 n, float u1, float u2)
 }
 
 // ---------------------------------------------------------------------
+// NEXT-EVENT ESTIMATION + MIS (rung 2). See the header for the math.
+// Every function below is dead code when claudeNee = 0: main() never
+// calls one, and the pure path does not lose or gain a single RNG draw.
+// ---------------------------------------------------------------------
+
+// The one place the sixteen slots are indexed. An if-chain, not an
+// array — see the GLSL PROFILE note about array uniform names.
+vec4 areaEmitter(int i)
+{
+	if (i == 0) return claudeArea0;
+	if (i == 1) return claudeArea1;
+	if (i == 2) return claudeArea2;
+	if (i == 3) return claudeArea3;
+	if (i == 4) return claudeArea4;
+	if (i == 5) return claudeArea5;
+	if (i == 6) return claudeArea6;
+	if (i == 7) return claudeArea7;
+	if (i == 8) return claudeArea8;
+	if (i == 9) return claudeArea9;
+	if (i == 10) return claudeArea10;
+	if (i == 11) return claudeArea11;
+	if (i == 12) return claudeArea12;
+	if (i == 13) return claudeArea13;
+	if (i == 14) return claudeArea14;
+	return claudeArea15;
+}
+
+// Face index -> outward cardinal normal. The order IS the bit order of
+// game.cpp's mask; the two must be read together or the light sampler
+// aims at faces the snapshot called sealed.
+vec3 faceNormal(int f)
+{
+	if (f == 0) return vec3(1.0, 0.0, 0.0);
+	if (f == 1) return vec3(-1.0, 0.0, 0.0);
+	if (f == 2) return vec3(0.0, 1.0, 0.0);
+	if (f == 3) return vec3(0.0, -1.0, 0.0);
+	if (f == 4) return vec3(0.0, 0.0, 1.0);
+	return vec3(0.0, 0.0, -1.0);
+}
+
+// The inverse, for a normal march() already produced. Cardinal normals
+// are law (§2), so this is exact, not a nearest-axis guess.
+int faceIndex(vec3 n)
+{
+	if (n.x > 0.5) return 0;
+	if (n.x < -0.5) return 1;
+	if (n.y > 0.5) return 2;
+	if (n.y < -0.5) return 3;
+	if (n.z > 0.5) return 4;
+	return 5;
+}
+
+// Can the light sampler at x put a sample on face f of cell c? Two
+// conditions, and BOTH sides of the MIS weight ask this same question:
+//   (1) the face is air-exposed, per the snapshot's mask. Every non-air
+//       class is opaque in rung 1, so an unexposed face is one no ray
+//       can reach — it belongs in neither pdf.
+//   (2) the face is turned toward x. Sampling the far side of a cube
+//       would spend half the samples on cos_y <= 0, and excluding it is
+//       a change of p_A, not a free optimisation — which is exactly why
+//       this predicate, and not two similar ones, answers for both.
+bool faceCandidate(vec3 c, int mask, int f, vec3 x)
+{
+	if (((mask >> f) & 1) == 0)
+		return false;
+	vec3 nf = faceNormal(f);
+	// cell centre c + 0.5, face centre half a cell further along nf
+	return dot(nf, x - (c + vec3(0.5) + nf * 0.5)) > 0.0;
+}
+
+// p_l for a point the BSDF sampler found, in SOLID ANGLE about x — the
+// density neeDirect() WOULD have had, had it aimed at this exact face
+// from this exact x. Zero when the light sampler cannot generate the
+// direction at all (cell absent from the list because the cap
+// overflowed, or the face not a candidate), and that zero is load
+// bearing: it makes w_b = 1 there, so a truncated list costs variance
+// and never energy.
+float neePdfSa(vec3 cellHit, vec3 nHit, vec3 x, float dist, float cosY,
+		int nLights)
+{
+	if (nLights <= 0 || cosY <= NEE_COS_MIN)
+		return 0.0;
+	int mask = 0;
+	bool listed = false;
+	for (int i = 0; i < AREA_CAP; i++) {
+		if (i >= nLights)
+			break;
+		vec4 e = areaEmitter(i);
+		if (all(lessThan(abs(e.xyz - cellHit), vec3(CELL_MATCH_EPS)))) {
+			mask = int(e.w + 0.5);
+			listed = true;
+			break;
+		}
+	}
+	if (!listed)
+		return 0.0;
+	if (!faceCandidate(cellHit, mask, faceIndex(nHit), x))
+		return 0.0;
+	int k = 0;
+	for (int f = 0; f < 6; f++) {
+		if (faceCandidate(cellHit, mask, f, x))
+			k++;
+	}
+	if (k == 0)
+		return 0.0; // unreachable: the hit face itself passed the test
+	// p_A = 1/(N*k) over unit-square faces, converted to solid angle
+	return (dist * dist) / (float(nLights) * float(k) * cosY);
+}
+
+// One light sample at vertex (x, nx) with reflectance rho. Returns the
+// MIS-weighted direct contribution WITHOUT the path throughput, which
+// the caller multiplies in.
+//
+// Cost: exactly four RNG draws and one shadow march when it runs to
+// completion — fewer on an early out, which is fine, the draws are a
+// per-pixel chain and not a fixed budget.
+vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights)
+{
+	// uniform over the list. Not importance-weighted by distance or
+	// power: p_A must be reproducible by neePdfSa() from the hit alone,
+	// and 1/(N*k) is.
+	float us = rnd1();
+	int li = min(int(float(nLights) * us), nLights - 1);
+	vec4 e = areaEmitter(li);
+	vec3 c = e.xyz;
+	int mask = int(e.w + 0.5);
+
+	int k = 0;
+	for (int f = 0; f < 6; f++) {
+		if (faceCandidate(c, mask, f, x))
+			k++;
+	}
+	if (k == 0)
+		return vec3(0.0); // this emitter shows x nothing
+
+	float uf = rnd1();
+	int pick = min(int(float(k) * uf), k - 1);
+	int face = 5;
+	int seen = 0;
+	for (int f = 0; f < 6; f++) {
+		if (!faceCandidate(c, mask, f, x))
+			continue;
+		if (seen == pick) {
+			face = f;
+			break;
+		}
+		seen++;
+	}
+
+	// AREA, NOT A POINT (§4). A uniform point on the unit face — this is
+	// the whole reason penumbra exists in this renderer, and the wrapped
+	// cosine point light that came before it could not produce one at any
+	// sample count.
+	vec3 nL = faceNormal(face);
+	float u1 = rnd1();
+	float u2 = rnd1();
+	vec3 ta = abs(nL.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = cross(ta, nL); // cardinal x cardinal: already unit
+	vec3 ty = cross(nL, tx);
+	vec3 y = c + vec3(0.5) + nL * 0.5
+			+ tx * (u1 - 0.5) + ty * (u2 - 0.5);
+
+	vec3 d = y - x;
+	float dist2 = dot(d, d);
+	if (dist2 < 1e-8)
+		return vec3(0.0);
+	float dist = sqrt(dist2);
+	vec3 wi = d / dist;
+	float cosX = dot(nx, wi);
+	float cosY = dot(nL, -wi);
+	if (cosX <= 0.0 || cosY <= NEE_COS_MIN)
+		return vec3(0.0); // same threshold neePdfSa() uses — see the const
+
+	// VISIBILITY through the one traversal. Visible iff the first opaque
+	// cell on the way IS the emitter cell — no epsilon on t, and no way
+	// for the emitter to shadow itself.
+	vec3 shp, shn, shalb, shle, shcell;
+	float sht;
+	if (!march(x, wi, shp, shn, shalb, shle, sht, shcell))
+		return vec3(0.0);
+	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
+		return vec3(0.0); // occluded
+
+	// THE LAW: one Le. shle came out of march(), which ran the same
+	// cellEmission() the eye ray runs — no second formula here, and no
+	// CPU-side copy of Le to drift from it. Deliberately NOT guarded
+	// against shle == 0: a non-emissive cell in the list would have to
+	// be a snapshot bug, and multiplying it through returns black on its
+	// own. An early-out here would instead hide it, and would make
+	// neeDirect() decline a direction neePdfSa() still prices — the one
+	// asymmetry that actually loses energy.
+	float pdfL = dist2 / (float(nLights) * float(k) * cosY); // p_l, sa
+	float pdfB = cosX / PI;                                  // p_b, sa
+	float w = pdfL / (pdfL + pdfB);                          // balance
+	// f_r = rho/PI for a Lambertian; estimator = w * f_r * Le * cos_x/p_l
+	return w * (rho / PI) * shle * (cosX / pdfL);
+}
+
+// ---------------------------------------------------------------------
 
 void main(void)
 {
@@ -392,6 +757,13 @@ void main(void)
 
 	int view = int(claudeView + 0.5);
 	int maxBounces = int(claudeBounces + 0.5);
+	// nLights is the ONE gate on the whole rung-2 block. 0 means the pure
+	// path: with claudeNee = 0, or an empty/invalid list, not a single
+	// line below behaves differently from rung 1 — including the RNG draw
+	// order, which is what makes the A/B a real A/B and not two images
+	// that merely look alike.
+	int nLights = claudeNee > 0.5
+			? min(int(claudeAreaCount + 0.5), AREA_CAP) : 0;
 
 	g_rngState = hash13(vec3(gl_FragCoord.xy,
 			// animationTimer is unbounded seconds; wrapped by an
@@ -428,13 +800,23 @@ void main(void)
 	bool primaryHit = false;
 	float pathBounces = 0.0;     // view 5: scatters actually taken
 
+	// MIS bookkeeping for the BSDF strategy: the vertex the current ray
+	// left from, and that ray's solid-angle density there. misArmed is
+	// false on the camera ray on purpose — an eye ray is not a strategy
+	// the light sampler competes with, so a directly-visible emitter is
+	// added at full strength in BOTH modes. All three are inert when
+	// nLights is 0.
+	vec3 prevX = vec3(0.0);
+	float prevPdfB = 0.0;
+	bool misArmed = false;
+
 	for (int seg = 0; seg <= BOUNCE_CAP; seg++) {
 		if (seg > maxBounces)
 			break;
 
-		vec3 hp, n, alb, le;
+		vec3 hp, n, alb, le, cell;
 		float tHit;
-		if (!march(p, dir, hp, n, alb, le, tHit))
+		if (!march(p, dir, hp, n, alb, le, tHit, cell))
 			break; // escaped the volume: nothing to add
 
 		// clay: march computed le from the TRUE albedo above; clamping
@@ -451,12 +833,39 @@ void main(void)
 		}
 
 		// §4: the surface EMITS and REFLECTS. Collect Le, keep going.
-		L += tp * le;
+		//
+		// Under NEE this Le arrived by the BSDF strategy, and the light
+		// sampler at the previous vertex was already paid its share of
+		// the same Watt — so it carries the balance weight w_b here.
+		// Adding it at full strength on top of the NEE term is THE
+		// double count, the one failure mode this block exists to avoid.
+		// misW stays exactly 1.0 when nothing competed: the camera ray,
+		// an unlisted emitter, an empty list, claudeNee = 0.
+		float misW = 1.0;
+		if (misArmed && any(greaterThan(le, vec3(0.0)))) {
+			float cosY = dot(n, -dir);
+			float pdfL = neePdfSa(cell, n, prevX, tHit, cosY, nLights);
+			// A zero denominator means neither strategy claims a density
+			// for this direction, which can only happen at a degenerate
+			// cos; fall back to 1 rather than let a NaN into the history.
+			float denom = prevPdfB + pdfL;
+			misW = denom > 0.0 ? prevPdfB / denom : 1.0;
+		}
+		L += tp * misW * le;
 
 		if (seg == maxBounces)
 			break; // depth cap: no scatter from this vertex
 		if (view >= 1 && view <= 4)
 			break; // first-hit views need nothing past the primary
+
+		// NEXT-EVENT ESTIMATION at this vertex, before the throughput
+		// absorbs alb: neeDirect() carries its own rho/PI, and it must be
+		// the rho this vertex actually reflects with — which in clay
+		// (view 6) is CLAY_RHO, clamped above. The depth cap cuts this
+		// term at the same vertex it cuts the BSDF half, so claudeBounces
+		// means the same thing under either dial.
+		if (nLights > 0)
+			L += tp * neeDirect(hp, n, alb, nLights);
 
 		tp *= alb;
 
@@ -473,6 +882,13 @@ void main(void)
 		float u1 = rnd1();
 		float u2 = rnd1();
 		dir = cosineHemisphere(n, u1, u2);
+		// Arm the BSDF half of the MIS pair. Russian roulette above does
+		// not enter these pdfs: it scales the estimate by 1/q on the
+		// survivors, which leaves the SAMPLING DENSITY of the direction
+		// untouched, and the weights are densities.
+		prevX = hp;
+		prevPdfB = max(dot(n, dir), 0.0) / PI;
+		misArmed = nLights > 0;
 		p = hp;
 		pathBounces += 1.0;
 	}
