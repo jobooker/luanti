@@ -48,8 +48,73 @@ def doorway(**kv):
     time.sleep(1.4)  # poller runs at ~1 Hz
 
 
+# The bridge is a SINGLE-SLOT channel: one claude_cmd.json, one
+# claude_out.json, no queue. Two callers at once do not interleave, they
+# CLOBBER — the second request overwrites the first before the mod's
+# 0.5 Hz globalstep reads it, and the first caller waits out its full
+# 30 s timeout. Demonstrated 2026-08-15 by probing the world from a
+# second process while a sweep was mid-run: three timeouts here, and an
+# unknown number of stolen teleports there. A long measurement can be
+# silently corrupted by one interactive command, which is exactly the
+# class of contamination this repo keeps paying for.
+#
+# So rpc() takes an advisory lock. It is advisory only in that a caller
+# who does not use rpc() can still stomp the files, but every tool here
+# goes through rpc(). A lock older than RPC_LOCK_STALE is broken, so a
+# crashed run cannot wedge the seat forever.
+RPC_LOCK = os.path.join(WORLD, "claude_rpc.lock")
+RPC_LOCK_WAIT = 45.0    # s to wait for another caller to finish
+RPC_LOCK_STALE = 90.0   # s after which a lock is presumed abandoned
+
+
+def _lock_acquire():
+    deadline = time.time() + RPC_LOCK_WAIT
+    while True:
+        try:
+            fd = os.open(RPC_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, ("%d %f\n" % (os.getpid(), time.time())).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(RPC_LOCK)
+                holder = open(RPC_LOCK).read().strip()
+            except Exception:
+                age, holder = 0.0, "?"
+            if age > RPC_LOCK_STALE:
+                print("claude_lab: breaking stale bridge lock (%s, %.0fs old)"
+                      % (holder, age), file=sys.stderr)
+                try:
+                    os.unlink(RPC_LOCK)
+                except OSError:
+                    pass
+                continue
+            if time.time() > deadline:
+                raise RuntimeError(
+                    "bridge is busy: held by %s for %.0fs. Another run is "
+                    "driving this seat — do not talk to the bridge while a "
+                    "measurement is going, it will corrupt the run."
+                    % (holder, age))
+            time.sleep(0.5)
+
+
+def _lock_release():
+    try:
+        os.unlink(RPC_LOCK)
+    except OSError:
+        pass
+
+
 def rpc(op, **kw):
-    """One bridge call over the world-dir file protocol."""
+    """One bridge call over the world-dir file protocol, serialised."""
+    _lock_acquire()
+    try:
+        return _rpc_locked(op, **kw)
+    finally:
+        _lock_release()
+
+
+def _rpc_locked(op, **kw):
     req = dict(id="lab%d" % time.time_ns(), op=op, **kw)
     with open(os.path.join(WORLD, "claude_cmd.json"), "w") as f:
         json.dump(req, f)
