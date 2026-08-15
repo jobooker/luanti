@@ -261,8 +261,25 @@ FURNACE_PATCH = None
 # across every build). -073 SATURATES the ACES inversion (100% clipped),
 # so its ratio carries ~10% slop by construction and its tolerance is
 # wide on purpose: it is a truncation detector, not a precision one.
-FURNACE_PINNED = {"050": 0.982, "073": 0.733}
-FURNACE_TOL = {"050": 0.010, "073": 0.100}
+# DERIVED 2026-08-15 from two consecutive clean Release runs
+# (20260815-231750 and -232454, both @ 6fa72c640), at full precision
+# rather than the referee's 3-decimal print:
+#   furnace-050  0.982430 / 0.982430  -> spread 0.000000
+#   furnace-073  1.112564 / 1.112792  -> spread 0.000228 (3x = 0.00069)
+# 3x the spread is below the resolution the referee prints, so both
+# tolerances are floored at 3x that resolution (3 x 0.001). The old
+# blanket 0.15 is 50x looser; note what that does NOT buy, though —
+# furnace-050 reads 0.982 under claude_nee 0 AND 1, so no tolerance
+# makes this room able to see the NEE bias. Tightening it stops it
+# CERTIFYING a broken estimator, which is what it did twice.
+#
+# -073 carries a caveat: its patch is 100% CLIPPED (the ACES shoulder
+# saturates at rho 0.73), so its ratio is a saturation reading, not a
+# transport one — reproducible to 0.0002 but not physically meaningful
+# to that precision. Its own history moved with builds (0.733 fp16,
+# 1.068-1.087 mid-day, 1.113 today) and it is a truncation detector.
+FURNACE_PINNED = {"050": 0.982, "073": 1.113}
+FURNACE_TOL = {"050": 0.003, "073": 0.003}
 # Legacy name kept so old run.json rows still parse.
 FURNACE_RATIO_TOL = 0.15
 
