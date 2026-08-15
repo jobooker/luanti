@@ -35,8 +35,22 @@
     "time": 0.73,
     "notes": "west slot raking the hearth; t=0.73 (sun ~15-20 deg west \u2014 t=0.78 was beam-past-the-room, 2026-08-13)"
   },
+  "cozy-ci": {
+    "set": "gallery",
+    "ci": true,
+    "pos": [
+      5,
+      9,
+      1
+    ],
+    "yaw": 0,
+    "pitch": 15,
+    "time": 0.5,
+    "notes": "CI: feet just inside the south door (x=5,z=0), facing +Z up the room like cornell does; pitch +15 puts the y=13 x4-6 z=4 emissive bar high in frame (eye y~10.6, dz 3, dy 2.4 -> 38 deg up) while the floor to the back wall stays in shot"
+  },
   "furnace-050": {
     "set": "gallery",
+    "ci": true,
     "pos": [
       18,
       9,
@@ -45,10 +59,11 @@
     "yaw": 270,
     "pitch": 0,
     "time": 0.5,
-    "notes": "door plugged with wall node before capture"
+    "notes": "door plugged with wall node before capture (claude_ci does it: 20,9,0)"
   },
   "furnace-073": {
     "set": "gallery",
+    "ci": true,
     "pos": [
       31,
       9,
@@ -57,10 +72,11 @@
     "yaw": 270,
     "pitch": 0,
     "time": 0.5,
-    "notes": "door plugged with wall node before capture"
+    "notes": "door plugged with wall node before capture (claude_ci does it: 33,9,0)"
   },
   "cornell": {
     "set": "gallery",
+    "ci": true,
     "pos": [
       47,
       9,
@@ -69,6 +85,6 @@
     "yaw": 0,
     "pitch": 12,
     "time": 0.5,
-    "notes": "door plugged claude_bridge:gray221; red left, green right"
+    "notes": "door plugged claude_bridge:gray221 (claude_ci does it: 47,9,0); red left, green right"
   }
 }
