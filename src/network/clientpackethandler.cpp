@@ -338,6 +338,15 @@ void Client::handleCommand_BlockData(NetworkPacket* pkt)
 	// the only moment its nodes are guaranteed hot in cache anyway
 	claude_lod::summarizeBlock(this, block);
 
+	// claude_volume: a whole 16^3 of node content was just replaced, so
+	// the tracer's copy of this block is stale. Marking it here rather
+	// than snapping on a timer is the EVENT half of the re-snap fix — in
+	// a static scene BLOCKDATA arrives about once per 30 s, against the
+	// old timer's ten per 30 s. The drain re-walks the block and compares
+	// its hash, so a re-send that changed nothing costs a 4096-cell walk
+	// and touches neither the textures nor the accumulator.
+	claudeMarkBlockDirty(p);
+
 	/*
 		Add it to mesh update queue and set it to be acknowledged after update.
 	*/

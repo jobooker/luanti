@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
+#include <iomanip> // claude_stats: hex volume_hash
 // claude_volume uploads its 3D textures through raw GL directly.
 // Cross-platform GL via the engine's own loader (irr/include/mt_opengl.h):
 // it supplies BOTH entry points and enums as members of the global `GL`,
@@ -161,6 +162,32 @@ struct ClaudeVolume
 	// vantage.
 	u32 solid_count = 0;
 	u32 snap_seq = 0;
+	// ---- INCREMENTAL RE-SNAP (2026-08-16) ------------------------------
+	// The CPU mirrors of the uploaded volumes, kept alive BETWEEN
+	// snapshots so a changed 16^3 block can be re-walked in place and
+	// uploaded as a sub-box. They used to be locals of the snapshot
+	// function, which is why the only way to reflect a dug node was to
+	// re-read all 2.1 M cells (spec/measured.md "Volume re-snap fix").
+	static constexpr int BLK = 16;                // volume block edge, cells
+	static constexpr int NB = SIZE / BLK;         // 8 blocks per axis
+	static constexpr int NBLOCKS = NB * NB * NB;  // 512
+	std::vector<u8> occ;      // SIZE^3 RGBA: rgb = colour, a = class
+	std::vector<u8> mids;     // SIZE^3 material ids
+	std::vector<u8> pyr[6];   // occupancy mip pyramid, 128..4 cubed
+	// PER-BLOCK HASHES, combined order-independently into content_hash.
+	// The old content_hash was an FNV chain over every cell in index
+	// order, which cannot be updated for a sub-box at all — so the whole
+	// "unchanged -> skip the upload and don't disturb accumulation"
+	// early return depended on re-walking everything.
+	u64 block_hash[NBLOCKS] = {};
+	u32 block_solid[NBLOCKS] = {};
+	// Point emitters carry the cell that produced them, so a block
+	// re-walk can drop exactly the ones that block owned (a dug lamp that
+	// stays in this list keeps getting sampled by NEE, and the room stays
+	// lit with nothing in the log) and so the list can be restored to
+	// whole-volume cell order before the nearest-8 distance sort.
+	struct PointEmit { u32 cell; float v[5]; };
+	std::vector<PointEmit> emit_all;
 	// Held (wielded) light lives in its OWN slot, never in emitters[]:
 	// writing it into emitters[7] STOMPED the 8th-nearest real torch in
 	// place, and the content-hash snapshot gate preserved the corruption
@@ -1994,48 +2021,91 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 			<< V.model_of.size() << " node bindings" << std::endl;
 }
 
-// with the GL context current; the ~2 MB walk causes a brief hitch, which
-// is acceptable for a manually-triggered debug snapshot.
-static void claudeVolumeSnapshot(Client *client)
+// ---- INCREMENTAL VOLUME RE-SNAP -------------------------------------
+// (2026-08-16; spec/measured.md "Volume re-snap fix".) The volume used to
+// be rebuilt from scratch on a 2 s timer that the 1 Hz poll quantized to
+// every 3 s. MEASURED at the cozy-ci vantage, Release: 12.0 ms of CPU
+// walk on EVERY tick even when nothing had changed — the unchanged-hash
+// early return skips the upload, never the walk — and 28.6 ms when
+// something had (walk 12.5, bake 4.4, GL 10.9, emitters 0.7). Worst
+// frame with follow on 39.7 ms vs 15.8 ms with it off, same seat, same
+// scene, one variable. That is a hitch you can see, and it ran on a
+// clock rather than on the world changing.
+//
+// Now the CPU mirrors live in ClaudeVolume, the client pushes changed
+// block positions into a dirty set (Client::claudeMarkBlockDirty, fed
+// from addNode / removeNode / handleCommand_BlockData), and the poll
+// re-walks only the 16^3 volume blocks those touch and uploads only that
+// sub-box. The full walk survives for exactly two callers: bootstrap,
+// and a >24-node re-centre — which moves the origin, so nothing can be
+// reused (the deadband makes that rare, and shift-and-fill is not worth
+// the class of bug it invites).
+
+// Pack a sub-box out of one of the linear 3D CPU mirrors so that a
+// glTexSubImage3D has a contiguous source. The alternative,
+// GL_UNPACK_ROW_LENGTH / IMAGE_HEIGHT, leaves global pixel-store state
+// behind for Irrlicht to trip over; a 16^3 box is 16 KB, so packing is
+// not worth being clever about.
+static void claudePackBox(const u8 *src, int dx, int dy, int comp,
+		int x0, int y0, int z0, int w, int h, int d, std::vector<u8> &out)
 {
-	constexpr int S = ClaudeVolume::SIZE;
-	u64 t0 = porting::getTimeMs();
-	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
-	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
-	// ORIGIN DEADBAND (John, 2026-08-13: "things shift when I move
-	// around"): the detail ring rides volume-local coords, so an
-	// origin that re-quantizes with every camera step sweeps the
-	// carve/cube boundary through the world at walking pace. Keep the
-	// previous origin while the camera stays within +/-6 m of the
-	// volume center — walking around a room then shifts NOTHING, and
-	// a genuine relocation costs one rebase instead of a pop per step.
-	{
-		v3s16 prev_center = g_claude_volume.prev_origin
-				+ v3s16(S / 2, S / 2, S / 2);
-		v3s16 d = center - prev_center;
-		if (g_claude_volume.valid
-				&& std::abs(d.X) <= 6 && std::abs(d.Y) <= 6
-				&& std::abs(d.Z) <= 6)
-			origin = g_claude_volume.prev_origin;
+	out.resize((size_t)w * h * d * comp);
+	const size_t rowbytes = (size_t)w * comp;
+	size_t o = 0;
+	for (int z = z0; z < z0 + d; z++)
+	for (int y = y0; y < y0 + h; y++) {
+		memcpy(&out[o], src + (((size_t)z * dy + y) * dx + x0) * comp,
+				rowbytes);
+		o += rowbytes;
 	}
-	Map &map = client->getEnv().getMap();
-	const NodeDefManager *ndef = client->getNodeDefManager();
-	// RGBA per cell: rgb = the node type's average color (same one the
-	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
-	// reflection rays can recognize it), 255 solid.
-	std::vector<u8> occ(S * S * S * 4);
-	std::vector<u8> coarse(32 * 32 * 32, 0);
+}
+
+// Walk ONE 16^3 volume block into the persistent CPU mirrors.
+//
+// This is the only place the map is read and cells are classified. The
+// full walk is 512 calls to this, so the incremental path CANNOT drift
+// from the full path: gate 4 asks the two to produce the identical
+// volume, and the only honest way to promise that is to have one
+// implementation rather than two that agree today.
+static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
+		Map &map, v3s16 origin, int b)
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	constexpr int B = ClaudeVolume::BLK;
+	constexpr int NB = ClaudeVolume::NB;
+	const int bx = b % NB, by = (b / NB) % NB, bz = b / (NB * NB);
+	// The point emitters this block owned die with the re-walk and are
+	// re-pushed below. Miss this and next-event estimation keeps aiming
+	// at a lamp that was dug: the room stays lit and nothing says why.
+	V.emit_all.erase(std::remove_if(V.emit_all.begin(), V.emit_all.end(),
+			[&](const ClaudeVolume::PointEmit &e) {
+				return (int)(e.cell % S) / B == bx
+						&& (int)((e.cell / S) % S) / B == by
+						&& (int)(e.cell / ((size_t)S * S)) / B == bz;
+			}), V.emit_all.end());
+	u8 *occ = V.occ.data();
+	u8 *mids = V.mids.data();
+	size_t i = 0; // the cell the loop below is on; captured by emit_push
+	auto emit_push = [&](const std::array<float, 5> &e) {
+		V.emit_all.push_back({(u32)i, {e[0], e[1], e[2], e[3], e[4]}});
+	};
+	// Seeded by block index, so 512 empty blocks do not all hash alike
+	// and a solid that MOVES between blocks changes both their hashes.
+	u64 hash = 14695981039346656037ULL ^ (u64)b;
 	u32 solid = 0;
-	u64 hash = 14695981039346656037ULL ^ (u64)origin.X
-			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
-	std::vector<std::array<float, 5>> emitters; // xyz, intensity, radius
-	std::vector<u8> mids(S * S * S, 0);
-	claudeLoadModels(ndef);
-	g_claude_volume.modelids.assign((size_t)S * S * S, 0);
-	size_t i = 0;
-	for (s16 z = 0; z < S; z++)
-	for (s16 y = 0; y < S; y++)
-	for (s16 x = 0; x < S; x++, i++) {
+	for (s16 z = bz * B; z < (bz + 1) * B; z++)
+	for (s16 y = by * B; y < (by + 1) * B; y++)
+	for (s16 x = bx * B; x < (bx + 1) * B; x++) {
+		i = ((size_t)z * S + y) * S + x;
+		// Air until this walk says otherwise. The old full walk got this
+		// for free from a freshly zeroed vector; an in-place re-walk has
+		// to do it explicitly, and a dug node is exactly the case that
+		// would otherwise leave the old class sitting there.
+		occ[i * 4 + 0] = 0; occ[i * 4 + 1] = 0;
+		occ[i * 4 + 2] = 0; occ[i * 4 + 3] = 0;
+		mids[i] = 0;
+		V.modelids[i] = 0;
 		MapNode n = map.getNode(origin + v3s16(x, y, z));
 		content_t c = n.getContent();
 		if (c == CONTENT_AIR || c == CONTENT_IGNORE)
@@ -2125,7 +2195,7 @@ static void claudeVolumeSnapshot(Client *client)
 					const auto &gl = g_claude_volume
 							.model_glow[mit->second - 1][rot];
 					if (gl[3] > 0.0f)
-						emitters.push_back({x + gl[0], y + gl[1],
+						emit_push({x + gl[0], y + gl[1],
 								z + gl[2],
 								std::min<int>(f.light_source, 14)
 									/ 14.0f, gl[4]});
@@ -2133,8 +2203,6 @@ static void claudeVolumeSnapshot(Client *client)
 					occ[i * 4 + 1] = col.getGreen();
 					occ[i * 4 + 2] = col.getBlue();
 					occ[i * 4 + 3] = 250;
-					coarse[(z / 4) * 32 * 32 + (y / 4) * 32
-							+ (x / 4)] = 255;
 					hash = hash * 1099511628211ULL
 							+ (u64)i * 7919 + 250;
 					solid++;
@@ -2151,13 +2219,12 @@ static void claudeVolumeSnapshot(Client *client)
 			// ("give the torch a single glowing thing right where it
 			// emits") — light rays pass through it (cellTransmit 1.0),
 			// so it still cannot occlude or re-radiate its own light.
-			emitters.push_back({(float)x + 0.5f, (float)y + 0.65f,
+			emit_push({(float)x + 0.5f, (float)y + 0.65f,
 					(float)z + 0.5f,
 					std::min<int>(f.light_source, 14) / 14.0f,
 					0.08f}); // nub: assume a small flame
 			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
 			occ[i * 4 + 3] = 165;
-			coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 			hash = hash * 1099511628211ULL + (u64)i * 7919 + 165;
 			solid++;
 			continue;
@@ -2199,12 +2266,11 @@ static void claudeVolumeSnapshot(Client *client)
 				const auto &gl = g_claude_volume
 						.model_glow[mit->second - 1][rot];
 				if (gl[3] > 0.0f)
-					emitters.push_back({x + gl[0], y + gl[1],
+					emit_push({x + gl[0], y + gl[1],
 							z + gl[2], gl[3], gl[4]});
 			}
 		}
 		occ[i * 4 + 3] = acls;
-		coarse[(z / 4) * 32 * 32 + (y / 4) * 32 + (x / 4)] = 255;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
 		// material id (0 = untextured); palette + atlas grow on first sight
 		auto pit = g_claude_volume.palette.find(c);
@@ -2218,281 +2284,59 @@ static void claudeVolumeSnapshot(Client *client)
 		}
 		solid++;
 	}
-	// Updated unconditionally, BEFORE the unchanged-content early
-	// return below: this walk really did just run, whether or not its
-	// result differs from last time, so solid_count/snap_seq must
-	// reflect it either way -- otherwise the early-return path (the
-	// common case once a room has settled) would leave a stale
-	// solid_count sitting there looking like a fresh read.
-	g_claude_volume.solid_count = solid;
-	g_claude_volume.snap_seq++;
-	// world unchanged since the last snapshot: skip the upload and — key
-	// for image stability — do NOT disturb the converged accumulation
-	if (g_claude_volume.valid && hash == g_claude_volume.content_hash) {
-		g_claude_volume.last_snap_ms = porting::getTimeMs();
-		return;
-	}
-	g_claude_volume.content_hash = hash;
-	// Save the unit the driver's cache believes is active and restore it
-	// at the end — restoring a hard-coded GL.TEXTURE0 desyncs the
-	// COpenGLCoreCacheHandler mirror (see the per-frame rebind block).
-	GLint prev_active_unit = GL.TEXTURE0;
-	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
-	if (!g_claude_volume.tex)
-		GL.GenTextures(1, &g_claude_volume.tex);
-	GL.ActiveTexture(GL.TEXTURE10);
-	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, S, S, S, 0, GL.RGBA,
-			GL.UNSIGNED_BYTE, occ.data());
-	// OCCUPANCY MIP PYRAMID on unit 11 (Teardown's accelerator, ADR-0007
-	// overnight 2026-08-12): the old 32^3 brick map becomes level 2 of a
-	// 128^3 R8 texture with real GL mips 0..5 (any-content, max-reduced).
-	// Shaders sample with textureLod: level 2 reproduces the old leap
-	// exactly; the claude_pyramid dial lets marchers CLIMB to 8/16/32-
-	// cell leaps through deep emptiness. ~2.4 MB total.
-	{
+	V.block_hash[b] = hash;
+	V.block_solid[b] = solid;
+}
 
-	// ---- REAL SUB-VOXEL BITS: the ring [48,80)^3 (volume-local; the
-	// volume follows the camera) holds one bit per 1/16 m voxel — the
-	// ONLY sub-voxel occupancy the renderer ever sees. Modeled cells
-	// take their authored 16^3 mask; every other solid is 4096 ones, a
-	// plain 1m voxel. No runtime carving (John, 2026-08-13: "true 1m
-	// voxels no longer get carved unless they have a 1/16 higher res
-	// model"). Rebaked every snapshot.
-	{
-		auto &sv = g_claude_volume.subvox;
-		if (sv.empty())
-			sv.assign((size_t)64 * 512 * 512, 0);
-		std::fill(sv.begin(), sv.end(), 0);
-		const int R0 = 48, RN = 32;
-		for (int rz = 0; rz < RN; rz++)
-		for (int ry = 0; ry < RN; ry++)
-		for (int rx = 0; rx < RN; rx++) {
-			int vx = R0 + rx, vy = R0 + ry, vz = R0 + rz;
-			size_t vi = (size_t)(vz * S + vy) * S + vx;
-			u8 a = occ[vi * 4 + 3];
-			if (a <= 230)
-				continue; // air / water / glass / nub: no bits
-			u8 mtag = g_claude_volume.modelids[vi];
-			if (mtag >> 2) {
-				// authored model: its pre-rotated mask IS the cell
-				const auto &mm = g_claude_volume
-						.models[(mtag >> 2) - 1][mtag & 3];
-				for (int sz2 = 0; sz2 < 16; sz2++)
-				for (int sy2 = 0; sy2 < 16; sy2++) {
-					size_t row = ((size_t)(rz * 16 + sz2) * 512
-							+ (ry * 16 + sy2)) * 64 + (size_t)rx * 2;
-					sv[row] = mm[(size_t)(sz2 * 16 + sy2) * 2];
-					sv[row + 1] = mm[(size_t)(sz2 * 16 + sy2) * 2 + 1];
-				}
-				continue;
-			}
-			// plain 1m voxel: two full bytes per (y,z) row
-			size_t bx = (size_t)rx * 2;
-			for (int s2 = 0; s2 < 16; s2++)
-			for (int t2 = 0; t2 < 16; t2++) {
-				size_t row = ((size_t)(rz * 16 + s2) * 512
-						+ (ry * 16 + t2)) * 64 + bx;
-				sv[row] = 0xFF;
-				sv[row + 1] = 0xFF;
-			}
-		}
-		GLint prev_au = GL.TEXTURE0;
-		GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_au);
-		bool fresh_sv = !g_claude_volume.subvox_tex;
-		if (fresh_sv)
-			GL.GenTextures(1, &g_claude_volume.subvox_tex);
-		GL.ActiveTexture(GL.TEXTURE7);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.subvox_tex);
-		if (fresh_sv) {
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-			GL.TexImage3D(GL.TEXTURE_3D, 0,
-					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 64, 512, 512,
-					0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
-					GL.UNSIGNED_BYTE, nullptr);
-		}
-		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
-				claudeUseR8() ? GL.RED : GL_LUMINANCE,
-				GL.UNSIGNED_BYTE, sv.data());
+// Combine the 512 per-block hashes ORDER-INDEPENDENTLY, which is the
+// whole reason they exist: the old hash was an FNV chain over all 2.1 M
+// cells in index order, and a chain cannot be updated for a sub-box.
+// XOR is the order-independent part; the splitmix64 finalizer is what
+// stops two blocks whose walks happened to land on related values from
+// cancelling each other out. Deterministic, so the incremental path and
+// a full walk of the same world agree bit for bit (gate 4).
+static u64 claudeVolumeContentHash(v3s16 origin)
+{
+	u64 h = 14695981039346656037ULL ^ (u64)origin.X
+			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
+	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++) {
+		u64 z = g_claude_volume.block_hash[b] + 0x9E3779B97F4A7C15ULL;
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+		h ^= z ^ (z >> 31);
+	}
+	return h;
+}
 
-		// v2 model textures: per-cell tag ring (128^3 R8, per
-		// snapshot), voxel-palette atlas + palettes (static, on load)
-		auto texParams3D = []() {
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-		};
-		bool fresh_ids = !g_claude_volume.model_ids_tex;
-		if (fresh_ids)
-			GL.GenTextures(1, &g_claude_volume.model_ids_tex);
-		GL.ActiveTexture(GL.TEXTURE0 + 16);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.model_ids_tex);
-		if (fresh_ids) {
-			texParams3D();
-			GL.TexImage3D(GL.TEXTURE_3D, 0,
-					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, S, S, S, 0,
-					claudeUseR8() ? GL.RED : GL_LUMINANCE,
-					GL.UNSIGNED_BYTE, nullptr);
-		}
-		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, S, S, S,
-				claudeUseR8() ? GL.RED : GL_LUMINANCE,
-				GL.UNSIGNED_BYTE, g_claude_volume.modelids.data());
-		if (g_claude_volume.model_tex_dirty) {
-			g_claude_volume.model_tex_dirty = false;
-			// atlas 16x16x1024: layer = (idx0*4+rot)*16+sz, 16 models max
-			std::vector<u8> atlas((size_t)16 * 16 * 1024, 0);
-			std::vector<u8> pals((size_t)256 * 64 * 4, 0);
-			size_t nm = std::min<size_t>(g_claude_volume.model_vox.size(), 16);
-			for (size_t m = 0; m < nm; m++) {
-				for (int r = 0; r < 4; r++) {
-					const auto &vr = g_claude_volume.model_vox[m][r];
-					for (int sz2 = 0; sz2 < 16; sz2++) {
-						size_t layer = ((m * 4 + r) * 16 + sz2);
-						for (int sy2 = 0; sy2 < 16; sy2++)
-						for (int sx2 = 0; sx2 < 16; sx2++)
-							atlas[(layer * 16 + sy2) * 16 + sx2] =
-									vr[(size_t)(sz2 * 16 + sy2) * 16 + sx2];
-					}
-				}
-				memcpy(&pals[m * 256 * 4],
-						g_claude_volume.model_pal[m].data(), 256 * 4);
-			}
-			bool fresh_ma = !g_claude_volume.model_atlas_tex;
-			if (fresh_ma)
-				GL.GenTextures(1, &g_claude_volume.model_atlas_tex);
-			GL.ActiveTexture(GL.TEXTURE0 + 17);
-			GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.model_atlas_tex);
-			if (fresh_ma) {
-				texParams3D();
-				GL.TexImage3D(GL.TEXTURE_3D, 0,
-						claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
-						16, 16, 1024, 0,
-						claudeUseR8() ? GL.RED : GL_LUMINANCE,
-						GL.UNSIGNED_BYTE, nullptr);
-			}
-			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 16, 16, 1024,
-					claudeUseR8() ? GL.RED : GL_LUMINANCE,
-					GL.UNSIGNED_BYTE, atlas.data());
-			bool fresh_mp = !g_claude_volume.model_pal_tex;
-			if (fresh_mp)
-				GL.GenTextures(1, &g_claude_volume.model_pal_tex);
-			GL.ActiveTexture(GL.TEXTURE0 + 18);
-			GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.model_pal_tex);
-			if (fresh_mp) {
-				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-				GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-				GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 64, 0,
-						GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
-			}
-			GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 64,
-					GL.RGBA, GL.UNSIGNED_BYTE, pals.data());
-		}
-		GL.ActiveTexture(prev_au);
-	}
-
-		static std::vector<u8> pyr0(S * S * S), pyr1(64 * 64 * 64),
-				pyr2(32 * 32 * 32), pyr3(16 * 16 * 16),
-				pyr4(8 * 8 * 8), pyr5(4 * 4 * 4);
-		for (int i = 0; i < S * S * S; i++)
-			pyr0[i] = occ[(size_t)i * 4 + 3] ? 255 : 0;
-		auto reduce = [](const std::vector<u8> &src, std::vector<u8> &dst,
-				int n) {
-			for (int z = 0; z < n; z++)
-			for (int y = 0; y < n; y++)
-			for (int x = 0; x < n; x++) {
-				u8 v = 0;
-				for (int k = 0; k < 8 && !v; k++) {
-					int sx = x * 2 + (k & 1), sy = y * 2 + ((k >> 1) & 1),
-						sz = z * 2 + (k >> 2);
-					v |= src[((size_t)sz * n * 2 + sy) * n * 2 + sx];
-				}
-				dst[((size_t)z * n + y) * n + x] = v;
-			}
-		};
-		reduce(pyr0, pyr1, 64); reduce(pyr1, pyr2, 32);
-		reduce(pyr2, pyr3, 16); reduce(pyr3, pyr4, 8); reduce(pyr4, pyr5, 4);
-		if (!g_claude_volume.coarse_tex)
-			GL.GenTextures(1, &g_claude_volume.coarse_tex);
-		GL.ActiveTexture(GL.TEXTURE11);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.coarse_tex);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER,
-				GL.NEAREST_MIPMAP_NEAREST);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_BASE_LEVEL, 0);
-		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAX_LEVEL, 5);
-		GLenum ifmt = claudeUseR8() ? GL.R8 : GL_LUMINANCE8;
-		GLenum fmt = claudeUseR8() ? GL.RED : GL_LUMINANCE;
-		GL.TexImage3D(GL.TEXTURE_3D, 0, ifmt, S, S, S, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr0.data());
-		GL.TexImage3D(GL.TEXTURE_3D, 1, ifmt, 64, 64, 64, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr1.data());
-		GL.TexImage3D(GL.TEXTURE_3D, 2, ifmt, 32, 32, 32, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr2.data());
-		GL.TexImage3D(GL.TEXTURE_3D, 3, ifmt, 16, 16, 16, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr3.data());
-		GL.TexImage3D(GL.TEXTURE_3D, 4, ifmt, 8, 8, 8, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr4.data());
-		GL.TexImage3D(GL.TEXTURE_3D, 5, ifmt, 4, 4, 4, 0, fmt,
-				GL.UNSIGNED_BYTE, pyr5.data());
-	}
-	(void)coarse;
-	// material-id volume on unit 6
-	if (!g_claude_volume.material_tex)
-		GL.GenTextures(1, &g_claude_volume.material_tex);
-	GL.ActiveTexture(GL.TEXTURE12);
-	GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.material_tex);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-	GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
-			S, S, S, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
-			GL.UNSIGNED_BYTE, mids.data());
-	// tile atlas on unit 7 (uploaded only when the palette grew)
-	if (g_claude_volume.atlas_dirty) {
-		if (!g_claude_volume.atlas_tex)
-			GL.GenTextures(1, &g_claude_volume.atlas_tex);
-		GL.ActiveTexture(GL.TEXTURE13);
-		GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.atlas_tex);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 256, 0, GL.BGRA,
-				GL.UNSIGNED_BYTE, g_claude_volume.atlas.data());
-		// per-material response params (256x1 RGBA), unit 15
-		if (!g_claude_volume.matparams_tex)
-			GL.GenTextures(1, &g_claude_volume.matparams_tex);
-		if (g_claude_volume.matparams.empty())
-			g_claude_volume.matparams.assign(256 * 4, 0);
-		GL.ActiveTexture(GL.TEXTURE15);
-		GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.matparams_tex);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 1, 0, GL.RGBA,
-				GL.UNSIGNED_BYTE, g_claude_volume.matparams.data());
-		g_claude_volume.atlas_dirty = false;
-	}
-	GL.ActiveTexture(prev_active_unit);
+// Point emitters -> nearest 8; area emitters -> nearest AREA_CAP.
+//
+// Neither list is patched, both are rebuilt from state that is already
+// correct, and that is deliberate:
+//
+//  - emit_all is re-sorted into whole-volume CELL order first, so the
+//    distance sort below sees the identical input sequence a full z,y,x
+//    walk would have handed it. std::sort is not stable; a tie decided
+//    differently is a different torch in slot 7, an image that moves,
+//    and nothing in the diff to explain it.
+//  - the area list is regenerated wholesale from the finished occupancy.
+//    It costs 0.7 ms MEASURED, and it makes "the incremental list equals
+//    the full-walk list" true by construction rather than by assertion.
+//    A cell's air-exposed face mask depends on its six neighbours, so an
+//    incremental area update would have to re-own a one-cell halo around
+//    every dirty block anyway; 0.7 ms buys the entire problem away.
+static void claudeVolumeFinishEmitters()
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	std::sort(V.emit_all.begin(), V.emit_all.end(),
+			[](const ClaudeVolume::PointEmit &a,
+					const ClaudeVolume::PointEmit &b) {
+				return a.cell < b.cell;
+			});
+	std::vector<std::array<float, 5>> emitters;
+	emitters.reserve(V.emit_all.size());
+	for (const auto &e : V.emit_all)
+		emitters.push_back({e.v[0], e.v[1], e.v[2], e.v[3], e.v[4]});
 	// nearest-8 emitters to the camera (= volume center) for NEE
 	std::sort(emitters.begin(), emitters.end(),
 			[](const std::array<float, 5> &a, const std::array<float, 5> &b) {
@@ -2502,13 +2346,11 @@ static void claudeVolumeSnapshot(Client *client)
 				};
 				return d2(a) < d2(b);
 			});
-	g_claude_volume.emitter_count = std::min<size_t>(emitters.size(), 8);
+	V.emitter_count = std::min<size_t>(emitters.size(), 8);
 	for (int e = 0; e < 8; e++) {
 		for (int k = 0; k < 4; k++)
-			g_claude_volume.emitters[e][k] =
-					e < g_claude_volume.emitter_count ? emitters[e][k] : 0.0f;
-		g_claude_volume.emitter_rad[e] =
-				e < g_claude_volume.emitter_count ? emitters[e][4] : 0.0f;
+			V.emitters[e][k] = e < V.emitter_count ? emitters[e][k] : 0.0f;
+		V.emitter_rad[e] = e < V.emitter_count ? emitters[e][4] : 0.0f;
 	}
 
 	// ---- AREA EMITTERS: the list claude_trace's NEE samples -------------
@@ -2525,6 +2367,7 @@ static void claudeVolumeSnapshot(Client *client)
 	// at the half-byte midpoints, so 170..240 inclusive here is the same
 	// set of cells, with no 8-bit round-trip on either side.
 	{
+		const u8 *occ = V.occ.data();
 		std::vector<std::array<float, 4>> areas;
 		auto is_air = [&](s16 ax, s16 ay, s16 az) {
 			// Out of the volume counts as NOT air: the outward faces of a
@@ -2566,25 +2409,24 @@ static void claudeVolumeSnapshot(Client *client)
 					};
 					return d2(a) < d2(b);
 				});
-		g_claude_volume.area_total = (int)areas.size();
-		g_claude_volume.area_count =
-				(int)std::min<size_t>(areas.size(), ClaudeVolume::AREA_CAP);
+		V.area_total = (int)areas.size();
+		V.area_count = (int)std::min<size_t>(areas.size(),
+				ClaudeVolume::AREA_CAP);
 		for (int e = 0; e < ClaudeVolume::AREA_CAP; e++)
 			for (int k = 0; k < 4; k++)
-				g_claude_volume.area[e][k] =
-						e < g_claude_volume.area_count ? areas[e][k] : 0.0f;
+				V.area[e][k] = e < V.area_count ? areas[e][k] : 0.0f;
 		// NO SILENT TRUNCATION. Overflow is not a correctness failure —
 		// the shader's light-sampling pdf is zero for an unlisted cell, so
 		// the balance heuristic hands those emitters' full radiance to the
 		// BSDF sample and the image still converges to photo mode — but it
 		// IS a variance failure, and it must be visible in the log when a
 		// room looks noisier than it should.
-		if (g_claude_volume.area_total > g_claude_volume.area_count) {
-			const auto &first_drop = areas[g_claude_volume.area_count];
+		if (V.area_total > V.area_count) {
+			const auto &first_drop = areas[V.area_count];
 			warningstream << "[claude_volume] area emitters "
-					<< g_claude_volume.area_total << " > cap "
+					<< V.area_total << " > cap "
 					<< ClaudeVolume::AREA_CAP << ": dropping "
-					<< (g_claude_volume.area_total - g_claude_volume.area_count)
+					<< (V.area_total - V.area_count)
 					<< " from next-event sampling, farthest first; nearest"
 					   " dropped cell is (" << (int)first_drop[0] << ","
 					<< (int)first_drop[1] << "," << (int)first_drop[2]
@@ -2597,25 +2439,602 @@ static void claudeVolumeSnapshot(Client *client)
 					   " stays correct and gets noisier." << std::endl;
 		}
 	}
+}
 
-	g_claude_volume.origin = origin;
-	g_claude_volume.valid = true;
-	g_claude_volume.last_snap_ms = porting::getTimeMs();
+// REAL SUB-VOXEL BITS: the ring [48,80)^3 (volume-local; the volume
+// follows the camera) holds one bit per 1/16 m voxel — the ONLY
+// sub-voxel occupancy the renderer ever sees. Modeled cells take their
+// authored 16^3 mask; every other solid is 4096 ones, a plain 1m voxel.
+// No runtime carving (John, 2026-08-13: "true 1m voxels no longer get
+// carved unless they have a 1/16 higher res model").
+//
+// Re-baked over the given cell box only. Each ring cell zeroes its own
+// 512 bytes before deciding, so a box refill leaves exactly what a full
+// re-bake would (the old code std::fill'd the whole 16 MB first, which
+// is not something a sub-box may do).
+static void claudeVolumeBakeSubvox(int x0, int y0, int z0, int w, int h, int d)
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	const int R0 = 48, R1 = 80;
+	auto &sv = V.subvox;
+	if (sv.empty())
+		sv.assign((size_t)64 * 512 * 512, 0);
+	int lx = std::max(x0, R0), hx = std::min(x0 + w, R1);
+	int ly = std::max(y0, R0), hy = std::min(y0 + h, R1);
+	int lz = std::max(z0, R0), hz = std::min(z0 + d, R1);
+	for (int vz = lz; vz < hz; vz++)
+	for (int vy = ly; vy < hy; vy++)
+	for (int vx = lx; vx < hx; vx++) {
+		int rx = vx - R0, ry = vy - R0, rz = vz - R0;
+		size_t vi = (size_t)(vz * S + vy) * S + vx;
+		u8 a = V.occ[vi * 4 + 3];
+		u8 mtag = a > 230 ? V.modelids[vi] : 0;
+		const u8 *mm = nullptr;
+		if (mtag >> 2) {
+			// authored model: its pre-rotated mask IS the cell
+			mm = V.models[(mtag >> 2) - 1][mtag & 3].data();
+		}
+		// a <= 230 is air / water / glass / nub: no bits
+		u8 fill = (a > 230 && !mm) ? 0xFF : 0x00;
+		for (int sz2 = 0; sz2 < 16; sz2++)
+		for (int sy2 = 0; sy2 < 16; sy2++) {
+			size_t row = ((size_t)(rz * 16 + sz2) * 512
+					+ (ry * 16 + sy2)) * 64 + (size_t)rx * 2;
+			if (mm) {
+				sv[row] = mm[(size_t)(sz2 * 16 + sy2) * 2];
+				sv[row + 1] = mm[(size_t)(sz2 * 16 + sy2) * 2 + 1];
+			} else {
+				sv[row] = fill;
+				sv[row + 1] = fill;
+			}
+		}
+	}
+}
+
+// OCCUPANCY MIP PYRAMID on unit 11 (Teardown's accelerator, ADR-0007
+// overnight 2026-08-12): the old 32^3 brick map is level 2 of a 128^3 R8
+// texture with real GL mips 0..5 (any-content, max-reduced). Shaders
+// sample with textureLod: level 2 reproduces the old leap exactly; the
+// claude_pyramid dial lets marchers CLIMB to 8/16/32-cell leaps through
+// deep emptiness.
+//
+// THE BRICK MAP IS RECOMPUTED FROM CELLS, NEVER TOGGLED (handoff
+// landmine): a dug node inside a brick that still holds other solids
+// must not clear the brick, and the only way to be sure of that is to
+// re-reduce from the occupancy. Levels 0..2 are redone over the dirty
+// box; 3..5 are 4.6 KB in total and are redone wholesale, which also
+// sidesteps a 1-wide row hitting GL's 4-byte unpack alignment.
+static void claudeVolumeBakePyramid(int x0, int y0, int z0, int w, int h, int d)
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	for (int z = z0; z < z0 + d; z++)
+	for (int y = y0; y < y0 + h; y++)
+	for (int x = x0; x < x0 + w; x++) {
+		size_t i = ((size_t)z * S + y) * S + x;
+		V.pyr[0][i] = V.occ[i * 4 + 3] ? 255 : 0;
+	}
+	auto reduce = [&](int lvl, int n, int rx0, int ry0, int rz0,
+			int rw, int rh, int rd) {
+		const std::vector<u8> &src = V.pyr[lvl - 1];
+		std::vector<u8> &dst = V.pyr[lvl];
+		for (int z = rz0; z < rz0 + rd; z++)
+		for (int y = ry0; y < ry0 + rh; y++)
+		for (int x = rx0; x < rx0 + rw; x++) {
+			u8 v = 0;
+			for (int k = 0; k < 8 && !v; k++) {
+				int sx = x * 2 + (k & 1), sy = y * 2 + ((k >> 1) & 1),
+					sz = z * 2 + (k >> 2);
+				v |= src[((size_t)sz * n * 2 + sy) * n * 2 + sx];
+			}
+			dst[((size_t)z * n + y) * n + x] = v;
+		}
+	};
+	// levels 1 and 2 over the box, shrinking (lo rounds down, hi up)
+	for (int lvl = 1; lvl <= 2; lvl++) {
+		int n = S >> lvl;
+		int lx = x0 >> lvl, ly = y0 >> lvl, lz = z0 >> lvl;
+		int hx = (x0 + w + (1 << lvl) - 1) >> lvl;
+		int hy = (y0 + h + (1 << lvl) - 1) >> lvl;
+		int hz = (z0 + d + (1 << lvl) - 1) >> lvl;
+		reduce(lvl, n, lx, ly, lz, hx - lx, hy - ly, hz - lz);
+	}
+	// levels 3..5 wholesale: 4096 + 512 + 64 bytes
+	for (int lvl = 3; lvl <= 5; lvl++) {
+		int n = S >> lvl;
+		reduce(lvl, n, 0, 0, 0, n, n, n);
+	}
+}
+
+static void claudeVolumeTexParams3D()
+{
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+}
+
+// v2 model textures: the voxel-palette atlas + palettes, uploaded once
+// on load. Unchanged; lifted out so both upload paths can call it.
+static void claudeVolumeUploadModelTex()
+{
+	ClaudeVolume &V = g_claude_volume;
+	if (!V.model_tex_dirty)
+		return;
+	V.model_tex_dirty = false;
+	// atlas 16x16x1024: layer = (idx0*4+rot)*16+sz, 16 models max
+	std::vector<u8> atlas((size_t)16 * 16 * 1024, 0);
+	std::vector<u8> pals((size_t)256 * 64 * 4, 0);
+	size_t nm = std::min<size_t>(V.model_vox.size(), 16);
+	for (size_t m = 0; m < nm; m++) {
+		for (int r = 0; r < 4; r++) {
+			const auto &vr = V.model_vox[m][r];
+			for (int sz2 = 0; sz2 < 16; sz2++) {
+				size_t layer = ((m * 4 + r) * 16 + sz2);
+				for (int sy2 = 0; sy2 < 16; sy2++)
+				for (int sx2 = 0; sx2 < 16; sx2++)
+					atlas[(layer * 16 + sy2) * 16 + sx2] =
+							vr[(size_t)(sz2 * 16 + sy2) * 16 + sx2];
+			}
+		}
+		memcpy(&pals[m * 256 * 4], V.model_pal[m].data(), 256 * 4);
+	}
+	bool fresh_ma = !V.model_atlas_tex;
+	if (fresh_ma)
+		GL.GenTextures(1, &V.model_atlas_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 17);
+	GL.BindTexture(GL.TEXTURE_3D, V.model_atlas_tex);
+	if (fresh_ma) {
+		claudeVolumeTexParams3D();
+		GL.TexImage3D(GL.TEXTURE_3D, 0,
+				claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 16, 16, 1024, 0,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, nullptr);
+	}
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 16, 16, 1024,
+			claudeUseR8() ? GL.RED : GL_LUMINANCE,
+			GL.UNSIGNED_BYTE, atlas.data());
+	bool fresh_mp = !V.model_pal_tex;
+	if (fresh_mp)
+		GL.GenTextures(1, &V.model_pal_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 18);
+	GL.BindTexture(GL.TEXTURE_2D, V.model_pal_tex);
+	if (fresh_mp) {
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 64, 0,
+				GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
+	}
+	GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 64,
+			GL.RGBA, GL.UNSIGNED_BYTE, pals.data());
+}
+
+// tile atlas on unit 13 + per-material response params on unit 15,
+// uploaded only when the palette grew. Append-only, so it is the same
+// call on both paths.
+static void claudeVolumeUploadAtlas()
+{
+	ClaudeVolume &V = g_claude_volume;
+	if (!V.atlas_dirty)
+		return;
+	if (!V.atlas_tex)
+		GL.GenTextures(1, &V.atlas_tex);
+	GL.ActiveTexture(GL.TEXTURE13);
+	GL.BindTexture(GL.TEXTURE_2D, V.atlas_tex);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 256, 0, GL.BGRA,
+			GL.UNSIGNED_BYTE, V.atlas.data());
+	// per-material response params (256x1 RGBA), unit 15
+	if (!V.matparams_tex)
+		GL.GenTextures(1, &V.matparams_tex);
+	if (V.matparams.empty())
+		V.matparams.assign(256 * 4, 0);
+	GL.ActiveTexture(GL.TEXTURE15);
+	GL.BindTexture(GL.TEXTURE_2D, V.matparams_tex);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 1, 0, GL.RGBA,
+			GL.UNSIGNED_BYTE, V.matparams.data());
+	V.atlas_dirty = false;
+}
+
+// Full upload of every volume texture: bootstrap and re-centre only.
+static void claudeVolumeUploadFull()
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	// Save the unit the driver's cache believes is active and restore it
+	// at the end — restoring a hard-coded GL.TEXTURE0 desyncs the
+	// COpenGLCoreCacheHandler mirror (see the per-frame rebind block).
+	GLint prev_active_unit = GL.TEXTURE0;
+	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
+	if (!V.tex)
+		GL.GenTextures(1, &V.tex);
+	GL.ActiveTexture(GL.TEXTURE10);
+	GL.BindTexture(GL.TEXTURE_3D, V.tex);
+	claudeVolumeTexParams3D();
+	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, S, S, S, 0, GL.RGBA,
+			GL.UNSIGNED_BYTE, V.occ.data());
+	{
+		bool fresh_sv = !V.subvox_tex;
+		if (fresh_sv)
+			GL.GenTextures(1, &V.subvox_tex);
+		GL.ActiveTexture(GL.TEXTURE7);
+		GL.BindTexture(GL.TEXTURE_3D, V.subvox_tex);
+		if (fresh_sv) {
+			claudeVolumeTexParams3D();
+			GL.TexImage3D(GL.TEXTURE_3D, 0,
+					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 64, 512, 512,
+					0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, nullptr);
+		}
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, V.subvox.data());
+		bool fresh_ids = !V.model_ids_tex;
+		if (fresh_ids)
+			GL.GenTextures(1, &V.model_ids_tex);
+		GL.ActiveTexture(GL.TEXTURE0 + 16);
+		GL.BindTexture(GL.TEXTURE_3D, V.model_ids_tex);
+		if (fresh_ids) {
+			claudeVolumeTexParams3D();
+			GL.TexImage3D(GL.TEXTURE_3D, 0,
+					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, S, S, S, 0,
+					claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, nullptr);
+		}
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, S, S, S,
+				claudeUseR8() ? GL.RED : GL_LUMINANCE,
+				GL.UNSIGNED_BYTE, V.modelids.data());
+		claudeVolumeUploadModelTex();
+	}
+	{
+		if (!V.coarse_tex)
+			GL.GenTextures(1, &V.coarse_tex);
+		GL.ActiveTexture(GL.TEXTURE11);
+		GL.BindTexture(GL.TEXTURE_3D, V.coarse_tex);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER,
+				GL.NEAREST_MIPMAP_NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_BASE_LEVEL, 0);
+		GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAX_LEVEL, 5);
+		GLenum ifmt = claudeUseR8() ? GL.R8 : GL_LUMINANCE8;
+		GLenum fmt = claudeUseR8() ? GL.RED : GL_LUMINANCE;
+		for (int lvl = 0; lvl <= 5; lvl++) {
+			int n = S >> lvl;
+			GL.TexImage3D(GL.TEXTURE_3D, lvl, ifmt, n, n, n, 0, fmt,
+					GL.UNSIGNED_BYTE, V.pyr[lvl].data());
+		}
+	}
+	// material-id volume on unit 12
+	if (!V.material_tex)
+		GL.GenTextures(1, &V.material_tex);
+	GL.ActiveTexture(GL.TEXTURE12);
+	GL.BindTexture(GL.TEXTURE_3D, V.material_tex);
+	claudeVolumeTexParams3D();
+	GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
+			S, S, S, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
+			GL.UNSIGNED_BYTE, V.mids.data());
+	claudeVolumeUploadAtlas();
+	GL.ActiveTexture(prev_active_unit);
+}
+
+// Sub-box upload: the incremental half. Same texture-unit save/restore
+// wrapper as the full path — restoring a hard-coded GL.TEXTURE0 desyncs
+// Irrlicht's cache mirror, and that is just as true for a 16 KB upload.
+//
+// Every box handed here is a whole-number of 16-cell volume blocks, so
+// every R8 row width is a multiple of 4 and GL's default 4-byte unpack
+// alignment cannot bite. The guard below refuses the box rather than
+// upload skewed rows if that ever stops being true.
+static bool claudeVolumeUploadBox(int x0, int y0, int z0, int w, int h, int d)
+{
+	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeVolume::SIZE;
+	if ((w & 3) || (x0 & 3))
+		return false;
+	static std::vector<u8> staging;
+	GLint prev_active_unit = GL.TEXTURE0;
+	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
+	GLenum fmt = claudeUseR8() ? GL.RED : GL_LUMINANCE;
+
+	claudePackBox(V.occ.data(), S, S, 4, x0, y0, z0, w, h, d, staging);
+	GL.ActiveTexture(GL.TEXTURE10);
+	GL.BindTexture(GL.TEXTURE_3D, V.tex);
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, x0, y0, z0, w, h, d, GL.RGBA,
+			GL.UNSIGNED_BYTE, staging.data());
+
+	claudePackBox(V.modelids.data(), S, S, 1, x0, y0, z0, w, h, d, staging);
+	GL.ActiveTexture(GL.TEXTURE0 + 16);
+	GL.BindTexture(GL.TEXTURE_3D, V.model_ids_tex);
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, x0, y0, z0, w, h, d, fmt,
+			GL.UNSIGNED_BYTE, staging.data());
+
+	claudePackBox(V.mids.data(), S, S, 1, x0, y0, z0, w, h, d, staging);
+	GL.ActiveTexture(GL.TEXTURE12);
+	GL.BindTexture(GL.TEXTURE_3D, V.material_tex);
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, x0, y0, z0, w, h, d, fmt,
+			GL.UNSIGNED_BYTE, staging.data());
+
+	GL.ActiveTexture(GL.TEXTURE11);
+	GL.BindTexture(GL.TEXTURE_3D, V.coarse_tex);
+	for (int lvl = 0; lvl <= 2; lvl++) {
+		int n = S >> lvl;
+		int lx = x0 >> lvl, ly = y0 >> lvl, lz = z0 >> lvl;
+		int bw = ((x0 + w + (1 << lvl) - 1) >> lvl) - lx;
+		int bh = ((y0 + h + (1 << lvl) - 1) >> lvl) - ly;
+		int bd = ((z0 + d + (1 << lvl) - 1) >> lvl) - lz;
+		claudePackBox(V.pyr[lvl].data(), n, n, 1, lx, ly, lz, bw, bh, bd,
+				staging);
+		GL.TexSubImage3D(GL.TEXTURE_3D, lvl, lx, ly, lz, bw, bh, bd, fmt,
+				GL.UNSIGNED_BYTE, staging.data());
+	}
+	for (int lvl = 3; lvl <= 5; lvl++) {
+		int n = S >> lvl;
+		GL.TexSubImage3D(GL.TEXTURE_3D, lvl, 0, 0, 0, n, n, n, fmt,
+				GL.UNSIGNED_BYTE, V.pyr[lvl].data());
+	}
+
+	// sub-voxel ring [48,80)^3 = volume blocks 3 and 4 on each axis, so
+	// an intersection is always a whole number of 16-cell spans and the
+	// 2-bytes-per-cell x extent is always a multiple of 4
+	{
+		const int R0 = 48, R1 = 80;
+		int lx = std::max(x0, R0), hx = std::min(x0 + w, R1);
+		int ly = std::max(y0, R0), hy = std::min(y0 + h, R1);
+		int lz = std::max(z0, R0), hz = std::min(z0 + d, R1);
+		if (lx < hx && ly < hy && lz < hz && !V.subvox.empty()) {
+			int tx = (lx - R0) * 2, tw = (hx - lx) * 2;
+			int ty = (ly - R0) * 16, th = (hy - ly) * 16;
+			int tz = (lz - R0) * 16, td = (hz - lz) * 16;
+			claudePackBox(V.subvox.data(), 64, 512, 1, tx, ty, tz,
+					tw, th, td, staging);
+			GL.ActiveTexture(GL.TEXTURE7);
+			GL.BindTexture(GL.TEXTURE_3D, V.subvox_tex);
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, tx, ty, tz, tw, th, td,
+					fmt, GL.UNSIGNED_BYTE, staging.data());
+		}
+	}
+	claudeVolumeUploadModelTex();
+	claudeVolumeUploadAtlas();
+	GL.ActiveTexture(prev_active_unit);
+	return true;
+}
+
+// with the GL context current; the full 2.1 M-cell walk causes a brief
+// hitch (MEASURED below), which is acceptable for the two callers that
+// still need it: bootstrap and a >24-node re-centre.
+static void claudeVolumeSnapshot(Client *client)
+{
+	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeVolume &V = g_claude_volume;
+	u64 t0 = porting::getTimeMs();
+	// PHASE TIMERS (gate 5 of the volume re-snap handoff): the cost of a
+	// re-snap had been attributed to "the walk" by a comment nobody had
+	// measured, and it was wrong by 20x in one direction and 25x in the
+	// other. Every phase is timed in us and printed.
+	u64 tu0 = porting::getTimeUs();
+	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
+	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
+	// ORIGIN DEADBAND (John, 2026-08-13: "things shift when I move
+	// around"): the detail ring rides volume-local coords, so an
+	// origin that re-quantizes with every camera step sweeps the
+	// carve/cube boundary through the world at walking pace. Keep the
+	// previous origin while the camera stays within +/-6 m of the
+	// volume center — walking around a room then shifts NOTHING, and
+	// a genuine relocation costs one rebase instead of a pop per step.
+	{
+		v3s16 prev_center = V.prev_origin + v3s16(S / 2, S / 2, S / 2);
+		v3s16 d = center - prev_center;
+		if (V.valid && std::abs(d.X) <= 6 && std::abs(d.Y) <= 6
+				&& std::abs(d.Z) <= 6)
+			origin = V.prev_origin;
+	}
+	Map &map = client->getEnv().getMap();
+	const NodeDefManager *ndef = client->getNodeDefManager();
+	claudeLoadModels(ndef);
+	// RGBA per cell: rgb = the node type's average color (same one the
+	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
+	// reflection rays can recognize it), 255 solid.
+	if (V.occ.size() != (size_t)S * S * S * 4) {
+		V.occ.assign((size_t)S * S * S * 4, 0);
+		V.mids.assign((size_t)S * S * S, 0);
+		V.modelids.assign((size_t)S * S * S, 0);
+		for (int lvl = 0; lvl <= 5; lvl++) {
+			int n = S >> lvl;
+			V.pyr[lvl].assign((size_t)n * n * n, 0);
+		}
+	}
+	// A full walk owns every cell, so nothing survives it: drop the whole
+	// point-emitter list rather than let 512 per-block erases do it.
+	V.emit_all.clear();
+	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
+		claudeVolumeWalkBlock(client, ndef, map, origin, b);
+	u32 solid = 0;
+	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
+		solid += V.block_solid[b];
+	u64 hash = claudeVolumeContentHash(origin);
+	// Updated unconditionally, BEFORE the unchanged-content early
+	// return below: this walk really did just run, whether or not its
+	// result differs from last time, so solid_count/snap_seq must
+	// reflect it either way -- otherwise the early-return path would
+	// leave a stale solid_count sitting there looking like a fresh read.
+	V.solid_count = solid;
+	V.snap_seq++;
+	u64 walk_us = porting::getTimeUs() - tu0;
+	// world unchanged since the last snapshot: skip the upload and — key
+	// for image stability — do NOT disturb the converged accumulation
+	if (V.valid && hash == V.content_hash && origin == V.origin) {
+		V.last_snap_ms = porting::getTimeMs();
+		actionstream << "[claude_volume] snapshot UNCHANGED (upload"
+				" skipped) walk=" << walk_us << "us" << std::endl;
+		return;
+	}
+	V.content_hash = hash;
+	u64 tbake = porting::getTimeUs();
+	claudeVolumeBakeSubvox(0, 0, 0, S, S, S);
+	claudeVolumeBakePyramid(0, 0, 0, S, S, S);
+	u64 bake_us = porting::getTimeUs() - tbake;
+	u64 tgl = porting::getTimeUs();
+	claudeVolumeUploadFull();
+	u64 gl_us = porting::getTimeUs() - tgl;
+	u64 temit = porting::getTimeUs();
+	claudeVolumeFinishEmitters();
+	u64 emit_us = porting::getTimeUs() - temit;
+
+	V.origin = origin;
+	V.valid = true;
+	V.last_snap_ms = porting::getTimeMs();
 	// let the accumulator adapt to new world content within ~1s even
 	// when deeply converged (placed torches shouldn't fade in slowly)
-	if (g_claude_volume.still_frames > 10.0f)
-		g_claude_volume.still_frames = 10.0f;
-	actionstream << "[claude_volume] snapshot origin=(" << origin.X << ","
+	if (V.still_frames > 10.0f)
+		V.still_frames = 10.0f;
+	actionstream << "[claude_volume] snapshot FULL origin=(" << origin.X << ","
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
 			<< (S * S * S) << " area_emitters="
-			<< g_claude_volume.area_count << "/"
-			<< g_claude_volume.area_total
+			<< V.area_count << "/" << V.area_total
 			// palette caps at 254 and never evicts: past the cap new
 			// materials render UNTEXTURED and nothing said so until now
 			// (spec/measured.md "Owed to the harness")
-			<< " palette=" << g_claude_volume.palette.size() << "/254"
-			<< " in "
-			<< (porting::getTimeMs() - t0) << " ms" << std::endl;
+			<< " palette=" << V.palette.size() << "/254"
+			<< " in " << (porting::getTimeMs() - t0) << " ms"
+			<< " [walk=" << walk_us << "us bake=" << bake_us
+			<< "us gl=" << gl_us << "us emit=" << emit_us
+			<< "us total=" << (porting::getTimeUs() - tu0) << "us]"
+			<< std::endl;
+}
+
+// THE INCREMENTAL PATH. Drain the client's dirty-block set and fold just
+// those blocks into the live volume. Returns true if the volume changed.
+//
+// Everything here is gated on a per-block hash actually differing, not
+// on a packet having arrived: BLOCKDATA lands for reasons that do not
+// change a single node (a re-send, a block leaving and re-entering
+// range), and resetting still_frames on those would restart convergence
+// in a static scene — the exact opposite of the fix.
+static bool claudeVolumeIncremental(Client *client)
+{
+	constexpr int S = ClaudeVolume::SIZE;
+	constexpr int B = ClaudeVolume::BLK;
+	constexpr int NB = ClaudeVolume::NB;
+	ClaudeVolume &V = g_claude_volume;
+	std::vector<v3s16> dirty;
+	bool overflow = client->takeClaudeDirtyBlocks(dirty);
+	if (!V.valid)
+		return false;
+	if (overflow) {
+		// A mass edit (a mod filling a box, a world deploy) blew the
+		// dirty-set cap, so the list is not the whole truth and folding
+		// it in would leave a volume that disagrees with the world in
+		// places nothing would ever look at again.
+		warningstream << "[claude_volume] dirty-block set overflowed;"
+				" falling back to a full walk" << std::endl;
+		claudeVolumeSnapshot(client);
+		return true;
+	}
+	if (dirty.empty())
+		return false;
+	u64 tu0 = porting::getTimeUs();
+	// map block (16^3 world nodes, world-aligned) -> volume cell box ->
+	// the volume blocks it touches. The volume origin is arbitrary, so
+	// one map block straddles up to 2 volume blocks per axis; re-walking
+	// whole volume blocks costs at most 8 x 4096 cells and keeps one
+	// alignment story for the hashes, the pyramid and the uploads.
+	static std::vector<u8> mark;
+	mark.assign(ClaudeVolume::NBLOCKS, 0);
+	int marked = 0;
+	for (const v3s16 &bp : dirty) {
+		v3s16 lo = bp * MAP_BLOCKSIZE - V.origin;
+		int x0 = std::max(0, (int)lo.X), x1 = std::min(S, (int)lo.X + MAP_BLOCKSIZE);
+		int y0 = std::max(0, (int)lo.Y), y1 = std::min(S, (int)lo.Y + MAP_BLOCKSIZE);
+		int z0 = std::max(0, (int)lo.Z), z1 = std::min(S, (int)lo.Z + MAP_BLOCKSIZE);
+		if (x0 >= x1 || y0 >= y1 || z0 >= z1)
+			continue; // outside the bubble entirely
+		for (int bz = z0 / B; bz <= (z1 - 1) / B; bz++)
+		for (int by = y0 / B; by <= (y1 - 1) / B; by++)
+		for (int bx = x0 / B; bx <= (x1 - 1) / B; bx++) {
+			int b = (bz * NB + by) * NB + bx;
+			if (!mark[b]) { mark[b] = 1; marked++; }
+		}
+	}
+	if (!marked)
+		return false;
+	Map &map = client->getEnv().getMap();
+	const NodeDefManager *ndef = client->getNodeDefManager();
+	claudeLoadModels(ndef);
+	int cx0 = S, cy0 = S, cz0 = S, cx1 = 0, cy1 = 0, cz1 = 0;
+	int changed = 0;
+	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++) {
+		if (!mark[b])
+			continue;
+		u64 before = V.block_hash[b];
+		claudeVolumeWalkBlock(client, ndef, map, V.origin, b);
+		if (V.block_hash[b] == before)
+			continue;
+		changed++;
+		int bx = b % NB, by = (b / NB) % NB, bz = b / (NB * NB);
+		cx0 = std::min(cx0, bx * B); cx1 = std::max(cx1, (bx + 1) * B);
+		cy0 = std::min(cy0, by * B); cy1 = std::max(cy1, (by + 1) * B);
+		cz0 = std::min(cz0, bz * B); cz1 = std::max(cz1, (bz + 1) * B);
+	}
+	u64 walk_us = porting::getTimeUs() - tu0;
+	V.snap_seq++;
+	u32 solid = 0;
+	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
+		solid += V.block_solid[b];
+	V.solid_count = solid;
+	if (!changed) {
+		// A packet arrived and changed nothing. Say so and leave the
+		// accumulator alone; this is the case the old timer could not
+		// distinguish from a real edit.
+		V.last_snap_ms = porting::getTimeMs();
+		infostream << "[claude_volume] incremental " << marked
+				<< " blocks, none changed, walk=" << walk_us << "us"
+				<< std::endl;
+		return false;
+	}
+	u64 hash = claudeVolumeContentHash(V.origin);
+	V.content_hash = hash;
+	u64 tbake = porting::getTimeUs();
+	claudeVolumeBakeSubvox(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	claudeVolumeBakePyramid(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	u64 bake_us = porting::getTimeUs() - tbake;
+	u64 tgl = porting::getTimeUs();
+	bool boxed = claudeVolumeUploadBox(cx0, cy0, cz0,
+			cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	if (!boxed)
+		claudeVolumeUploadFull();
+	u64 gl_us = porting::getTimeUs() - tgl;
+	u64 temit = porting::getTimeUs();
+	claudeVolumeFinishEmitters();
+	u64 emit_us = porting::getTimeUs() - temit;
+	V.last_snap_ms = porting::getTimeMs();
+	// let the accumulator adapt to new world content within ~1s even
+	// when deeply converged (placed torches shouldn't fade in slowly)
+	if (V.still_frames > 10.0f)
+		V.still_frames = 10.0f;
+	actionstream << "[claude_volume] incremental " << changed << "/"
+			<< marked << " blocks box=(" << cx0 << "," << cy0 << ","
+			<< cz0 << ")+(" << (cx1 - cx0) << "," << (cy1 - cy0) << ","
+			<< (cz1 - cz0) << ") solid=" << solid
+			<< " area_emitters=" << V.area_count << "/" << V.area_total
+			<< " [walk=" << walk_us << "us bake=" << bake_us
+			<< "us gl=" << gl_us << "us emit=" << emit_us
+			<< "us total=" << (porting::getTimeUs() - tu0) << "us]"
+			<< (boxed ? "" : " (full upload fallback)") << std::endl;
+	return true;
 }
 
 // Once per frame: decide how strongly this frame's traced sample should
@@ -2776,6 +3195,15 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// solid_count: non-air cells the LAST WALK found (roadmap 1b).
 			<< ", \"volume_solid\": " << g_claude_volume.solid_count
 			<< ", \"volume_snap_seq\": " << g_claude_volume.snap_seq
+			// The content hash itself, so a harness can prove the
+			// INCREMENTAL path converges to the same state a full walk
+			// would: edit a node, put it back, and this must return to
+			// the value it had before. It is the per-block hashes
+			// combined order-independently, so it is stable across the
+			// two paths by construction rather than by luck.
+			<< ", \"volume_hash\": \"" << std::hex << std::setw(16)
+			<< std::setfill('0') << g_claude_volume.content_hash
+			<< std::dec << std::setfill(' ') << "\""
 			<< ", \"emitters\": " << g_claude_volume.emitter_count
 			// the two numbers that explain a noisy room: how many area
 			// emitters NEE can aim at, and how many exist
@@ -3024,21 +3452,28 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 	// claude_volume follow (Phase 0-lite streaming): whenever any volume
 	// consumer (ghost view or water reflections) is enabled, keep a volume
 	// alive around the camera — bootstrap one if none exists (e.g. right
-	// after a restart), and re-snapshot when the camera strays >24 nodes
-	// from the current center. claude_volume_follow = 0 restores the
-	// frozen-bubble behavior.
+	// after a restart), re-snapshot when the camera strays >24 nodes from
+	// the current center, and fold in whatever blocks the server told us
+	// changed. claude_volume_follow = 0 restores the frozen-bubble
+	// behavior (the CI seat used to need that; it does not any more).
 	//
-	// KNOWN DEFECT (measured 2026-08-15, spec/measured.md "The 3-second
-	// hitch"): the periodic "every 2 s" re-snap below costs ~295 ms on
-	// the lab scene (not the ~15 ms this comment once claimed) and the
-	// 1 Hz poll quantizes it to a hitch every 3 s. The fix has two
-	// halves and needs both: (1) event-driven — snap on received block
-	// change, not a timer (BLOCKDATA arrives ~once/30 s in a static
-	// scene vs this timer's 10); (2) incremental — re-walk only the
-	// changed blocks and upload only that dirty region, so one edit is
-	// a 16^3 walk, not a full-volume rebuild. Event-driven alone still
-	// hitches ~295 ms per edit; a longer timer fixes nothing. First
-	// step: attribute the 295 ms (CPU walk vs GL upload) — unmeasured.
+	// WAS A KNOWN DEFECT, now measured and fixed (spec/measured.md
+	// "Volume re-snap fix"). This block used to re-snapshot the whole
+	// 128^3 volume on a "every 2 s" timer that the 1 Hz poll quantized to
+	// every 3 s. MEASURED at cozy-ci, Release, before: 12.0 ms of CPU
+	// walk on EVERY tick (the unchanged-hash early return skips the
+	// upload, never the walk), 28.6 ms when content had changed, worst
+	// frame 39.7 ms against a 15.8 ms follow-off baseline. An earlier
+	// comment here claimed ~15 ms and a later one ~295 ms; both were
+	// written without a timer in the function, which is why there is one
+	// now and why it prints on every exit.
+	//
+	// AFTER: no timer at all. Snaps are event-driven (Client's
+	// dirty-block set, fed from addNode / removeNode / BLOCKDATA) and
+	// incremental (re-walk the changed 16^3 volume blocks, upload that
+	// sub-box). Costs are in the [claude_volume] log lines and in
+	// measured.md; the full walk survives only for the two cases where
+	// nothing can be reused.
 	{
 		auto setting_on = [](const char *name) {
 			return g_settings->exists(name)
@@ -3056,12 +3491,22 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 			constexpr s16 H = ClaudeVolume::SIZE / 2;
 			v3s16 center = g_claude_volume.origin + v3s16(H, H, H);
 			v3s16 d = floatToInt(client->getCamera()->getPosition(), BS) - center;
-			// re-snap on straying — or every 2 s while a consumer is on,
-			// so world edits (placed torches, dug holes) appear promptly
-			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24 || std::abs(d.Z) > 24
-					|| (consumer_on && porting::getTimeMs()
-							- g_claude_volume.last_snap_ms > 2000))
+			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24
+					|| std::abs(d.Z) > 24) {
+				// re-centre: the origin moves, so no cell of the old
+				// volume is at the address it used to be. Full walk.
 				claudeVolumeSnapshot(client);
+			} else if (consumer_on) {
+				claudeVolumeIncremental(client);
+			}
+		}
+		if (!follow || !consumer_on) {
+			// Nothing is going to consume the dirty list; drain it so it
+			// cannot grow without bound while the bubble is frozen. The
+			// overflow flag is cleared with it, and the next real
+			// snapshot is a full walk anyway.
+			std::vector<v3s16> discard;
+			client->takeClaudeDirtyBlocks(discard);
 		}
 		if (consumer_on)
 			claudeCascadeUpdate(client);

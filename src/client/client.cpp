@@ -1542,6 +1542,32 @@ void Client::sendUpdateClientInfo(const ClientDynamicInfo& info)
 	Send(&pkt);
 }
 
+// claude_volume: the tracer's dirty-block set. See client.h for why this
+// exists (the volume used to be rebuilt on a 3 s clock instead of on the
+// world changing). Kept trivially cheap — a dig must not pay for GI.
+void Client::claudeMarkBlockDirty(v3s16 blockpos)
+{
+	if (m_claude_dirty_blocks.size() >= CLAUDE_DIRTY_CAP) {
+		// A mass edit (a mod filling a box, a world deploy). Stop
+		// collecting and tell the drain to do a full re-walk instead of
+		// handing it a truncated list it would trust.
+		m_claude_dirty_blocks.clear();
+		m_claude_dirty_overflow = true;
+		return;
+	}
+	if (!m_claude_dirty_overflow)
+		m_claude_dirty_blocks.insert(blockpos);
+}
+
+bool Client::takeClaudeDirtyBlocks(std::vector<v3s16> &out)
+{
+	out.assign(m_claude_dirty_blocks.begin(), m_claude_dirty_blocks.end());
+	m_claude_dirty_blocks.clear();
+	bool overflow = m_claude_dirty_overflow;
+	m_claude_dirty_overflow = false;
+	return overflow;
+}
+
 void Client::removeNode(v3s16 p)
 {
 	std::map<v3s16, MapBlock*> modified_blocks;
@@ -1551,6 +1577,11 @@ void Client::removeNode(v3s16 p)
 	}
 	catch(InvalidPositionException &e) {
 	}
+
+	// Only the block holding p can change CONTENT here; the rest of
+	// modified_blocks are lighting/mesh neighbours, and the volume walk
+	// reads content and param2, not light.
+	claudeMarkBlockDirty(getNodeBlockPos(p));
 
 	for (const auto &modified_block : modified_blocks) {
 		addUpdateMeshTaskWithEdge(modified_block.first, false, true);
@@ -1613,6 +1644,9 @@ void Client::addNode(v3s16 p, MapNode n, bool remove_metadata)
 	}
 	catch(InvalidPositionException &e) {
 	}
+
+	// see removeNode: content changes in exactly one block
+	claudeMarkBlockDirty(getNodeBlockPos(p));
 
 	for (const auto &modified_block : modified_blocks) {
 		addUpdateMeshTaskWithEdge(modified_block.first, false, true);
