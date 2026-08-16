@@ -112,11 +112,23 @@ CANONICAL_DIALS = {
     # this one decides what the Monte Carlo integrator integrates.
     "claude_rng": 1,
     "claude_stats": 1,
-    # freeze the volume bubble: the periodic re-snap is a ~295 ms hitch
-    # every 3 s and a silent scene change under a settling accumulator.
-    # With follow off, each capture takes its own snapshot after the
+    # The volume follows the camera again (2026-08-16). This was pinned
+    # to 0 from 2026-08-15 because the re-snap ran on a 3 s timer and
+    # cost a visible hitch plus a silent scene change under a settling
+    # accumulator. It is now event-driven and incremental (game.cpp
+    # claudeVolumeIncremental; spec/measured.md "Volume re-snap fix"), so
+    # a tick with no world change costs nothing and touches nothing.
+    # Pinned EXPLICITLY at 1 rather than left unset: the unset value
+    # happens to be 1 too, and that is exactly the hidden-default class
+    # environment-laws warns about.
+    #
+    # This makes CI honest about one thing it could not see before: the
+    # world is NOT static. Mineclonia's grass ABM turns a covered
+    # dirt_with_grass into dirt every 30-90 s, and with follow on that
+    # reaches the trace and caps still_frames, as a real world change
+    # should. Each capture still forces its own snapshot after the
     # teleport (see capture()).
-    "claude_volume_follow": 0,
+    "claude_volume_follow": 1,
     # --- overlay suppression, and it is NOT cosmetic --------------------
     # Region means and RMS compare PIXELS. The hotbar covers the only
     # floor this vantage can see, and each capture's "Saved screenshot
@@ -964,13 +976,15 @@ VOLUME_SOLID_FLOOR_SEALED = 100000
 def await_volume(marker, block, room=None, tries=3):
     """Prove the tracer has something to trace BEFORE the settle starts.
 
-    claude_volume_follow = 0 freezes the bubble, which is what a
-    measurement wants — but it also means NOTHING bootstraps a volume:
-    an idle seat sits at volume_valid = 0 with the traced pipeline on,
-    marching an empty bubble, and the frame looks like the tracer is
-    off (John, from the screen, 2026-08-15 — and he was right). Each
-    capture therefore triggers its own snapshot after the teleport, and
-    this waits for the client to say it took.
+    A capture must never be taken over an empty bubble: a client with no
+    volume marches nothing, and the frame looks like the tracer is off
+    (John, from the screen, 2026-08-15 — and he was right). That used to
+    be the normal state, because claude_volume_follow was pinned to 0 and
+    nothing bootstrapped a volume. Follow is on again as of 2026-08-16,
+    so the seat does bootstrap — but each capture still triggers its own
+    snapshot after the teleport (the follow path re-centres on the poll,
+    up to 1 s later, and a settle must not start before the volume is the
+    one being photographed), and this waits for the client to say it took.
 
     FOUND 2026-08-15 (roadmap 1b, cave-skylight/cave-glass): this used
     to also require area_total > 0, on the theory that a snapshot fired
@@ -1057,9 +1071,11 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
             dials, "%s_pre_%d" % (name, time.time_ns()))
     info["reset_error"] = reset_accumulation(vantage, park)
     info["aim_at_start"] = read_aim()
-    # with claude_volume_follow = 0 the bubble never re-centres on its
-    # own, so take one snapshot here — before the settle, since it
-    # clamps still_frames — and re-assert the dials after it.
+    # Take one snapshot here — before the settle, since it clamps
+    # still_frames — and re-assert the dials after it. Follow being on
+    # does not make this redundant: the follow path only re-centres on
+    # its next 1 Hz poll, and the settle must not start against the
+    # PREVIOUS vantage's bubble.
     marker = "%s_%d" % (name, time.time_ns())
     block = dict(dials, claude_volume_snapshot=marker)
     info["dials_pushed"] = push_dials(block, marker)

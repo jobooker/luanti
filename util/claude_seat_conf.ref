@@ -26,6 +26,13 @@ default_privs = interact, shout, fly, fast, noclip, teleport, settime, privs, gi
 # --- traced pipeline master switch (0 = raster pass-through, 3 = traced)
 claude_volume_debug = 3
 claude_stats = 1
+# The 128^3 volume follows the camera. Event-driven and
+# incremental since 2026-08-16 (spec/measured.md "Volume re-snap
+# fix"); it was pinned to 0 for a day while the re-snap still ran
+# on a 3 s timer and cost a visible hitch. Set EXPLICITLY even
+# though the unset value is also 1 -- an unset claude_* dial is a
+# silent default, which is the bug class this file exists for.
+claude_volume_follow = 1
 # --- console -> client dial channel: /dial in-game writes here, polled by
 # pollSettingsPatch() alongside claude_settings_patch.conf (~1 Hz)
 claude_dial_file = worlds/gallery/claude_dial.conf
