@@ -153,7 +153,7 @@ COST_SETTLE = 12.0   # s parked before the cost samples are believed —
 # Dials pushed explicitly on EVERY arm. An unset dial is not a default —
 # it is a silent zero, and this sweep must not measure one by accident.
 SWEEP_DIALS = {"claude_view": 0, "claude_bounces": 24, "claude_stats": 1,
-               "claude_volume_follow": 0,
+               "claude_grid_follow": 0,
                # --- HUD suppression, and it is not cosmetic ------------
                # The RMS referee compares PIXELS, so anything drawn over
                # the frame is measured as if it were the renderer. Two
@@ -516,7 +516,7 @@ def measure_cost(room, mode):
         area_emitters=last.get("area_emitters"),
         area_total=last.get("area_total"),
         emitters=last.get("emitters"),
-        volume_valid=last.get("volume_valid"),
+        grid_valid=last.get("grid_valid"),
     )
     return row
 
@@ -551,8 +551,8 @@ def capture_golden(rooms, vantages, outdir):
         lab.doorway(claude_nee=0, **SWEEP_DIALS)   # nee=0 IS photo mode (§6)
         set_caps(FAST_FPS)
         lab.goto(v)
-        lab.doorway(claude_volume_snapshot="golden_%s_%d" % (room, time.time_ns()))
-        lab.doorway(claude_volume_follow=0)
+        lab.doorway(claude_grid_snapshot="golden_%s_%d" % (room, time.time_ns()))
+        lab.doorway(claude_grid_follow=0)
         err = reset_accumulation(v, vantages[PARK_ROOM if room != PARK_ROOM
                                                  else PARK_ALT])
         if err:
@@ -603,11 +603,11 @@ def arm(room, mode, vantage, park, golden_png, outdir):
 
     lab.goto(vantage)
     # re-centre the 128^3 bubble on THIS room before follow is frozen —
-    # with claude_volume_follow=0 the bubble never re-centres on its own,
+    # with claude_grid_follow=0 the bubble never re-centres on its own,
     # and a room outside a stale bubble renders wrong.
     snap_token = "nee_snap_%s_m%d_%d" % (room, mode, time.time_ns())
-    lab.doorway(claude_volume_snapshot=snap_token)
-    lab.doorway(claude_volume_follow=0)  # re-assert after the snapshot
+    lab.doorway(claude_grid_snapshot=snap_token)
+    lab.doorway(claude_grid_follow=0)  # re-assert after the snapshot
 
     proof = [l for l in lab.patch_log() if "claude_nee = %d" % mode in l
              or "claude_nee=%d" % mode in l]
@@ -664,7 +664,7 @@ def write_md(path, data):
                  % (COST_SAMPLES, COST_SETTLE))
     lines.append("")
     lines.append("| room | mode | frame_ms_avg | busy_ms | frame_ms_worst | "
-                 "area_emitters/total | volume_valid | note |")
+                 "area_emitters/total | grid_valid | note |")
     lines.append("|---|---|---|---|---|---|---|---|")
     for arm_result in data["arms"]:
         c = arm_result.get("cost") or {}
@@ -675,7 +675,7 @@ def write_md(path, data):
         lines.append("| %s | %s | %s | %s | %s | %s/%s | %s | |" % (
             arm_result["room"], arm_result["mode"],
             c.get("frame_ms_avg"), c.get("busy_ms"), c.get("frame_ms_worst"),
-            c.get("area_emitters"), c.get("area_total"), c.get("volume_valid")))
+            c.get("area_emitters"), c.get("area_total"), c.get("grid_valid")))
     lines.append("")
     lines.append("## RMS vs golden, per room")
     lines.append("")
@@ -709,7 +709,7 @@ def print_tables(data):
                 arm_result["room"], arm_result["mode"], c.get("frame_ms_avg"),
                 c.get("busy_ms"), c.get("frame_ms_worst"),
                 c.get("area_emitters"), c.get("area_total"),
-                c.get("volume_valid")))
+                c.get("grid_valid")))
     print("\n=== rms vs golden ===")
     for arm_result in data["arms"]:
         for pt in arm_result.get("curve", []):

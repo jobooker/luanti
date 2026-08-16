@@ -32,7 +32,7 @@
 #include "minimap.h"
 #include "network/networkexceptions.h"
 #include "nodedef.h"         // Needed for determining pointing to nodes
-#include "node_visuals.h"    // claude_volume: per-nodetype minimap_color
+#include "node_visuals.h"    // claude_grid: per-nodetype minimap_color
 #include "client/claude_lod.h" // far cascade (Phase 1)
 #include "nodemetadata.h"
 #include "particles.h"
@@ -43,9 +43,10 @@
 #include <array>
 #include <algorithm>
 #include <unordered_map>
+#include <set> // claude_grid: legacy setting-name warning, once per name
 #include <cstring>
-#include <iomanip> // claude_stats: hex volume_hash
-// claude_volume uploads its 3D textures through raw GL directly.
+#include <iomanip> // claude_stats: hex grid_hash
+// claude_grid uploads its 3D textures through raw GL directly.
 // Cross-platform GL via the engine's own loader (irr/include/mt_opengl.h):
 // it supplies BOTH entry points and enums as members of the global `GL`,
 // and LoadAllProcedures() runs on both driver paths. The old
@@ -92,13 +93,13 @@ using GLuint = unsigned int;
 
 typedef s32 SamplerLayer_t;
 
-// claude_volume: one-shot 128^3 occupancy snapshot of the map around the
+// claude_grid: one-shot 128^3 occupancy snapshot of the map around the
 // camera, held as a raw GL.R8 3D texture bound to texture unit 4 — outside
 // Irrlicht's material system, which only manages units 0-3, so nothing else
-// touches the binding. Written by claudeVolumeSnapshot() (triggered through
+// touches the binding. Written by claudeTraceGridSnapshot() (triggered through
 // claude_settings_patch.conf), read each frame by the uniform setter below
-// and marched in the second_stage shader when claude_volume_debug is set.
-struct ClaudeVolume
+// and marched in the second_stage shader when claude_grid_debug is set.
+struct ClaudeTraceGrid
 {
 	static constexpr int SIZE = 128;
 	u32 tex = 0; // GL texture name (GLuint)
@@ -107,7 +108,7 @@ struct ClaudeVolume
 	bool valid = false;
 	u64 last_snap_ms = 0;
 	u64 content_hash = 0;
-	// nearest emissive cells (volume cell coords + intensity), for NEE
+	// nearest emissive cells (grid cell coords + intensity), for NEE
 	float emitters[8][4] = {};
 	// Measured flame size (cell units): RMS spread of the model's
 	// emissive voxels about the glow centroid, x1.6, computed in the
@@ -127,14 +128,14 @@ struct ClaudeVolume
 	// is not a point", and a point has no area to sample.
 	//
 	// One entry per emissive CELL, class 170..240:
-	//   xyz = integer volume-cell coords (the DDA's own cell space)
+	//   xyz = integer grid-cell coords (the DDA's own cell space)
 	//   w   = air-exposed face mask; bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z,
 	//         5 -Z. A face whose neighbour is non-air is dropped: in
 	//         rung 1 every non-air class is opaque, so that is a face no
 	//         ray can reach, and dropping it keeps the light-sampling pdf
 	//         identical on both sides of the MIS weight.
 	// NO RADIANCE IS STORED HERE, on purpose. THE LAW is one Le (§4): the
-	// shader re-reads the cell out of claudeVolume and runs the same
+	// shader re-reads the cell out of claudeTraceGrid and runs the same
 	// cellAlbedo()/cellEmission() the eye ray runs. A CPU-side copy of Le
 	// would be exactly the second emission formula the contract forbids.
 	static constexpr int AREA_CAP = 16;
@@ -145,18 +146,18 @@ struct ClaudeVolume
 	// next-event estimation, class 170..240 only. It is legitimately 0
 	// for a fully solid, fully lightless sealed room -- every referee
 	// room built before 1b happened to have a lamp, so `area_total > 0`
-	// silently worked as an "is there a volume" proxy for months and was
+	// silently worked as an "is there a grid" proxy for months and was
 	// never actually testing that. See solid_count below for the real one.
 	int area_total = 0;         // emissive cells the snapshot actually found
 	// solid_count / snap_seq (roadmap 1b, gate hardening 2026-08-16):
 	// `valid` is set true once and never cleared (see below), so
-	// `volume_valid == 1` alone is a TAUTOLOGY after the first snapshot
+	// `grid_valid == 1` alone is a TAUTOLOGY after the first snapshot
 	// ever taken on a seat -- an all-air bubble at a brand-new vantage
 	// still reads valid=1. solid_count is the number of non-air cells
 	// the WALK JUST COMPLETED actually found (computed unconditionally,
 	// every call, before the unchanged-content early return), so it is
 	// zero exactly when the bubble really is empty. snap_seq increments
-	// once per call to claudeVolumeSnapshot(), so a caller can prove a
+	// once per call to claudeTraceGridSnapshot(), so a caller can prove a
 	// NEW walk happened between two reads rather than reading a stale
 	// solid_count left over from a walk at a completely different
 	// vantage.
@@ -187,12 +188,12 @@ struct ClaudeVolume
 	// thresholds loop.
 	u32 accum_resets = 0;
 	// ---- INCREMENTAL RE-SNAP (2026-08-16) ------------------------------
-	// The CPU mirrors of the uploaded volumes, kept alive BETWEEN
+	// The CPU mirrors of the uploaded grids, kept alive BETWEEN
 	// snapshots so a changed 16^3 block can be re-walked in place and
 	// uploaded as a sub-box. They used to be locals of the snapshot
 	// function, which is why the only way to reflect a dug node was to
 	// re-read all 2.1 M cells (spec/measured.md "Volume re-snap fix").
-	static constexpr int BLK = 16;                // volume block edge, cells
+	static constexpr int BLK = 16;                // grid block edge, cells
 	static constexpr int NB = SIZE / BLK;         // 8 blocks per axis
 	static constexpr int NBLOCKS = NB * NB * NB;  // 512
 	std::vector<u8> occ;      // SIZE^3 RGBA: rgb = colour, a = class
@@ -209,7 +210,7 @@ struct ClaudeVolume
 	// re-walk can drop exactly the ones that block owned (a dug lamp that
 	// stays in this list keeps getting sampled by NEE, and the room stays
 	// lit with nothing in the log) and so the list can be restored to
-	// whole-volume cell order before the nearest-8 distance sort.
+	// whole-grid cell order before the nearest-8 distance sort.
 	struct PointEmit { u32 cell; float v[5]; };
 	std::vector<PointEmit> emit_all;
 	// Held (wielded) light lives in its OWN slot, never in emitters[]:
@@ -219,13 +220,13 @@ struct ClaudeVolume
 	// light at a stale camera position ("circular shadow" bug,
 	// 2026-08-12). w = 0 means no held light this frame.
 	float held_emitter[4] = {};
-	// textured-albedo path: per-cell material id volume (unit 6) + a
+	// textured-albedo path: per-cell material id grid (unit 6) + a
 	// 256x256 atlas of 16px top-tile images (unit 7), palette grown lazily
 	u32 material_tex = 0;
 	u32 atlas_tex = 0;
 	u32 matparams_tex = 0;      // 256x1 per-material: R=spec G=gloss B=ore
 	// REAL SUB-VOXEL BITS: 16^3 bits per node for the 32^3 ring at
-	// volume-local [48,80)^3 — model masks or full-solid, baked per
+	// grid-local [48,80)^3 — model masks or full-solid, baked per
 	// snapshot (ADR-0011: the ONLY sub-voxel occupancy); the shader's
 	// microSolid is one fetch. R8 64x512x512 (one byte = 8 x-subvoxels):
 	// integer samplers silently kill the Irrlicht material (the
@@ -267,7 +268,7 @@ struct ClaudeVolume
 	v3f prev_light_col;          // last frame's sun/moon colour
 	int light_body = 0;          // 0 none, 1 sun, 2 moon (for stats)
 	float still_frames = 0.0f;
-	// last frame's ray-camera basis (volume-local), for reprojection:
+	// last frame's ray-camera basis (grid-local), for reprojection:
 	// shader_* is what the shader sees (frame N-1); cur_* staged this frame
 	v3f shader_prev_pos, shader_prev_fwd, shader_prev_rightu, shader_prev_upu;
 	float shader_prev_tanx = 1.0f, shader_prev_tany = 1.0f;
@@ -275,16 +276,16 @@ struct ClaudeVolume
 	float cur_tanx = 1.0f, cur_tany = 1.0f;
 	// radiance cache (claude_radiance): frame counter drives which 1/8 of
 	// cells the GPU update pass refreshes; reset > 0 makes the pass write
-	// zeros — the cache is volume-local, so an origin shift invalidates it
+	// zeros — the cache is grid-local, so an origin shift invalidates it
 	// wholesale (2 frames, to clear both ping-pong targets). Starts at 2
 	// as belt-and-braces over the FBO clear.
 	float radiance_frame = 0.0f;
 	int radiance_reset = 2;
-	// near-ring sub-face atlas (ADR-0006 v2): ring corner in volume-local
+	// near-ring sub-face atlas (ADR-0006 v2): ring corner in grid-local
 	// cell coords, plus last frame's for cross-shift address remapping
 	v3f near_origin = v3f(48.0f, 48.0f, 48.0f);
 	v3f near_prev = v3f(48.0f, 48.0f, 48.0f);
-	// volume-rebase delta in cells (origin_new - origin_old) on the shift
+	// grid-rebase delta in cells (origin_new - origin_old) on the shift
 	// frame, zero otherwise: lets cache passes REMAP instead of zeroing
 	// (the pulse-to-black John caught 2026-08-12)
 	v3f origin_delta = v3f(0.0f, 0.0f, 0.0f);
@@ -303,7 +304,7 @@ struct ClaudeVolume
 		float ms = 0.0f;         // last build+upload cost (stats)
 	} casc[5];                   // [0]=2m [1]=4m [2]=8m [3]=16m [4]=32m
 };
-static ClaudeVolume g_claude_volume;
+static ClaudeTraceGrid g_claude_grid;
 
 
 class GameGlobalShaderUniformSetter : public IShaderUniformSetter
@@ -353,7 +354,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_ssao_strength;
 	CachedPixelShaderSetting<float> m_bump_strength_pixel{"bumpStrength"};
 	float m_bump_strength;
-	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_volume_sampler_pixel{"claudeVolume"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_grid_sampler_pixel{"claudeTraceGrid"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_coarse_sampler_pixel{"claudeCoarse"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_materials_sampler_pixel{"claudeMaterials"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
@@ -367,7 +368,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_cascade4_origin_pixel{"cascade4Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid_pixel{"cascadeValid"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
-	CachedPixelShaderSetting<float, 3, false> m_volume_origin_pixel{"volumeOrigin"};
+	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
 	CachedPixelShaderSetting<float, 1, false> m_gray_pixel{"grayWorld"};
 	CachedPixelShaderSetting<float, 1, false> m_pure_pixel{"purePhoto"};
@@ -464,11 +465,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
-	CachedPixelShaderSetting<float, 1, false> m_volume_debug_pixel{"volumeDebug"};
-	CachedPixelShaderSetting<float, 3, false> m_volume_cam_pos_pixel{"volumeCamPos"};
-	CachedPixelShaderSetting<float, 3, false> m_volume_cam_fwd_pixel{"volumeCamFwd"};
-	CachedPixelShaderSetting<float, 3, false> m_volume_cam_right_pixel{"volumeCamRight"};
-	CachedPixelShaderSetting<float, 3, false> m_volume_cam_up_pixel{"volumeCamUp"};
+	CachedPixelShaderSetting<float, 1, false> m_grid_debug_pixel{"gridDebug"};
+	CachedPixelShaderSetting<float, 3, false> m_grid_cam_pos_pixel{"gridCamPos"};
+	CachedPixelShaderSetting<float, 3, false> m_grid_cam_fwd_pixel{"gridCamFwd"};
+	CachedPixelShaderSetting<float, 3, false> m_grid_cam_right_pixel{"gridCamRight"};
+	CachedPixelShaderSetting<float, 3, false> m_grid_cam_up_pixel{"gridCamUp"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_sun_dir_pixel{"volumeSunDir"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_light_col_pixel{"volumeLightCol"};
 	CachedPixelShaderSetting<float, 2, false> m_volume_depth_range_pixel{"volumeDepthRange"};
@@ -495,13 +496,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// does a literal string compare against whatever glGetActiveUniform
 	// handed back — so an array would resolve on one driver and silently
 	// no-op on the next. Sixteen scalars resolve everywhere.
-	CachedPixelShaderSetting<float, 4, false> m_area_pixel[ClaudeVolume::AREA_CAP] = {
+	CachedPixelShaderSetting<float, 4, false> m_area_pixel[ClaudeTraceGrid::AREA_CAP] = {
 		{"claudeArea0"}, {"claudeArea1"}, {"claudeArea2"}, {"claudeArea3"},
 		{"claudeArea4"}, {"claudeArea5"}, {"claudeArea6"}, {"claudeArea7"},
 		{"claudeArea8"}, {"claudeArea9"}, {"claudeArea10"}, {"claudeArea11"},
 		{"claudeArea12"}, {"claudeArea13"}, {"claudeArea14"}, {"claudeArea15"}};
 	CachedPixelShaderSetting<float> m_area_count_pixel{"claudeAreaCount"};
-	float m_volume_debug;
+	float m_grid_debug;
 	float m_water_reflections;
 	float m_gi_strength;
 	float m_gi_split;
@@ -521,7 +522,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"golden_hour_strength",
 		"ssao_strength",
 		"bump_strength",
-		"claude_volume_debug",
+		"claude_grid_debug",
 		"claude_water_reflections",
 		"claude_gi",
 		"claude_gi_split",
@@ -585,9 +586,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("bump_strength", 0.0f, 2.0f);
 	}
 
-	static float readVolumeDebug()
+	static float readGridDebug()
 	{
-		if (!g_settings->exists("claude_volume_debug"))
+		if (!g_settings->exists("claude_grid_debug"))
 			return 0.0f;
 		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
 		// 3 = pure path-traced view (zero ambient, all light via rays),
@@ -597,7 +598,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		// 11 = shadow-ray WHY-map (cause-coded colors).
 		// The old 4.0 clamp silently rewrote every mode-5/6 request to 4
 		// — a whole evening of "nothing changed" (John caught it).
-		return g_settings->getFloat("claude_volume_debug", 0.0f, 12.0f);
+		return g_settings->getFloat("claude_grid_debug", 0.0f, 12.0f);
 	}
 
 	static float readWaterReflections()
@@ -806,7 +807,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_face_texels", 1.0f, 2.0f);
 	}
 
-	// 1 (default) = shift face caches across a volume rebase; 0 = the
+	// 1 (default) = shift face caches across a grid rebase; 0 = the
 	// old zero-and-rebuild (the pulse), kept for A/B
 	static float readCacheRemap()
 	{
@@ -952,8 +953,8 @@ public:
 			m_ssao_strength = readSsaoStrength();
 		if (name == "bump_strength")
 			m_bump_strength = readBumpStrength();
-		if (name == "claude_volume_debug")
-			m_volume_debug = readVolumeDebug();
+		if (name == "claude_grid_debug")
+			m_grid_debug = readGridDebug();
 		if (name == "claude_water_reflections")
 			m_water_reflections = readWaterReflections();
 		if (name == "claude_gi")
@@ -1054,7 +1055,7 @@ public:
 		m_golden_hour_strength = readGoldenHourStrength();
 		m_ssao_strength = readSsaoStrength();
 		m_bump_strength = readBumpStrength();
-		m_volume_debug = readVolumeDebug();
+		m_grid_debug = readGridDebug();
 		m_water_reflections = readWaterReflections();
 		m_gi_strength = readGiStrength();
 		m_gi_split = readGiSplit();
@@ -1178,53 +1179,53 @@ public:
 		m_ssao_strength_pixel.set(&m_ssao_strength, services);
 		m_bump_strength_pixel.set(&m_bump_strength, services);
 
-		// claude_volume ghost view: hand the shader a ray-generation basis
-		// in volume-local node units. Camera position is absolute world
-		// coords / BS minus the volume origin — computed CPU-side so the
+		// claude_grid ghost view: hand the shader a ray-generation basis
+		// in grid-local node units. Camera position is absolute world
+		// coords / BS minus the grid origin — computed CPU-side so the
 		// trace never involves camera-offset space. Right/up are pre-scaled
 		// by tan(fov/2) so the shader builds rays with two multiply-adds.
 		{
-			float dbg = g_claude_volume.valid ? m_volume_debug : 0.0f;
-			m_volume_debug_pixel.set(&dbg, services);
-			float refl = g_claude_volume.valid ? m_water_reflections : 0.0f;
+			float dbg = g_claude_grid.valid ? m_grid_debug : 0.0f;
+			m_grid_debug_pixel.set(&dbg, services);
+			float refl = g_claude_grid.valid ? m_water_reflections : 0.0f;
 			m_water_refl_pixel.set(&refl, services);
-			float gi = g_claude_volume.valid ? m_gi_strength : 0.0f;
+			float gi = g_claude_grid.valid ? m_gi_strength : 0.0f;
 			m_gi_strength_pixel.set(&gi, services);
 			m_gi_split_pixel.set(&m_gi_split, services);
-			float clay = g_claude_volume.valid ? m_clay : 0.0f;
+			float clay = g_claude_grid.valid ? m_clay : 0.0f;
 			m_clay_pixel.set(&clay, services);
-			m_accum_alpha_pixel.set(&g_claude_volume.accum_alpha, services);
-			m_prev_pos_pixel.set(g_claude_volume.shader_prev_pos, services);
-			m_prev_fwd_pixel.set(g_claude_volume.shader_prev_fwd, services);
-			m_prev_rightu_pixel.set(g_claude_volume.shader_prev_rightu, services);
-			m_prev_upu_pixel.set(g_claude_volume.shader_prev_upu, services);
-			float ptan[2] = {g_claude_volume.shader_prev_tanx,
-					g_claude_volume.shader_prev_tany};
+			m_accum_alpha_pixel.set(&g_claude_grid.accum_alpha, services);
+			m_prev_pos_pixel.set(g_claude_grid.shader_prev_pos, services);
+			m_prev_fwd_pixel.set(g_claude_grid.shader_prev_fwd, services);
+			m_prev_rightu_pixel.set(g_claude_grid.shader_prev_rightu, services);
+			m_prev_upu_pixel.set(g_claude_grid.shader_prev_upu, services);
+			float ptan[2] = {g_claude_grid.shader_prev_tanx,
+					g_claude_grid.shader_prev_tany};
 			m_prev_tan_pixel.set(ptan, services);
 			for (int e = 0; e < 8; e++)
-				m_emitter_pixel[e].set(g_claude_volume.emitters[e], services);
-			float ecount = (float)g_claude_volume.emitter_runtime;
+				m_emitter_pixel[e].set(g_claude_grid.emitters[e], services);
+			float ecount = (float)g_claude_grid.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
-			m_held_emitter_pixel.set(g_claude_volume.held_emitter, services);
+			m_held_emitter_pixel.set(g_claude_grid.held_emitter, services);
 			// AREA emitters (claude_trace NEE). Sent whether or not the
-			// volume is valid: an invalid volume leaves area_count at 0,
+			// grid is valid: an invalid grid leaves area_count at 0,
 			// and a count of 0 is exactly "no light sampling", which the
 			// estimator handles by handing every BSDF-found emitter the
 			// full balance weight — i.e. it degrades to the photo path
 			// rather than to a wrong image.
-			for (int e = 0; e < ClaudeVolume::AREA_CAP; e++)
-				m_area_pixel[e].set(g_claude_volume.area[e], services);
-			float acount = g_claude_volume.valid
-					? (float)g_claude_volume.area_count : 0.0f;
+			for (int e = 0; e < ClaudeTraceGrid::AREA_CAP; e++)
+				m_area_pixel[e].set(g_claude_grid.area[e], services);
+			float acount = g_claude_grid.valid
+					? (float)g_claude_grid.area_count : 0.0f;
 			m_area_count_pixel.set(&acount, services);
 			// Radiance cache controls: delivered UNCONDITIONALLY (like the
 			// samplers below) because the claude_radiance update pass runs
 			// every frame regardless of mode and must be able to early-out
 			// on its own uniforms; a value only set when a consumer is on
 			// would leave the pass reading stale state after a toggle-off.
-			float rad = g_claude_volume.valid ? m_radiance : 0.0f;
+			float rad = g_claude_grid.valid ? m_radiance : 0.0f;
 			m_radiance_pixel.set(&rad, services);
-			float b2 = g_claude_volume.valid ? m_bounce2 : 0.0f;
+			float b2 = g_claude_grid.valid ? m_bounce2 : 0.0f;
 			m_bounce2_pixel.set(&b2, services);
 			m_cache_sky_pixel.set(&m_cache_sky, services);
 			m_bisect_pixel.set(&m_bisect, services);
@@ -1235,15 +1236,15 @@ public:
 			m_tiers_pixel.set(&m_tiers, services);
 			m_bounce_stride_pixel.set(&m_bounce_stride, services);
 			m_face_texels_pixel.set(&m_face_texels, services);
-			m_near_origin_pixel.set(g_claude_volume.near_origin, services);
-			m_near_prev_pixel.set(g_claude_volume.near_prev, services);
-			m_radiance_frame_pixel.set(&g_claude_volume.radiance_frame,
+			m_near_origin_pixel.set(g_claude_grid.near_origin, services);
+			m_near_prev_pixel.set(g_claude_grid.near_prev, services);
+			m_radiance_frame_pixel.set(&g_claude_grid.radiance_frame,
 					services);
 			// the COUNTER (2/1/0), not a flag: 2 = remap frame (apply
 			// origin delta), 1 = carry frame (plain copy of the remap)
-			float rreset = (float)g_claude_volume.radiance_reset;
+			float rreset = (float)g_claude_grid.radiance_reset;
 			m_radiance_reset_pixel.set(&rreset, services);
-			m_origin_delta_pixel.set(g_claude_volume.origin_delta, services);
+			m_origin_delta_pixel.set(g_claude_grid.origin_delta, services);
 			m_cache_remap_pixel.set(&m_cache_remap, services);
 			m_far_hist_pixel.set(&m_far_hist, services);
 			m_light_ladder_pixel.set(&m_light_ladder, services);
@@ -1253,7 +1254,7 @@ public:
 			m_sky_az_pixel.set(&m_sky_az, services);
 			// REBIND EVERY FRAME, UNCONDITIONALLY. These 3D textures are
 			// bound with raw GL outside Irrlicht's material system, and
-			// they were only bound inside claudeVolumeSnapshot() — which
+			// they were only bound inside claudeTraceGridSnapshot() — which
 			// runs every ~2 s, not per frame. Units 4-8 fall inside
 			// Irrlicht's managed range (MATERIAL_MAX_TEXTURES), and the
 			// GL3 cache handler resets those units between snapshots, so
@@ -1266,7 +1267,7 @@ public:
 			// two sampler types — which makes the PROGRAM invalid on core
 			// and every draw it makes undefined. So the sampler uniforms
 			// must be delivered whenever the program runs, not only once
-			// a traced consumer is switched on. (Before the first volume
+			// a traced consumer is switched on. (Before the first grid
 			// snapshot the textures are 0 and the binds no-op; the
 			// uniforms still point the samplers at distinct units, which
 			// is what validity requires.)
@@ -1282,52 +1283,52 @@ public:
 			{
 				GLint prev_active = GL.TEXTURE0;
 				GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active);
-				if (g_claude_volume.tex) {
+				if (g_claude_grid.tex) {
 					GL.ActiveTexture(GL.TEXTURE10);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.tex);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.tex);
 				}
-				if (g_claude_volume.coarse_tex) {
+				if (g_claude_grid.coarse_tex) {
 					GL.ActiveTexture(GL.TEXTURE11);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.coarse_tex);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.coarse_tex);
 				}
-				if (g_claude_volume.material_tex) {
+				if (g_claude_grid.material_tex) {
 					GL.ActiveTexture(GL.TEXTURE12);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.material_tex);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.material_tex);
 				}
-				if (g_claude_volume.atlas_tex) {
+				if (g_claude_grid.atlas_tex) {
 					GL.ActiveTexture(GL.TEXTURE13);
-					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.atlas_tex);
+					GL.BindTexture(GL.TEXTURE_2D, g_claude_grid.atlas_tex);
 				}
-				if (g_claude_volume.matparams_tex) {
+				if (g_claude_grid.matparams_tex) {
 					GL.ActiveTexture(GL.TEXTURE15);
-					GL.BindTexture(GL.TEXTURE_2D, g_claude_volume.matparams_tex);
+					GL.BindTexture(GL.TEXTURE_2D, g_claude_grid.matparams_tex);
 				}
-				if (g_claude_volume.subvox_tex) {
+				if (g_claude_grid.subvox_tex) {
 					GL.ActiveTexture(GL.TEXTURE7);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.subvox_tex);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.subvox_tex);
 				}
-				if (g_claude_volume.model_ids_tex) {
+				if (g_claude_grid.model_ids_tex) {
 					GL.ActiveTexture(GL.TEXTURE0 + 16);
 					GL.BindTexture(GL.TEXTURE_3D,
-							g_claude_volume.model_ids_tex);
+							g_claude_grid.model_ids_tex);
 					GL.ActiveTexture(GL.TEXTURE0 + 17);
 					GL.BindTexture(GL.TEXTURE_3D,
-							g_claude_volume.model_atlas_tex);
+							g_claude_grid.model_atlas_tex);
 					GL.ActiveTexture(GL.TEXTURE0 + 18);
 					GL.BindTexture(GL.TEXTURE_2D,
-							g_claude_volume.model_pal_tex);
+							g_claude_grid.model_pal_tex);
 				}
-				if (g_claude_volume.cascades_tex) {
+				if (g_claude_grid.cascades_tex) {
 					GL.ActiveTexture(GL.TEXTURE8);
-					GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_tex);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_tex);
 					GL.ActiveTexture(GL.TEXTURE9);
 					GL.BindTexture(GL.TEXTURE_3D,
-							g_claude_volume.cascades_coarse_tex);
+							g_claude_grid.cascades_coarse_tex);
 				}
 				GL.ActiveTexture(prev_active);
 
 				SamplerLayer_t layer = 10;
-				m_volume_sampler_pixel.set(&layer, services);
+				m_grid_sampler_pixel.set(&layer, services);
 				SamplerLayer_t clayer = 11;
 				m_coarse_sampler_pixel.set(&clayer, services);
 				SamplerLayer_t mlayer = 12;
@@ -1359,8 +1360,8 @@ public:
 				SamplerLayer_t casccl = 9;
 				m_cascades_coarse_sampler_pixel.set(&casccl, services);
 				// cascade origins handed to the shader VOLUME-LOCAL
-				// (cascade world origin minus volume world origin), so the
-				// shader converts a volume-local point to cascade cells
+				// (cascade world origin minus grid world origin), so the
+				// shader converts a grid-local point to cascade cells
 				// with one subtract and a divide
 				CachedPixelShaderSetting<float, 3, false> *corg_pixels[5] = {
 					&m_cascade0_origin_pixel, &m_cascade1_origin_pixel,
@@ -1368,24 +1369,24 @@ public:
 					&m_cascade4_origin_pixel };
 				float cvalid[5];
 				for (int lv = 0; lv < 5; lv++) {
-					v3f corg = v3f((float)(g_claude_volume.casc[lv].origin.X
-								- g_claude_volume.origin.X),
-							(float)(g_claude_volume.casc[lv].origin.Y
-								- g_claude_volume.origin.Y),
-							(float)(g_claude_volume.casc[lv].origin.Z
-								- g_claude_volume.origin.Z));
+					v3f corg = v3f((float)(g_claude_grid.casc[lv].origin.X
+								- g_claude_grid.origin.X),
+							(float)(g_claude_grid.casc[lv].origin.Y
+								- g_claude_grid.origin.Y),
+							(float)(g_claude_grid.casc[lv].origin.Z
+								- g_claude_grid.origin.Z));
 					corg_pixels[lv]->set(corg, services);
-					cvalid[lv] = g_claude_volume.casc[lv].valid ? 1.0f : 0.0f;
+					cvalid[lv] = g_claude_grid.casc[lv].valid ? 1.0f : 0.0f;
 				}
 				m_cascade_valid_pixel.set(cvalid, services);
 				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};
 				m_cascade_valid2_pixel.set(cvalid2, services);
 			}
 			if (dbg > 0.0f || refl > 0.0f || gi > 0.0f || clay > 0.0f) {
-				v3f vorg((float)g_claude_volume.origin.X,
-						(float)g_claude_volume.origin.Y,
-						(float)g_claude_volume.origin.Z);
-				m_volume_origin_pixel.set(vorg, services);
+				v3f vorg((float)g_claude_grid.origin.X,
+						(float)g_claude_grid.origin.Y,
+						(float)g_claude_grid.origin.Z);
+				m_grid_origin_pixel.set(vorg, services);
 				m_texture_amount_pixel.set(&m_texture_amount, services);
 				m_gray_pixel.set(&m_gray, services);
 				m_pure_pixel.set(&m_pure, services);
@@ -1399,10 +1400,10 @@ public:
 				m_nightsky_pixel.set(&m_nightsky, services);
 				Camera *camera = m_client->getCamera();
 				v3f local = camera->getPosition() / BS
-						- v3f(g_claude_volume.origin.X,
-							g_claude_volume.origin.Y,
-							g_claude_volume.origin.Z);
-				m_volume_cam_pos_pixel.set(local, services);
+						- v3f(g_claude_grid.origin.X,
+							g_claude_grid.origin.Y,
+							g_claude_grid.origin.Z);
+				m_grid_cam_pos_pixel.set(local, services);
 				v3f fwd = camera->getDirection();
 				fwd.normalize();
 				v3f right = v3f(0.f, 1.f, 0.f).crossProduct(fwd);
@@ -1410,9 +1411,9 @@ public:
 				v3f up = fwd.crossProduct(right);
 				right *= std::tan(camera->getFovX() * 0.5f);
 				up *= std::tan(camera->getFovY() * 0.5f);
-				m_volume_cam_fwd_pixel.set(fwd, services);
-				m_volume_cam_right_pixel.set(right, services);
-				m_volume_cam_up_pixel.set(up, services);
+				m_grid_cam_fwd_pixel.set(fwd, services);
+				m_grid_cam_right_pixel.set(right, services);
+				m_grid_cam_up_pixel.set(up, services);
 				// Traced light source: the sun when it's up (warm, ramped
 				// by day-night ratio), else the moon (cool, dim, a real
 				// light source so traced nights aren't pitch black), else
@@ -1435,17 +1436,17 @@ public:
 						sun = sdir;
 						float ramp = std::min(dnr, 1.0f);
 						lcol = v3f(1.0f * ramp, 0.95f * ramp, 0.82f * ramp);
-						g_claude_volume.light_body = 1;
+						g_claude_grid.light_body = 1;
 					} else if (m_sky->getMoonVisible() && mdir.Y > 0.0f) {
 						sun = mdir;
 						lcol = v3f(0.10f, 0.13f, 0.22f) * m_moongain;
-						g_claude_volume.light_body = 2;
+						g_claude_grid.light_body = 2;
 					} else {
-						g_claude_volume.light_body = 0;
+						g_claude_grid.light_body = 0;
 					}
 				} else {
 					lcol = v3f(1.0f, 0.95f, 0.82f);
-					g_claude_volume.light_body = 1;
+					g_claude_grid.light_body = 1;
 				}
 				sun.normalize();
 				// Temporal accumulation invalidated on CAMERA motion only, so
@@ -1455,16 +1456,16 @@ public:
 				// smears eleven disc-widths a second; at the default speed it
 				// reads as haze rather than a streak, which is why it went
 				// unnoticed. Treat a moved sky as a moved camera.
-				if ((sun - g_claude_volume.prev_light_dir).getLength() > 1e-4f
-						|| (lcol - g_claude_volume.prev_light_col).getLength()
+				if ((sun - g_claude_grid.prev_light_dir).getLength() > 1e-4f
+						|| (lcol - g_claude_grid.prev_light_col).getLength()
 								> 1e-4f) {
-					g_claude_volume.still_frames = 0.0f;
-					g_claude_volume.accum_resets++;
-					g_claude_volume.accum_alpha =
-							std::max(g_claude_volume.accum_alpha, 0.5f);
+					g_claude_grid.still_frames = 0.0f;
+					g_claude_grid.accum_resets++;
+					g_claude_grid.accum_alpha =
+							std::max(g_claude_grid.accum_alpha, 0.5f);
 				}
-				g_claude_volume.prev_light_dir = sun;
-				g_claude_volume.prev_light_col = lcol;
+				g_claude_grid.prev_light_dir = sun;
+				g_claude_grid.prev_light_col = lcol;
 				m_volume_sun_dir_pixel.set(sun, services);
 				m_volume_light_col_pixel.set(lcol, services);
 				// near/far for reconstructing eye depth from the depth
@@ -1653,6 +1654,10 @@ Game::Game() :
 		g_settings->registerChangedCallback(s, &settingChangedCallback, this);
 
 	readSettings();
+
+	// The conf on disk is the other way a dead claude_volume_* name gets
+	// in, and it is the one nobody re-reads. Say so once, at startup.
+	claudeWarnRenamedSettings(g_settings, "minetest.conf");
 }
 
 
@@ -1737,6 +1742,57 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 }
 
 
+// claude_grid: LEGACY SETTING NAMES ARE LOUD, NEVER SILENT.
+//
+// On 2026-08-16 the tracer's 128^3 map mirror was renamed "volume" ->
+// "grid" (spec/environment-laws.md, "The volume -> grid rename"). Three
+// SETTINGS moved with it, and renaming a setting is the dangerous half of
+// a rename: an old name in a conf, a patch file or a dial file is not an
+// error, it is simply a key nothing reads. It configures nothing and says
+// nothing.
+//
+// That exact failure class already cost this project a session, before the
+// rename even existed: a leftover claude_settings_patch.conf pushed
+// `claude_volume_follow = 0` onto a seat whose minetest.conf said 1, the
+// client ran with follow OFF, and grepping the conf -- the instrument
+// everyone reached for -- could not see it (util/claude_ci.py PATCH_HEADER;
+// environment-laws "a runtime /set shadows the conf").
+//
+// So every old name found anywhere gets one loud line naming its
+// replacement, on actionstream (the stream CI captures into client.log) and
+// on warningstream. Once per name per process: the patch file is re-read at
+// ~1 Hz and a per-poll warning would bury the log it is trying to be seen
+// in. Covered by src/unittest/test_claude_grid_settings.cpp.
+static const struct {
+	const char *old_name;
+	const char *new_name;
+} g_claude_renamed_settings[] = {
+	{"claude_volume_follow",   "claude_grid_follow"},
+	{"claude_volume_debug",    "claude_grid_debug"},
+	{"claude_volume_snapshot", "claude_grid_snapshot"},
+};
+
+int claudeWarnRenamedSettings(const Settings *src, const char *source)
+{
+	static std::set<std::string> warned;
+	int found = 0;
+	for (const auto &r : g_claude_renamed_settings) {
+		if (!src->existsLocal(r.old_name))
+			continue;
+		found++;
+		if (!warned.insert(r.old_name).second)
+			continue; // already said once; still counted for the caller
+		actionstream << "[claude_grid] IGNORED SETTING '" << r.old_name
+				<< "' (" << (source ? source : "?") << "): renamed to '"
+				<< r.new_name << "' on 2026-08-16 — the old name does "
+				<< "NOTHING. See spec/environment-laws.md." << std::endl;
+		warningstream << "[claude_grid] IGNORED SETTING '" << r.old_name
+				<< "' -> use '" << r.new_name << "'" << std::endl;
+	}
+	return found;
+}
+
+
 // claude_settings_patch: poll <path_user>/claude_settings_patch.conf (~1 Hz)
 // and apply its key = value lines through g_settings — the same route the
 // in-game settings GUI uses, so live-appliable settings (view range, shadows,
@@ -1746,9 +1802,9 @@ bool Game::startup(volatile std::sig_atomic_t *kill,
 static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 		video::SColor fallback)
 {
-	if (g_claude_volume.atlas.empty())
-		g_claude_volume.atlas.assign(256 * 256 * 4, 0);
-	u32 *dst = (u32 *)g_claude_volume.atlas.data();
+	if (g_claude_grid.atlas.empty())
+		g_claude_grid.atlas.assign(256 * 256 * 4, 0);
+	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
 	bool ok = false;
 	const std::string &tname = f.tiledef[0].name;
@@ -1776,10 +1832,10 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 			else { ore_spec = 0.50f; ore_gloss = 0.50f; }
 		}
 	}
-	if (g_claude_volume.matparams.empty())
-		g_claude_volume.matparams.assign(256 * 4, 0);
+	if (g_claude_grid.matparams.empty())
+		g_claude_grid.matparams.assign(256 * 4, 0);
 	{
-		u8 *row = &g_claude_volume.matparams[(size_t)mid * 4];
+		u8 *row = &g_claude_grid.matparams[(size_t)mid * 4];
 		row[0] = (u8)(ore_spec * 255.0f + 0.5f);
 		row[1] = (u8)(ore_gloss * 255.0f + 0.5f);
 		row[2] = is_ore ? 255 : 0;
@@ -1894,7 +1950,7 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 	// runtime carve, ADR-0011 — sub-voxel shape comes from the model
 	// shop's authored 16^3 models, nowhere else.)
 	(void)fallback;
-	g_claude_volume.atlas_dirty = true;
+	g_claude_grid.atlas_dirty = true;
 }
 
 // GL_LUMINANCE was REMOVED in the OpenGL core profile, so these uploads
@@ -1913,9 +1969,9 @@ static bool claudeUseR8()
 	return cached == 1;
 }
 
-// claude_volume_snapshot: walk the client's loaded map ±SIZE/2 nodes around
+// claude_grid_snapshot: walk the client's loaded map ±SIZE/2 nodes around
 // the camera into a solid/air occupancy grid and upload it as a GL.R8 3D
-// texture on unit 4. One-shot: the volume does not follow the camera
+// texture on unit 4. One-shot: the grid does not follow the camera
 // afterwards (streaming updates are a later patch). Unloaded map (IGNORE)
 // reads as air, so rays pass through it and miss. Runs on the main thread
 // Authored-model loader (phase 4.5 v1: occupancy shapes only). Reads
@@ -1925,7 +1981,7 @@ static bool claudeUseR8()
 // uncarved glowing cube until then).
 static void claudeLoadModels(const NodeDefManager *ndef)
 {
-	auto &V = g_claude_volume;
+	auto &V = g_claude_grid;
 	if (V.models_loaded)
 		return;
 	V.models_loaded = true; // one attempt; missing files = no models
@@ -2047,7 +2103,7 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 }
 
 // ---- INCREMENTAL VOLUME RE-SNAP -------------------------------------
-// (2026-08-16; spec/measured.md "Volume re-snap fix".) The volume used to
+// (2026-08-16; spec/measured.md "Volume re-snap fix".) The grid used to
 // be rebuilt from scratch on a 2 s timer that the 1 Hz poll quantized to
 // every 3 s. MEASURED at the cozy-ci vantage, Release: 12.0 ms of CPU
 // walk on EVERY tick even when nothing had changed — the unchanged-hash
@@ -2057,10 +2113,10 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 // scene, one variable. That is a hitch you can see, and it ran on a
 // clock rather than on the world changing.
 //
-// Now the CPU mirrors live in ClaudeVolume, the client pushes changed
+// Now the CPU mirrors live in ClaudeTraceGrid, the client pushes changed
 // block positions into a dirty set (Client::claudeMarkBlockDirty, fed
 // from addNode / removeNode / handleCommand_BlockData), and the poll
-// re-walks only the 16^3 volume blocks those touch and uploads only that
+// re-walks only the 16^3 grid blocks those touch and uploads only that
 // sub-box. The full walk survives for exactly two callers: bootstrap,
 // and a >24-node re-centre — which moves the origin, so nothing can be
 // reused (the deadband makes that rare, and shift-and-fill is not worth
@@ -2085,26 +2141,26 @@ static void claudePackBox(const u8 *src, int dx, int dy, int comp,
 	}
 }
 
-// Walk ONE 16^3 volume block into the persistent CPU mirrors.
+// Walk ONE 16^3 grid block into the persistent CPU mirrors.
 //
 // This is the only place the map is read and cells are classified. The
 // full walk is 512 calls to this, so the incremental path CANNOT drift
 // from the full path: gate 4 asks the two to produce the identical
-// volume, and the only honest way to promise that is to have one
+// grid, and the only honest way to promise that is to have one
 // implementation rather than two that agree today.
-static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
+static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		Map &map, v3s16 origin, int b)
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
-	constexpr int B = ClaudeVolume::BLK;
-	constexpr int NB = ClaudeVolume::NB;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	constexpr int B = ClaudeTraceGrid::BLK;
+	constexpr int NB = ClaudeTraceGrid::NB;
 	const int bx = b % NB, by = (b / NB) % NB, bz = b / (NB * NB);
 	// The point emitters this block owned die with the re-walk and are
 	// re-pushed below. Miss this and next-event estimation keeps aiming
 	// at a lamp that was dug: the room stays lit and nothing says why.
 	V.emit_all.erase(std::remove_if(V.emit_all.begin(), V.emit_all.end(),
-			[&](const ClaudeVolume::PointEmit &e) {
+			[&](const ClaudeTraceGrid::PointEmit &e) {
 				return (int)(e.cell % S) / B == bx
 						&& (int)((e.cell / S) % S) / B == by
 						&& (int)(e.cell / ((size_t)S * S)) / B == bz;
@@ -2212,12 +2268,12 @@ static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
 			// ladder rework gives models real far rungs.
 			if (x >= 48 && x < 80 && y >= 48 && y < 80
 					&& z >= 48 && z < 80) {
-				auto mit = g_claude_volume.model_of.find(c);
-				if (mit != g_claude_volume.model_of.end()) {
+				auto mit = g_claude_grid.model_of.find(c);
+				if (mit != g_claude_grid.model_of.end()) {
 					u8 rot = n.getParam2() & 3;
-					g_claude_volume.modelids[i] =
+					g_claude_grid.modelids[i] =
 							(u8)((mit->second << 2) | rot);
-					const auto &gl = g_claude_volume
+					const auto &gl = g_claude_grid
 							.model_glow[mit->second - 1][rot];
 					if (gl[3] > 0.0f)
 						emit_push({x + gl[0], y + gl[1],
@@ -2279,16 +2335,16 @@ static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
 		// small-emitter law; honest until the NEE+MIS area block).
 		// Sub-cube point lights (torch/lantern/campfire, class 165)
 		// keep their existing nub+NEE treatment.
-		if (!g_claude_volume.model_of.empty()
+		if (!g_claude_grid.model_of.empty()
 				&& (acls >= 250 || (f.light_source > 0
 					&& f.drawtype == NDT_NORMAL))) {
-			auto mit = g_claude_volume.model_of.find(c);
-			if (mit != g_claude_volume.model_of.end()) {
+			auto mit = g_claude_grid.model_of.find(c);
+			if (mit != g_claude_grid.model_of.end()) {
 				acls = 250;
 				u8 rot = n.getParam2() & 3;
-				g_claude_volume.modelids[i] =
+				g_claude_grid.modelids[i] =
 						(u8)((mit->second << 2) | rot);
-				const auto &gl = g_claude_volume
+				const auto &gl = g_claude_grid
 						.model_glow[mit->second - 1][rot];
 				if (gl[3] > 0.0f)
 					emit_push({x + gl[0], y + gl[1],
@@ -2298,12 +2354,12 @@ static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
 		occ[i * 4 + 3] = acls;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
 		// material id (0 = untextured); palette + atlas grow on first sight
-		auto pit = g_claude_volume.palette.find(c);
-		if (pit != g_claude_volume.palette.end()) {
+		auto pit = g_claude_grid.palette.find(c);
+		if (pit != g_claude_grid.palette.end()) {
 			mids[i] = pit->second;
-		} else if (g_claude_volume.palette.size() < 254) {
-			u8 mid = (u8)(g_claude_volume.palette.size() + 1);
-			g_claude_volume.palette[c] = mid;
+		} else if (g_claude_grid.palette.size() < 254) {
+			u8 mid = (u8)(g_claude_grid.palette.size() + 1);
+			g_claude_grid.palette[c] = mid;
 			claudeAtlasAdd(client, mid, f, col);
 			mids[i] = mid;
 		}
@@ -2320,12 +2376,12 @@ static void claudeVolumeWalkBlock(Client *client, const NodeDefManager *ndef,
 // stops two blocks whose walks happened to land on related values from
 // cancelling each other out. Deterministic, so the incremental path and
 // a full walk of the same world agree bit for bit (gate 4).
-static u64 claudeVolumeContentHash(v3s16 origin)
+static u64 claudeTraceGridContentHash(v3s16 origin)
 {
 	u64 h = 14695981039346656037ULL ^ (u64)origin.X
 			^ ((u64)origin.Y << 20) ^ ((u64)origin.Z << 40);
-	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++) {
-		u64 z = g_claude_volume.block_hash[b] + 0x9E3779B97F4A7C15ULL;
+	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++) {
+		u64 z = g_claude_grid.block_hash[b] + 0x9E3779B97F4A7C15ULL;
 		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
 		z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
 		h ^= z ^ (z >> 31);
@@ -2338,7 +2394,7 @@ static u64 claudeVolumeContentHash(v3s16 origin)
 // Neither list is patched, both are rebuilt from state that is already
 // correct, and that is deliberate:
 //
-//  - emit_all is re-sorted into whole-volume CELL order first, so the
+//  - emit_all is re-sorted into whole-grid CELL order first, so the
 //    distance sort below sees the identical input sequence a full z,y,x
 //    walk would have handed it. std::sort is not stable; a tie decided
 //    differently is a different torch in slot 7, an image that moves,
@@ -2349,20 +2405,20 @@ static u64 claudeVolumeContentHash(v3s16 origin)
 //    A cell's air-exposed face mask depends on its six neighbours, so an
 //    incremental area update would have to re-own a one-cell halo around
 //    every dirty block anyway; 0.7 ms buys the entire problem away.
-static void claudeVolumeFinishEmitters()
+static void claudeTraceGridFinishEmitters()
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
 	std::sort(V.emit_all.begin(), V.emit_all.end(),
-			[](const ClaudeVolume::PointEmit &a,
-					const ClaudeVolume::PointEmit &b) {
+			[](const ClaudeTraceGrid::PointEmit &a,
+					const ClaudeTraceGrid::PointEmit &b) {
 				return a.cell < b.cell;
 			});
 	std::vector<std::array<float, 5>> emitters;
 	emitters.reserve(V.emit_all.size());
 	for (const auto &e : V.emit_all)
 		emitters.push_back({e.v[0], e.v[1], e.v[2], e.v[3], e.v[4]});
-	// nearest-8 emitters to the camera (= volume center) for NEE
+	// nearest-8 emitters to the camera (= grid center) for NEE
 	std::sort(emitters.begin(), emitters.end(),
 			[](const std::array<float, 5> &a, const std::array<float, 5> &b) {
 				auto d2 = [](const std::array<float, 5> &e) {
@@ -2395,7 +2451,7 @@ static void claudeVolumeFinishEmitters()
 		const u8 *occ = V.occ.data();
 		std::vector<std::array<float, 4>> areas;
 		auto is_air = [&](s16 ax, s16 ay, s16 az) {
-			// Out of the volume counts as NOT air: the outward faces of a
+			// Out of the grid counts as NOT air: the outward faces of a
 			// boundary cell can only be seen from outside the 128^3, and
 			// no ray ever starts there. Calling them exposed would put
 			// area in the pdf that no BSDF sample can ever reach.
@@ -2424,7 +2480,7 @@ static void claudeVolumeFinishEmitters()
 				continue;
 			areas.push_back({(float)x, (float)y, (float)z, (float)mask});
 		}
-		// nearest to the camera (= volume centre) first, the same key the
+		// nearest to the camera (= grid centre) first, the same key the
 		// point-emitter list uses
 		std::sort(areas.begin(), areas.end(),
 				[](const std::array<float, 4> &a, const std::array<float, 4> &b) {
@@ -2436,8 +2492,8 @@ static void claudeVolumeFinishEmitters()
 				});
 		V.area_total = (int)areas.size();
 		V.area_count = (int)std::min<size_t>(areas.size(),
-				ClaudeVolume::AREA_CAP);
-		for (int e = 0; e < ClaudeVolume::AREA_CAP; e++)
+				ClaudeTraceGrid::AREA_CAP);
+		for (int e = 0; e < ClaudeTraceGrid::AREA_CAP; e++)
 			for (int k = 0; k < 4; k++)
 				V.area[e][k] = e < V.area_count ? areas[e][k] : 0.0f;
 		// NO SILENT TRUNCATION. Overflow is not a correctness failure —
@@ -2448,9 +2504,9 @@ static void claudeVolumeFinishEmitters()
 		// room looks noisier than it should.
 		if (V.area_total > V.area_count) {
 			const auto &first_drop = areas[V.area_count];
-			warningstream << "[claude_volume] area emitters "
+			warningstream << "[claude_grid] area emitters "
 					<< V.area_total << " > cap "
-					<< ClaudeVolume::AREA_CAP << ": dropping "
+					<< ClaudeTraceGrid::AREA_CAP << ": dropping "
 					<< (V.area_total - V.area_count)
 					<< " from next-event sampling, farthest first; nearest"
 					   " dropped cell is (" << (int)first_drop[0] << ","
@@ -2466,7 +2522,7 @@ static void claudeVolumeFinishEmitters()
 	}
 }
 
-// REAL SUB-VOXEL BITS: the ring [48,80)^3 (volume-local; the volume
+// REAL SUB-VOXEL BITS: the ring [48,80)^3 (grid-local; the grid
 // follows the camera) holds one bit per 1/16 m voxel — the ONLY
 // sub-voxel occupancy the renderer ever sees. Modeled cells take their
 // authored 16^3 mask; every other solid is 4096 ones, a plain 1m voxel.
@@ -2477,10 +2533,10 @@ static void claudeVolumeFinishEmitters()
 // 512 bytes before deciding, so a box refill leaves exactly what a full
 // re-bake would (the old code std::fill'd the whole 16 MB first, which
 // is not something a sub-box may do).
-static void claudeVolumeBakeSubvox(int x0, int y0, int z0, int w, int h, int d)
+static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int d)
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
 	const int R0 = 48, R1 = 80;
 	auto &sv = V.subvox;
 	if (sv.empty())
@@ -2530,10 +2586,10 @@ static void claudeVolumeBakeSubvox(int x0, int y0, int z0, int w, int h, int d)
 // re-reduce from the occupancy. Levels 0..2 are redone over the dirty
 // box; 3..5 are 4.6 KB in total and are redone wholesale, which also
 // sidesteps a 1-wide row hitting GL's 4-byte unpack alignment.
-static void claudeVolumeBakePyramid(int x0, int y0, int z0, int w, int h, int d)
+static void claudeTraceGridBakePyramid(int x0, int y0, int z0, int w, int h, int d)
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
 	for (int z = z0; z < z0 + d; z++)
 	for (int y = y0; y < y0 + h; y++)
 	for (int x = x0; x < x0 + w; x++) {
@@ -2572,7 +2628,7 @@ static void claudeVolumeBakePyramid(int x0, int y0, int z0, int w, int h, int d)
 	}
 }
 
-static void claudeVolumeTexParams3D()
+static void claudeTraceGridTexParams3D()
 {
 	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
 	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
@@ -2583,9 +2639,9 @@ static void claudeVolumeTexParams3D()
 
 // v2 model textures: the voxel-palette atlas + palettes, uploaded once
 // on load. Unchanged; lifted out so both upload paths can call it.
-static void claudeVolumeUploadModelTex()
+static void claudeTraceGridUploadModelTex()
 {
-	ClaudeVolume &V = g_claude_volume;
+	ClaudeTraceGrid &V = g_claude_grid;
 	if (!V.model_tex_dirty)
 		return;
 	V.model_tex_dirty = false;
@@ -2612,7 +2668,7 @@ static void claudeVolumeUploadModelTex()
 	GL.ActiveTexture(GL.TEXTURE0 + 17);
 	GL.BindTexture(GL.TEXTURE_3D, V.model_atlas_tex);
 	if (fresh_ma) {
-		claudeVolumeTexParams3D();
+		claudeTraceGridTexParams3D();
 		GL.TexImage3D(GL.TEXTURE_3D, 0,
 				claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 16, 16, 1024, 0,
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
@@ -2641,9 +2697,9 @@ static void claudeVolumeUploadModelTex()
 // tile atlas on unit 13 + per-material response params on unit 15,
 // uploaded only when the palette grew. Append-only, so it is the same
 // call on both paths.
-static void claudeVolumeUploadAtlas()
+static void claudeTraceGridUploadAtlas()
 {
-	ClaudeVolume &V = g_claude_volume;
+	ClaudeTraceGrid &V = g_claude_grid;
 	if (!V.atlas_dirty)
 		return;
 	if (!V.atlas_tex)
@@ -2672,11 +2728,11 @@ static void claudeVolumeUploadAtlas()
 	V.atlas_dirty = false;
 }
 
-// Full upload of every volume texture: bootstrap and re-centre only.
-static void claudeVolumeUploadFull()
+// Full upload of every grid texture: bootstrap and re-centre only.
+static void claudeTraceGridUploadFull()
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
 	// Save the unit the driver's cache believes is active and restore it
 	// at the end — restoring a hard-coded GL.TEXTURE0 desyncs the
 	// COpenGLCoreCacheHandler mirror (see the per-frame rebind block).
@@ -2686,7 +2742,7 @@ static void claudeVolumeUploadFull()
 		GL.GenTextures(1, &V.tex);
 	GL.ActiveTexture(GL.TEXTURE10);
 	GL.BindTexture(GL.TEXTURE_3D, V.tex);
-	claudeVolumeTexParams3D();
+	claudeTraceGridTexParams3D();
 	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, S, S, S, 0, GL.RGBA,
 			GL.UNSIGNED_BYTE, V.occ.data());
 	{
@@ -2696,7 +2752,7 @@ static void claudeVolumeUploadFull()
 		GL.ActiveTexture(GL.TEXTURE7);
 		GL.BindTexture(GL.TEXTURE_3D, V.subvox_tex);
 		if (fresh_sv) {
-			claudeVolumeTexParams3D();
+			claudeTraceGridTexParams3D();
 			GL.TexImage3D(GL.TEXTURE_3D, 0,
 					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 64, 512, 512,
 					0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
@@ -2711,7 +2767,7 @@ static void claudeVolumeUploadFull()
 		GL.ActiveTexture(GL.TEXTURE0 + 16);
 		GL.BindTexture(GL.TEXTURE_3D, V.model_ids_tex);
 		if (fresh_ids) {
-			claudeVolumeTexParams3D();
+			claudeTraceGridTexParams3D();
 			GL.TexImage3D(GL.TEXTURE_3D, 0,
 					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, S, S, S, 0,
 					claudeUseR8() ? GL.RED : GL_LUMINANCE,
@@ -2720,7 +2776,7 @@ static void claudeVolumeUploadFull()
 		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, S, S, S,
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
 				GL.UNSIGNED_BYTE, V.modelids.data());
-		claudeVolumeUploadModelTex();
+		claudeTraceGridUploadModelTex();
 	}
 	{
 		if (!V.coarse_tex)
@@ -2743,16 +2799,16 @@ static void claudeVolumeUploadFull()
 					GL.UNSIGNED_BYTE, V.pyr[lvl].data());
 		}
 	}
-	// material-id volume on unit 12
+	// material-id grid on unit 12
 	if (!V.material_tex)
 		GL.GenTextures(1, &V.material_tex);
 	GL.ActiveTexture(GL.TEXTURE12);
 	GL.BindTexture(GL.TEXTURE_3D, V.material_tex);
-	claudeVolumeTexParams3D();
+	claudeTraceGridTexParams3D();
 	GL.TexImage3D(GL.TEXTURE_3D, 0, claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
 			S, S, S, 0, claudeUseR8() ? GL.RED : GL_LUMINANCE,
 			GL.UNSIGNED_BYTE, V.mids.data());
-	claudeVolumeUploadAtlas();
+	claudeTraceGridUploadAtlas();
 	GL.ActiveTexture(prev_active_unit);
 }
 
@@ -2760,14 +2816,14 @@ static void claudeVolumeUploadFull()
 // wrapper as the full path — restoring a hard-coded GL.TEXTURE0 desyncs
 // Irrlicht's cache mirror, and that is just as true for a 16 KB upload.
 //
-// Every box handed here is a whole-number of 16-cell volume blocks, so
+// Every box handed here is a whole-number of 16-cell grid blocks, so
 // every R8 row width is a multiple of 4 and GL's default 4-byte unpack
 // alignment cannot bite. The guard below refuses the box rather than
 // upload skewed rows if that ever stops being true.
-static bool claudeVolumeUploadBox(int x0, int y0, int z0, int w, int h, int d)
+static bool claudeTraceGridUploadBox(int x0, int y0, int z0, int w, int h, int d)
 {
-	ClaudeVolume &V = g_claude_volume;
-	constexpr int S = ClaudeVolume::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
 	if ((w & 3) || (x0 & 3))
 		return false;
 	static std::vector<u8> staging;
@@ -2812,7 +2868,7 @@ static bool claudeVolumeUploadBox(int x0, int y0, int z0, int w, int h, int d)
 				GL.UNSIGNED_BYTE, V.pyr[lvl].data());
 	}
 
-	// sub-voxel ring [48,80)^3 = volume blocks 3 and 4 on each axis, so
+	// sub-voxel ring [48,80)^3 = grid blocks 3 and 4 on each axis, so
 	// an intersection is always a whole number of 16-cell spans and the
 	// 2-bytes-per-cell x extent is always a multiple of 4
 	{
@@ -2832,8 +2888,8 @@ static bool claudeVolumeUploadBox(int x0, int y0, int z0, int w, int h, int d)
 					fmt, GL.UNSIGNED_BYTE, staging.data());
 		}
 	}
-	claudeVolumeUploadModelTex();
-	claudeVolumeUploadAtlas();
+	claudeTraceGridUploadModelTex();
+	claudeTraceGridUploadAtlas();
 	GL.ActiveTexture(prev_active_unit);
 	return true;
 }
@@ -2841,12 +2897,12 @@ static bool claudeVolumeUploadBox(int x0, int y0, int z0, int w, int h, int d)
 // with the GL context current; the full 2.1 M-cell walk causes a brief
 // hitch (MEASURED below), which is acceptable for the two callers that
 // still need it: bootstrap and a >24-node re-centre.
-static void claudeVolumeSnapshot(Client *client)
+static void claudeTraceGridSnapshot(Client *client)
 {
-	constexpr int S = ClaudeVolume::SIZE;
-	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	ClaudeTraceGrid &V = g_claude_grid;
 	u64 t0 = porting::getTimeMs();
-	// PHASE TIMERS (gate 5 of the volume re-snap handoff): the cost of a
+	// PHASE TIMERS (gate 5 of the grid re-snap handoff): the cost of a
 	// re-snap had been attributed to "the walk" by a comment nobody had
 	// measured, and it was wrong by 20x in one direction and 25x in the
 	// other. Every phase is timed in us and printed.
@@ -2854,11 +2910,11 @@ static void claudeVolumeSnapshot(Client *client)
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
 	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
 	// ORIGIN DEADBAND (John, 2026-08-13: "things shift when I move
-	// around"): the detail ring rides volume-local coords, so an
+	// around"): the detail ring rides grid-local coords, so an
 	// origin that re-quantizes with every camera step sweeps the
 	// carve/cube boundary through the world at walking pace. Keep the
 	// previous origin while the camera stays within +/-6 m of the
-	// volume center — walking around a room then shifts NOTHING, and
+	// grid center — walking around a room then shifts NOTHING, and
 	// a genuine relocation costs one rebase instead of a pop per step.
 	{
 		v3s16 prev_center = V.prev_origin + v3s16(S / 2, S / 2, S / 2);
@@ -2885,12 +2941,12 @@ static void claudeVolumeSnapshot(Client *client)
 	// A full walk owns every cell, so nothing survives it: drop the whole
 	// point-emitter list rather than let 512 per-block erases do it.
 	V.emit_all.clear();
-	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
-		claudeVolumeWalkBlock(client, ndef, map, origin, b);
+	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++)
+		claudeTraceGridWalkBlock(client, ndef, map, origin, b);
 	u32 solid = 0;
-	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
+	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++)
 		solid += V.block_solid[b];
-	u64 hash = claudeVolumeContentHash(origin);
+	u64 hash = claudeTraceGridContentHash(origin);
 	// Updated unconditionally, BEFORE the unchanged-content early
 	// return below: this walk really did just run, whether or not its
 	// result differs from last time, so solid_count/snap_seq must
@@ -2903,20 +2959,20 @@ static void claudeVolumeSnapshot(Client *client)
 	// for image stability — do NOT disturb the converged accumulation
 	if (V.valid && hash == V.content_hash && origin == V.origin) {
 		V.last_snap_ms = porting::getTimeMs();
-		actionstream << "[claude_volume] snapshot UNCHANGED (upload"
+		actionstream << "[claude_grid] snapshot UNCHANGED (upload"
 				" skipped) walk=" << walk_us << "us" << std::endl;
 		return;
 	}
 	V.content_hash = hash;
 	u64 tbake = porting::getTimeUs();
-	claudeVolumeBakeSubvox(0, 0, 0, S, S, S);
-	claudeVolumeBakePyramid(0, 0, 0, S, S, S);
+	claudeTraceGridBakeSubvox(0, 0, 0, S, S, S);
+	claudeTraceGridBakePyramid(0, 0, 0, S, S, S);
 	u64 bake_us = porting::getTimeUs() - tbake;
 	u64 tgl = porting::getTimeUs();
-	claudeVolumeUploadFull();
+	claudeTraceGridUploadFull();
 	u64 gl_us = porting::getTimeUs() - tgl;
 	u64 temit = porting::getTimeUs();
-	claudeVolumeFinishEmitters();
+	claudeTraceGridFinishEmitters();
 	u64 emit_us = porting::getTimeUs() - temit;
 
 	V.origin = origin;
@@ -2926,7 +2982,7 @@ static void claudeVolumeSnapshot(Client *client)
 	// when deeply converged (placed torches shouldn't fade in slowly)
 	if (V.still_frames > 10.0f)
 		V.still_frames = 10.0f;
-	actionstream << "[claude_volume] snapshot FULL origin=(" << origin.X << ","
+	actionstream << "[claude_grid] snapshot FULL origin=(" << origin.X << ","
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
 			<< (S * S * S) << " area_emitters="
 			<< V.area_count << "/" << V.area_total
@@ -2942,19 +2998,19 @@ static void claudeVolumeSnapshot(Client *client)
 }
 
 // THE INCREMENTAL PATH. Drain the client's dirty-block set and fold just
-// those blocks into the live volume. Returns true if the volume changed.
+// those blocks into the live grid. Returns true if the grid changed.
 //
 // Everything here is gated on a per-block hash actually differing, not
 // on a packet having arrived: BLOCKDATA lands for reasons that do not
 // change a single node (a re-send, a block leaving and re-entering
 // range), and resetting still_frames on those would restart convergence
 // in a static scene — the exact opposite of the fix.
-static bool claudeVolumeIncremental(Client *client)
+static bool claudeTraceGridIncremental(Client *client)
 {
-	constexpr int S = ClaudeVolume::SIZE;
-	constexpr int B = ClaudeVolume::BLK;
-	constexpr int NB = ClaudeVolume::NB;
-	ClaudeVolume &V = g_claude_volume;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	constexpr int B = ClaudeTraceGrid::BLK;
+	constexpr int NB = ClaudeTraceGrid::NB;
+	ClaudeTraceGrid &V = g_claude_grid;
 	std::vector<v3s16> dirty;
 	bool overflow = client->takeClaudeDirtyBlocks(dirty);
 	if (!V.valid)
@@ -2962,23 +3018,23 @@ static bool claudeVolumeIncremental(Client *client)
 	if (overflow) {
 		// A mass edit (a mod filling a box, a world deploy) blew the
 		// dirty-set cap, so the list is not the whole truth and folding
-		// it in would leave a volume that disagrees with the world in
+		// it in would leave a grid that disagrees with the world in
 		// places nothing would ever look at again.
-		warningstream << "[claude_volume] dirty-block set overflowed;"
+		warningstream << "[claude_grid] dirty-block set overflowed;"
 				" falling back to a full walk" << std::endl;
-		claudeVolumeSnapshot(client);
+		claudeTraceGridSnapshot(client);
 		return true;
 	}
 	if (dirty.empty())
 		return false;
 	u64 tu0 = porting::getTimeUs();
-	// map block (16^3 world nodes, world-aligned) -> volume cell box ->
-	// the volume blocks it touches. The volume origin is arbitrary, so
-	// one map block straddles up to 2 volume blocks per axis; re-walking
-	// whole volume blocks costs at most 8 x 4096 cells and keeps one
+	// map block (16^3 world nodes, world-aligned) -> grid cell box ->
+	// the grid blocks it touches. The grid origin is arbitrary, so
+	// one map block straddles up to 2 grid blocks per axis; re-walking
+	// whole grid blocks costs at most 8 x 4096 cells and keeps one
 	// alignment story for the hashes, the pyramid and the uploads.
 	static std::vector<u8> mark;
-	mark.assign(ClaudeVolume::NBLOCKS, 0);
+	mark.assign(ClaudeTraceGrid::NBLOCKS, 0);
 	int marked = 0;
 	for (const v3s16 &bp : dirty) {
 		v3s16 lo = bp * MAP_BLOCKSIZE - V.origin;
@@ -3001,11 +3057,11 @@ static bool claudeVolumeIncremental(Client *client)
 	claudeLoadModels(ndef);
 	int cx0 = S, cy0 = S, cz0 = S, cx1 = 0, cy1 = 0, cz1 = 0;
 	int changed = 0;
-	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++) {
+	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++) {
 		if (!mark[b])
 			continue;
 		u64 before = V.block_hash[b];
-		claudeVolumeWalkBlock(client, ndef, map, V.origin, b);
+		claudeTraceGridWalkBlock(client, ndef, map, V.origin, b);
 		if (V.block_hash[b] == before)
 			continue;
 		changed++;
@@ -3017,7 +3073,7 @@ static bool claudeVolumeIncremental(Client *client)
 	u64 walk_us = porting::getTimeUs() - tu0;
 	V.snap_seq++;
 	u32 solid = 0;
-	for (int b = 0; b < ClaudeVolume::NBLOCKS; b++)
+	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++)
 		solid += V.block_solid[b];
 	V.solid_count = solid;
 	if (!changed) {
@@ -3025,32 +3081,32 @@ static bool claudeVolumeIncremental(Client *client)
 		// accumulator alone; this is the case the old timer could not
 		// distinguish from a real edit.
 		V.last_snap_ms = porting::getTimeMs();
-		infostream << "[claude_volume] incremental " << marked
+		infostream << "[claude_grid] incremental " << marked
 				<< " blocks, none changed, walk=" << walk_us << "us"
 				<< std::endl;
 		return false;
 	}
-	u64 hash = claudeVolumeContentHash(V.origin);
+	u64 hash = claudeTraceGridContentHash(V.origin);
 	V.content_hash = hash;
 	u64 tbake = porting::getTimeUs();
-	claudeVolumeBakeSubvox(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
-	claudeVolumeBakePyramid(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	claudeTraceGridBakeSubvox(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	claudeTraceGridBakePyramid(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
 	u64 bake_us = porting::getTimeUs() - tbake;
 	u64 tgl = porting::getTimeUs();
-	bool boxed = claudeVolumeUploadBox(cx0, cy0, cz0,
+	bool boxed = claudeTraceGridUploadBox(cx0, cy0, cz0,
 			cx1 - cx0, cy1 - cy0, cz1 - cz0);
 	if (!boxed)
-		claudeVolumeUploadFull();
+		claudeTraceGridUploadFull();
 	u64 gl_us = porting::getTimeUs() - tgl;
 	u64 temit = porting::getTimeUs();
-	claudeVolumeFinishEmitters();
+	claudeTraceGridFinishEmitters();
 	u64 emit_us = porting::getTimeUs() - temit;
 	V.last_snap_ms = porting::getTimeMs();
 	// let the accumulator adapt to new world content within ~1s even
 	// when deeply converged (placed torches shouldn't fade in slowly)
 	if (V.still_frames > 10.0f)
 		V.still_frames = 10.0f;
-	actionstream << "[claude_volume] incremental " << changed << "/"
+	actionstream << "[claude_grid] incremental " << changed << "/"
 			<< marked << " blocks box=(" << cx0 << "," << cy0 << ","
 			<< cz0 << ")+(" << (cx1 - cx0) << "," << (cy1 - cy0) << ","
 			<< (cz1 - cz0) << ") solid=" << solid
@@ -3063,7 +3119,7 @@ static bool claudeVolumeIncremental(Client *client)
 }
 
 // Once per frame: decide how strongly this frame's traced sample should
-// overwrite the accumulation history. Teleports and volume swaps trash
+// overwrite the accumulation history. Teleports and grid swaps trash
 // the history entirely; gentle drift blends fast; stillness accumulates
 // deep (the converged, soft-lit image).
 static void claudeUpdateAccum(Client *client)
@@ -3071,25 +3127,25 @@ static void claudeUpdateAccum(Client *client)
 	Camera *cam = client->getCamera();
 	v3f p = cam->getPosition();
 	v3f d = cam->getDirection();
-	float moved = p.getDistanceFrom(g_claude_volume.prev_cam_pos);
-	float turned = (d - g_claude_volume.prev_cam_dir).getLength();
-	bool origin_changed = g_claude_volume.origin != g_claude_volume.prev_origin;
-	v3s16 odelta = g_claude_volume.origin - g_claude_volume.prev_origin;
-	g_claude_volume.origin_delta = origin_changed
+	float moved = p.getDistanceFrom(g_claude_grid.prev_cam_pos);
+	float turned = (d - g_claude_grid.prev_cam_dir).getLength();
+	bool origin_changed = g_claude_grid.origin != g_claude_grid.prev_origin;
+	v3s16 odelta = g_claude_grid.origin - g_claude_grid.prev_origin;
+	g_claude_grid.origin_delta = origin_changed
 			? v3f(odelta.X, odelta.Y, odelta.Z) : v3f(0.0f, 0.0f, 0.0f);
-	g_claude_volume.prev_cam_pos = p;
-	g_claude_volume.prev_cam_dir = d;
-	g_claude_volume.prev_origin = g_claude_volume.origin;
+	g_claude_grid.prev_cam_pos = p;
+	g_claude_grid.prev_cam_dir = d;
+	g_claude_grid.prev_origin = g_claude_grid.origin;
 	// near-ring sub-face atlas follows the camera, corner clamped so the
-	// 32^3 ring never leaves the volume; prev kept one frame for remap.
-	// Across a volume rebase, express last frame's corner in the NEW
-	// volume space so the remap keeps pointing at the same world cells.
-	g_claude_volume.near_prev = origin_changed
-			? g_claude_volume.near_origin - g_claude_volume.origin_delta
-			: g_claude_volume.near_origin;
-	v3f lp = p / BS - v3f(g_claude_volume.origin.X,
-			g_claude_volume.origin.Y, g_claude_volume.origin.Z);
-	g_claude_volume.near_origin = v3f(
+	// 32^3 ring never leaves the grid; prev kept one frame for remap.
+	// Across a grid rebase, express last frame's corner in the NEW
+	// grid space so the remap keeps pointing at the same world cells.
+	g_claude_grid.near_prev = origin_changed
+			? g_claude_grid.near_origin - g_claude_grid.origin_delta
+			: g_claude_grid.near_origin;
+	v3f lp = p / BS - v3f(g_claude_grid.origin.X,
+			g_claude_grid.origin.Y, g_claude_grid.origin.Z);
+	g_claude_grid.near_origin = v3f(
 			core::clamp(std::floor(lp.X) - 16.0f, 0.0f, 96.0f),
 			core::clamp(std::floor(lp.Y) - 16.0f, 0.0f, 96.0f),
 			core::clamp(std::floor(lp.Z) - 16.0f, 0.0f, 96.0f));
@@ -3101,44 +3157,44 @@ static void claudeUpdateAccum(Client *client)
 	// perpetual 5%-new-sample pulse.
 	// radiance cache housekeeping: advance the amortization counter (the
 	// GPU pass refreshes cells whose interleave group == frame mod 8), and
-	// invalidate wholesale on an origin shift — the cache is volume-local,
+	// invalidate wholesale on an origin shift — the cache is grid-local,
 	// so rebasing makes every cell wrong. Two reset frames clear both
 	// ping-pong targets. Wrapped at 8 so the float compare in the shader
 	// stays exact forever.
 	// wrapped at 16 (was 8) so coarse light-ladder rungs can ride a
 	// 1/16 wheel; every mod-4/mod-8 consumer divides 16 evenly
-	g_claude_volume.radiance_frame =
-			std::fmod(g_claude_volume.radiance_frame + 1.0f, 16.0f);
+	g_claude_grid.radiance_frame =
+			std::fmod(g_claude_grid.radiance_frame + 1.0f, 16.0f);
 	if (origin_changed)
-		g_claude_volume.radiance_reset = 2;
-	else if (g_claude_volume.radiance_reset > 0)
-		g_claude_volume.radiance_reset--;
+		g_claude_grid.radiance_reset = 2;
+	else if (g_claude_grid.radiance_reset > 0)
+		g_claude_grid.radiance_reset--;
 
 	if (origin_changed || moved > 20.0f) {
-		g_claude_volume.accum_alpha = 1.0f;
-		g_claude_volume.still_frames = 0.0f;
-		g_claude_volume.accum_resets++;
+		g_claude_grid.accum_alpha = 1.0f;
+		g_claude_grid.still_frames = 0.0f;
+		g_claude_grid.accum_resets++;
 	} else if (moved > 0.05f || turned > 1e-4f) {
-		g_claude_volume.accum_alpha = 0.5f;
-		g_claude_volume.still_frames = 0.0f;
-		g_claude_volume.accum_resets++;
+		g_claude_grid.accum_alpha = 0.5f;
+		g_claude_grid.still_frames = 0.0f;
+		g_claude_grid.accum_resets++;
 	} else {
-		g_claude_volume.still_frames += 1.0f;
+		g_claude_grid.still_frames += 1.0f;
 		// True 1/N running average, NO floor. The old renderer floored
 		// this at 0.02, which silently turns the average into an EMA
 		// whose noise never drops below ~10% of per-sample sigma — the
 		// "never stops bubbling" defect. A parked camera must actually
 		// converge; motion and teleports reset above.
-		g_claude_volume.accum_alpha =
-				1.0f / (2.0f + g_claude_volume.still_frames);
+		g_claude_grid.accum_alpha =
+				1.0f / (2.0f + g_claude_grid.still_frames);
 	}
 
 	// Held light: if the wielded item is a light-emitting node, place an
 	// emitter at the camera every frame. Real-time by construction — no
 	// server round trip, no snapshot lag, no light node in the world.
-	g_claude_volume.emitter_runtime = g_claude_volume.emitter_count;
-	g_claude_volume.held_emitter[3] = 0.0f; // cleared unless wielding a light
-	if (g_claude_volume.valid) {
+	g_claude_grid.emitter_runtime = g_claude_grid.emitter_count;
+	g_claude_grid.held_emitter[3] = 0.0f; // cleared unless wielding a light
+	if (g_claude_grid.valid) {
 		LocalPlayer *lp = client->getEnv().getLocalPlayer();
 		const NodeDefManager *ndef = client->getNodeDefManager();
 		if (lp && ndef) {
@@ -3149,12 +3205,12 @@ static void claudeUpdateAccum(Client *client)
 					&& cid != CONTENT_IGNORE) {
 				u8 ls = ndef->get(cid).light_source;
 				if (ls > 0) {
-					v3f lpos = p / BS - v3f(g_claude_volume.origin.X,
-							g_claude_volume.origin.Y, g_claude_volume.origin.Z);
-					g_claude_volume.held_emitter[0] = lpos.X;
-					g_claude_volume.held_emitter[1] = lpos.Y + 0.2f;
-					g_claude_volume.held_emitter[2] = lpos.Z;
-					g_claude_volume.held_emitter[3] =
+					v3f lpos = p / BS - v3f(g_claude_grid.origin.X,
+							g_claude_grid.origin.Y, g_claude_grid.origin.Z);
+					g_claude_grid.held_emitter[0] = lpos.X;
+					g_claude_grid.held_emitter[1] = lpos.Y + 0.2f;
+					g_claude_grid.held_emitter[2] = lpos.Z;
+					g_claude_grid.held_emitter[3] =
 							std::min<int>(ls, 14) / 14.0f;
 				}
 			}
@@ -3163,26 +3219,26 @@ static void claudeUpdateAccum(Client *client)
 
 	// stage the ray-camera basis: what was current becomes the shader's
 	// previous frame
-	g_claude_volume.shader_prev_pos = g_claude_volume.cur_pos;
-	g_claude_volume.shader_prev_fwd = g_claude_volume.cur_fwd;
-	g_claude_volume.shader_prev_rightu = g_claude_volume.cur_rightu;
-	g_claude_volume.shader_prev_upu = g_claude_volume.cur_upu;
-	g_claude_volume.shader_prev_tanx = g_claude_volume.cur_tanx;
-	g_claude_volume.shader_prev_tany = g_claude_volume.cur_tany;
+	g_claude_grid.shader_prev_pos = g_claude_grid.cur_pos;
+	g_claude_grid.shader_prev_fwd = g_claude_grid.cur_fwd;
+	g_claude_grid.shader_prev_rightu = g_claude_grid.cur_rightu;
+	g_claude_grid.shader_prev_upu = g_claude_grid.cur_upu;
+	g_claude_grid.shader_prev_tanx = g_claude_grid.cur_tanx;
+	g_claude_grid.shader_prev_tany = g_claude_grid.cur_tany;
 
 	v3f fwd = d;
 	fwd.normalize();
 	v3f right = v3f(0.f, 1.f, 0.f).crossProduct(fwd);
 	right.normalize();
 	v3f up = fwd.crossProduct(right);
-	g_claude_volume.cur_pos = p / BS
-			- v3f(g_claude_volume.origin.X, g_claude_volume.origin.Y,
-					g_claude_volume.origin.Z);
-	g_claude_volume.cur_fwd = fwd;
-	g_claude_volume.cur_rightu = right;
-	g_claude_volume.cur_upu = up;
-	g_claude_volume.cur_tanx = std::tan(cam->getFovX() * 0.5f);
-	g_claude_volume.cur_tany = std::tan(cam->getFovY() * 0.5f);
+	g_claude_grid.cur_pos = p / BS
+			- v3f(g_claude_grid.origin.X, g_claude_grid.origin.Y,
+					g_claude_grid.origin.Z);
+	g_claude_grid.cur_fwd = fwd;
+	g_claude_grid.cur_rightu = right;
+	g_claude_grid.cur_upu = up;
+	g_claude_grid.cur_tanx = std::tan(cam->getFovX() * 0.5f);
+	g_claude_grid.cur_tany = std::tan(cam->getFovY() * 0.5f);
 }
 
 // claude_stats: when enabled, write rolling frame statistics to
@@ -3215,51 +3271,51 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"frame_ms_worst\": " << (worst * 1000.0f)
 			<< ", \"frame_ms_best\": " << (best * 1000.0f)
 			<< ", \"frames\": " << frames
-			<< ", \"volume_valid\": " << (g_claude_volume.valid ? 1 : 0)
-			// volume_valid is a tautology after the first snapshot ever
+			<< ", \"grid_valid\": " << (g_claude_grid.valid ? 1 : 0)
+			// grid_valid is a tautology after the first snapshot ever
 			// taken on a seat (set true once, never cleared) -- these
 			// two are the actual "is there something here" proof.
 			// solid_count: non-air cells the LAST WALK found (roadmap 1b).
-			<< ", \"volume_solid\": " << g_claude_volume.solid_count
-			<< ", \"volume_snap_seq\": " << g_claude_volume.snap_seq
+			<< ", \"grid_solid\": " << g_claude_grid.solid_count
+			<< ", \"grid_snap_seq\": " << g_claude_grid.snap_seq
 			// The content hash itself, so a harness can prove the
 			// INCREMENTAL path converges to the same state a full walk
 			// would: edit a node, put it back, and this must return to
 			// the value it had before. It is the per-block hashes
 			// combined order-independently, so it is stable across the
 			// two paths by construction rather than by luck.
-			<< ", \"volume_hash\": \"" << std::hex << std::setw(16)
-			<< std::setfill('0') << g_claude_volume.content_hash
+			<< ", \"grid_hash\": \"" << std::hex << std::setw(16)
+			<< std::setfill('0') << g_claude_grid.content_hash
 			<< std::dec << std::setfill(' ') << "\""
-			<< ", \"emitters\": " << g_claude_volume.emitter_count
+			<< ", \"emitters\": " << g_claude_grid.emitter_count
 			// the two numbers that explain a noisy room: how many area
 			// emitters NEE can aim at, and how many exist
-			<< ", \"area_emitters\": " << g_claude_volume.area_count
-			<< ", \"area_total\": " << g_claude_volume.area_total
-			<< ", \"accum_alpha\": " << g_claude_volume.accum_alpha
-			<< ", \"light_body\": " << g_claude_volume.light_body
-			<< ", \"light_y\": " << g_claude_volume.prev_light_dir.Y
-			<< ", \"light_lum\": " << (g_claude_volume.prev_light_col.X
-					+ g_claude_volume.prev_light_col.Y
-					+ g_claude_volume.prev_light_col.Z) / 3.0f
-			<< ", \"still_frames\": " << g_claude_volume.still_frames
-			// zeroings, not clamps -- see ClaudeVolume::accum_resets
-			<< ", \"accum_resets\": " << g_claude_volume.accum_resets
-			<< ", \"casc_valid\": [" << (g_claude_volume.casc[0].valid ? 1 : 0)
-			<< "," << (g_claude_volume.casc[1].valid ? 1 : 0)
-			<< "," << (g_claude_volume.casc[2].valid ? 1 : 0)
-			<< "," << (g_claude_volume.casc[3].valid ? 1 : 0)
-			<< "," << (g_claude_volume.casc[4].valid ? 1 : 0)
-			<< "], \"casc_solid\": [" << g_claude_volume.casc[0].solid
-			<< "," << g_claude_volume.casc[1].solid
-			<< "," << g_claude_volume.casc[2].solid
-			<< "," << g_claude_volume.casc[3].solid
-			<< "," << g_claude_volume.casc[4].solid
-			<< "], \"casc_ms\": [" << g_claude_volume.casc[0].ms
-			<< "," << g_claude_volume.casc[1].ms
-			<< "," << g_claude_volume.casc[2].ms
-			<< "," << g_claude_volume.casc[3].ms
-			<< "," << g_claude_volume.casc[4].ms
+			<< ", \"area_emitters\": " << g_claude_grid.area_count
+			<< ", \"area_total\": " << g_claude_grid.area_total
+			<< ", \"accum_alpha\": " << g_claude_grid.accum_alpha
+			<< ", \"light_body\": " << g_claude_grid.light_body
+			<< ", \"light_y\": " << g_claude_grid.prev_light_dir.Y
+			<< ", \"light_lum\": " << (g_claude_grid.prev_light_col.X
+					+ g_claude_grid.prev_light_col.Y
+					+ g_claude_grid.prev_light_col.Z) / 3.0f
+			<< ", \"still_frames\": " << g_claude_grid.still_frames
+			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
+			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
+			<< ", \"casc_valid\": [" << (g_claude_grid.casc[0].valid ? 1 : 0)
+			<< "," << (g_claude_grid.casc[1].valid ? 1 : 0)
+			<< "," << (g_claude_grid.casc[2].valid ? 1 : 0)
+			<< "," << (g_claude_grid.casc[3].valid ? 1 : 0)
+			<< "," << (g_claude_grid.casc[4].valid ? 1 : 0)
+			<< "], \"casc_solid\": [" << g_claude_grid.casc[0].solid
+			<< "," << g_claude_grid.casc[1].solid
+			<< "," << g_claude_grid.casc[2].solid
+			<< "," << g_claude_grid.casc[3].solid
+			<< "," << g_claude_grid.casc[4].solid
+			<< "], \"casc_ms\": [" << g_claude_grid.casc[0].ms
+			<< "," << g_claude_grid.casc[1].ms
+			<< "," << g_claude_grid.casc[2].ms
+			<< "," << g_claude_grid.casc[3].ms
+			<< "," << g_claude_grid.casc[4].ms
 			<< "], \"summary_blocks\": " << claude_lod::summaryCount();
 	os << ", \"draw_ms\": " << (draw_total / frames / 1000.0f)
 			<< ", \"busy_ms\": " << (busy_total / frames / 1000.0f);
@@ -3276,11 +3332,11 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 
 // Exposes trace accumulation state to the F5 debug overlay (gameui.cpp),
 // which lives outside this translation unit and so can't reach the
-// file-local g_claude_volume directly.
+// file-local g_claude_grid directly.
 void claudeGetTraceStats(float *still_frames, float *accum_alpha)
 {
-	*still_frames = g_claude_volume.still_frames;
-	*accum_alpha = g_claude_volume.accum_alpha;
+	*still_frames = g_claude_grid.still_frames;
+	*accum_alpha = g_claude_grid.accum_alpha;
 }
 
 // claude_lod Phase 2: (re)build and upload cascade levels when stale or
@@ -3292,13 +3348,13 @@ static void claudeCascadeUpdate(Client *client)
 	// PURE 1 m MODE (claude_cascades = 0): the LOD ladder is not merely
 	// frozen, it is RETIRED — every level's validity is cleared so the
 	// shader's farTrace finds no valid rung and eye rays end at the 128^3
-	// volume edge (sky beyond). Without the invalidation, flipping the
+	// grid edge (sky beyond). Without the invalidation, flipping the
 	// dial off at runtime only stopped REBUILDS and the stale ladder kept
 	// being marched, which would read as "the dial does nothing".
 	if (!g_settings->exists("claude_cascades")
 			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f) {
 		for (int lv = 0; lv < 5; lv++)
-			g_claude_volume.casc[lv].valid = false;
+			g_claude_grid.casc[lv].valid = false;
 		return;
 	}
 	static const int CELL[5] = {2, 4, 8, 16, 32};
@@ -3319,7 +3375,7 @@ static void claudeCascadeUpdate(Client *client)
 	u64 ver = claude_lod::contentVersion();
 
 	for (int lv = 0; lv < 5; lv++) {
-		auto &L = g_claude_volume.casc[lv];
+		auto &L = g_claude_grid.casc[lv];
 		const int half = 128 * CELL[lv] / 2;
 		const int stray = 16 * CELL[lv]; // 32 / 64 / 128 nodes
 		bool need = !L.valid;
@@ -3360,13 +3416,13 @@ static void claudeCascadeUpdate(Client *client)
 
 		GLint prev_active_unit = GL.TEXTURE0;
 		GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
-		bool fresh_alloc = !g_claude_volume.cascades_tex;
+		bool fresh_alloc = !g_claude_grid.cascades_tex;
 		if (fresh_alloc) {
-			GL.GenTextures(1, &g_claude_volume.cascades_tex);
-			GL.GenTextures(1, &g_claude_volume.cascades_coarse_tex);
+			GL.GenTextures(1, &g_claude_grid.cascades_tex);
+			GL.GenTextures(1, &g_claude_grid.cascades_coarse_tex);
 		}
 		GL.ActiveTexture(GL.TEXTURE8);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_tex);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_tex);
 		if (fresh_alloc) {
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
@@ -3379,7 +3435,7 @@ static void claudeCascadeUpdate(Client *client)
 		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
 				GL.RGBA, GL.UNSIGNED_BYTE, rgba.data());
 		GL.ActiveTexture(GL.TEXTURE9);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_volume.cascades_coarse_tex);
+		GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_coarse_tex);
 		if (fresh_alloc) {
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
@@ -3431,6 +3487,9 @@ static bool claudeApplyPatchFile(const std::string &path,
 	std::istringstream is(content);
 	if (!patch.parseConfigLines(is))
 		return false;
+	// A patch file is the channel that once shadowed the conf in silence;
+	// an old claude_volume_* name arriving here must not be a no-op.
+	claudeWarnRenamedSettings(&patch, path.c_str());
 	for (const std::string &name : patch.getNames()) {
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
@@ -3440,10 +3499,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 					<< std::endl;
 			continue;
 		}
-		// Pseudo-key: any value change re-snapshots the volume around the
+		// Pseudo-key: any value change re-snapshots the grid around the
 		// current camera position.
-		if (name == "claude_volume_snapshot") {
-			claudeVolumeSnapshot(client);
+		if (name == "claude_grid_snapshot") {
+			claudeTraceGridSnapshot(client);
 			continue;
 		}
 		g_settings->set(name, patch.get(name));
@@ -3478,17 +3537,17 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 		return;
 	timer = 0.0f;
 
-	// claude_volume follow (Phase 0-lite streaming): whenever any volume
-	// consumer (ghost view or water reflections) is enabled, keep a volume
+	// claude_grid follow (Phase 0-lite streaming): whenever any grid
+	// consumer (ghost view or water reflections) is enabled, keep a grid
 	// alive around the camera — bootstrap one if none exists (e.g. right
 	// after a restart), re-snapshot when the camera strays >24 nodes from
 	// the current center, and fold in whatever blocks the server told us
-	// changed. claude_volume_follow = 0 restores the frozen-bubble
+	// changed. claude_grid_follow = 0 restores the frozen-bubble
 	// behavior (the CI seat used to need that; it does not any more).
 	//
 	// WAS A KNOWN DEFECT, now measured and fixed (spec/measured.md
 	// "Volume re-snap fix"). This block used to re-snapshot the whole
-	// 128^3 volume on a "every 2 s" timer that the 1 Hz poll quantized to
+	// 128^3 grid on a "every 2 s" timer that the 1 Hz poll quantized to
 	// every 3 s. MEASURED at cozy-ci, Release, before: 12.0 ms of CPU
 	// walk on EVERY tick (the unchanged-hash early return skips the
 	// upload, never the walk), 28.6 ms when content had changed, worst
@@ -3499,8 +3558,8 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 	//
 	// AFTER: no timer at all. Snaps are event-driven (Client's
 	// dirty-block set, fed from addNode / removeNode / BLOCKDATA) and
-	// incremental (re-walk the changed 16^3 volume blocks, upload that
-	// sub-box). Costs are in the [claude_volume] log lines and in
+	// incremental (re-walk the changed 16^3 grid blocks, upload that
+	// sub-box). Costs are in the [claude_grid] log lines and in
 	// measured.md; the full walk survives only for the two cases where
 	// nothing can be reused.
 	{
@@ -3508,25 +3567,25 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 			return g_settings->exists(name)
 					&& g_settings->getFloat(name, 0.0f, 2.0f) > 0.0f;
 		};
-		bool follow = !g_settings->exists("claude_volume_follow")
-				|| g_settings->getFloat("claude_volume_follow", 0.0f, 1.0f) > 0.0f;
-		bool consumer_on = setting_on("claude_volume_debug")
+		bool follow = !g_settings->exists("claude_grid_follow")
+				|| g_settings->getFloat("claude_grid_follow", 0.0f, 1.0f) > 0.0f;
+		bool consumer_on = setting_on("claude_grid_debug")
 				|| setting_on("claude_water_reflections")
 				|| setting_on("claude_gi")
 				|| setting_on("claude_clay");
-		if (follow && !g_claude_volume.valid && consumer_on) {
-			claudeVolumeSnapshot(client);
-		} else if (follow && g_claude_volume.valid) {
-			constexpr s16 H = ClaudeVolume::SIZE / 2;
-			v3s16 center = g_claude_volume.origin + v3s16(H, H, H);
+		if (follow && !g_claude_grid.valid && consumer_on) {
+			claudeTraceGridSnapshot(client);
+		} else if (follow && g_claude_grid.valid) {
+			constexpr s16 H = ClaudeTraceGrid::SIZE / 2;
+			v3s16 center = g_claude_grid.origin + v3s16(H, H, H);
 			v3s16 d = floatToInt(client->getCamera()->getPosition(), BS) - center;
 			if (std::abs(d.X) > 24 || std::abs(d.Y) > 24
 					|| std::abs(d.Z) > 24) {
 				// re-centre: the origin moves, so no cell of the old
-				// volume is at the address it used to be. Full walk.
-				claudeVolumeSnapshot(client);
+				// grid is at the address it used to be. Full walk.
+				claudeTraceGridSnapshot(client);
 			} else if (consumer_on) {
-				claudeVolumeIncremental(client);
+				claudeTraceGridIncremental(client);
 			}
 		}
 		if (!follow || !consumer_on) {
@@ -4906,14 +4965,14 @@ void Game::toggleMinimap(bool shift_pressed)
 }
 
 // One key, one client: vanilla raster vs the traced renderer. The whole
-// traced pipeline hangs off claude_volume_debug (0 = pass-through, 3 =
+// traced pipeline hangs off claude_grid_debug (0 = pass-through, 3 =
 // path traced), read live by the uniform setter, so flipping the setting
 // IS the toggle — no restart, no second build.
 void Game::toggleClaudeTrace()
 {
-	float cur = g_settings->getFloat("claude_volume_debug", 0.0f, 10.0f);
+	float cur = g_settings->getFloat("claude_grid_debug", 0.0f, 10.0f);
 	bool to_traced = cur < 2.5f;
-	g_settings->set("claude_volume_debug", to_traced ? "3" : "0");
+	g_settings->set("claude_grid_debug", to_traced ? "3" : "0");
 	if (to_traced)
 		m_game_ui->showTranslatedStatusText("Ray tracing ON");
 	else

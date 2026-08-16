@@ -9,7 +9,7 @@ transform (claude_present: ACES Narkowicz fit, then gamma 1/2.2 — accum
 is linear radiance), and compares per channel.
 
 Engine-side constants (claude_accum/opengl_fragment.glsl @ a9c07ba52,
-game.cpp claudeVolumeSnapshot):
+game.cpp claudeTraceGridSnapshot):
   albedo      rho = pow(c/255, 2.2) of the stored cell color
   warm force  emissive cells store r=255, g=max(g,200), b=max(b,120)
   emissive class a = (170 + 5*light_source)/255; e=(a-0.65)/0.29 clamped

@@ -6,7 +6,7 @@
 --
 -- The furnace and Cornell rooms are built from claude_bridge:* nodes
 -- with UNIFORM single-color textures, so the tracer's cell albedo (the
--- minimap average color, game.cpp claudeVolumeSnapshot) is exact by
+-- minimap average color, game.cpp claudeTraceGridSnapshot) is exact by
 -- construction, and pathAlbedo() linearizes it as pow(c/255, 2.2):
 --   texture 186 -> albedo 0.50        texture 221 -> albedo 0.73
 -- CAVEAT (game.cpp, emissive forcing): cells with light_source > 0 are

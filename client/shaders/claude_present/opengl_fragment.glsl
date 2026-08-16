@@ -11,7 +11,7 @@
 uniform sampler2D merged;
 uniform sampler2D accum;
 uniform sampler2D depthmap;
-uniform lowp float volumeDebug;
+uniform lowp float gridDebug;
 // claude_view: 0 = photo, 1-5 = claude_trace's diagnostic views. Only
 // used to choose the display transform below; the photo path is
 // untouched.
@@ -24,14 +24,14 @@ CENTROID_ VARYING_ mediump vec2 varTexCoord;
 void main(void)
 {
 	vec2 uv = varTexCoord.st;
-	if (volumeDebug < 2.5) {
+	if (gridDebug < 2.5) {
 		gl_FragColor = vec4(texture2D(merged, uv).rgb, 1.0);
 		return;
 	}
 
 	// CLAUDE-DEBUG (temporary): pure-green 12px block in the bottom-left
 	// proves the TRACED present path executed. A raster frame passed
-	// through (volumeDebug lost/reverted) scores scene-level stddev too,
+	// through (gridDebug lost/reverted) scores scene-level stddev too,
 	// which fooled the harness once (afb4168) — the marker cannot appear
 	// on that path, so verdict = marker AND stddev.
 	if (gl_FragCoord.x < 12.0 && gl_FragCoord.y < 12.0) {

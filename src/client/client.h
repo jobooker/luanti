@@ -255,9 +255,9 @@ public:
 
 	void addNode(v3s16 p, MapNode n, bool remove_metadata = true);
 
-	// claude_volume: WHICH BLOCKS CHANGED, so the tracer's 128^3 voxel
+	// claude_grid: WHICH BLOCKS CHANGED, so the tracer's 128^3 voxel
 	// copy of the world can be re-walked incrementally instead of on a
-	// clock. Before this the volume was rebuilt from scratch every 3 s
+	// clock. Before this the grid was rebuilt from scratch every 3 s
 	// whether or not a node had moved — 12 ms of CPU walk per tick, a
 	// visible hitch, and a snapshot that still lagged a dug node by up
 	// to 3 s (spec/measured.md "Volume re-snap fix").
@@ -265,12 +265,12 @@ public:
 	// Pushed from the three places a client's map contents change:
 	// addNode / removeNode (TOCLIENT_ADDNODE / REMOVENODE) and
 	// handleCommand_BlockData (a whole 16^3 block replaced). Drained by
-	// the volume-follow poll in game.cpp. Main thread only — all three
+	// the grid-follow poll in game.cpp. Main thread only — all three
 	// callers run inside Client::step.
 	void claudeMarkBlockDirty(v3s16 blockpos);
 	// Returns true if the set overflowed since the last drain, i.e. the
 	// caller must do a full re-walk because the list it just got is not
-	// the whole truth. Half the changes is a corrupted volume.
+	// the whole truth. Half the changes is a corrupted grid.
 	bool takeClaudeDirtyBlocks(std::vector<v3s16> &out);
 
 	void setPlayerControl(PlayerControl &control);
@@ -532,11 +532,11 @@ private:
 	// If 0, server init hasn't been received yet.
 	u16 m_proto_ver = 0;
 
-	// claude_volume dirty-block set (see claudeMarkBlockDirty). A set,
+	// claude_grid dirty-block set (see claudeMarkBlockDirty). A set,
 	// not a vector: a single dig sends REMOVENODE and then BLOCKDATA for
 	// the same block, and re-walking it twice is pure waste. CAPPED —
 	// past the cap the set is cleared and a full re-walk is asked for,
-	// because "half the changes" is a corrupted volume and unbounded
+	// because "half the changes" is a corrupted grid and unbounded
 	// growth is worse than one 12 ms walk.
 	std::set<v3s16> m_claude_dirty_blocks;
 	bool m_claude_dirty_overflow = false;

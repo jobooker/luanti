@@ -67,7 +67,7 @@ void summarizeBlock(Client *client, MapBlock *block)
 		if (c == CONTENT_AIR || c == CONTENT_IGNORE)
 			continue;
 		const ContentFeatures &f = ndef->get(c);
-		// Same skip rules as claudeVolumeSnapshot: decorations are quads,
+		// Same skip rules as claudeTraceGridSnapshot: decorations are quads,
 		// not cubes, and airlike light nodes are invisible.
 		if (f.light_source == 0
 				&& (f.drawtype == NDT_PLANTLIKE
@@ -339,7 +339,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 				occ_acc[ci] += s.occ[sub];
 				water_acc[ci] += s.water[sub];
 				leaf_acc[ci] += s.leaf[sub];
-				// COLOR = the cell's TOP occupied layer only. The volume
+				// COLOR = the cell's TOP occupied layer only. The grid
 				// average mixed one white snow cap with seven dirt nodes
 				// into green-brown ("snow at 1m rendered as maybe green,
 				// before we go to it") — the face you SEE is the top.

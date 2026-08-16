@@ -115,7 +115,7 @@ public:
 	 */
 	virtual void setImageCaching(bool enabled) {};
 
-	/// claude_volume: CPU-side image of a texture string (caller drops it).
+	/// claude_grid: CPU-side image of a texture string (caller drops it).
 	/// Used to composite the traced-mode material atlas.
 	virtual video::IImage *claudeGetImage(const std::string &name) { return nullptr; }
 };

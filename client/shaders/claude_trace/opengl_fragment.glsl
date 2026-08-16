@@ -18,11 +18,11 @@
 // WHAT IT DOES
 // ---------------------------------------------------------------------
 // One sample per pixel per frame, sub-pixel jittered. 3D-DDA through the
-// 128^3 occupancy volume (texture unit 10). Every non-air cell is an
+// 128^3 occupancy grid (texture unit 10). Every non-air cell is an
 // opaque Lambertian surface with a cardinal normal (§2: "cardinal
 // normals are law"). Emissive classes also carry Le, and they EMIT AND
 // REFLECT — one surface, both terms (§4). Cosine-weighted hemisphere
-// scatter. Ray escapes the volume: contributes nothing. The frame is
+// scatter. Ray escapes the grid: contributes nothing. The frame is
 // blended into the persistent history buffer under the CPU's accumAlpha,
 // so a parked camera converges by 1/N to the reference image.
 //
@@ -117,11 +117,11 @@
 // THE PUNT LIST — documented absences, not quiet hacks (§3)
 // ---------------------------------------------------------------------
 //  * sun/sky: DOCUMENTED PUNT, RUNG 1. A ray that leaves the 128^3
-//    volume returns black. There is no sun, no sky dome, no ambient.
+//    grid returns black. There is no sun, no sky dome, no ambient.
 //    Rung 1's target scenes are a SEALED Cornell box and a SEALED
 //    furnace room, where no ray escapes; outdoors this renders night.
 //  * NEE beyond 16 area emitters: the uniform list is capped (game.cpp
-//    ClaudeVolume::AREA_CAP). Past that, emitters are lit by being HIT,
+//    ClaudeTraceGrid::AREA_CAP). Past that, emitters are lit by being HIT,
 //    which is correct and noisier — see the weights above.
 //  * NEE for the point-light list (claudeEmitter0..7): NOT connected.
 //    Those are class 165/250 cells, which cellEmission() gives no Le, so
@@ -130,7 +130,7 @@
 //  * spatial denoising: deleted. Noise is resolved by convergence only.
 //  * reprojection: not done. History is read at the SAME uv. Camera
 //    motion is handled entirely by accumAlpha (0.5 moving, 1.0 on
-//    teleport/volume-rebase), so motion smears over ~2 frames and rest
+//    teleport/grid-rebase), so motion smears over ~2 frames and rest
 //    converges exactly. Photo mode is a parked-camera instrument.
 //  * cell sizes other than 1 m: rung 1 is 1 m only. Sub-voxel bits
 //    (class 250 / unit 7) and the authored 16^3 models are NOT
@@ -190,20 +190,20 @@
 #define history texture0
 
 uniform sampler2D history;      // previous frame's accumulated radiance
-uniform sampler3D claudeVolume; // unit 10: RGBA8 128^3, rgb = cell colour,
+uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
                                 // a = class byte / 255
 uniform vec2 texelSize0;        // one texel of the trace-res target
-uniform lowp float volumeDebug; // pipeline master switch: <2.5 = raster
+uniform lowp float gridDebug; // pipeline master switch: <2.5 = raster
 
-// WORLD node coords of volume cell (0,0,0). game.cpp sets it in the same
-// block as volumeCamPos, so it is live whenever the trace runs. Used ONLY
+// WORLD node coords of grid cell (0,0,0). game.cpp sets it in the same
+// block as gridCamPos, so it is live whenever the trace runs. Used ONLY
 // by the roadmap-1a instrument views (9/10/11), which have to name a
 // world-space rectangle in the DDA's cell-index space.
-uniform vec3 volumeOrigin;
-uniform vec3 volumeCamPos;   // camera in volume-local node units
-uniform vec3 volumeCamFwd;   // unit look direction
-uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
-uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
+uniform vec3 gridOrigin;
+uniform vec3 gridCamPos;   // camera in grid-local node units
+uniform vec3 gridCamFwd;   // unit look direction
+uniform vec3 gridCamRight; // camera right, pre-scaled by tan(fovX/2)
+uniform vec3 gridCamUp;    // camera up, pre-scaled by tan(fovY/2)
 
 uniform float animationTimer; // seconds; per-frame RNG decorrelation
 uniform lowp float accumAlpha; // CPU: 1.0 hard reset, 0.5 moving,
@@ -254,8 +254,8 @@ uniform float claudeNee;
 uniform float claudeRng;
 
 // AREA-EMITTER LIST for next-event estimation (game.cpp
-// claudeVolumeSnapshot, ClaudeVolume::area). One emissive CELL per slot:
-//   xyz = integer volume-cell coords, the DDA's own cell space
+// claudeTraceGridSnapshot, ClaudeTraceGrid::area). One emissive CELL per slot:
+//   xyz = integer grid-cell coords, the DDA's own cell space
 //   w   = air-exposed face mask, bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z
 // NO RADIANCE RIDES ALONG, on purpose: THE LAW is one Le (§4), so the
 // shadow ray's own march() hit supplies it via cellEmission(). A second
@@ -288,12 +288,12 @@ CENTROID_ VARYING_ mediump vec2 varTexCoord;
 // NAMED CONSTANTS
 // ---------------------------------------------------------------------
 
-// The volume is 128 cells on a side (game.cpp claudeVolumeSnapshot).
-const float VOL_S = 128.0;
+// The grid is 128 cells on a side (game.cpp claudeTraceGridSnapshot).
+const float GRID_S = 128.0;
 
 // A ray crosses at most one cell boundary per DDA step, and at most 128
 // boundaries per axis, so 3*128 is the exact worst case for a diagonal
-// crossing of the volume. Any smaller bound would silently truncate a
+// crossing of the grid. Any smaller bound would silently truncate a
 // ray and darken the image, which is the one failure a truth renderer
 // may not have.
 const int MARCH_STEPS = 384;
@@ -324,8 +324,8 @@ const float RR_Q_MAX = 0.95;
 // furnace referee's rho stays the same number it always was.
 const float ALBEDO_FLOOR = 0.005;
 
-// CLASS BANDS (game.cpp claudeVolumeSnapshot writes the class byte into
-// the volume's alpha; the shader sees byte/255).
+// CLASS BANDS (game.cpp claudeTraceGridSnapshot writes the class byte into
+// the grid's alpha; the shader sees byte/255).
 //   0 air | 100 water | 130 leaves | 145 glass | 165 point-light nub
 //   170..240 emissive as 170 + light_source*5 | 250 authored model
 //   255 solid
@@ -372,7 +372,7 @@ const float DDA_MIN_ABS = 1e-6;
 const float PI = 3.14159265358979323846;
 const float PI2 = 6.28318530717958647692;
 
-// Slots in the area-emitter list. MUST equal ClaudeVolume::AREA_CAP in
+// Slots in the area-emitter list. MUST equal ClaudeTraceGrid::AREA_CAP in
 // game.cpp: the shader trusts claudeAreaCount as the size of the set it
 // samples uniformly, and a mismatch would make the 1/N in the pdf a
 // different N from the one the selection actually used — which is not a
@@ -407,7 +407,7 @@ const float VIEW_N_NY = 0.15; // -Y  (down)
 // Le display gain for view 3. The brightest rung-1 emitter is
 // albedo*(0.4+2*1) <= 2.4, so a third of it stays below clip.
 const float VIEW_EMIT_SCALE = 1.0 / 3.0;
-// Distance display range for view 4: the volume's body diagonal,
+// Distance display range for view 4: the grid's body diagonal,
 // 128*sqrt(3), log-scaled so near geometry is not all one black step.
 const float VIEW_DIST_MAX = 221.7;
 
@@ -509,7 +509,7 @@ vec3 cellEmission(float cls, vec3 albedo)
 // fine". One traversal, no second code path to keep in agreement.
 //
 // Returns true on an opaque hit and fills hp / n / alb / le / tHit /
-// cellOut. False = the ray left the volume (or ran out of steps, which
+// cellOut. False = the ray left the grid (or ran out of steps, which
 // the MARCH_STEPS bound makes unreachable inside a 128^3 grid).
 //
 // SHADOW RAYS USE THIS FUNCTION, not a lighter copy of it. §2 lists "a
@@ -552,10 +552,10 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		}
 
 		if (any(lessThan(cell, vec3(0.0)))
-				|| any(greaterThanEqual(cell, vec3(VOL_S))))
+				|| any(greaterThanEqual(cell, vec3(GRID_S))))
 			return false; // escaped: contributes nothing (sky is punted)
 
-		vec4 s = texture3D(claudeVolume, (cell + 0.5) / VOL_S);
+		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / GRID_S);
 		if (s.a <= CLASS_AIR_MAX)
 			continue; // air
 
@@ -816,7 +816,7 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
 		w = pdfL / (pdfL + pdfB);                        // balance
 	// forensics: this call is about to contribute. Record WHAT it aimed
 	// at and at what grazing angle, in world coords, for views 12/13.
-	g_neeDiag = vec4(1.0, c.y + volumeOrigin.y, cosX, float(li));
+	g_neeDiag = vec4(1.0, c.y + gridOrigin.y, cosX, float(li));
 	g_neeDiagK = float(k);
 	// f_r = rho/PI for a Lambertian; estimator = w * f_r * Le * cos_x/p_l
 	return w * (rho / PI) * shle * (cosX / pdfL);
@@ -884,18 +884,18 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
 // the 3x3 white_lit panel is FLUSH in the ceiling layer at world nodes
 // x 46..48, y 16, z 3..5. Its one air-exposed downward face is the
 // rectangle x in [46,49], z in [3,6] in the plane y = 16, WORLD node
-// coords — the DDA's cell-index space is that minus volumeOrigin.
+// coords — the DDA's cell-index space is that minus gridOrigin.
 const vec3 PANEL_WMIN = vec3(46.0, 16.0, 3.0);
 const vec3 PANEL_WMAX = vec3(49.0, 16.0, 6.0);
-// A cell of the panel, world node coords, for reading Le off the volume.
+// A cell of the panel, world node coords, for reading Le off the grid.
 const vec3 PANEL_WCELL = vec3(47.0, 16.0, 4.0);
 
 // THE LAW IS ONE Le (§4): read it out of the same texture through the
 // same cellEmission() the eye ray runs, rather than restating 2.4 here.
 vec3 panelLe()
 {
-	vec3 c = PANEL_WCELL - volumeOrigin;
-	vec4 s = texture3D(claudeVolume, (c + 0.5) / VOL_S);
+	vec3 c = PANEL_WCELL - gridOrigin;
+	vec4 s = texture3D(claudeTraceGrid, (c + 0.5) / GRID_S);
 	return cellEmission(s.a, cellAlbedo(s.rgb));
 }
 
@@ -925,8 +925,8 @@ float rectIrradiance(vec3 x, vec3 n, vec3 p0, vec3 p1, vec3 p2, vec3 p3)
 // view 11: rho/PI * E from the Cornell panel. CORNELL ONLY.
 vec3 panelDirect(vec3 x, vec3 nx, vec3 rho)
 {
-	vec3 pmin = PANEL_WMIN - volumeOrigin;
-	vec3 pmax = PANEL_WMAX - volumeOrigin;
+	vec3 pmin = PANEL_WMIN - gridOrigin;
+	vec3 pmax = PANEL_WMAX - gridOrigin;
 	// the panel emits DOWNWARD only (its -Y face is the exposed one), so
 	// a receiver on or above its plane sees nothing from it
 	if (x.y >= pmin.y)
@@ -943,7 +943,7 @@ vec3 panelDirect(vec3 x, vec3 nx, vec3 rho)
 void main(void)
 {
 	vec2 uv = varTexCoord.st;
-	if (volumeDebug < 2.5) {
+	if (gridDebug < 2.5) {
 		// traced mode off: carry history through untouched
 		gl_FragColor = texture2D(history, uv);
 		return;
@@ -984,11 +984,11 @@ void main(void)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
-	vec3 rd = normalize(volumeCamFwd
-			+ ndc.x * volumeCamRight + ndc.y * volumeCamUp);
-	// +0.5: volumeCamPos is node-CENTRED (game.cpp: cam/BS - origin),
+	vec3 rd = normalize(gridCamFwd
+			+ ndc.x * gridCamRight + ndc.y * gridCamUp);
+	// +0.5: gridCamPos is node-CENTRED (game.cpp: cam/BS - origin),
 	// the DDA works in cell-index space where cell i spans [i, i+1)
-	vec3 ro = volumeCamPos + 0.5;
+	vec3 ro = gridCamPos + 0.5;
 
 	// --- the path ----------------------------------------------------
 	vec3 L = vec3(0.0);
@@ -1066,8 +1066,8 @@ void main(void)
 				float u1 = rnd1();
 				float u2 = rnd1();
 				vec3 wi = cosineHemisphere(n, u1, u2);
-				vec3 pmin = PANEL_WMIN - volumeOrigin;
-				vec3 pmax = PANEL_WMAX - volumeOrigin;
+				vec3 pmin = PANEL_WMIN - gridOrigin;
+				vec3 pmax = PANEL_WMAX - gridOrigin;
 				if (wi.y > 1e-6 && hp.y < pmin.y) {
 					float t = (pmin.y - hp.y) / wi.y;
 					vec3 q = hp + wi * t;
@@ -1121,7 +1121,7 @@ void main(void)
 		vec3 hp, n, alb, le, cell;
 		float tHit;
 		if (!march(p, dir, hp, n, alb, le, tHit, cell))
-			break; // escaped the volume: nothing to add
+			break; // escaped the grid: nothing to add
 
 		// clay: march computed le from the TRUE albedo above; clamping
 		// rho afterward changes reflectance only, never the lights
@@ -1244,7 +1244,7 @@ void main(void)
 	// history is LINEAR radiance in a 16F target; averaging must happen
 	// in linear light or jittered noise converges biased dark.
 	// accumAlpha is the whole reset mechanism: 1.0 on teleport or a
-	// volume rebase (history discarded), 0.5 while moving, 1/(2+N) at
+	// grid rebase (history discarded), 0.5 while moving, 1/(2+N) at
 	// rest — a true running average, so a parked camera converges by
 	// 1/N rather than sitting at an EMA's perpetual noise floor.
 	vec3 fresh = max(L, vec3(0.0));

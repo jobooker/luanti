@@ -21,8 +21,8 @@ anything the referee can see. This builds the evidence:
 WHY FRAMES AND NOT SECONDS. `still_frames` is the real variable. The
 same 60 s bought 3,928 frames on one CI run and 7,491 on another, because
 fps moves with the scene, the build and the machine — and worse, ANY
-world change clamps still_frames to 10 (game.cpp claudeVolumeSnapshot /
-claudeVolumeIncremental), so a wall-clock settle interrupted in its last
+world change clamps still_frames to 10 (game.cpp claudeTraceGridSnapshot /
+claudeTraceGridIncremental), so a wall-clock settle interrupted in its last
 second fires the shutter on an accumulator ~1 frame deep and calls it a
 measurement. That is not hypothetical: it is measured.md's "Gate 4,
 second half". A frames-based wait is immune by construction — a reset
@@ -199,7 +199,7 @@ def reset_for_walk(v, park):
 
 
 def start_arm(arm, vantages, dials, log):
-    """dials -> reset -> snapshot -> volume proven -> RESET AGAIN -> walk.
+    """dials -> reset -> snapshot -> grid proven -> RESET AGAIN -> walk.
 
     The second reset is the whole reason this function is not just
     claude_ci.capture()'s preamble. Getting a genuinely SHALLOW first
@@ -213,7 +213,7 @@ def start_arm(arm, vantages, dials, log):
 
     The first thing tried instead was a second snapshot request, on the
     theory that a snapshot clamps still_frames to 10. IT DOES NOT, on
-    the second one: game.cpp claudeVolumeSnapshot takes an
+    the second one: game.cpp claudeTraceGridSnapshot takes an
     unchanged-content early return ("do NOT disturb the converged
     accumulation") before the clamp, so asking twice about an unchanged
     world clamps nothing and the wait timed out in silence -- a blind
@@ -231,16 +231,16 @@ def start_arm(arm, vantages, dials, log):
     reset_err = ci.reset_accumulation(v, park)
     aim0 = ci.read_aim()
     marker = "%s_%d" % (arm, time.time_ns())
-    block = dict(dials, claude_volume_snapshot=marker)
-    seq0 = (lab.read_stats() or {}).get("volume_snap_seq")
+    block = dict(dials, claude_grid_snapshot=marker)
+    seq0 = (lab.read_stats() or {}).get("grid_snap_seq")
     ci.push_dials(block, marker)
-    vol = ci.await_volume(marker, block, room=ci.room_of(arm),
+    vol = ci.await_grid(marker, block, room=ci.room_of(arm),
                           seq_before=seq0)
     reset_err2, sf0 = reset_for_walk(v, park)
-    log("    volume ok=%s solid=%s; walk starts at still_frames %s"
-        % (vol.get("ok"), vol.get("volume_solid"), sf0))
+    log("    grid ok=%s solid=%s; walk starts at still_frames %s"
+        % (vol.get("ok"), vol.get("grid_solid"), sf0))
     return v, aim0, {"reset_error": reset_err, "reset_error_2": reset_err2,
-                     "volume": vol, "still_frames_at_walk_start": sf0}
+                     "grid": vol, "still_frames_at_walk_start": sf0}
 
 
 def walk_to(targets, outdir, prefix, log, with_regions):
@@ -274,8 +274,8 @@ def walk_to(targets, outdir, prefix, log, with_regions):
             pt = {"target": target, "still_frames_read": sf,
                   "still_frames_after_shutter": sf_after,
                   "fps": st.get("fps"), "accum_alpha": st.get("accum_alpha"),
-                  "volume_hash": st.get("volume_hash"),
-                  "volume_snap_seq": st.get("volume_snap_seq"),
+                  "grid_hash": st.get("grid_hash"),
+                  "grid_snap_seq": st.get("grid_snap_seq"),
                   "png": os.path.basename(dst)}
             pt.update(measure(dst, with_regions))
             points.append(pt)

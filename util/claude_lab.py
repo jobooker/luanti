@@ -447,7 +447,7 @@ def cmd_tour(args):
     out = []
     for n in names:
         goto(vs[n])
-        doorway(claude_volume_snapshot="tour_" + n)
+        doorway(claude_grid_snapshot="tour_" + n)
         p = shot("tour_" + n, settle=args.settle)
         out.append({"vantage": n, "shot": p})
         print("%-24s -> %s" % (n, os.path.basename(p)))

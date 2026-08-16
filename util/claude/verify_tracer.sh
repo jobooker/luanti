@@ -27,7 +27,7 @@ python3 - "$DATA/minetest.conf" <<'EOF'
 import sys, re
 p = sys.argv[1]
 txt = open(p).read()
-want = {"video_driver": "opengl3", "claude_volume_debug": "3",
+want = {"video_driver": "opengl3", "claude_grid_debug": "3",
         "claude_stats": "1", "claude_trace_scale": "0.75"}
 for k, v in want.items():
     if re.search(rf"^{k}\s*=", txt, re.M):
@@ -62,15 +62,15 @@ if [ "$CORE" -lt 1 ]; then
 fi
 echo "core asserted ($CORE markers since launch)"
 
-# 5. wait for a valid volume, then settle. No daylight gate: the parked
+# 5. wait for a valid grid, then settle. No daylight gate: the parked
 # camera faces the torch-lit cabin, so a working tracer is structured at
 # any hour (calibrated: broken band sd 6.3 at night, working 33+).
 for i in $(seq 1 30); do
-  VV=$(python3 -c "import json;d=json.load(open('$DATA/claude_stats.json'));print(d['volume_valid'])" 2>/dev/null)
+  VV=$(python3 -c "import json;d=json.load(open('$DATA/claude_stats.json'));print(d['grid_valid'])" 2>/dev/null)
   [ "$VV" = "1" ] && break
   sleep 2
 done
-[ "$VV" = "1" ] || { echo "VOID: volume never valid"; exit 2; }
+[ "$VV" = "1" ] || { echo "VOID: grid never valid"; exit 2; }
 sleep 5  # accumulation settle
 
 # 6. screenshot via settings-patch pseudo-key

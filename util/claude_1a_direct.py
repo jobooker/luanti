@@ -230,7 +230,7 @@ def main():
             ok_marker, marker_detail = ci.trace_marker(png)
             ds = cap.get("dial_state") or {}
             aim = cap.get("aim_at_shutter") or {}
-            vol = cap.get("volume") or {}
+            vol = cap.get("grid") or {}
             sf = cap.get("still_frames_at_shutter")
             row = {"png": os.path.basename(png), "dials": arm["dials"],
                    "still_frames": sf, "traced": ok_marker,
@@ -239,12 +239,12 @@ def main():
                    "dials_seen": {k: ds.get("seen", {}).get(k)
                                   for k in ci.PROVEN_DIALS},
                    "aim_ok": aim.get("ok"), "aim_detail": aim.get("detail"),
-                   "volume_ok": vol.get("ok"),
+                   "grid_ok": vol.get("ok"),
                    "area_emitters": vol.get("area_emitters"),
                    "area_total": vol.get("area_total")}
             run["shots"][arm["name"]] = row
             for claim, ok in (("dials", ds.get("ok")), ("traced", ok_marker),
-                              ("aim", aim.get("ok")), ("volume", vol.get("ok")),
+                              ("aim", aim.get("ok")), ("grid", vol.get("ok")),
                               ("converged", (sf or 0) >= ci.CONVERGED_MIN)):
                 if not ok:
                     run["problems"].append("%s-%s" % (arm["name"], claim))

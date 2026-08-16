@@ -72,7 +72,7 @@ import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
 #    fps moves with the scene, the build and the machine. Depth is the
 #    quantity the image quality actually depends on.
 # 2. ANY world change clamps still_frames to 10 (game.cpp
-#    claudeVolumeSnapshot / claudeVolumeIncremental), and Mineclonia's
+#    claudeTraceGridSnapshot / claudeTraceGridIncremental), and Mineclonia's
 #    grass ABM changes a node inside the bubble every ~30-180 s. A clock
 #    interrupted in its last second fires the shutter on an accumulator
 #    one frame deep and calls it a measurement -- measured.md "Gate 4,
@@ -149,7 +149,7 @@ CANONICAL_DIALS = {
     # traced). Pushed EXPLICITLY: it lived only in minetest.conf, and a
     # conf that lost the line would have had CI silently photographing
     # the raster renderer and calling it a golden.
-    "claude_volume_debug": 3,
+    "claude_grid_debug": 3,
     "claude_nee": 0,            # PHOTO MODE IS THE TRUTH (§6). The
                                 # estimator gets its own arm below.
     # RNG source: 1 = the counter-based PCG, the default since roadmap
@@ -161,11 +161,11 @@ CANONICAL_DIALS = {
     # this one decides what the Monte Carlo integrator integrates.
     "claude_rng": 1,
     "claude_stats": 1,
-    # The volume follows the camera again (2026-08-16). This was pinned
+    # The grid follows the camera again (2026-08-16). This was pinned
     # to 0 from 2026-08-15 because the re-snap ran on a 3 s timer and
     # cost a visible hitch plus a silent scene change under a settling
     # accumulator. It is now event-driven and incremental (game.cpp
-    # claudeVolumeIncremental; spec/measured.md "Volume re-snap fix"), so
+    # claudeTraceGridIncremental; spec/measured.md "Volume re-snap fix"), so
     # a tick with no world change costs nothing and touches nothing.
     # Pinned EXPLICITLY at 1 rather than left unset: the unset value
     # happens to be 1 too, and that is exactly the hidden-default class
@@ -177,7 +177,7 @@ CANONICAL_DIALS = {
     # reaches the trace and caps still_frames, as a real world change
     # should. Each capture still forces its own snapshot after the
     # teleport (see capture()).
-    "claude_volume_follow": 1,
+    "claude_grid_follow": 1,
     # --- overlay suppression, and it is NOT cosmetic --------------------
     # Region means and RMS compare PIXELS. The hotbar covers the only
     # floor this vantage can see, and each capture's "Saved screenshot
@@ -200,7 +200,7 @@ CANONICAL_DIALS = {
 # The dials proven per capture. The rest are pushed but not asserted;
 # these three are the ones that have silently invalidated measurements.
 PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
-                "claude_volume_debug", "claude_rng")
+                "claude_grid_debug", "claude_rng")
 
 # Pinned capture resolution AND frame pacing. Luanti SAVES its window
 # size back into minetest.conf on exit, so one manual resize silently
@@ -268,7 +268,7 @@ DIAL_HEADER = ("# claude_dial.conf: console-set client dials (/dial),\n"
 # file silently reconfigures the next seat, and minetest.conf — which
 # every instrument in this repo reads — does not show it.
 #
-# Cost, 2026-08-16: a leftover `claude_volume_follow = 0` from a baseline
+# Cost, 2026-08-16: a leftover `claude_grid_follow = 0` from a baseline
 # arm pushed itself onto a fresh seat that had been started explicitly to
 # measure follow ON. The conf said 1, the client ran 0, and the only
 # evidence was one ACTION line in debug.txt. This is exactly the
@@ -335,7 +335,7 @@ CI_SHOTS = [
     # --- gallery phase 2 (roadmap 1b): sky/sun/glass referee rooms ------
     # Content + harness only — no shader/estimator change, so none of
     # these have an image referee yet. Every one of them still gets the
-    # full generic gate (dials, traced marker, aim, volume, converged,
+    # full generic gate (dials, traced marker, aim, grid, converged,
     # room hash) — "referee: None" means "eyes only, or perf only until
     # 2b", not "unchecked". Goldens are pinned WRONG-BY-DESIGN (dark or
     # black) until 2b lands the sky/sun terms; see spec/measured.md "1b —
@@ -865,7 +865,7 @@ def reset_accumulation(vantage, park):
     half", inside a flake that was attributed wholly to the grass ABM.
 
     game.cpp now exports `accum_resets`, incremented wherever
-    still_frames is ZEROED (camera move, volume rebase, sky change) and
+    still_frames is ZEROED (camera move, grid rebase, sky change) and
     NOT where it is merely clamped to 10 by a world change. A counter
     cannot be missed by sampling — any two reads bracket every reset
     between them — so this is exact where a threshold was a guess.
@@ -933,7 +933,7 @@ def trace_marker(png):
         return ok, ("bottom-left %dpx marker mean RGB %s%s"
                     % (TRACE_MARKER_PX, mean.round(1),
                        "" if ok else " — NOT the traced present path: this "
-                       "frame is the raster pass-through, or the volume was "
+                       "frame is the raster pass-through, or the grid was "
                        "empty"))
     except Exception as e:
         return False, "marker check failed: %s" % e
@@ -1017,7 +1017,7 @@ def dial_state(png, expect, marker):
     return out
 
 
-VOLUME_TIMEOUT = 25.0      # s to wait for a snapshot to become valid
+GRID_TIMEOUT = 25.0      # s to wait for a snapshot to become valid
 VOLUME_POLL = 1.0
 # How far the camera may sit from the vantage at the shutter. Turning
 # does NOT reset the accumulator (measured), so one stray mouse-look
@@ -1071,8 +1071,8 @@ def aim_ok(start, now, vantage):
 
 # Rooms that are fully sealed boxes (walls/floor/ceiling close around the
 # camera) get a HIGHER solid-count floor than the universal one below.
-# Measured live 2026-08-16 (fresh Release binary, volume_debug=3,
-# volume_follow=0, one snapshot per vantage): volume_solid ranged
+# Measured live 2026-08-16 (fresh Release binary, grid_debug=3,
+# grid_follow=0, one snapshot per vantage): grid_solid ranged
 # 239,200 (furnace-050, the smallest room) to 322,562 (cozy) — the 128^3
 # bubble also picks up the mgflat ground plane and anything else within
 # 64 nodes, so even "exterior-ci" (no build at all) read 269,377. 100,000
@@ -1083,17 +1083,17 @@ SEALED_ROOMS = {"furnace-050", "furnace-073", "cornell", "cozy",
 VOLUME_SOLID_FLOOR_SEALED = 100000
 
 
-def await_volume(marker, block, room=None, tries=3, seq_before=None):
+def await_grid(marker, block, room=None, tries=3, seq_before=None):
     """Prove the tracer has something to trace BEFORE the settle starts.
 
     A capture must never be taken over an empty bubble: a client with no
-    volume marches nothing, and the frame looks like the tracer is off
+    grid marches nothing, and the frame looks like the tracer is off
     (John, from the screen, 2026-08-15 — and he was right). That used to
-    be the normal state, because claude_volume_follow was pinned to 0 and
-    nothing bootstrapped a volume. Follow is on again as of 2026-08-16,
+    be the normal state, because claude_grid_follow was pinned to 0 and
+    nothing bootstrapped a grid. Follow is on again as of 2026-08-16,
     so the seat does bootstrap — but each capture still triggers its own
     snapshot after the teleport (the follow path re-centres on the poll,
-    up to 1 s later, and a settle must not start before the volume is the
+    up to 1 s later, and a settle must not start before the grid is the
     one being photographed), and this waits for the client to say it took.
 
     FOUND 2026-08-15 (roadmap 1b, cave-skylight/cave-glass): this used
@@ -1102,21 +1102,21 @@ def await_volume(marker, block, room=None, tries=3, seq_before=None):
     game.cpp before trusting that theory further (debugging discipline:
     read the code, not the memory of intent) — area_total is not a
     general occupancy count, it is the NEE area-LIGHT-cell count
-    ("emissive cells the snapshot actually found", ClaudeVolume::
+    ("emissive cells the snapshot actually found", ClaudeTraceGrid::
     area_total, game.cpp ~149). So area_total > 0 was never "is there a
-    volume" — it was "is there a LIT volume", true by coincidence for
+    grid" — it was "is there a LIT grid", true by coincidence for
     every room that existed before 1b (all of them had lamps) and false
     BY DESIGN for a sealed box with none.
 
-    FOUND AGAIN 2026-08-16 (Opus review of the 1b diff): volume_valid ==
+    FOUND AGAIN 2026-08-16 (Opus review of the 1b diff): grid_valid ==
     1 alone is a TAUTOLOGY, not just an insufficient-for-unlit-rooms
-    check — game.cpp sets g_claude_volume.valid = true ONCE and never
-    clears it, so after the very first snapshot on a seat, volume_valid
+    check — game.cpp sets g_claude_grid.valid = true ONCE and never
+    clears it, so after the very first snapshot on a seat, grid_valid
     reads 1 forever regardless of what a later snapshot actually found.
     An all-air bubble at a brand-new vantage would pass. Fixed at the
-    source: game.cpp now exports volume_solid (non-air cells the LAST
+    source: game.cpp now exports grid_solid (non-air cells the LAST
     WALK actually found, computed unconditionally every call, before
-    the unchanged-content early return) and volume_snap_seq (increments
+    the unchanged-content early return) and grid_snap_seq (increments
     once per call, so a caller can prove a NEW walk happened rather than
     reading a stale count from a walk at a different vantage entirely).
 
@@ -1126,28 +1126,28 @@ def await_volume(marker, block, room=None, tries=3, seq_before=None):
     written the request and slept 1.4 s for the client's ~1 Hz poll. The
     poll usually lands inside that sleep, so seq_before was routinely the
     POST-snapshot value, "has a new walk happened" could never become
-    true, and attempt 1 burned the full VOLUME_TIMEOUT before a retry
+    true, and attempt 1 burned the full GRID_TIMEOUT before a retry
     with a fresh marker got the answer. It cost 25 s per capture: every
-    shot of both runs since claude_volume_follow went back to 1 reports
+    shot of both runs since claude_grid_follow went back to 1 reports
     `attempts: 2` (13/13 and 12/13), against 13/13 `attempts: 1` on the
     follow-off golden run -- follow ON makes the race near-certain,
     because the follow path re-centres on arrival at the new vantage and
     bumps snap_seq on its own. ~5 minutes of every ~22 minute run.
     """
     if seq_before is None:                 # legacy callers: racy, as above
-        seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
+        seq_before = (lab.read_stats() or {}).get("grid_snap_seq")
     floor = VOLUME_SOLID_FLOOR_SEALED if room in SEALED_ROOMS else 1
     for attempt in range(tries):
-        deadline = time.time() + VOLUME_TIMEOUT
+        deadline = time.time() + GRID_TIMEOUT
         while time.time() < deadline:
             st = lab.read_stats() or {}
-            solid = st.get("volume_solid") or 0
-            if (st.get("volume_valid") == 1 and solid >= floor
-                    and st.get("volume_snap_seq") != seq_before):
+            solid = st.get("grid_solid") or 0
+            if (st.get("grid_valid") == 1 and solid >= floor
+                    and st.get("grid_snap_seq") != seq_before):
                 return {"ok": True, "attempts": attempt + 1,
-                        "volume_valid": st.get("volume_valid"),
-                        "volume_solid": solid, "volume_floor": floor,
-                        "volume_snap_seq": st.get("volume_snap_seq"),
+                        "grid_valid": st.get("grid_valid"),
+                        "grid_solid": solid, "grid_floor": floor,
+                        "grid_snap_seq": st.get("grid_snap_seq"),
                         "area_emitters": st.get("area_emitters"),
                         "area_total": st.get("area_total"),
                         "emitters": st.get("emitters")}
@@ -1156,16 +1156,16 @@ def await_volume(marker, block, room=None, tries=3, seq_before=None):
             push_dials(block, "%s_retry%d" % (marker, attempt))
     st = lab.read_stats() or {}
     return {"ok": False, "attempts": tries,
-            "volume_valid": st.get("volume_valid"),
-            "volume_solid": st.get("volume_solid"), "volume_floor": floor,
+            "grid_valid": st.get("grid_valid"),
+            "grid_solid": st.get("grid_solid"), "grid_floor": floor,
             "area_emitters": st.get("area_emitters"),
             "area_total": st.get("area_total"),
-            "error": "no volume after %d snapshot requests: volume_valid=%s "
-                     "volume_solid=%s (floor %s), snap_seq unchanged=%s — "
+            "error": "no grid after %d snapshot requests: grid_valid=%s "
+                     "grid_solid=%s (floor %s), snap_seq unchanged=%s — "
                      "the tracer would be marching an empty bubble, or this "
                      "is a stale read from a different vantage's snapshot"
-                     % (tries, st.get("volume_valid"), st.get("volume_solid"),
-                        floor, st.get("volume_snap_seq") == seq_before)}
+                     % (tries, st.get("grid_valid"), st.get("grid_solid"),
+                        floor, st.get("grid_snap_seq") == seq_before)}
 
 
 def await_frames(target, max_s=SETTLE_MAX_S, min_frames=SETTLE_MIN_FRAMES,
@@ -1248,17 +1248,17 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # its next 1 Hz poll, and the settle must not start against the
     # PREVIOUS vantage's bubble.
     marker = "%s_%d" % (name, time.time_ns())
-    block = dict(dials, claude_volume_snapshot=marker)
+    block = dict(dials, claude_grid_snapshot=marker)
     # BEFORE the request is written: the client cannot have served a
     # snapshot we have not asked for yet, and push_dials sleeps 1.4 s for
     # the ~1 Hz poll, which is long enough for the answer to arrive
-    # before a read taken after it. See await_volume.
-    seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
+    # before a read taken after it. See await_grid.
+    seq_before = (lab.read_stats() or {}).get("grid_snap_seq")
     info["dials_pushed"] = push_dials(block, marker)
-    # the settle clock starts only once the volume is proven present:
+    # the settle clock starts only once the grid is proven present:
     # a snapshot also clamps still_frames, so waiting here costs nothing
     # and a capture over an empty bubble costs everything.
-    info["volume"] = await_volume(marker, block, room=room,
+    info["grid"] = await_grid(marker, block, room=room,
                                   seq_before=seq_before)
     info["settle"] = await_frames(settle)
 
@@ -1273,8 +1273,8 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     st = lab.read_stats() or {}
     info["still_frames_at_shutter"] = st.get("still_frames")
     info["stats_at_shutter"] = {k: st.get(k) for k in
-                                ("volume_valid", "volume_solid",
-                                 "volume_snap_seq", "area_emitters",
+                                ("grid_valid", "grid_solid",
+                                 "grid_snap_seq", "area_emitters",
                                  "area_total", "emitters", "frame_ms_avg",
                                  "busy_ms", "pass_ms", "accum_alpha")}
     with open(lab.PATCH, "w") as f:
@@ -1929,11 +1929,11 @@ def cmd_run(args):
             A.add("%s-traced" % name, ok, detail)
             aim = cap.get("aim_at_shutter") or {}
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
-            vol = cap.get("volume") or {}
-            A.add("%s-volume" % name, vol.get("ok"),
+            vol = cap.get("grid") or {}
+            A.add("%s-grid" % name, vol.get("ok"),
                   vol.get("error") or "solid=%s (floor %s) area_emitters=%s/%s "
                   "(snapshot attempt %s)"
-                  % (vol.get("volume_solid"), vol.get("volume_floor"),
+                  % (vol.get("grid_solid"), vol.get("grid_floor"),
                      vol.get("area_emitters"), vol.get("area_total"),
                      vol.get("attempts")))
             st = (cap.get("stats_at_shutter") or {})

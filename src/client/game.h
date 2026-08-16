@@ -15,6 +15,7 @@
 
 class InputHandler;
 class ChatBackend;
+class Settings;
 class RenderingEngine;
 struct GameStartData;
 
@@ -45,5 +46,13 @@ void the_game(volatile std::sig_atomic_t *kill,
 		bool *reconnect_requested);
 
 // Trace accumulation stats for the F5 debug overlay (gameui.cpp); the
-// backing state (g_claude_volume) is file-local to game.cpp.
+// backing state (g_claude_grid) is file-local to game.cpp.
 void claudeGetTraceStats(float *still_frames, float *accum_alpha);
+
+// claude_grid: report and warn (once per name, per process) about legacy
+// claude_volume_* setting names left over from the 2026-08-16 "volume" ->
+// "grid" rename. Returns how many legacy names `src` carries, whatever was
+// already logged. A renamed setting whose old name is silently ignored is a
+// bug, not a rename — see spec/environment-laws.md.
+// Exposed for src/unittest/test_claude_grid_settings.cpp.
+int claudeWarnRenamedSettings(const Settings *src, const char *source);

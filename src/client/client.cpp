@@ -1542,8 +1542,8 @@ void Client::sendUpdateClientInfo(const ClientDynamicInfo& info)
 	Send(&pkt);
 }
 
-// claude_volume: the tracer's dirty-block set. See client.h for why this
-// exists (the volume used to be rebuilt on a 3 s clock instead of on the
+// claude_grid: the tracer's dirty-block set. See client.h for why this
+// exists (the grid used to be rebuilt on a 3 s clock instead of on the
 // world changing). Kept trivially cheap — a dig must not pay for GI.
 void Client::claudeMarkBlockDirty(v3s16 blockpos)
 {
@@ -1579,7 +1579,7 @@ void Client::removeNode(v3s16 p)
 	}
 
 	// Only the block holding p can change CONTENT here; the rest of
-	// modified_blocks are lighting/mesh neighbours, and the volume walk
+	// modified_blocks are lighting/mesh neighbours, and the grid walk
 	// reads content and param2, not light.
 	claudeMarkBlockDirty(getNodeBlockPos(p));
 

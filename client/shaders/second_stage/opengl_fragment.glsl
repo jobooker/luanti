@@ -26,15 +26,15 @@ uniform lowp float goldenHourStrength = 0.0;
 uniform sampler2D depthmap;
 uniform lowp float ssaoStrength = 0.0;
 
-uniform lowp float volumeDebug = 0.0;
-uniform sampler3D claudeVolume;
+uniform lowp float gridDebug = 0.0;
+uniform sampler3D claudeTraceGrid;
 #if __VERSION__ >= 130
 #define texture3D texture
 #endif
-uniform vec3 volumeCamPos;   // camera in volume-local node units
-uniform vec3 volumeCamFwd;   // unit look direction
-uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
-uniform vec3 volumeCamUp;    // camera up, pre-scaled by tan(fovY/2)
+uniform vec3 gridCamPos;   // camera in grid-local node units
+uniform vec3 gridCamFwd;   // unit look direction
+uniform vec3 gridCamRight; // camera right, pre-scaled by tan(fovX/2)
+uniform vec3 gridCamUp;    // camera up, pre-scaled by tan(fovY/2)
 uniform vec3 volumeSunDir;   // unit direction toward the sun
 uniform vec2 volumeDepthRange; // camera near/far (world BS units)
 uniform lowp float waterReflStrength = 0.0;
@@ -45,8 +45,8 @@ uniform lowp float clayStrength = 0.0; // blend toward flat per-block color
 // Shadow ray: second DDA march from a hit point toward the sun. Starts in
 // the empty cell the primary ray hit from (caller nudges the origin out
 // along the face normal) and tests only after the first step, so the
-// surface never shadows itself. Leaving the volume = reached open sky.
-float volumeShadow(vec3 ro)
+// surface never shadows itself. Leaving the grid = reached open sky.
+float gridShadow(vec3 ro)
 {
 	const float S = 128.0;
 	vec3 rd = volumeSunDir;
@@ -64,7 +64,7 @@ float volumeShadow(vec3 ro)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
-		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
+		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > 0.25)
 			return 0.45;
 	}
 	return 1.0;
@@ -73,7 +73,7 @@ float volumeShadow(vec3 ro)
 // Reflection march: DDA from just above a water surface, returning the
 // shaded hit color (face + traced sun shadow) or a day-scaled sky
 // gradient on miss. Advances before sampling so the origin cell is skipped.
-vec3 volumeReflect(vec3 ro, vec3 rd)
+vec3 gridReflect(vec3 ro, vec3 rd)
 {
 	const float S = 128.0;
 	vec3 cell = floor(ro);
@@ -92,7 +92,7 @@ vec3 volumeReflect(vec3 ro, vec3 rd)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			break;
-		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
 		if (s.a > 0.25) {
 			float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 					: (axis == 0 ? 0.8 : 0.62);
@@ -100,8 +100,8 @@ vec3 volumeReflect(vec3 ro, vec3 rd)
 			if (axis == 0) n.x = -stepDir.x;
 			else if (axis == 1) n.y = -stepDir.y;
 			else n.z = -stepDir.z;
-			float shade = volumeShadow(ro + rd * t + n * 0.01);
-			// volume colors are full-bright; light the mirrored world
+			float shade = gridShadow(ro + rd * t + n * 0.01);
+			// grid colors are full-bright; light the mirrored world
 			// like the real one or night water reflects a daylit phantom
 			return s.rgb * face * shade * clamp(dayNightRatio, 0.06, 1.0);
 		}
@@ -130,7 +130,7 @@ vec3 giSky(vec3 rd)
 
 // Short sun-visibility probe used from GI-ray hit points (64 cells is
 // plenty for canopy scale; cheaper than the full shadow march).
-float volumeSunVis(vec3 ro)
+float gridSunVis(vec3 ro)
 {
 	const float S = 128.0;
 	vec3 rd = volumeSunDir;
@@ -148,7 +148,7 @@ float volumeSunVis(vec3 ro)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
-		if (texture3D(claudeVolume, (cell + 0.5) / S).a > 0.25)
+		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > 0.25)
 			return 0.0;
 	}
 	// unresolved after 144 cells: assume blocked, not lit — a timeout
@@ -180,7 +180,7 @@ vec3 giTrace(vec3 ro, vec3 rd)
 				return vec3(0.01);
 			return giSky(rd);
 		}
-		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
 		if (s.a > 0.25) {
 			// Real forest bounce comes almost entirely from SUNLIT
 			// surfaces — pools of sun on the floor re-radiating onto
@@ -191,7 +191,7 @@ vec3 giTrace(vec3 ro, vec3 rd)
 			else if (axis == 1) n.y = -stepDir.y;
 			else n.z = -stepDir.z;
 			float sunlit = axis < 0 ? 0.0
-					: volumeSunVis(ro + rd * t + n * 0.01);
+					: gridSunVis(ro + rd * t + n * 0.01);
 			float fall = 1.0 - t / float(STEPS);
 			vec3 warm = mix(vec3(1.0), vec3(1.05, 0.93, 0.78), sunlit);
 			return s.rgb * warm * (0.18 + 1.1 * sunlit) * fall
@@ -203,17 +203,17 @@ vec3 giTrace(vec3 ro, vec3 rd)
 	return vec3(0.02);
 }
 
-// claude_volume ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
+// claude_grid ghost-depth view: one DDA ray per pixel (Amanatides & Woo)
 // through the 128^3 occupancy snapshot. Voxel i spans [i, i+1) in cell
-// space; node centers sit at integer volume-local coords, hence the +0.5
+// space; node centers sit at integer grid-local coords, hence the +0.5
 // shift on the ray origin. Shading: face brightness by hit axis (sun-from-
 // above convention) times distance fog — geometry only, no lighting.
 vec4 ghostView(vec2 uv)
 {
 	const float S = 128.0;
 	vec2 ndc = uv * 2.0 - 1.0;
-	vec3 rd = normalize(volumeCamFwd + ndc.x * volumeCamRight + ndc.y * volumeCamUp);
-	vec3 ro = volumeCamPos + 0.5;
+	vec3 rd = normalize(gridCamFwd + ndc.x * gridCamRight + ndc.y * gridCamUp);
+	vec3 ro = gridCamPos + 0.5;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
@@ -223,21 +223,21 @@ vec4 ghostView(vec2 uv)
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			// rgb = node average color; a: 0 air, ~0.5 water, 1 solid
-			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+			vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
 			if (s.a > 0.25) {
 				float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 						: (axis == 0 ? 0.8 : 0.62);
 				float shade = 1.0;
 				if (axis < 0) {
 					face = 0.9;
-				} else if (volumeDebug < 1.5) {
+				} else if (gridDebug < 1.5) {
 					// nudge off the hit face, then trace toward the sun
-					// (claude_volume_debug = 2 skips this: A/B compare)
+					// (claude_grid_debug = 2 skips this: A/B compare)
 					vec3 n = vec3(0.0);
 					if (axis == 0) n.x = -stepDir.x;
 					else if (axis == 1) n.y = -stepDir.y;
 					else n.z = -stepDir.z;
-					shade = volumeShadow(ro + rd * t + n * 0.01);
+					shade = gridShadow(ro + rd * t + n * 0.01);
 				}
 				// gentle: colors+shadows carry depth now; the old 0.015
 				// clay-ghost fog crushed everything past ~70 cells
@@ -245,7 +245,7 @@ vec4 ghostView(vec2 uv)
 				return vec4(s.rgb * face * shade * fog, 1.0);
 			}
 		} else if (i > 0) {
-			break; // left the volume
+			break; // left the grid
 		}
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
 			t = sideDist.x; sideDist.x += invRd.x; cell.x += stepDir.x; axis = 0;
@@ -258,7 +258,7 @@ vec4 ghostView(vec2 uv)
 	return vec4(0.0, 0.0, 0.04, 1.0); // miss: near-black, blue tint = "sky"
 }
 
-// ============ PURE PATH VIEW (claude_volume_debug = 3) ============
+// ============ PURE PATH VIEW (claude_grid_debug = 3) ============
 // 100% ray-traced illumination, zero ambient: every unit of brightness
 // arrives via an explicit ray path — direct sun (N.L x traced visibility),
 // sky dome (hemisphere rays paying ONLY on genuine sky exit), and one
@@ -329,7 +329,7 @@ vec3 pathRay(vec3 ro, vec3 rd)
 				return vec3(0.0); // exited underground: no light there
 			return pathSkyRadiance(rd);
 		}
-		vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
 		if (s.a > 0.25) {
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
@@ -338,7 +338,7 @@ vec3 pathRay(vec3 ro, vec3 rd)
 			float ndl = max(dot(n, volumeSunDir), 0.0);
 			if (ndl <= 0.0)
 				return vec3(0.0); // faces away from sun: radiates nothing
-			float sv = volumeSunVis(ro + rd * t + n * 0.01);
+			float sv = gridSunVis(ro + rd * t + n * 0.01);
 			// albedo x incident light, attenuated by distance falloff
 			float fall = 1.0 - t / 160.0;
 			return pathAlbedo(s.rgb) * ndl * sv * fall
@@ -352,8 +352,8 @@ vec4 pathView(vec2 uv)
 {
 	const float S = 128.0;
 	vec2 ndc = uv * 2.0 - 1.0;
-	vec3 rd = normalize(volumeCamFwd + ndc.x * volumeCamRight + ndc.y * volumeCamUp);
-	vec3 ro = volumeCamPos + 0.5;
+	vec3 rd = normalize(gridCamFwd + ndc.x * gridCamRight + ndc.y * gridCamUp);
+	vec3 ro = gridCamPos + 0.5;
 	vec3 cell = floor(ro);
 	vec3 stepDir = sign(rd);
 	vec3 invRd = 1.0 / max(abs(rd), vec3(1e-6));
@@ -362,7 +362,7 @@ vec4 pathView(vec2 uv)
 	int axis = -1;
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
-			vec4 s = texture3D(claudeVolume, (cell + 0.5) / S);
+			vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
 			if (s.a > 0.25 && axis >= 0) {
 				vec3 n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
@@ -371,14 +371,14 @@ vec4 pathView(vec2 uv)
 				vec3 hp = ro + rd * t + n * 0.01;
 				// mode 4: lighting-only — neutral albedo shows pure
 				// transport, isolating material darkness from light bugs
-				vec3 albedo = volumeDebug > 3.5
+				vec3 albedo = gridDebug > 3.5
 						? vec3(0.55) : pathAlbedo(s.rgb);
 				// direct light: sun by day, moon by night (color and
 				// intensity arrive via volumeLightCol)
 				float ndl = max(dot(n, volumeSunDir), 0.0);
 				vec3 direct = vec3(0.0);
 				if (ndl > 0.0)
-					direct = vec3(ndl * volumeSunVis(hp))
+					direct = vec3(ndl * gridSunVis(hp))
 							* volumeLightCol;
 				// sky + bounce: five hemisphere rays, cosine-biased
 				vec3 t1 = normalize(cross(n,
@@ -405,7 +405,7 @@ vec4 pathView(vec2 uv)
 				return vec4(pow(max(c, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
 			}
 		} else if (i > 0) {
-			// primary ray left the volume: show the sky itself
+			// primary ray left the grid: show the sky itself
 			return vec4(pow(pathSkyRadiance(rd), vec3(1.0 / 2.2)), 1.0);
 		}
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
@@ -525,17 +525,17 @@ void main(void)
 {
 	vec2 uv = varTexCoord.st;
 
-	// claude_volume_debug: 1/2 = ghost view here; 3/4 (path-traced) are
+	// claude_grid_debug: 1/2 = ghost view here; 3/4 (path-traced) are
 	// produced by the claude_accum/claude_present steps downstream
-	// The ghost view is a DEBUG-only path (claude_volume_debug 1/2). Its guard
-	// reads the volumeDebug uniform, which is not reliably delivered to this
+	// The ghost view is a DEBUG-only path (claude_grid_debug 1/2). Its guard
+	// reads the gridDebug uniform, which is not reliably delivered to this
 	// shader on a core profile — an unset uniform reads 0 on GL 2.1 (working by
 	// luck) but not necessarily on core, so the branch fired every frame and
 	// returned a flat image. That single line is what made post-processing look
 	// like it broke terrain rendering on 4.1. Compile it out unless explicitly
 	// asked for; the traced modes (3/4) are produced downstream regardless.
 #ifdef ENABLE_GHOST_VIEW
-	if (volumeDebug > 0.5 && volumeDebug < 2.5) {
+	if (gridDebug > 0.5 && gridDebug < 2.5) {
 		gl_FragColor = ghostView(uv);
 		return;
 	}
@@ -556,17 +556,17 @@ void main(void)
 
 	// Traced lighting in the real render (claude_water_reflections +
 	// claude_gi): reconstruct this pixel's position from the depth buffer
-	// once, then let each effect consult the volume.
-	if ((waterReflStrength > 0.0 || giStrength > 0.0) && volumeDebug < 0.5) {
+	// once, then let each effect consult the grid.
+	if ((waterReflStrength > 0.0 || giStrength > 0.0) && gridDebug < 0.5) {
 		float dw = texture2D(depthmap, uv).r;
 		if (dw < 0.9999) {
 			vec2 ndcw = uv * 2.0 - 1.0;
-			vec3 vdir = volumeCamFwd + ndcw.x * volumeCamRight + ndcw.y * volumeCamUp;
+			vec3 vdir = gridCamFwd + ndcw.x * gridCamRight + ndcw.y * gridCamUp;
 			float zn = volumeDepthRange.x;
 			float zf = volumeDepthRange.y;
 			float ez = 2.0 * zn * zf / (zf + zn - (2.0 * dw - 1.0) * (zf - zn));
-			// BS = 10: eye depth is in world units, the volume in nodes
-			vec3 p = volumeCamPos + 0.5 + vdir * (ez / 10.0);
+			// BS = 10: eye depth is in world units, the grid in nodes
+			vec3 p = gridCamPos + 0.5 + vdir * (ez / 10.0);
 			vec3 wcell = floor(p - vec3(0.0, 0.05, 0.0));
 			bool inVol = all(greaterThanEqual(wcell, vec3(0.0)))
 					&& all(lessThan(wcell, vec3(128.0)));
@@ -584,7 +584,7 @@ void main(void)
 						- vec3(0.0, 0.02, 0.0));
 				if (all(greaterThanEqual(ccell, vec3(0.0)))
 						&& all(lessThan(ccell, vec3(128.0)))) {
-					vec4 cv = texture3D(claudeVolume, (ccell + 0.5) / 128.0);
+					vec4 cv = texture3D(claudeTraceGrid, (ccell + 0.5) / 128.0);
 					if (cv.a > 0.25) {
 						if (clayStrength > 0.95) {
 							// stock-lighting comparison mode: keep the
@@ -610,13 +610,13 @@ void main(void)
 			// Water reflections: if this pixel is a tagged water cell,
 			// reflect the view ray about +Y and march it.
 			if (inVol && waterReflStrength > 0.0) {
-				vec4 wv = texture3D(claudeVolume, (wcell + 0.5) / 128.0);
+				vec4 wv = texture3D(claudeTraceGrid, (wcell + 0.5) / 128.0);
 				if (wv.a > 0.25 && wv.a < 0.75) {
 					isWater = true;
 					vec3 vn = normalize(vdir);
 					vec3 rdir = reflect(vn, vec3(0.0, 1.0, 0.0));
 					vec3 ro2 = vec3(p.x, wcell.y + 1.001, p.z);
-					vec3 refl = volumeReflect(ro2, rdir);
+					vec3 refl = gridReflect(ro2, rdir);
 					float fres = pow(1.0 - clamp(-vn.y, 0.0, 1.0), 2.0);
 					float k = waterReflStrength * (0.25 + 0.55 * fres);
 					color.rgb = mix(color.rgb, pow(refl, vec3(2.2)), k);
@@ -641,7 +641,7 @@ void main(void)
 			bool onSurface = false;
 			vec3 nrm = vec3(0.0, 1.0, 0.0);
 			if (inVol && giStrength > 0.0 && !isWater) {
-				vec4 sv = texture3D(claudeVolume, (scell + 0.5) / 128.0);
+				vec4 sv = texture3D(claudeTraceGrid, (scell + 0.5) / 128.0);
 				if (sv.a > 0.25) {
 					onSurface = true;
 					vec3 q = p - (scell + 0.5);
@@ -687,10 +687,10 @@ void main(void)
 				// relight collapses to pure ambient after dusk.
 				float dayL = clamp((dayNightRatio - 0.3) / 0.4, 0.0, 1.0);
 				float ndl = max(dot(nrm, volumeSunDir), 0.0);
-				// volumeShadow's 0.45 floor suits the ghost view, but
+				// gridShadow's 0.45 floor suits the ghost view, but
 				// for relighting it makes shadows read ~18% dimmer than
 				// sun — imperceptible. Remap: shadowed = 12% of direct.
-				float shraw = ndl > 0.02 ? volumeShadow(ro3) : 0.0;
+				float shraw = ndl > 0.02 ? gridShadow(ro3) : 0.0;
 				float direct = ndl * (shraw > 0.9 ? 1.0 : 0.12);
 				vec3 relight = m * mix(1.0, 0.45, dayL)
 						+ vec3(direct * 0.8 * dayL);
@@ -709,7 +709,7 @@ void main(void)
 				if (clayStrength > 0.95) {
 					// albedo from the SAME cell the lighting used —
 					// keeps 'painted' and 'lit' inseparable
-					vec3 albedo = pow(texture3D(claudeVolume,
+					vec3 albedo = pow(texture3D(claudeTraceGrid,
 							(scell + 0.5) / 128.0).rgb, vec3(2.2));
 					vec3 sunCol = vec3(1.06, 0.96, 0.82);
 					color.rgb = albedo * (gi * 0.26
