@@ -144,3 +144,10 @@ claude_stats.json
 claude_dial.conf
 debug.prev.txt
 __pycache__/
+
+# Luanti's own filesystem unittest (src/unittest/test_filesys.cpp) calls
+# CopyFileContents(file1, "somewhere") to assert the copy FAILS, and
+# leaves an empty file named "somewhere" in the working directory every
+# time --run-unittests runs. Upstream litter, not ours; it returns after
+# deletion, so ignore it rather than chasing it.
+/somewhere
