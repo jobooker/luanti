@@ -139,7 +139,28 @@ struct ClaudeVolume
 	static constexpr int AREA_CAP = 16;
 	float area[AREA_CAP][4] = {};
 	int area_count = 0;         // live slots, <= AREA_CAP
+	// AREA_TOTAL IS NOT AN OCCUPANCY COUNT (found 2026-08-15, roadmap
+	// 1b): this is the count of emissive CELLS the snapshot found for
+	// next-event estimation, class 170..240 only. It is legitimately 0
+	// for a fully solid, fully lightless sealed room -- every referee
+	// room built before 1b happened to have a lamp, so `area_total > 0`
+	// silently worked as an "is there a volume" proxy for months and was
+	// never actually testing that. See solid_count below for the real one.
 	int area_total = 0;         // emissive cells the snapshot actually found
+	// solid_count / snap_seq (roadmap 1b, gate hardening 2026-08-16):
+	// `valid` is set true once and never cleared (see below), so
+	// `volume_valid == 1` alone is a TAUTOLOGY after the first snapshot
+	// ever taken on a seat -- an all-air bubble at a brand-new vantage
+	// still reads valid=1. solid_count is the number of non-air cells
+	// the WALK JUST COMPLETED actually found (computed unconditionally,
+	// every call, before the unchanged-content early return), so it is
+	// zero exactly when the bubble really is empty. snap_seq increments
+	// once per call to claudeVolumeSnapshot(), so a caller can prove a
+	// NEW walk happened between two reads rather than reading a stale
+	// solid_count left over from a walk at a completely different
+	// vantage.
+	u32 solid_count = 0;
+	u32 snap_seq = 0;
 	// Held (wielded) light lives in its OWN slot, never in emitters[]:
 	// writing it into emitters[7] STOMPED the 8th-nearest real torch in
 	// place, and the content-hash snapshot gate preserved the corruption
@@ -2197,6 +2218,14 @@ static void claudeVolumeSnapshot(Client *client)
 		}
 		solid++;
 	}
+	// Updated unconditionally, BEFORE the unchanged-content early
+	// return below: this walk really did just run, whether or not its
+	// result differs from last time, so solid_count/snap_seq must
+	// reflect it either way -- otherwise the early-return path (the
+	// common case once a room has settled) would leave a stale
+	// solid_count sitting there looking like a fresh read.
+	g_claude_volume.solid_count = solid;
+	g_claude_volume.snap_seq++;
 	// world unchanged since the last snapshot: skip the upload and — key
 	// for image stability — do NOT disturb the converged accumulation
 	if (g_claude_volume.valid && hash == g_claude_volume.content_hash) {
@@ -2741,6 +2770,12 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"frame_ms_best\": " << (best * 1000.0f)
 			<< ", \"frames\": " << frames
 			<< ", \"volume_valid\": " << (g_claude_volume.valid ? 1 : 0)
+			// volume_valid is a tautology after the first snapshot ever
+			// taken on a seat (set true once, never cleared) -- these
+			// two are the actual "is there something here" proof.
+			// solid_count: non-air cells the LAST WALK found (roadmap 1b).
+			<< ", \"volume_solid\": " << g_claude_volume.solid_count
+			<< ", \"volume_snap_seq\": " << g_claude_volume.snap_seq
 			<< ", \"emitters\": " << g_claude_volume.emitter_count
 			// the two numbers that explain a noisy room: how many area
 			// emitters NEE can aim at, and how many exist
