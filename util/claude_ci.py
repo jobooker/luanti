@@ -62,7 +62,56 @@ import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
 # ---------------------------------------------------------------- constants
 # Nothing below this line is allowed to hide in the body of the script.
 
-SETTLE_DEFAULT = 60.0      # s of stillness before each shot (accumulator depth)
+# --- the settle: ACCUMULATED FRAMES, not wall-clock seconds -------------
+#
+# WAS `SETTLE_DEFAULT = 60.0` seconds, from the day the harness was
+# written and never measured. Two things were wrong with a clock:
+#
+# 1. It does not buy a fixed depth. The same 60 s bought still_frames
+#    3,928 on one run and 7,491 on another (measured, run.json), because
+#    fps moves with the scene, the build and the machine. Depth is the
+#    quantity the image quality actually depends on.
+# 2. ANY world change clamps still_frames to 10 (game.cpp
+#    claudeVolumeSnapshot / claudeVolumeIncremental), and Mineclonia's
+#    grass ABM changes a node inside the bubble every ~30-180 s. A clock
+#    interrupted in its last second fires the shutter on an accumulator
+#    one frame deep and calls it a measurement -- measured.md "Gate 4,
+#    second half", where cozy-day-ci came in at still_frames 11 and CI
+#    went red on a tree whose only change was harness hygiene.
+#
+# Waiting on FRAMES is immune to both: a reset merely extends the wait.
+#
+# 2000 is chosen from the convergence curve in spec/measured.md "Settle
+# calibration", NOT from the 0.25%-of-N=8000 rule the handoff proposed --
+# that rule turned out to be unanswerable, because Cornell's `floor`
+# region is still moving 0.27% between 8,000 and 16,000 frames, so the
+# reference it compares against is not converged either. The number that
+# decides instead is the tolerance CI actually enforces:
+# CORNELL_RATIO_TOL, 1% on the worst region ratio against the golden.
+# Worst observed over four independent runs: 0.99% at N=250, 1.14% at
+# N=500 (a genuine FAIL), 0.91% at 1000, 0.73% at 2000, 0.56% at 4000.
+# At 2000 the run-to-run sigma of that quantity is 0.36%, so 1% is 2.8
+# sigma. Today's 60 s buys cornell 3,928-5,781 frames, i.e. 3.0-3.3
+# sigma -- but it buys cornell-nee1 only 152-2,108 (measured across
+# three runs), i.e. as little as 1.0 sigma on the SAME 1% tolerance.
+# A flat 2,000 frames is therefore a large net gain in reliability, and
+# the arm it slightly relaxes is the one that was never at risk.
+SETTLE_FRAMES = 2000
+SETTLE_SECONDS_WAS = 60.0  # what SETTLE_FRAMES replaced, 2026-08-16
+# Ceiling, so an arm whose world never stops changing cannot wedge a
+# run. exterior-ci is unsealed and map blocks keep arriving there, each
+# one a real change that correctly caps still_frames; measured depths at
+# 60 s were 162 / 191 / 1,812 / 2,849. Reaching the ceiling is NOT a new
+# way to go red -- the shot is taken and the existing `-converged`
+# assertion (still_frames >= CONVERGED_MIN) judges it, exactly as before.
+SETTLE_MAX_S = 180.0
+# ...except that firing the shutter one frame after a reset is the whole
+# defect being removed, so the ceiling does not apply until the
+# accumulator is at least this deep. Past SETTLE_HARD_MAX_S the shot is
+# taken regardless and the run says so.
+SETTLE_MIN_FRAMES = 300
+SETTLE_HARD_MAX_S = 300.0
+SETTLE_POLL = 0.25
 FREEZE_WAIT = 8.0          # s between the two still_frames reads in freeze
 SEAT_PORT = 30000          # server port for the CI seat
 SEAT_WORLD = "worlds/gallery"
@@ -1082,9 +1131,55 @@ def await_volume(marker, block, room=None, tries=3, seq_before=None):
                         floor, st.get("volume_snap_seq") == seq_before)}
 
 
+def await_frames(target, max_s=SETTLE_MAX_S, min_frames=SETTLE_MIN_FRAMES,
+                 hard_max_s=SETTLE_HARD_MAX_S):
+    """Block until the accumulator is `target` frames deep. THE SETTLE.
+
+    Returns the record of what the wait actually did, which is the point:
+    a wall-clock settle could not say how deep the frame it shot was, and
+    every depth in this repo before today was an after-the-fact reading
+    rather than a precondition.
+
+    still_frames is read from claude_stats.json, which the client
+    rewrites once per second, so this UNDER-reports by up to one stats
+    window -- the safe direction for a floor. The shutter that follows
+    adds another ~1 s (the settings-patch poll plus a ~3 MB synchronous
+    PNG write), measured, so the frame taken is deeper than the number
+    this returns, consistently for every arm.
+
+    Resets are counted, not smoothed over: still_frames is monotone
+    between resets, so any decrease is a real world change (or a camera
+    move, which the aim guard would catch separately). Counting them is
+    how a run reports what the world did to it.
+    """
+    t0, last, resets = time.time(), None, []
+    while True:
+        st = lab.read_stats() or {}
+        sf = st.get("still_frames")
+        el = time.time() - t0
+        if sf is not None:
+            if last is not None and sf < last:
+                resets.append({"at_still_frames": last, "dropped_to": sf,
+                               "after_s": round(el, 1)})
+            last = sf
+            if sf >= target:
+                return {"reached": True, "still_frames": sf,
+                        "wall_s": round(el, 1), "target": target,
+                        "resets": resets}
+            if (el >= max_s and sf >= min_frames) or el >= hard_max_s:
+                return {"reached": False, "still_frames": sf,
+                        "wall_s": round(el, 1), "target": target,
+                        "resets": resets,
+                        "why": ("hard ceiling %.0fs" % hard_max_s
+                                if el >= hard_max_s
+                                else "ceiling %.0fs with >= %d frames"
+                                     % (max_s, min_frames))}
+        time.sleep(SETTLE_POLL)
+
+
 def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     """dials -> park -> vantage (proven reset) -> snapshot -> re-assert
-    dials -> settle -> shutter -> N read BEFORE the PNG write -> file it
+    dials -> settle (N frames) -> shutter -> N read BEFORE the PNG write
     under the arm name.
 
     THE ARM'S DIALS GO ON BEFORE THE ACCUMULATOR IS RESET, and that
@@ -1128,7 +1223,7 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # and a capture over an empty bubble costs everything.
     info["volume"] = await_volume(marker, block, room=room,
                                   seq_before=seq_before)
-    time.sleep(settle)
+    info["settle"] = await_frames(settle)
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
     # "Owed to the harness"): the record written after the write is 1-3
@@ -1515,7 +1610,7 @@ def write_run_html(rundir, run):
     parts.append("<title>CI %s</title><style>%s</style>" % (e(run["tag"]), CSS))
     parts.append("<h1>%s %s <span class=meta>%s</span></h1>"
                  % (e(run["tag"]), _rg(run), e(run["branch"])))
-    parts.append('<div class=meta>%s &middot; settle %gs &middot; build %s'
+    parts.append('<div class=meta>%s &middot; settle %g frames &middot; build %s'
                  ' &middot; freeze: %s &middot; prev %s &middot; golden %s'
                  ' &middot; <a href="../index.html">all runs</a></div>'
                  % (e(run["started_utc"]), run["settle"],
@@ -1806,8 +1901,20 @@ def cmd_run(args):
                      vol.get("attempts")))
             st = (cap.get("stats_at_shutter") or {})
             sf = cap.get("still_frames_at_shutter")
+            se = cap.get("settle") or {}
+            # The settle is now reported, not assumed: how deep it got,
+            # how long that took, and every accumulator reset it rode
+            # out. A wall-clock settle could say none of this, which is
+            # why the reset that turned CI into a coin flip was only
+            # visible after the fact, in the shutter depth.
             A.add("%s-converged" % name, (sf or 0) >= CONVERGED_MIN,
-                  "still_frames at shutter %s (min %d)" % (sf, CONVERGED_MIN))
+                  "still_frames at shutter %s (min %d); settle reached %s "
+                  "of %s in %ss, %d reset(s)%s"
+                  % (sf, CONVERGED_MIN, se.get("still_frames"),
+                     se.get("target"), se.get("wall_s"),
+                     len(se.get("resets") or []),
+                     "" if se.get("reached") else
+                     " — TARGET NOT REACHED: %s" % se.get("why")))
             if cap.get("reset_error"):
                 A.add("%s-accum-reset" % name, False, cap["reset_error"])
             if shot_def["referee"]:
@@ -2014,9 +2121,12 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--settle", type=float, default=SETTLE_DEFAULT,
-                       help="seconds of stillness before each shot "
-                            "(default %(default)s)")
+        p.add_argument("--settle", type=int, default=SETTLE_FRAMES,
+                       metavar="FRAMES",
+                       help="ACCUMULATED FRAMES of stillness before each "
+                            "shot (default %(default)s). Was 60.0 SECONDS "
+                            "until 2026-08-16; see SETTLE_FRAMES for why "
+                            "a clock was the wrong gate.")
         p.add_argument("--skip-build", action="store_true",
                        help="capture with the binaries already in ./bin")
         p.add_argument("--skip-deploy", action="store_true",
