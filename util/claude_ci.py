@@ -997,7 +997,7 @@ SEALED_ROOMS = {"furnace-050", "furnace-073", "cornell", "cozy",
 VOLUME_SOLID_FLOOR_SEALED = 100000
 
 
-def await_volume(marker, block, room=None, tries=3):
+def await_volume(marker, block, room=None, tries=3, seq_before=None):
     """Prove the tracer has something to trace BEFORE the settle starts.
 
     A capture must never be taken over an empty bubble: a client with no
@@ -1033,8 +1033,23 @@ def await_volume(marker, block, room=None, tries=3):
     the unchanged-content early return) and volume_snap_seq (increments
     once per call, so a caller can prove a NEW walk happened rather than
     reading a stale count from a walk at a different vantage entirely).
+
+    MEASURED 2026-08-16 (settle calibration): seq_before must be read by
+    the CALLER, BEFORE the snapshot is requested, and it was not. This
+    function read it on entry -- i.e. AFTER push_dials() had already
+    written the request and slept 1.4 s for the client's ~1 Hz poll. The
+    poll usually lands inside that sleep, so seq_before was routinely the
+    POST-snapshot value, "has a new walk happened" could never become
+    true, and attempt 1 burned the full VOLUME_TIMEOUT before a retry
+    with a fresh marker got the answer. It cost 25 s per capture: every
+    shot of both runs since claude_volume_follow went back to 1 reports
+    `attempts: 2` (13/13 and 12/13), against 13/13 `attempts: 1` on the
+    follow-off golden run -- follow ON makes the race near-certain,
+    because the follow path re-centres on arrival at the new vantage and
+    bumps snap_seq on its own. ~5 minutes of every ~22 minute run.
     """
-    seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
+    if seq_before is None:                 # legacy callers: racy, as above
+        seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
     floor = VOLUME_SOLID_FLOOR_SEALED if room in SEALED_ROOMS else 1
     for attempt in range(tries):
         deadline = time.time() + VOLUME_TIMEOUT
@@ -1102,11 +1117,17 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # PREVIOUS vantage's bubble.
     marker = "%s_%d" % (name, time.time_ns())
     block = dict(dials, claude_volume_snapshot=marker)
+    # BEFORE the request is written: the client cannot have served a
+    # snapshot we have not asked for yet, and push_dials sleeps 1.4 s for
+    # the ~1 Hz poll, which is long enough for the answer to arrive
+    # before a read taken after it. See await_volume.
+    seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
     info["dials_pushed"] = push_dials(block, marker)
     # the settle clock starts only once the volume is proven present:
     # a snapshot also clamps still_frames, so waiting here costs nothing
     # and a capture over an empty bubble costs everything.
-    info["volume"] = await_volume(marker, block, room=room)
+    info["volume"] = await_volume(marker, block, room=room,
+                                  seq_before=seq_before)
     time.sleep(settle)
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md

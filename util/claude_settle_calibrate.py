@@ -51,7 +51,7 @@ import claude_ci as ci              # noqa: E402
 import claude_cornell_check as cornell  # noqa: E402
 
 OUT_ROOT = os.path.join(REPO, "screenshots", "settle")
-DEFAULT_TARGETS = [250, 500, 1000, 2000, 4000, 8000]
+DEFAULT_TARGETS = [250, 500, 1000, 2000, 4000, 8000, 16000]
 # Arms: the tightest-tolerance / highest-variance referee arm, and the
 # general scene. cornell runs claude_nee = 0 with 24 bounces off a small
 # panel, so it is the noise floor of the whole set by construction.
@@ -64,7 +64,7 @@ POLL = 0.25            # s between still_frames reads (stats file is 1 Hz)
 # shallow point is a small drop, so a slack window would miss exactly the
 # early resets that matter most.
 ARM_ATTEMPTS = 3       # a world change mid-curve costs the whole arm
-CURVE_TIMEOUT = 600.0  # s per arm attempt
+CURVE_TIMEOUT = 900.0  # s per arm attempt
 
 
 # ---------------------------------------------------------------- instrument
@@ -166,9 +166,44 @@ def start_arm(arm, vantages, dials):
     aim0 = ci.read_aim()
     marker = "%s_%d" % (arm, time.time_ns())
     block = dict(dials, claude_volume_snapshot=marker)
+    seq0 = (lab.read_stats() or {}).get("volume_snap_seq")
     ci.push_dials(block, marker)
-    vol = ci.await_volume(marker, block, room=ci.room_of(arm))
-    return v, aim0, {"reset_error": reset_err, "volume": vol}
+    vol = ci.await_volume(marker, block, room=ci.room_of(arm),
+                          seq_before=seq0)
+    sync = sync_clamp(dials)
+    return v, aim0, {"reset_error": reset_err, "volume": vol, "sync": sync}
+
+
+SYNC_TIMEOUT = 20.0
+
+
+def sync_clamp(dials):
+    """Put a known, SHALLOW still_frames under the start of the walk.
+
+    Without this the walk's first stats read already sits at 400-2,500
+    frames: reset -> aim rpc -> dial push -> volume proof is 5-30 s of
+    bridge round trips, and the accumulator has been climbing through
+    all of it. The low end of the curve is then simply unreachable and
+    the instrument silently reports its own latency as the answer.
+
+    So: ask for one more snapshot (which clamps still_frames to <= 10 --
+    game.cpp claudeVolumeSnapshot, the same clamp every capture already
+    takes) and poll until the DROP is visible. The walk then starts
+    within one stats window of a known floor. Nothing else is touched;
+    this is the same operation the capture path already performs.
+    """
+    st0 = lab.read_stats() or {}
+    before = st0.get("still_frames")
+    marker = "sync_%d" % time.time_ns()
+    ci.push_dials(dict(dials, claude_volume_snapshot=marker), marker)
+    deadline = time.time() + SYNC_TIMEOUT
+    while time.time() < deadline:
+        sf = (lab.read_stats() or {}).get("still_frames")
+        if sf is not None and before is not None and sf < before:
+            return {"ok": True, "before": before, "after": sf}
+        time.sleep(0.2)
+    return {"ok": False, "before": before,
+            "after": (lab.read_stats() or {}).get("still_frames")}
 
 
 def walk_to(targets, outdir, prefix, log, with_regions):
