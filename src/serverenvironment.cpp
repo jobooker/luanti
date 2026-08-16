@@ -1011,7 +1011,33 @@ void ServerEnvironment::step(float dtime)
 		}
 	}
 
-	if (m_active_block_modifier_interval.step(dtime, m_cache_abm_interval)) {
+	// claude_abm = 0 STOPS THE WORLD CHANGING BY ITSELF, for a
+	// measurement seat. Mineclonia's grass-spread ABM turns a covered
+	// dirt_with_grass into dirt inside the cosy bubble every 30-90 s, the
+	// client's trace grid correctly folds that in, and folding it in
+	// correctly clamps the accumulator -- so CI spent 65-180 s settling
+	// exterior-ci against 20-30 s for a quiet arm (spec/measured.md,
+	// "Per-arm settle cost"). mobs_spawn = false, time_speed 0 and
+	// claude_input_lock are all already on this seat for the same reason:
+	// A REFEREE NEEDS A STILL WORLD. ABMs were the missing member.
+	//
+	// Read live, not cached like the three intervals above, so the
+	// harness can turn it off for a run and back on afterwards through
+	// the bridge without a server restart (one getBool per abm_interval
+	// tick, i.e. 1 Hz). The .step() call is FIRST so the timer keeps
+	// running while ABMs are off -- short-circuiting it would bank the
+	// whole off-period and fire one huge catch-up pass on the way back.
+	bool claude_abm = g_settings->getBool("claude_abm");
+	if (claude_abm != m_claude_abm_last) {
+		m_claude_abm_last = claude_abm;
+		actionstream << "[claude_abm] active block modifiers "
+				<< (claude_abm ? "ENABLED (the real game)"
+						: "DISABLED -- this is a measurement seat, "
+						  "the world will not change by itself")
+				<< std::endl;
+	}
+	if (m_active_block_modifier_interval.step(dtime, m_cache_abm_interval)
+			&& claude_abm) {
 		ScopeProfiler sp(g_profiler, "SEnv: modify in blocks avg per interval", SPT_AVG);
 		TimeTaker timer("modify in active blocks per interval");
 

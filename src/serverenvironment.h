@@ -414,6 +414,9 @@ private:
 	float m_cache_abm_interval;
 	float m_cache_nodetimer_interval;
 	float m_cache_abm_time_budget;
+	// claude_abm, remembered only so the state change prints once
+	// instead of once per second. Starts true = the shipped default.
+	bool m_claude_abm_last = true;
 
 	// peer_ids in here should be unique, except that there may be many 0s
 	std::vector<RemotePlayer*> m_players;

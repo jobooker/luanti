@@ -508,6 +508,22 @@ void set_default_settings()
 	settings->setDefault("active_block_mgmt_interval", "2.0");
 	settings->setDefault("abm_interval", "1.0");
 	settings->setDefault("abm_time_budget", "0.2");
+	// claude_abm: 1 (default, the real game) = Active Block Modifiers run.
+	// 0 = the ABM pass is skipped entirely, i.e. THE WORLD STOPS CHANGING
+	// BY ITSELF. For the measurement seat only, and it is read live so a
+	// run can turn it off and put it back without a restart -- see
+	// ServerEnvironment::step and mods/claude_bridge's OPS.abm.
+	//
+	// Why a new setting rather than one of the three above: abm_interval
+	// is CLAMPED to 30 s (rangelim in ServerEnvironment's constructor),
+	// and Mineclonia's grass ABM already fires only every 30-90 s, so
+	// "set the interval very high" cannot still the world -- it just
+	// asks for the same thing on a 30 s tick. active_block_range = 0
+	// still leaves the player's own map block active, which in the cosy
+	// cabin is the block that was firing. Both were read before either
+	// was ruled out (spec/handoffs/2026-08-16-still-the-world-abm.md
+	// says to read the code, not to pick by name).
+	settings->setDefault("claude_abm", "true");
 	settings->setDefault("nodetimer_interval", "0.2");
 	settings->setDefault("ignore_world_load_errors", "false");
 	settings->setDefault("remote_media", "");

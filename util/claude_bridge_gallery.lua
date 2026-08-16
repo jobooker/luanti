@@ -453,3 +453,38 @@ function OPS.revive(p)
     end
     return { hp = pl:get_hp(), pos = pl:get_pos() }
 end
+
+-- ABMs off/on, ASSERTED rather than set (2026-08-16, the "still the
+-- world" step). claude_abm is a SERVER setting -- the grid, the
+-- accumulator and the stats are all client-side, so putting it in the
+-- client conf does nothing and looks exactly like the fix failing.
+--
+-- It is pushed at runtime and read back in the same call, because
+-- spec/handoffs/2026-08-16-still-the-world-abm.md gate 2 asks for the
+-- effective value, not for the write to have returned: the last session
+-- found a stale claude_settings_patch.conf silently running
+-- claude_grid_follow = 0 on a seat whose conf on disk said 1, and
+-- grepping the conf was a blind instrument.
+--
+-- Runtime and NOT the conf file, deliberately. The dedicated server
+-- returns from run_dedicated_server before main()'s
+-- g_settings->updateConfigFile, so nothing set here is ever written to
+-- minetest.conf -- which means a measurement run cannot leave a
+-- gameplay seat with its world silently frozen. claude_ci turns it off
+-- after seat start and back on in a finally, the same shape as the
+-- doors and the lamps.
+function OPS.abm(p)
+    if p.on ~= nil then
+        core.settings:set_bool("claude_abm", p.on and true or false)
+    end
+    return { claude_abm = core.settings:get_bool("claude_abm", true) }
+end
+
+-- Read any server setting back by name. The generic half of OPS.abm:
+-- "what is this seat actually running" is a question the harness has
+-- had to answer by grepping a conf file that the client rewrites on
+-- exit (spec/environment-laws.md). Asking the server is the only
+-- honest form of the question.
+function OPS.setting(p)
+    return { name = p.name, value = core.settings:get(p.name) }
+end
