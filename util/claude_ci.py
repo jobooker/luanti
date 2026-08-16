@@ -838,7 +838,7 @@ SHOT_SETTLE_INTERVAL = 0.25
 
 
 def reset_accumulation(vantage, park):
-    """Reset still_frames by teleporting AWAY and back, and PROVE it.
+    """Reset the accumulator by teleporting AWAY and back, and PROVE it.
 
     Two arms of the same room (cornell / cornell-nee1) sit at the same
     position, and game.cpp only resets the accumulator when the camera
@@ -848,8 +848,30 @@ def reset_accumulation(vantage, park):
     the PLAYER's yaw, the client owns its camera, still_frames climbed
     straight through it). Returning to the vantage's stored REST position
     lands the body where it already rests, so nothing slides.
+
+    THE PROOF IS A COUNTER, and it had to become one (2026-08-16, settle
+    calibration). This used to poll still_frames for a value <= 3, or
+    below whatever it read before the teleport. Both clauses look
+    through a 1 Hz keyhole: claude_stats.json is rewritten once per
+    second while still_frames climbs at 70-90 per second, so the window
+    in which a reset frame is visible as "<= 3" is ~0.03 s wide, and the
+    "below before" clause is unusable whenever `before` is ALREADY small.
+    That is not a corner case — cozy-day-dark-ci enters with `before` =
+    11, because the previous arm's lamp swap clamped it — and it
+    produced `still_frames never dropped after reset (was 11, last seen
+    1353)`: a RED for a reset the engine guarantees on any camera move
+    and the aim assertion independently confirms happened. The same
+    false RED is already on record in spec/measured.md "Gate 4, second
+    half", inside a flake that was attributed wholly to the grass ABM.
+
+    game.cpp now exports `accum_resets`, incremented wherever
+    still_frames is ZEROED (camera move, volume rebase, sky change) and
+    NOT where it is merely clamped to 10 by a world change. A counter
+    cannot be missed by sampling — any two reads bracket every reset
+    between them — so this is exact where a threshold was a guess.
     """
     st0 = lab.read_stats() or {}
+    before_resets = st0.get("accum_resets")
     before = st0.get("still_frames")
     try:
         lab.goto(park)
@@ -858,18 +880,33 @@ def reset_accumulation(vantage, park):
     except Exception as e:
         return "reset rpc failed: %s" % e
     deadline = time.time() + RESET_POLL_TIMEOUT
-    last = None
+    last, last_resets = None, None
     while time.time() < deadline:
-        st = lab.read_stats()
+        st = lab.read_stats() or {}
         last = st.get("still_frames") if st else None
-        if last is not None:
+        last_resets = st.get("accum_resets") if st else None
+        if before_resets is not None and last_resets is not None:
+            # Two teleports happened (away, then back), so the counter
+            # must have moved at least twice; require only that it moved,
+            # since a client that started mid-sequence is still proof.
+            if last_resets > before_resets:
+                return None
+        elif last is not None:
+            # Pre-counter client (older binary): fall back to the old,
+            # keyhole-limited test rather than refusing to run at all.
             if last <= RESET_STILL_FRAMES_MAX:
                 return None
             if before is not None and last < before:
                 return None
         time.sleep(RESET_POLL_INTERVAL)
-    return ("still_frames never dropped after reset (was %s, last seen %s)"
-            % (before, last))
+    if before_resets is not None and last_resets is not None:
+        return ("accum_resets never moved after the teleport (%s -> %s); "
+                "the camera did not move, or the client is not the one "
+                "being measured" % (before_resets, last_resets))
+    return ("still_frames never dropped after reset (was %s, last seen %s) "
+            "— and this client exports no accum_resets, so the check is "
+            "the old sampled one and may be reporting a reset it simply "
+            "could not see" % (before, last))
 
 
 # The traced present path stamps a 12x12 pure-green square in the

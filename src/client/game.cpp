@@ -162,6 +162,30 @@ struct ClaudeVolume
 	// vantage.
 	u32 solid_count = 0;
 	u32 snap_seq = 0;
+	// accum_resets: how many times the accumulator has been ZEROED (not
+	// clamped) since the client started. Exists so a harness can PROVE a
+	// reset happened rather than infer it from a sampled value.
+	//
+	// Why it had to exist (2026-08-16, settle calibration). CI resets
+	// between arms by teleporting away and back, then proves it by
+	// polling still_frames for a value <= 3 or below what it read
+	// before. Both clauses look through a 1 Hz keyhole:
+	// claude_stats.json is rewritten once per second and the counter
+	// climbs at 70-90 per second, so the window in which a reset frame
+	// is visible as "<= 3" is ~0.03 s wide, and the "below before"
+	// clause is unusable whenever `before` is ALREADY small -- which is
+	// exactly the cozy-day-dark-ci case, where the previous arm's lamp
+	// swap had clamped it to 11. Measured: the check timed out reporting
+	// "still_frames never dropped after reset (was 11, last seen 1353)"
+	// for a reset the engine guarantees and the aim guard independently
+	// confirms. That false RED had already been recorded once, in
+	// spec/measured.md "Gate 4, second half", as part of a flake blamed
+	// wholly on the grass ABM.
+	//
+	// A counter cannot be missed by sampling: it only goes up, so any
+	// two reads bracket every reset between them. Instruments terminate;
+	// thresholds loop.
+	u32 accum_resets = 0;
 	// ---- INCREMENTAL RE-SNAP (2026-08-16) ------------------------------
 	// The CPU mirrors of the uploaded volumes, kept alive BETWEEN
 	// snapshots so a changed 16^3 block can be re-walked in place and
@@ -1435,6 +1459,7 @@ public:
 						|| (lcol - g_claude_volume.prev_light_col).getLength()
 								> 1e-4f) {
 					g_claude_volume.still_frames = 0.0f;
+					g_claude_volume.accum_resets++;
 					g_claude_volume.accum_alpha =
 							std::max(g_claude_volume.accum_alpha, 0.5f);
 				}
@@ -3092,9 +3117,11 @@ static void claudeUpdateAccum(Client *client)
 	if (origin_changed || moved > 20.0f) {
 		g_claude_volume.accum_alpha = 1.0f;
 		g_claude_volume.still_frames = 0.0f;
+		g_claude_volume.accum_resets++;
 	} else if (moved > 0.05f || turned > 1e-4f) {
 		g_claude_volume.accum_alpha = 0.5f;
 		g_claude_volume.still_frames = 0.0f;
+		g_claude_volume.accum_resets++;
 	} else {
 		g_claude_volume.still_frames += 1.0f;
 		// True 1/N running average, NO floor. The old renderer floored
@@ -3216,6 +3243,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 					+ g_claude_volume.prev_light_col.Y
 					+ g_claude_volume.prev_light_col.Z) / 3.0f
 			<< ", \"still_frames\": " << g_claude_volume.still_frames
+			// zeroings, not clamps -- see ClaudeVolume::accum_resets
+			<< ", \"accum_resets\": " << g_claude_volume.accum_resets
 			<< ", \"casc_valid\": [" << (g_claude_volume.casc[0].valid ? 1 : 0)
 			<< "," << (g_claude_volume.casc[1].valid ? 1 : 0)
 			<< "," << (g_claude_volume.casc[2].valid ? 1 : 0)
