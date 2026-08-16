@@ -330,18 +330,47 @@ def room_of(vantage_name):
     return VANTAGE_ROOM.get(vantage_name, vantage_name)
 
 
+ROOM_HASH_RETRIES = 4
+ROOM_HASH_RETRY_WAIT = 3.0   # s
+
+
 def room_hash(room_name):
-    """(hash, error) for ROOM_BOXES[room_name], via the bridge's OPS.scan."""
+    """(hash, error) for ROOM_BOXES[room_name], via the bridge's OPS.scan.
+
+    FOUND 2026-08-15 (roadmap 1b gate, the deliberate-break demonstration
+    itself): OPS.scan reports an unloaded cell as the literal string
+    "unloaded" rather than failing, so a room whose chunks have not
+    finished loading yet hashes to a value that mixes real node names
+    with "unloaded" placeholders -- a hash that is internally consistent
+    (reproducible) but not the room's true content. Caught live: a
+    --skip-deploy run refused cave-glass against the golden even though
+    the room was untouched; re-scanning after the chunk finished loading
+    reproduced the golden hash exactly. This is the documented
+    environment-laws landmine ("async block emerge races any sampler
+    that reads the world") arriving through a new door. Retrying here,
+    not just waiting longer once, because the failure is silent at the
+    OPS.scan layer -- there is nothing to distinguish "genuinely all air"
+    from "not loaded yet" without looking at the counts.
+    """
     box = ROOM_BOXES.get(room_name)
     if not box:
         return None, "no ROOM_BOXES entry for %r" % room_name
     p1, p2 = box
-    try:
-        r = lab.rpc("scan", p1={"x": p1[0], "y": p1[1], "z": p1[2]},
-                    p2={"x": p2[0], "y": p2[1], "z": p2[2]})
-        return r["hash"], None
-    except Exception as e:
-        return None, str(e)
+    last_err = None
+    for attempt in range(ROOM_HASH_RETRIES):
+        try:
+            r = lab.rpc("scan", p1={"x": p1[0], "y": p1[1], "z": p1[2]},
+                        p2={"x": p2[0], "y": p2[1], "z": p2[2]})
+            unloaded = (r.get("counts") or {}).get("unloaded", 0)
+            if not unloaded:
+                return r["hash"], None
+            last_err = ("%d/%d cells unloaded at scan time (attempt %d/%d)"
+                       % (unloaded, r.get("total"), attempt + 1,
+                          ROOM_HASH_RETRIES))
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(ROOM_HASH_RETRY_WAIT)
+    return None, last_err
 
 
 # Referee-room integrity. A room is a referee only while it is SEALED
