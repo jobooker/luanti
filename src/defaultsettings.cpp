@@ -169,6 +169,9 @@ void set_default_settings()
 	settings->setDefault("keymap_toggle_fog", "SYSTEM_SCANCODE_60"); // KEY_F3
 	settings->setDefault("keymap_toggle_claude_trace", "SYSTEM_SCANCODE_18"); // KEY_KEY_O
 	settings->setDefault("keymap_toggle_claude_bounce", "SYSTEM_SCANCODE_10"); // KEY_KEY_G (B is hotbar_previous)
+	// U cycles claude_view 0..6. Free letter next to O (the trace
+	// toggle); I, V, G, P, C, B, N, M, H, J, K are all taken.
+	settings->setDefault("keymap_claude_view_cycle", "SYSTEM_SCANCODE_24"); // KEY_KEY_U
 	settings->setDefault("keymap_claude_time_back", "SYSTEM_SCANCODE_47"); // [
 	settings->setDefault("keymap_claude_time_fwd", "SYSTEM_SCANCODE_48"); // ]
 	settings->setDefault("keymap_claude_time_toggle", "SYSTEM_SCANCODE_19"); // P

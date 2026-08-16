@@ -54,6 +54,7 @@ void MyEventReceiver::reloadKeybindings()
 	keybindings[KeyType::TOGGLE_FOG] = getKeySetting("keymap_toggle_fog");
 	keybindings[KeyType::TOGGLE_CLAUDE_TRACE] = getKeySetting("keymap_toggle_claude_trace");
 	keybindings[KeyType::TOGGLE_CLAUDE_BOUNCE] = getKeySetting("keymap_toggle_claude_bounce");
+	keybindings[KeyType::CLAUDE_VIEW_CYCLE] = getKeySetting("keymap_claude_view_cycle");
 	keybindings[KeyType::CLAUDE_TIME_BACK] = getKeySetting("keymap_claude_time_back");
 	keybindings[KeyType::CLAUDE_TIME_FWD] = getKeySetting("keymap_claude_time_fwd");
 	keybindings[KeyType::CLAUDE_TIME_TOGGLE] = getKeySetting("keymap_claude_time_toggle");

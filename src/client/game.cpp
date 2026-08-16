@@ -4929,6 +4929,8 @@ void Game::processItemSelection(u16 *new_playeritem)
 	}
 
 	// Clamp selection again in case it wasn't changed but max_item was
+	} else if (wasKeyPressed(KeyType::CLAUDE_VIEW_CYCLE)) {
+		claudeCycleView();
 	*new_playeritem = MYMIN(*new_playeritem, max_item);
 }
 
@@ -5256,6 +5258,49 @@ void Game::toggleDebug()
 // actually decides how far light bounces is claude_bounces (the shader
 // declares `claudeBounces` and the path loop reads it), so the key now
 // flips that: 1 = direct light only, 24 = the full transport the goldens
+// U: cycle the diagnostic views, 0 -> 1 -> ... -> 6 -> 0, naming each
+// one in words on the status line.
+//
+// It exists because there was no key at all: to see the normal ladder
+// John had to go Esc -> Settings -> find claude_view -> type a number,
+// which is not a thing anyone does mid-look (2026-08-16).
+//
+// The names are the shader header's own list (claude_trace/
+// opengl_fragment.glsl, "DIAGNOSTIC SUITE"), spelled out rather than
+// numbered, because a status line reading "claude_view 4" tells the
+// reader nothing they did not already type. Views 7 and 8 do not exist,
+// and 9/10/11 are roadmap-1a instrument A, which is a measurement rather
+// than a look-around view; the cycle stops at 6 and those stay reachable
+// by setting the dial.
+//
+// THE RESET IS THE POINT, not politeness. The shader header records it
+// as a known instrument side-effect: views 1-5 write their deterministic
+// image into the ping-pong history, so returning to view 0 at a parked
+// camera leaves that flat frame inside a running average whose alpha is
+// ~1/N -- for thousands of frames. Every step of the cycle resets, not
+// only the ones leaving 1-5: entering a view wants a clean start for the
+// same reason, and a rule with an exception in it is a rule someone gets
+// wrong later.
+void Game::claudeCycleView()
+{
+	static const char *const NAMES[] = {
+		"photo",            // 0
+		"normal ladder",    // 1
+		"albedo",           // 2
+		"emission (Le)",    // 3
+		"distance",         // 4
+		"bounce count",     // 5
+		"clay",             // 6
+	};
+	constexpr int N = (int)(sizeof(NAMES) / sizeof(NAMES[0]));
+	int cur = (int)g_settings->getFloat("claude_view", 0.0f, 16.0f);
+	int next = (cur >= 0 && cur < N - 1) ? cur + 1 : 0;
+	g_settings->set("claude_view", std::to_string(next));
+	claudeResetAccumulation();
+	m_game_ui->showStatusText(utf8_to_wide(
+			"claude_view " + std::to_string(next) + ": " + NAMES[next]));
+}
+
 // are taken with.
 //
 // The accumulator is reset here for the same reason the view key resets
