@@ -385,7 +385,15 @@ def new_run(tag):
 
 
 def cmd_curve(args):
-    args.runs = 1
+    """--runs > 1 walks the curve that many times from one seat.
+
+    It used to be hard-wired to one walk, so "three independent runs"
+    (which is what a run-to-run sd needs, and what spec/measured.md's
+    tables are means of) cost three seat restarts -- three builds, three
+    deploys, three freezes -- for data that only needs three teleports.
+    Each rep files its PNGs under its own prefix, so nothing overwrites
+    anything.
+    """
     out, rec = new_run("curve")
     err = bring_up(args, out, rec)
     if err:
@@ -394,7 +402,8 @@ def cmd_curve(args):
         print("ABORTED: %s" % err)
         return 1
     targets = [int(t) for t in args.targets.split(",")]
-    run_arms(args, out, rec, targets, lambda arm, rep: arm, print)
+    run_arms(args, out, rec, targets,
+             lambda arm, rep: "%s_r%d" % (arm, rep + 1), print)
     write_out(out, rec)
     return 0
 
@@ -536,6 +545,10 @@ def main():
 
     p = common(sub.add_parser("curve"))
     p.add_argument("--targets", default=",".join(str(t) for t in DEFAULT_TARGETS))
+    p.add_argument("--runs", type=int, default=1,
+                   help="independent walks of the curve per arm, from one "
+                        "seat (default %(default)s). A run-to-run sd needs "
+                        "at least 3.")
     p.set_defaults(func=ci.with_run_lock(cmd_curve))
     p = common(sub.add_parser("repeat"))
     p.add_argument("--n", type=int, required=True)

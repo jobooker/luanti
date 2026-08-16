@@ -488,3 +488,32 @@ end
 function OPS.setting(p)
     return { name = p.name, value = core.settings:get(p.name) }
 end
+
+-- Dig a node the way a player's hand does, not the way a mod does.
+--
+-- OPS.lamps and the room builders use core.set_node, which is the "mod
+-- edit" path. The bug under test (roadmap: "world edits do not reach the
+-- tracer while John drives") was reported for a HAND dig, and the whole
+-- question was whether the two paths differ from the client's point of
+-- view. core.node_dig runs the real thing: the protection check, the
+-- node's on_dig / after_dig_node, the drops, and core.remove_node.
+--
+-- WHAT THIS CANNOT REPRODUCE, stated rather than glossed: a real hand
+-- dig also runs the CLIENT-SIDE PREDICTION in game.cpp
+-- (client->removeNode(nodepos) when node_dig_prediction is "air"). A
+-- headless seat has no hand to press the mouse. It is the same
+-- Client::removeNode that handleCommand_RemoveNode calls for the
+-- server's packet, and both mark the same map block dirty, so the
+-- prediction cannot be the difference -- but this op tests the server
+-- half only, and the claim is scoped to that.
+function OPS.dig(p)
+    local pos = vector.new(p.x, p.y, p.z)
+    local node = core.get_node(pos)
+    if node.name == "air" or node.name == "ignore" then
+        return { dug = false, was = node.name }
+    end
+    local digger = core.get_player_by_name(p.player or ADMIN)
+    core.node_dig(pos, node, digger)
+    return { dug = core.get_node(pos).name == "air", was = node.name,
+             now = core.get_node(pos).name }
+end

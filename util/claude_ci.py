@@ -368,6 +368,31 @@ CI_SHOTS = [
 # PHOTO arm of the pinned golden run.
 GOLDEN_REF_SHOT = "cornell"
 
+
+def shots_for(args):
+    """The arms this invocation will shoot. ALL THIRTEEN unless --scored.
+
+    Only four arms carry a pass/fail verdict -- furnace-050, furnace-073,
+    cornell, cornell-nee1 -- because they are the only ones with a
+    referee. The other nine are captured, diffed against their goldens
+    and PUT IN THE GALLERY, but `A.add` is never called with an image
+    comparison for them, so no pixel they contain can turn a run red.
+    --scored shoots only the four.
+
+    THE DEFAULT DOES NOT MOVE, and that is deliberate rather than
+    cautious. John's standing rule from the settle calibration is "no arm
+    dropped", and the nine unscored arms are how a human sees a
+    regression the referees are blind to -- the cosy rooms are where
+    every geometry change has actually shown itself. --scored is a fast
+    inner loop for someone iterating on Cornell, not a cheaper CI. What
+    it costs in coverage is written into DECISIONS.md with the numbers
+    attached; whether it should ever be the default is not this session's
+    call to make.
+    """
+    if getattr(args, "scored", False):
+        return [d for d in CI_SHOTS if d["referee"]]
+    return list(CI_SHOTS)
+
 # Room doorways (claude_gallery_deploy layout: floor y=8, walk y=9, doors
 # on the z=0 line). The referee rooms MUST be shut to be referees — an
 # open door leaks the sky into an analytic furnace. Plugged before the
@@ -975,6 +1000,40 @@ def await_complete(path):
     return None
 
 
+class Timeline:
+    """Where a shot's seconds actually went.
+
+    THE HANDOFF'S ORDER, and it is the right one: ~185 s of a 682 s run
+    was not settle at all and NOBODY HAD ATTRIBUTED IT. The last time
+    someone looked at a number of that shape it turned out to be 25 s per
+    capture burning a timeout inside await_grid, which had read as a
+    benign retry for a month. So this is built before anything is cut,
+    and it stays afterwards -- a phase that grows back is then one grep
+    away instead of one archaeology session away.
+
+    Wall clock only, and deliberately dumb: a monotonic clock, one mark
+    per phase, no averaging and no smoothing. The numbers land in
+    run.json next to the settle they are being compared against.
+    """
+
+    def __init__(self):
+        self._t0 = time.monotonic()
+        self._last = self._t0
+        self.phases = {}
+
+    def mark(self, name):
+        now = time.monotonic()
+        self.phases[name] = round(now - self._last, 2)
+        self._last = now
+        return self.phases[name]
+
+    def done(self):
+        d = dict(self.phases)
+        d["TOTAL"] = round(time.monotonic() - self._t0, 2)
+        d["_other"] = round(d["TOTAL"] - sum(self.phases.values()), 2)
+        return d
+
+
 def push_dials(dials, marker):
     """Write the whole dial block plus a unique per-capture marker.
 
@@ -1246,10 +1305,14 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     name = shot["name"]
     room = room_of(vantage_name or shot["name"])
     info = {}
+    tl = Timeline()
     info["dials_preapplied"] = push_dials(
             dials, "%s_pre_%d" % (name, time.time_ns()))
+    tl.mark("dials_pre")
     info["reset_error"] = reset_accumulation(vantage, park)
+    tl.mark("reset")
     info["aim_at_start"] = read_aim()
+    tl.mark("aim_start")
     # Take one snapshot here — before the settle, since it clamps
     # still_frames — and re-assert the dials after it. Follow being on
     # does not make this redundant: the follow path only re-centres on
@@ -1263,12 +1326,15 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # before a read taken after it. See await_grid.
     seq_before = (lab.read_stats() or {}).get("grid_snap_seq")
     info["dials_pushed"] = push_dials(block, marker)
+    tl.mark("dials_push")
     # the settle clock starts only once the grid is proven present:
     # a snapshot also clamps still_frames, so waiting here costs nothing
     # and a capture over an empty bubble costs everything.
     info["grid"] = await_grid(marker, block, room=room,
                                   seq_before=seq_before)
+    tl.mark("await_grid")
     info["settle"] = await_frames(settle)
+    tl.mark("settle")
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
     # "Owed to the harness"): the record written after the write is 1-3
@@ -1277,6 +1343,7 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # which is the safe side for a convergence floor.
     ok, detail = aim_ok(info.get("aim_at_start"), read_aim(), vantage)
     info["aim_at_shutter"] = {"ok": ok, "detail": detail}
+    tl.mark("aim_shutter")
     before = lab.newest_shot()
     st = lab.read_stats() or {}
     info["still_frames_at_shutter"] = st.get("still_frames")
@@ -1297,6 +1364,7 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
         time.sleep(SHOT_POLL_INTERVAL)
     if not png:
         raise RuntimeError("no complete screenshot appeared for %s" % name)
+    tl.mark("shutter")
     lab.write_capture_record(png)
 
     dst = os.path.join(rundir, name + ".png")
@@ -1312,7 +1380,9 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
                  "still_frames": st2.get("still_frames"),
                  "accum_alpha": st2.get("accum_alpha"), "fps": st2.get("fps"),
                  "cap_artifact": cap.get("cap_artifact")})
+    tl.mark("png")
     info["dial_state"] = dial_state(png, dials, marker)
+    tl.mark("dial_state")
 
     # Room hash (roadmap 1b): the same box every run, hashed by the
     # bridge (OPS.scan) AFTER the settle, so it reflects exactly what was
@@ -1332,6 +1402,8 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     except Exception as e:
         info["room_hash_error"] = "%s (also: sidecar write failed: %s)" % (herr, e)
 
+    tl.mark("room_hash")
+    info["timeline"] = tl.done()
     return dst, info
 
 
@@ -1823,9 +1895,11 @@ def cmd_run(args):
     base = dict(CANONICAL_DIALS)
     base["claude_nee"] = args.nee
     run = dict(git, run_id=run_id, settle=args.settle,
+               scored_only=bool(getattr(args, "scored", False)),
                started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                dials=base, shots={}, assertions=[])
     A = Assertions()
+    rtl = Timeline()
 
     err = bring_up_seat(rundir, run, args)
     if err:
@@ -1833,6 +1907,7 @@ def cmd_run(args):
         A.add("seat", False, err)
         return finish(run, rundir, A)
 
+    rtl.mark("seat_up")
     A.add("build-release", (run.get("build_type") or "").lower() in RELEASE_TYPES,
           "CMAKE_BUILD_TYPE=%s" % run.get("build_type"))
     dep = run.get("gallery_deploy") or {}
@@ -1855,7 +1930,9 @@ def cmd_run(args):
 
     vs = lab.load_vantages()
     run["doors_shut"] = set_doors(True)
+    rtl.mark("doors_shut")
     run["room_integrity"] = check_room_integrity()
+    rtl.mark("room_integrity")
     for item in run["room_integrity"]:
         bad = item.get("off_spec") or []
         A.add("room-%s-onspec" % item["room"], not bad,
@@ -1870,7 +1947,7 @@ def cmd_run(args):
         prev, gold = previous_run(run_id), read_golden()
         run["prev_run"], run["golden_run"] = prev, gold
         run["golden_png"] = gold_png
-        for shot_def in CI_SHOTS:
+        for shot_def in shots_for(args):
             name, vname = shot_def["name"], shot_def["vantage"]
             if vname not in vs:
                 A.add("%s-capture" % name, False,
@@ -1922,6 +1999,7 @@ def cmd_run(args):
                     gold_png if kind == "cornell" else None,
                     golden_refused=gold_refused if kind == "cornell" else None)
             shot["verdict"] = list(verdict(shot_def, shot.get("referee")))
+            shot["shot_s"] = rtl.mark("shot_" + name)
             run["shots"][name] = shot
             A.add("%s-room-hash" % name, not gold_refused,
                   gold_refused or ("hash %s (room %s)"
@@ -1967,6 +2045,8 @@ def cmd_run(args):
                       shot["verdict"][0] == "PASS", shot["verdict"][1])
     finally:
         run["doors_reopened"] = set_doors(False)
+        rtl.mark("doors_reopened")
+        run["timeline"] = rtl.done()
     return finish(run, rundir, A)
 
 
@@ -1985,6 +2065,23 @@ def finish(run, rundir, A):
                                 run.get("shots", {}).get(d["name"], {})
                                 .get("verdict", ["-"])[0])
                      for d in CI_SHOTS)
+    if run.get("scored_only"):
+        print("!! --scored: %d of %d arms shot. This run proves LESS than a "
+              "full one and must not be pinned as a golden."
+              % (len(run.get("shots") or {}), len(CI_SHOTS)))
+    tl = run.get("timeline") or {}
+    if tl:
+        settle_s = sum((s.get("capture", {}).get("settle", {}) or {})
+                       .get("wall_s", 0) or 0
+                       for s in run.get("shots", {}).values())
+        over = sum((s.get("capture", {}).get("timeline", {}) or {})
+                   .get("TOTAL", 0) - ((s.get("capture", {}).get("settle", {})
+                                        or {}).get("wall_s", 0) or 0)
+                   for s in run.get("shots", {}).values())
+        print("wall clock %.0f s = settle %.0f s + per-shot overhead %.0f s "
+              "+ seat/deploy/referees %.0f s"
+              % (tl.get("TOTAL", 0), settle_s, over,
+                 tl.get("TOTAL", 0) - settle_s - over))
     print("%s %s@%s  %s" % ("DIRTY" if run["dirty"] else "clean",
                             run["branch"], run["sha"], marks))
     print(master)
@@ -2120,6 +2217,12 @@ def cmd_golden(args):
         print("REFUSING: %s was captured against a %s build tree."
               % (rid, run.get("build_type")))
         return 1
+    if run.get("scored_only"):
+        print("REFUSING: %s was a --scored run (%d of %d arms). A golden "
+              "every later run is measured against cannot be missing nine "
+              "of its images." % (rid, len(run.get("shots") or {}),
+                                  len(CI_SHOTS)))
+        return 1
     if (run.get("dials") or {}).get("claude_nee") not in (0, "0"):
         print("REFUSING: %s is not a PHOTO run (claude_nee=%s). The golden "
               "is the truth mode (physics-contract §6)."
@@ -2144,6 +2247,26 @@ def cmd_regions(args):
         cornell.print_regions(args.image)
         if args.golden:
             cornell.print_ratios(args.image, args.golden)
+    if args.annotate:
+        # §8 clause 4: a referee box gets LOOKED AT on a real frame before
+        # it is believed, not just printed as four numbers. Outlines are
+        # white-on-black double strokes and each box is captioned with its
+        # region name -- John is colorblind, so the drawing carries its
+        # meaning in brightness, shape and words, never in hue.
+        from PIL import Image, ImageDraw
+        im = Image.open(args.image).convert("RGB")
+        d = ImageDraw.Draw(im)
+        w, h = im.size
+        for name, boxes in cornell.REGIONS.items():
+            for (x0, y0, x1, y1) in boxes:
+                px = (x0 * w, y0 * h, x1 * w, y1 * h)
+                d.rectangle(px, outline=(0, 0, 0), width=6)
+                d.rectangle(px, outline=(255, 255, 255), width=2)
+                d.text((px[0] + 6, max(0, px[1] - 16)), name,
+                       fill=(255, 255, 255), stroke_width=3,
+                       stroke_fill=(0, 0, 0))
+        im.save(args.annotate)
+        print("annotated: %s" % args.annotate)
     return 0
 
 
@@ -2183,6 +2306,13 @@ def main():
         p.add_argument("--allow-debug", action="store_true",
                        help="capture against a Debug build tree anyway "
                             "(scratch only — environment-laws forbids it)")
+        p.add_argument("--scored", action="store_true",
+                       help="shoot ONLY the four arms that carry a "
+                            "pass/fail verdict (furnace-050, furnace-073, "
+                            "cornell, cornell-nee1). NOT the default and "
+                            "not a cheaper CI -- the nine it drops are how "
+                            "a human sees what the referees are blind to. "
+                            "A fast inner loop for Cornell work.")
         p.add_argument("--nee", type=int, default=0, choices=(0, 1),
                        help="claude_nee for the base arms: 0 = the photo "
                             "path, the truth mode (default). The cornell-nee1 "
@@ -2200,6 +2330,9 @@ def main():
     p = sub.add_parser("regions", help="show the Cornell region boxes")
     p.add_argument("image", nargs="?")
     p.add_argument("--golden")
+    p.add_argument("--annotate", metavar="OUT.png",
+                   help="draw the boxes on IMAGE and save, so a human can "
+                        "check a referee box is on the surface it names")
     p.set_defaults(func=cmd_regions)
     args = ap.parse_args()
     sys.exit(args.func(args))

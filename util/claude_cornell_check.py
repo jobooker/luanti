@@ -69,8 +69,49 @@ REGIONS = {
     # means, not spot samples, and moving the box moves the number.
     "red_wall": [(0.02, 0.10, 0.24, 0.78)],
     "green_wall": [(0.74, 0.10, 0.98, 0.66)],
-    # the bottom-left floor wedge: the only floor a HUD-on frame shows.
-    "floor": [(0.165, 0.930, 0.225, 0.990)],
+    # THE FLOOR, THREE BOXES, ~62,000 px. It was ONE box of 7,465 px in
+    # the bottom-left wedge, and that box alone set how deep every CI shot
+    # in the run had to be.
+    #
+    # Why it was small: the comment above says "the only floor a HUD-on
+    # frame shows", and that was true when it was written. CI has pushed
+    # claude_show_hud = 0 since 2026-08-15 (CANONICAL_DIALS -- the hotbar
+    # is pixels inside a measured crop), so the hotbar has not covered
+    # anything for a day and the floor wedge visible to a referee is
+    # eight times larger than the box drawn over it.
+    #
+    # Why it mattered (spec/measured.md, "THE KNEE RULE HAS NO ANSWER"):
+    # `floor` is the noisiest surface in the room per pixel -- dark, seen
+    # at a grazing angle, lit almost entirely by indirect -- AND it had
+    # the smallest box by 3-42x. The two multiply: 19x the run-to-run sd
+    # of back_wall, 0.876 % at N=250 falling as 1/sqrt(N) with no
+    # systematic part. Four of the five regions are settled by N=250;
+    # this one is not settled at N=16,000, so it forced SETTLE_FRAMES =
+    # 2000 on all thirteen arms.
+    #
+    # MEASURED before any seat time was spent, by re-reading the 46
+    # cornell.png files already on disk in screenshots/ci: over the three
+    # clean runs at 3dec2a935 the old box's sd is 0.2152 % and the new
+    # one's 0.0147 % -- and over the six at b9e4382df, 0.1309 % against
+    # 0.0374 %. A 3.5-14.6x reduction, more than the sqrt(8.3) = 2.9x the
+    # area alone predicts, because three boxes on three parts of the
+    # floor decorrelate what one box could not.
+    #
+    # WHAT THE NEW REGION CAN AND CANNOT SEE (physics-contract §8.3).
+    # CAN: indirect light on the floor across the width of the room, both
+    # occluders' contact shadows, and the near-to-far grazing gradient.
+    # It still contains the old box's surface, so its answer is a
+    # superset of the old one's, not a different question.
+    # CANNOT: the emitter, the ceiling, either coloured wall (all outside
+    # every box, and the purity test would fail if one crept in); the
+    # occluder faces themselves; and -- unchanged from before -- anything
+    # about specular response, since the renderer has none.
+    #
+    # The boxes are clear of every seam by >= 14 px at 1920x1080 and were
+    # checked by eye on an annotated frame, per §8 clause 4.
+    "floor": [(0.458, 0.843, 0.599, 0.990),    # between the two occluders
+              (0.182, 0.917, 0.232, 0.990),    # the old bottom-left wedge
+              (0.747, 0.944, 0.838, 0.990)],   # right of the far occluder
 }
 
 # Legacy bleed strips. MEASURED 2026-08-15: at this vantage these two
