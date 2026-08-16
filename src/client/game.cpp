@@ -372,15 +372,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// bug in the estimator, never a reason to retune the truth (§6).
 	float m_nee = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_nee_pixel{"claudeNee"};
-	// claude_trace RNG source. 0 (default) = the rung-1 sine-free hash
-	// CHAIN (g_rngState = hash11(g_rngState + phi)); 1 = a counter-based
-	// PCG keyed on (pixel, frame, draw index). INSTRUMENT B of roadmap
-	// step 1a: an iterated float hash is not a random number generator,
-	// and its successive-draw structure biases a Monte Carlo estimator
-	// DETERMINISTICALLY — which is the shape of the defect (identical to
-	// four decimals across seats). One dial, one variable, both modes
-	// measurable in the same run.
-	float m_rng = 0.0f;
+	// claude_trace RNG source. 1 (DEFAULT since roadmap 1a) = a
+	// counter-based PCG keyed on (pixel, frame, draw index). 0 = the
+	// rung-1 sine-free hash CHAIN (g_rngState = hash11(g_rngState +
+	// phi)), kept reachable for one release as the A/B partner and
+	// documented as THE OLD, BIASED CHAIN: an iterated float hash is a
+	// trajectory, not a generator, and its successive-draw structure
+	// biased the cosine-hemisphere sampler by ~9% against a compact
+	// overhead light — deterministically, which is why it reproduced to
+	// four decimals across seats. It made PHOTO MODE 1-8% dark in
+	// Cornell (spec/measured.md "1a"), so every Cornell number taken
+	// before that line was measured against a dark truth renderer.
+	float m_rng = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_rng_pixel{"claudeRng"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
@@ -847,13 +850,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_nee", 0.0f, 1.0f);
 	}
 
-	// claude_trace RNG source, 0/1. 0 (default) = the rung-1 hash chain,
-	// which is what every number in measured.md was taken with. 1 = the
-	// counter-based PCG. See m_rng.
+	// claude_trace RNG source, 0/1. 1 (default) = the counter-based PCG.
+	// 0 = the old, biased hash chain, which is what every Cornell number
+	// in measured.md before the "1a" section was taken with. See m_rng.
 	static float readRng()
 	{
 		if (!g_settings->exists("claude_rng"))
-			return 0.0f;
+			return 1.0f;
 		return g_settings->getFloat("claude_rng", 0.0f, 1.0f);
 	}
 

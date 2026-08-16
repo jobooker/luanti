@@ -233,15 +233,24 @@ uniform float claudeBounces;
 // sampling, no MIS weight, not one extra RNG draw). 1 = next-event
 // estimation with multiple importance sampling. See the rung-2 header.
 uniform float claudeNee;
-// RNG SOURCE — INSTRUMENT B of roadmap step 1a. 0 (default) = the rung-1
-// hash CHAIN below, which is what every number in measured.md was taken
-// with. 1 = a counter-based PCG keyed on (pixel, frame, draw index).
-// An iterated float hash is not a random number generator: whatever
+// RNG SOURCE. 1 (DEFAULT since roadmap 1a) = the counter-based PCG
+// below, keyed on (pixel, frame, draw index). 0 = the rung-1 hash CHAIN
+// (g_rngState = hash11(g_rngState + phi)) — kept reachable for one
+// release as the A/B partner, and it is THE OLD, BIASED ONE.
+//
+// An iterated float hash is a trajectory, not a generator. Whatever
 // structure its successive outputs carry becomes a DETERMINISTIC bias in
-// every estimator that consumes them, which is exactly the shape of the
-// 1a defect (reproducible to four decimals on two seats). This dial is
-// the one variable that separates "the estimator is wrong" from "the
-// numbers it is fed are not random".
+// every estimator that consumes them, and this one biased
+// cosineHemisphere() by ~9% against a compact overhead light. The
+// marginals looked fine (E[u1] = 0.4993, E[sqrt(1-u1)] = 0.6643 vs
+// 0.6667, P(u1<0.1) = 0.1010) — it is JOINT structure between successive
+// draws, which no test of one draw at a time can see.
+//
+// It reproduced to four decimals on two separate seats, which is what
+// made it look like an estimator bug rather than noise. It was in PHOTO
+// MODE: the pure path is nothing but this sampler, so the truth renderer
+// itself ran 1-8% dark in Cornell and the "NEE is hot" finding was the
+// estimator being RIGHT. spec/measured.md "1a".
 uniform float claudeRng;
 
 // AREA-EMITTER LIST for next-event estimation (game.cpp
@@ -431,7 +440,7 @@ float hash13(vec3 p3)
 
 float g_rngState;
 
-// --- counter-based alternative (claudeRng = 1) ------------------------
+// --- the RNG (claudeRng = 1, the default) ------------------------------
 // PCG output-permuted LCG on a 32-bit word. Unlike the chain above, the
 // draw index enters as DATA rather than as iteration count, so draw n
 // and draw n+1 are two hashes of two different inputs and share no

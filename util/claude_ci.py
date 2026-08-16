@@ -103,12 +103,14 @@ CANONICAL_DIALS = {
     "claude_volume_debug": 3,
     "claude_nee": 0,            # PHOTO MODE IS THE TRUTH (§6). The
                                 # estimator gets its own arm below.
-    # RNG source: 0 = the rung-1 hash chain, which is what every number
-    # in measured.md was taken with. Pushed EXPLICITLY and proven, like
-    # the rest — an unset claude_* dial is a silent default
-    # (environment-laws, the hidden-default class), and this one decides
-    # what the Monte Carlo integrator is actually integrating.
-    "claude_rng": 0,
+    # RNG source: 1 = the counter-based PCG, the default since roadmap
+    # 1a. 0 is the old hash chain, which biased the direction sampler by
+    # ~9% and made photo mode 1-8% dark in Cornell — every Cornell number
+    # before measured.md's "1a" section was taken with it. Pushed
+    # EXPLICITLY and proven, like the rest: an unset claude_* dial is a
+    # silent default (environment-laws, the hidden-default class), and
+    # this one decides what the Monte Carlo integrator integrates.
+    "claude_rng": 1,
     "claude_stats": 1,
     # freeze the volume bubble: the periodic re-snap is a ~295 ms hitch
     # every 3 s and a silent scene change under a settling accumulator.
