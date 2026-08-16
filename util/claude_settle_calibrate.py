@@ -161,6 +161,43 @@ def shutter(outdir, label):
     return dst, sf_after
 
 
+# claude_ci.reset_accumulation cannot prove the SECOND reset, and that
+# is not a flaw in it -- it is being asked a question it was not built
+# for. It returns when still_frames is <= 3 or has fallen BELOW the value
+# it read on entry. Entering with a deep accumulator both conditions are
+# easy; entering right after a snapshot clamp, with `before` already ~5,
+# a poll that lands one stats window late reads 200, which is neither
+# <= 3 nor < 5 -- so it polls out its full 15 s and reports a reset that
+# demonstrably happened. MEASURED: cozy-ci started its walk at
+# still_frames 1,414 (15 s x 92 fps) for exactly this reason.
+#
+# The teleport itself is not in doubt (the aim guard checks where the
+# camera ended up, and game.cpp zeroes on any move > 0.05 nodes). What
+# is wanted here is only "start the walk with a SHALLOW accumulator, and
+# say how shallow" -- so this asks that question directly, and reports
+# the depth rather than a boolean.
+WALK_START_MAX = 300       # still_frames; ~3 s at this seat's frame rate
+WALK_RESET_TIMEOUT = 10.0
+
+
+def reset_for_walk(v, park):
+    """(error_or_None, still_frames_at_walk_start)."""
+    try:
+        lab.goto(park)
+        time.sleep(0.3)
+        lab.goto(v)
+    except Exception as e:
+        return "reset rpc failed: %s" % e, None
+    deadline, sf = time.time() + WALK_RESET_TIMEOUT, None
+    while time.time() < deadline:
+        sf = (lab.read_stats() or {}).get("still_frames")
+        if sf is not None and sf <= WALK_START_MAX:
+            return None, sf
+        time.sleep(0.2)
+    return ("still_frames stayed at %s (> %d) after the teleport"
+            % (sf, WALK_START_MAX)), sf
+
+
 def start_arm(arm, vantages, dials, log):
     """dials -> reset -> snapshot -> volume proven -> RESET AGAIN -> walk.
 
@@ -199,8 +236,7 @@ def start_arm(arm, vantages, dials, log):
     ci.push_dials(block, marker)
     vol = ci.await_volume(marker, block, room=ci.room_of(arm),
                           seq_before=seq0)
-    reset_err2 = ci.reset_accumulation(v, park)
-    sf0 = (lab.read_stats() or {}).get("still_frames")
+    reset_err2, sf0 = reset_for_walk(v, park)
     log("    volume ok=%s solid=%s; walk starts at still_frames %s"
         % (vol.get("ok"), vol.get("volume_solid"), sf0))
     return v, aim0, {"reset_error": reset_err, "reset_error_2": reset_err2,
