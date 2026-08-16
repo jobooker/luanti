@@ -34,6 +34,7 @@
 #include "nodedef.h"         // Needed for determining pointing to nodes
 #include "node_visuals.h"    // claude_grid: per-nodetype minimap_color
 #include "client/claude_lod.h" // far cascade (Phase 1)
+#include "client/claude_nodebox.h" // real geometry from ContentFeatures::node_box
 #include "nodemetadata.h"
 #include "particles.h"
 #include "porting.h"
@@ -255,6 +256,27 @@ struct ClaudeTraceGrid
 	std::vector<std::array<std::array<float, 5>, 4>> model_glow; // xyz,int,radius
 	u32 model_ids_tex = 0, model_atlas_tex = 0, model_pal_tex = 0;
 	bool model_tex_dirty = false;
+	// REAL GEOMETRY FROM THE NODE DEFINITION (2026-08-16, coverage 2).
+	// Stairs, slabs and beds already carry their true shape in
+	// ContentFeatures::node_box, and vanilla's own raycast reads it. The
+	// converter turns that box list into the SAME 16^3 mask the authored
+	// models produce, so there is one sub-voxel format and one consumer.
+	//
+	// Cached by (content << 8) | param2, NOT by content alone:
+	// transformNodeBox rotates a NODEBOX_FIXED box list by facedir, so one
+	// stair node at two param2 values is two different shapes. That is
+	// also why the block hash mixes the mask id below — see the walk.
+	//
+	// Ring-local (32^3), because the sub-voxel ring is [48,80)^3 and a
+	// cell outside it has nowhere to put bits: outside the ring a nodebox
+	// node stays an honest 1 m cube, exactly as it is today.
+	static constexpr int NBOX_R0 = 48, NBOX_R1 = 80;
+	static constexpr int NBOX_RING = NBOX_R1 - NBOX_R0;
+	static constexpr size_t NBOX_CAP = 4096; // distinct shapes; 2 MB
+	bool nodebox_on = true;
+	std::vector<u16> nbox_ids;                   // RING^3, 0 = none
+	std::vector<std::array<u8, 512>> nbox_masks; // 1-based via nbox_ids
+	std::unordered_map<u32, u16> nbox_of;        // shape cache
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
 	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
@@ -2148,6 +2170,81 @@ static void claudePackBox(const u8 *src, int dx, int dy, int comp,
 // from the full path: gate 4 asks the two to produce the identical
 // grid, and the only honest way to promise that is to have one
 // implementation rather than two that agree today.
+// 1 (default) = read stairs/slabs/beds from ContentFeatures::node_box;
+// 0 = every solid stays an honest 1 m cube, i.e. the behaviour before
+// 2026-08-16. An explicit default rather than an absent-key fallback,
+// because an unset dial silently taking a hidden default is a whole bug
+// class in this tree (environment-laws.md, "the hidden-default class").
+//
+// This is also the A/B toggle the debugging discipline requires: the
+// cost recorded in spec/measured.md "Nodebox geometry" is one dial apart.
+static bool claudeNodeBoxEnabled()
+{
+	if (!g_settings->exists("claude_nodebox"))
+		return true;
+	return g_settings->getFloat("claude_nodebox", 0.0f, 1.0f) >= 0.5f;
+}
+
+// Ring-local index for the sub-voxel ring, or -1 outside it. The ring is
+// the ONLY place a cell can carry 16^3 bits (game.cpp's subvox texture is
+// 32 cells wide), so it gates the nodebox path exactly as it gates the
+// authored-model path for point lights.
+static inline int claudeNBoxRing(int x, int y, int z)
+{
+	constexpr int R0 = ClaudeTraceGrid::NBOX_R0, R1 = ClaudeTraceGrid::NBOX_R1;
+	constexpr int W = ClaudeTraceGrid::NBOX_RING;
+	if (x < R0 || x >= R1 || y < R0 || y >= R1 || z < R0 || z >= R1)
+		return -1;
+	return ((z - R0) * W + (y - R0)) * W + (x - R0);
+}
+
+// One node's real box list -> a 16^3 mask id, memoised per shape.
+//
+// The rasterizer runs once per DISTINCT (content, param2), not once per
+// cell: a cabin floor of 200 identical slabs converts one box list. The
+// cache is never invalidated because a node definition does not change
+// inside a session; param2 is in the key, so a rotated stair is a
+// different entry rather than a stale one.
+//
+// Returns 0 for "leave this cell a 1 m cube", which is the answer for
+// every shape the grid must not express: an empty box list (a
+// NODEBOX_REGULAR cube), a box list that fills the whole cell anyway
+// (a mask that costs 512 bytes to say nothing), and a shape found after
+// the budget is spent. 0 is CACHED too, so a fallback costs one
+// rasterization, not one per cell per walk.
+static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, const MapNode &n,
+		content_t c, const ContentFeatures &f)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	u32 key = ((u32)c << 8) | (u32)n.getParam2();
+	auto it = V.nbox_of.find(key);
+	if (it != V.nbox_of.end())
+		return it->second;
+
+	u16 id = 0;
+	if (V.nbox_masks.size() < ClaudeTraceGrid::NBOX_CAP) {
+		std::vector<aabb3f> boxes;
+		// Luanti's OWN reader, not a re-derivation of it: this is the
+		// function the mesh generator and the raycast use, so the traced
+		// shape cannot drift from the shape the player collides with.
+		// neighbours = 0 is safe because claudeNodeBoxConvertible()
+		// refuses NODEBOX_CONNECTED, the only type that reads them.
+		n.getNodeBoxes(ndef, &boxes, 0);
+		std::array<u8, 512> mask{};
+		int bits = claudeRasterizeBoxes(boxes, mask.data());
+		if (bits > 0 && bits < 4096) {
+			V.nbox_masks.push_back(mask);
+			id = (u16)V.nbox_masks.size();
+		}
+	} else if (V.nbox_of.size() == ClaudeTraceGrid::NBOX_CAP) {
+		warningstream << "[claude_grid] nodebox shape cache full at "
+				<< ClaudeTraceGrid::NBOX_CAP
+				<< "; further shapes render as 1 m cubes" << std::endl;
+	}
+	V.nbox_of[key] = id;
+	return id;
+}
+
 static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		Map &map, v3s16 origin, int b)
 {
@@ -2187,6 +2284,13 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		occ[i * 4 + 2] = 0; occ[i * 4 + 3] = 0;
 		mids[i] = 0;
 		V.modelids[i] = 0;
+		// Ring-local shape id, cleared for the same reason modelids is:
+		// an in-place re-walk that leaves the old id sitting there is a
+		// dug stair whose shadow stays behind.
+		int nbring = claudeNBoxRing(x, y, z);
+		if (nbring >= 0 && !V.nbox_ids.empty())
+			V.nbox_ids[nbring] = 0;
+		u16 nbid = 0;
 		MapNode n = map.getNode(origin + v3s16(x, y, z));
 		content_t c = n.getContent();
 		if (c == CONTENT_AIR || c == CONTENT_IGNORE)
@@ -2284,8 +2388,11 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 					occ[i * 4 + 1] = col.getGreen();
 					occ[i * 4 + 2] = col.getBlue();
 					occ[i * 4 + 3] = 250;
+					// ROTATION IS SHAPE (2026-08-16). See the general
+					// path below for why param2 has to reach the hash.
 					hash = hash * 1099511628211ULL
-							+ (u64)i * 7919 + 250;
+							+ (u64)i * 7919 + 250
+							+ (u64)g_claude_grid.modelids[i] * 31;
 					solid++;
 					continue;
 				}
@@ -2351,8 +2458,48 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 							z + gl[2], gl[3], gl[4]});
 			}
 		}
+		// REAL GEOMETRY FROM THE NODE DEFINITION. After the authored-model
+		// branch on purpose: a hand-made model beats an extracted box
+		// list, so model_of stays the override it has always been.
+		//
+		// Gated to acls == 255 (a plain opaque solid): water, glass,
+		// leaves and every emissive class keep the classification they
+		// have today, and NODEBOX_REGULAR cannot reach here at all
+		// because claudeNodeBoxConvertible() refuses it (handoff gate 2).
+		if (V.nodebox_on && nbring >= 0 && acls == 255
+				&& V.modelids[i] == 0
+				&& f.drawtype == NDT_NODEBOX
+				&& claudeNodeBoxConvertible(f.node_box)) {
+			nbid = claudeNodeBoxMaskId(ndef, n, c, f);
+			if (nbid) {
+				acls = 250;              // "this cell has sub-voxel bits"
+				V.nbox_ids[nbring] = nbid;
+			}
+		}
 		occ[i * 4 + 3] = acls;
 		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
+		// SHAPE IS PART OF THE CONTENT, and until 2026-08-16 it was not.
+		//
+		// The hash decides whether a re-walked block gets baked and
+		// uploaded (claudeTraceGridIncremental: `if (block_hash[b] ==
+		// before) continue;`). It mixed the class byte and the red
+		// channel and NOTHING derived from param2 -- so rotating a node
+		// in place re-walked the block, updated the CPU mirror, produced
+		// an identical hash, and skipped the upload. The GPU kept the old
+		// shape and the log said "none changed". That was already true of
+		// the authored models' `rot`; a nodebox makes it true of every
+		// stair, and the handoff names it as the landmine that
+		// invalidates the whole step.
+		//
+		// The mask ID is the right thing to mix, not param2 itself: it is
+		// the geometry that will actually be baked, so two param2 values
+		// that mean the same shape correctly hash the same, and a param2
+		// change that means nothing here (a biome tint, a liquid level)
+		// does not churn the upload path.
+		if (nbid)
+			hash = hash * 1099511628211ULL + (u64)nbid * 7919;
+		else if (V.modelids[i])
+			hash = hash * 1099511628211ULL + (u64)V.modelids[i] * 31;
 		// material id (0 = untextured); palette + atlas grow on first sight
 		auto pit = g_claude_grid.palette.find(c);
 		if (pit != g_claude_grid.palette.end()) {
@@ -2537,7 +2684,10 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 {
 	ClaudeTraceGrid &V = g_claude_grid;
 	constexpr int S = ClaudeTraceGrid::SIZE;
-	const int R0 = 48, R1 = 80;
+	// ONE ring definition. The nodebox path indexes nbox_ids with the
+	// same constants (claudeNBoxRing), and two copies of 48/80 is how a
+	// mask ends up written one cell away from the cell that claims it.
+	const int R0 = ClaudeTraceGrid::NBOX_R0, R1 = ClaudeTraceGrid::NBOX_R1;
 	auto &sv = V.subvox;
 	if (sv.empty())
 		sv.assign((size_t)64 * 512 * 512, 0);
@@ -2555,6 +2705,14 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 		if (mtag >> 2) {
 			// authored model: its pre-rotated mask IS the cell
 			mm = V.models[(mtag >> 2) - 1][mtag & 3].data();
+		} else if (a > 230 && !V.nbox_ids.empty()) {
+			// NODE-DEFINITION GEOMETRY (stairs, slabs, beds). Same
+			// 512-byte layout, same consumer, one rung below an authored
+			// model in priority. rx/ry/rz are already ring-local.
+			u16 nb = V.nbox_ids[((size_t)rz * ClaudeTraceGrid::NBOX_RING
+					+ ry) * ClaudeTraceGrid::NBOX_RING + rx];
+			if (nb)
+				mm = V.nbox_masks[nb - 1].data();
 		}
 		// a <= 230 is air / water / glass / nub: no bits
 		u8 fill = (a > 230 && !mm) ? 0xFF : 0x00;
@@ -2872,7 +3030,7 @@ static bool claudeTraceGridUploadBox(int x0, int y0, int z0, int w, int h, int d
 	// an intersection is always a whole number of 16-cell spans and the
 	// 2-bytes-per-cell x extent is always a multiple of 4
 	{
-		const int R0 = 48, R1 = 80;
+		const int R0 = ClaudeTraceGrid::NBOX_R0, R1 = ClaudeTraceGrid::NBOX_R1;
 		int lx = std::max(x0, R0), hx = std::min(x0 + w, R1);
 		int ly = std::max(y0, R0), hy = std::min(y0 + h, R1);
 		int lz = std::max(z0, R0), hz = std::min(z0 + d, R1);
@@ -2926,6 +3084,7 @@ static void claudeTraceGridSnapshot(Client *client)
 	Map &map = client->getEnv().getMap();
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	claudeLoadModels(ndef);
+	V.nodebox_on = claudeNodeBoxEnabled();
 	// RGBA per cell: rgb = the node type's average color (same one the
 	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
 	// reflection rays can recognize it), 255 solid.
@@ -2933,6 +3092,9 @@ static void claudeTraceGridSnapshot(Client *client)
 		V.occ.assign((size_t)S * S * S * 4, 0);
 		V.mids.assign((size_t)S * S * S, 0);
 		V.modelids.assign((size_t)S * S * S, 0);
+		V.nbox_ids.assign((size_t)ClaudeTraceGrid::NBOX_RING
+				* ClaudeTraceGrid::NBOX_RING
+				* ClaudeTraceGrid::NBOX_RING, 0);
 		for (int lvl = 0; lvl <= 5; lvl++) {
 			int n = S >> lvl;
 			V.pyr[lvl].assign((size_t)n * n * n, 0);
@@ -2994,6 +3156,13 @@ static void claudeTraceGridSnapshot(Client *client)
 			<< " [walk=" << walk_us << "us bake=" << bake_us
 			<< "us gl=" << gl_us << "us emit=" << emit_us
 			<< "us total=" << (porting::getTimeUs() - tu0) << "us]"
+			// DIAL STATE NEXT TO THE MEASUREMENT (environment-laws.md:
+			// "record the dial state with every capture, not in your
+			// head"). nbox_shapes is the converter's whole working set:
+			// distinct (content, param2) box lists actually seen.
+			<< " nodebox=" << (V.nodebox_on ? 1 : 0)
+			<< " nbox_shapes=" << V.nbox_masks.size()
+			<< "/" << V.nbox_of.size()
 			<< std::endl;
 }
 
@@ -3055,6 +3224,7 @@ static bool claudeTraceGridIncremental(Client *client)
 	Map &map = client->getEnv().getMap();
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	claudeLoadModels(ndef);
+	V.nodebox_on = claudeNodeBoxEnabled();
 	int cx0 = S, cy0 = S, cz0 = S, cx1 = 0, cy1 = 0, cz1 = 0;
 	int changed = 0;
 	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++) {
