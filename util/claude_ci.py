@@ -161,6 +161,23 @@ PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                "fullscreen": "false", "window_maximized": "false",
                "autosave_screensize": "false",
                "fps_max": "200", "fps_max_unfocused": "200",
+               # Harness precondition, not a feature (John, 2026-08-15,
+               # after a creeper detonated inside the Cornell box and
+               # damaged a referee room): a hostile mob wandering into a
+               # sealed referee is the same class of silent damage as a
+               # dug node, and this game's mob spawner reads this ONE
+               # global bool at server start (mcl_mobs/spawning.lua,
+               # `core.settings:get_bool("mobs_spawn", true)`, file
+               # scope — not hot-reloadable, so it must be in the conf
+               # BEFORE start_seat(), not pushed live).
+               "mobs_spawn": "false",
+               # /warp (roadmap 1b) reads/writes util/claude_vantages.json,
+               # which sits outside the world dir and outside every mod
+               # dir — the sandboxed `io` refuses both (environment-laws:
+               # the client REWRITES minetest.conf on exit, which is how
+               # this line gets silently dropped if it is only ever
+               # hand-added once instead of pinned here).
+               "secure.trusted_mods": "claude_bridge",
                # Without this key the console->client dial channel is
                # SILENTLY DEAD: pollSettingsPatch reads claude_dial_file,
                # an empty path means "off", and /dial then writes its
@@ -229,6 +246,30 @@ CI_SHOTS = [
     {"name": "cornell-nee1", "vantage": "cornell", "referee": ("cornell", None),
      "dials": {"claude_nee": 1}},
     {"name": "cozy-ci", "vantage": "cozy-ci", "referee": None},
+
+    # --- gallery phase 2 (roadmap 1b): sky/sun/glass referee rooms ------
+    # Content + harness only — no shader/estimator change, so none of
+    # these have an image referee yet. Every one of them still gets the
+    # full generic gate (dials, traced marker, aim, volume, converged,
+    # room hash) — "referee: None" means "eyes only, or perf only until
+    # 2b", not "unchecked". Goldens are pinned WRONG-BY-DESIGN (dark or
+    # black) until 2b lands the sky/sun terms; see spec/measured.md "1b —
+    # Gallery phase 2" for which is which.
+    {"name": "exterior-ci", "vantage": "exterior-ci", "referee": None},
+    {"name": "skyfurnace-050", "vantage": "skyfurnace-050", "referee": None},
+    {"name": "cave-skylight-noon", "vantage": "cave-skylight-noon",
+     "referee": None},
+    {"name": "cave-skylight-night", "vantage": "cave-skylight-night",
+     "referee": None},
+    {"name": "cave-glass", "vantage": "cave-glass", "referee": None},
+    {"name": "cozy-night-ci", "vantage": "cozy-night-ci", "referee": None},
+    {"name": "cozy-day-ci", "vantage": "cozy-day-ci", "referee": None},
+    # Same physical vantage as cozy-day-ci; OPS.lamps swaps the panel to
+    # its unlit twin for this capture only (cmd_run restores it in a
+    # finally, even on a capture exception) — sunlight-only interior,
+    # honestly black until 2b lights it through the windows.
+    {"name": "cozy-day-dark-ci", "vantage": "cozy-day-ci", "referee": None,
+     "lamps_off": True},
 ]
 # The golden image every Cornell region ratio is measured against: the
 # PHOTO arm of the pinned golden run.
@@ -242,7 +283,66 @@ GOLDEN_REF_SHOT = "cornell"
 CI_DOORS = [{"pos": {"x": 20, "y": 9, "z": 0}, "name": None},   # furnace-050
             {"pos": {"x": 33, "y": 9, "z": 0}, "name": None},   # furnace-073
             {"pos": {"x": 47, "y": 9, "z": 0},
-             "name": "claude_bridge:gray221"}]                  # cornell
+             "name": "claude_bridge:gray221"},                  # cornell
+            {"pos": {"x": 14, "y": 9, "z": 85}, "name": None},  # cave-skylight
+            {"pos": {"x": 34, "y": 9, "z": 85}, "name": None}]  # cave-glass
+
+# Room hash (roadmap 1b): "the gate that proves rebuild determinism".
+# One dug node at (47,11,8) leaked daylight through Cornell for an
+# unknown period and nothing in the harness noticed (measured.md, "CI
+# red/green") — it surfaced only when a deep-convergence RMS drifted the
+# wrong way and someone looked at the frame. OPS.scan already returns an
+# order-dependent hash of every node name in a box (its ancestor, used by
+# check_room_integrity() for the three original rooms' full spec check);
+# this extends the SAME primitive to every CI room, including the ones
+# with no hand-written Python spec, and makes it a GATE: a capture whose
+# room hash disagrees with the golden's is REFUSED, not diffed. Boxes
+# include the door cell, so an unshut door changes the hash too.
+ROOM_BOXES = {
+    "furnace-050": ((17, 8, 0), (23, 14, 6)),
+    "furnace-073": ((30, 8, 0), (36, 14, 6)),
+    "cornell": ((43, 8, 0), (51, 16, 8)),
+    "cozy": ((0, 8, 0), (10, 17, 8)),
+    "cave-skylight": ((10, 8, 85), (18, 14, 93)),
+    "cave-glass": ((30, 8, 85), (38, 14, 93)),
+    "sky-furnace-050": ((47, 8, 97), (73, 9, 123)),
+    # exterior-ci is "no build" (the handoff's own words) — there is no
+    # structure to protect, so this is a small box around the stand
+    # point rather than a meaningful integrity claim. It still gets a
+    # hash in every sidecar, mechanically, because every capture does.
+    "exterior-ci": ((4, 8, -26), (6, 10, -24)),
+}
+# vantage name -> ROOM_BOXES key, for shots whose vantage name does not
+# match the room name 1:1 (cozy has four vantages over one physical room;
+# the two cave vantages share cave-skylight's box; sky-furnace-050 the
+# vantage vs sky-furnace-050 the pad).
+VANTAGE_ROOM = {
+    "cozy-ci": "cozy", "cozy-night-ci": "cozy", "cozy-day-ci": "cozy",
+    "cozy-day-dark-ci": "cozy",
+    "cave-skylight-noon": "cave-skylight", "cave-skylight-night": "cave-skylight",
+    "cave-glass": "cave-glass",
+    "skyfurnace-050": "sky-furnace-050",
+    "exterior-ci": "exterior-ci",
+}
+
+
+def room_of(vantage_name):
+    return VANTAGE_ROOM.get(vantage_name, vantage_name)
+
+
+def room_hash(room_name):
+    """(hash, error) for ROOM_BOXES[room_name], via the bridge's OPS.scan."""
+    box = ROOM_BOXES.get(room_name)
+    if not box:
+        return None, "no ROOM_BOXES entry for %r" % room_name
+    p1, p2 = box
+    try:
+        r = lab.rpc("scan", p1={"x": p1[0], "y": p1[1], "z": p1[2]},
+                    p2={"x": p2[0], "y": p2[1], "z": p2[2]})
+        return r["hash"], None
+    except Exception as e:
+        return None, str(e)
+
 
 # Referee-room integrity. A room is a referee only while it is SEALED
 # and made of exactly the nodes its builder laid down: one dug node at
@@ -434,6 +534,38 @@ def start_seat(rundir):
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                          start_new_session=True)
         time.sleep(wait)
+
+
+GALLERY_DEPLOY = os.path.join(HERE, "claude_gallery_deploy.py")
+# Marker of "vegetation has been cleared on this world at least once".
+# The clear step (claude_gallery_deploy.CLEAR) walks a large box in
+# y-slabs and is slow; the ROOM BUILDS are cheap idempotent box-fills and
+# must re-run every time (that is the whole point of 1b — a room a
+# creeper detonated inside, or a node someone dug, is repaired by the
+# next deploy, not trusted). So: full deploy (with clear) once per world,
+# --skip-clear on every run after, per the handoff ("idempotent;
+# --skip-clear after the first run of a seat").
+GALLERY_CLEARED_MARKER = os.path.join(REPO, SEAT_WORLD,
+                                      ".claude_gallery_cleared")
+
+
+def deploy_gallery():
+    """Rebuild the gallery on THIS run's seat, every run. Returns (ok, info).
+    Must run AFTER the server/client are up (it talks to the bridge)."""
+    skip_clear = os.path.exists(GALLERY_CLEARED_MARKER)
+    cmd = [sys.executable, GALLERY_DEPLOY] + (["--skip-clear"]
+                                               if skip_clear else [])
+    print("gallery: deploying (%s)..."
+          % ("skip-clear" if skip_clear else "FULL CLEAR, first run on this world"))
+    r = sh(cmd)
+    info = {"cmd": cmd, "returncode": r.returncode, "skip_clear": skip_clear,
+            "stdout_tail": (r.stdout or "")[-6000:],
+            "stderr_tail": (r.stderr or "")[-2000:]}
+    ok = r.returncode == 0 and "MISSING NODE NAMES" not in (r.stdout or "")
+    if ok and not skip_clear:
+        os.makedirs(os.path.dirname(GALLERY_CLEARED_MARKER), exist_ok=True)
+        open(GALLERY_CLEARED_MARKER, "w").write("cleared by run\n")
+    return ok, info
 
 
 def wait_for_client(timeout=CLIENT_READY_TIMEOUT):
@@ -755,7 +887,7 @@ def await_volume(marker, block, tries=3):
                                  st.get("area_total"))}
 
 
-def capture(shot, vantage, park, dials, rundir, settle):
+def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     """dials -> park -> vantage (proven reset) -> snapshot -> re-assert
     dials -> settle -> shutter -> N read BEFORE the PNG write -> file it
     under the arm name.
@@ -836,6 +968,26 @@ def capture(shot, vantage, park, dials, rundir, settle):
                  "accum_alpha": st2.get("accum_alpha"), "fps": st2.get("fps"),
                  "cap_artifact": cap.get("cap_artifact")})
     info["dial_state"] = dial_state(png, dials, marker)
+
+    # Room hash (roadmap 1b): the same box every run, hashed by the
+    # bridge (OPS.scan) AFTER the settle, so it reflects exactly what was
+    # in frame for this shutter — not what the deploy intended. Written
+    # into both this run's in-memory record and the copied sidecar, so a
+    # golden pinned from this run carries its own room hash forward.
+    room = room_of(vantage_name or shot["name"])
+    h, herr = room_hash(room)
+    info["room"] = room
+    info["room_hash"] = h
+    info["room_hash_error"] = herr
+    try:
+        capjson = os.path.join(rundir, name + ".capture.json")
+        capd = json.load(open(capjson)) if os.path.exists(capjson) else {}
+        capd["room"] = room
+        capd["room_hash"] = h
+        json.dump(capd, open(capjson, "w"), indent=2)
+    except Exception as e:
+        info["room_hash_error"] = "%s (also: sidecar write failed: %s)" % (herr, e)
+
     return dst, info
 
 
@@ -1032,6 +1184,46 @@ def diff_against(run_id, vantage, png):
         return {"error": str(ex)}
 
 
+def other_room_hash(run_id, name):
+    """The room hash a PREVIOUS run recorded for shot `name`, from its own
+    run.json (not the sidecar — run.json is what golden() pins)."""
+    if not run_id:
+        return None, "no run"
+    try:
+        run = json.load(open(os.path.join(CI_DIR, run_id, "run.json")))
+        s = (run.get("shots") or {}).get(name) or {}
+        h = (s.get("capture") or {}).get("room_hash")
+        return h, None if h else "that run recorded no room_hash for %s" % name
+    except Exception as e:
+        return None, str(e)
+
+
+def diff_against_gated(run_id, name, png, this_hash, kind):
+    """diff_against, but REFUSED (not computed) when the room hash the
+    comparison run recorded for this shot disagrees with this capture's
+    own hash. This is the mechanism roadmap 1b exists to add: a diff
+    against a room someone dug a hole in — or a creeper detonated inside
+    — must be refused on sight, not silently reported as a number that
+    then has to be explained after the fact (measured.md, "CI red/green":
+    one dug node leaked daylight through Cornell for a day and nothing
+    noticed until an RMS drifted the wrong way)."""
+    other_hash, other_err = other_room_hash(run_id, name)
+    if other_hash is None:
+        # No comparable hash on record (no run pinned, or it predates
+        # room hashing) — not a refusal, just nothing to gate on yet.
+        return diff_against(run_id, name, png), None
+    if this_hash is None:
+        return None, ("REFUSED: this capture has no room hash of its own "
+                      "(%s) — cannot compare against %s" % (kind, run_id))
+    if this_hash != other_hash:
+        return None, ("REFUSED: room hash mismatch vs %s %s (%s changed: "
+                      "%s -> %s). The room was rebuilt, damaged, or dug "
+                      "into since that capture; a pixel diff against it "
+                      "would compare two different rooms." % (
+                          kind, run_id, name, other_hash, this_hash))
+    return diff_against(run_id, name, png), None
+
+
 # ---------------------------------------------------------------- html
 
 CSS = """body{background:#101214;color:#d8d8d8;font:14px/1.5 -apple-system,
@@ -1086,8 +1278,11 @@ def _rg(run):
 def _one_rms(d):
     if not d:
         return "n/a"
-    return "err" if d.get("error") else \
-        "%.3f (worst %.1f)" % (d["rms"], d["worst_channel_delta"])
+    if d.get("refused"):
+        return "REFUSED (room hash)"
+    if d.get("error"):
+        return "err"
+    return "%.3f (worst %.1f)" % (d["rms"], d["worst_channel_delta"])
 
 
 def _rms(shot):
@@ -1210,6 +1405,14 @@ def bring_up_seat(rundir, run, args):
     if not wait_for_client():
         return "client never became ready after %.0fs" % CLIENT_READY_TIMEOUT
     print("seat: client ready")
+
+    ok, dep = deploy_gallery()
+    run["gallery_deploy"] = dep
+    if not ok:
+        return ("gallery deploy failed (rc=%s): %s"
+                % (dep["returncode"], dep["stdout_tail"][-800:]
+                   or dep["stderr_tail"][-800:]))
+
     run["shader_failures"] = shader_compile_failures()
     run["freeze"] = do_freeze()
     if not run["freeze"].get("deepening"):
@@ -1246,6 +1449,10 @@ def cmd_run(args):
 
     A.add("build-release", (run.get("build_type") or "").lower() in RELEASE_TYPES,
           "CMAKE_BUILD_TYPE=%s" % run.get("build_type"))
+    dep = run.get("gallery_deploy") or {}
+    A.add("gallery-deploy", dep.get("returncode") == 0
+          and "MISSING NODE NAMES" not in dep.get("stdout_tail", ""),
+          "skip_clear=%s rc=%s" % (dep.get("skip_clear"), dep.get("returncode")))
     A.add("shaders-compile", not run["shader_failures"],
           "%d 'Failed to compile' lines in debug.txt"
           % len(run["shader_failures"]))
@@ -1277,14 +1484,29 @@ def cmd_run(args):
                       "%s MISSING from claude_vantages.json" % vname)
                 continue
             dials = dict(base, **shot_def.get("dials", {}))
+            lamps_off = shot_def.get("lamps_off")
+            if lamps_off:
+                # cozy-day-dark-ci: swap the panel to its unlit twin for
+                # THIS capture only, and guarantee it goes back even if
+                # the capture throws — a stuck-dark cozy room would
+                # silently poison every later cozy arm's golden.
+                p1, p2 = ROOM_BOXES["cozy"]
+                lab.rpc("lamps", p1=dict(zip("xyz", p1)),
+                       p2=dict(zip("xyz", p2)), state="off")
             try:
-                png, cap = capture(shot_def, vs[vname], park_for(vname, vs),
-                                   dials, rundir, args.settle)
-            except Exception as ex:
-                # One dead vantage must not cost the other four.
-                run["shots"][name] = {"error": str(ex)}
-                A.add("%s-capture" % name, False, str(ex))
-                continue
+                try:
+                    png, cap = capture(shot_def, vs[vname], park_for(vname, vs),
+                                       dials, rundir, args.settle, vname)
+                except Exception as ex:
+                    # One dead vantage must not cost the other four.
+                    run["shots"][name] = {"error": str(ex)}
+                    A.add("%s-capture" % name, False, str(ex))
+                    continue
+            finally:
+                if lamps_off:
+                    p1, p2 = ROOM_BOXES["cozy"]
+                    lab.rpc("lamps", p1=dict(zip("xyz", p1)),
+                           p2=dict(zip("xyz", p2)), state="on")
             shot = {"png": os.path.basename(png), "capture": cap}
             if shot_def["referee"]:
                 kind, arg = shot_def["referee"]
@@ -1292,9 +1514,19 @@ def cmd_run(args):
                     kind, arg, png, rundir, name,
                     gold_png if kind == "cornell" else None)
             shot["verdict"] = list(verdict(shot_def, shot.get("referee")))
-            shot["rms_vs_prev"] = diff_against(prev, name, png)
-            shot["rms_vs_golden"] = diff_against(gold, name, png)
+            this_hash = cap.get("room_hash")
+            shot["rms_vs_prev"], prev_refused = diff_against_gated(
+                prev, name, png, this_hash, "prev")
+            shot["rms_vs_golden"], gold_refused = diff_against_gated(
+                gold, name, png, this_hash, "golden")
+            if prev_refused:
+                shot["rms_vs_prev"] = {"refused": prev_refused}
+            if gold_refused:
+                shot["rms_vs_golden"] = {"refused": gold_refused}
             run["shots"][name] = shot
+            A.add("%s-room-hash" % name, not gold_refused,
+                  gold_refused or ("hash %s (room %s)"
+                                   % (this_hash, cap.get("room"))))
 
             ds = cap.get("dial_state") or {}
             A.add("%s-dials" % name, ds.get("ok"),
@@ -1392,7 +1624,7 @@ def cmd_calibrate(args):
                 try:
                     png, cap = capture(dict(shot_def, name=name), vs[vname],
                                        park_for(vname, vs), dials, rundir,
-                                       args.settle)
+                                       args.settle, vname)
                 except Exception as ex:
                     print("CAPTURE FAILED: %s" % ex)
                     run["results"].append({"defect": defect["name"],

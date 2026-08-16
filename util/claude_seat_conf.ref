@@ -80,3 +80,13 @@ autosave_screensize = false
 # The lab seat pins both; John's own client may keep a low cap.
 fps_max = 200
 fps_max_unfocused = 200
+
+# --- gallery phase 2, PINNED (roadmap 1b, 2026-08-15) ---------------------
+# mobs_spawn: read once at server start (mcl_mobs/spawning.lua), not
+# hot-reloadable. A creeper detonated inside the sealed Cornell box and
+# damaged a referee room — harness precondition, not a feature.
+mobs_spawn = false
+# secure.trusted_mods: claude_bridge's /warp reads/writes
+# util/claude_vantages.json, which sits outside the world dir and every
+# mod dir, so the sandboxed `io` refuses it without this.
+secure.trusted_mods = claude_bridge
