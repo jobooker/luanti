@@ -158,7 +158,7 @@ void GameUI::update(const RunStats &stats, Client *client, MapDrawControl *draw_
 				<< std::setprecision(3)
 				<< " | alpha " << accum_alpha
 				<< std::setprecision(0)
-				<< " | view " << g_settings->getFloat("claude_view", 0.0f, 5.0f)
+				<< " | view " << g_settings->getFloat("claude_view", 0.0f, 16.0f)
 				<< " | bounces " << g_settings->getFloat("claude_bounces", 0.0f, 24.0f)
 				// transport mode: 0 = the pure photo path (§6 truth),
 				// 1 = next-event estimation + MIS. An absent key reads as

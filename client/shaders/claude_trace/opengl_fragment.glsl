@@ -195,6 +195,11 @@ uniform sampler3D claudeVolume; // unit 10: RGBA8 128^3, rgb = cell colour,
 uniform vec2 texelSize0;        // one texel of the trace-res target
 uniform lowp float volumeDebug; // pipeline master switch: <2.5 = raster
 
+// WORLD node coords of volume cell (0,0,0). game.cpp sets it in the same
+// block as volumeCamPos, so it is live whenever the trace runs. Used ONLY
+// by the roadmap-1a instrument views (9/10/11), which have to name a
+// world-space rectangle in the DDA's cell-index space.
+uniform vec3 volumeOrigin;
 uniform vec3 volumeCamPos;   // camera in volume-local node units
 uniform vec3 volumeCamFwd;   // unit look direction
 uniform vec3 volumeCamRight; // camera right, pre-scaled by tan(fovX/2)
@@ -212,6 +217,10 @@ uniform lowp float accumAlpha; // CPU: 1.0 hard reset, 0.5 moving,
 //   uniform albedo shows pure transport (the ray-traced "wireframe").
 //   Emission keeps its true Le; only rho is clamped. Accumulates and
 //   tonemaps exactly like view 0.
+//   9/10/11: INSTRUMENT A of roadmap step 1a — three independent
+//   estimates of ONE quantity, the DIRECT-light radiance leaving the
+//   primary hit. See the block above panelDirect() for the whole design.
+//   They are inert at claude_view 0 and cost the photo path nothing.
 // Views are GRAY LADDERS, not RGB: John is colorblind, and cardinal
 // normals mean there are only six possible normals, so a wrong normal
 // reads as a wrong BRIGHTNESS patch. See VIEW_N_* below for the ladder.
@@ -662,8 +671,32 @@ float neePdfSa(vec3 cellHit, vec3 nHit, vec3 x, float dist, float cosY,
 // Cost: exactly four RNG draws and one shadow march when it runs to
 // completion — fewer on an early out, which is fine, the draws are a
 // per-pixel chain and not a fixed budget.
-vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights)
+//
+// misOn is 1.0 for the transport path and is the ONLY thing the
+// instrument views change: at 0.0 the balance weight w_l is replaced by
+// 1.0, which turns this function into the plain light-sampling estimator
+// of the direct term (roadmap 1a instrument A, claude_view 9). Every
+// other line — the same list, the same k, the same face, the same
+// shadow march, the same pdf — is shared with the transport path by
+// construction, which is the point: an instrument that re-derives the
+// thing it is measuring measures its own copy.
+// FORENSICS for roadmap 1a, filled by neeDirect() on every call and read
+// by claude_view 12/13. It is written, never read, inside the transport
+// path — the dead store is the entire cost, and it buys an instrument
+// that reports on THE SAME CALL that produced the pixel rather than on a
+// re-derived copy of it.
+//   x = 1.0 when this call produced a nonzero contribution, else 0
+//   y = the WORLD y of the emitter cell it aimed at
+//   z = cos_x at the receiver
+//   w = vec2(slot index, k) packed as slot + 16*k is not needed: view 13
+//       reads slot and k out of two separate accumulations instead.
+vec4 g_neeDiag;
+float g_neeDiagK;
+
+vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
 {
+	g_neeDiag = vec4(0.0);
+	g_neeDiagK = 0.0;
 	// uniform over the list. Not importance-weighted by distance or
 	// power: p_A must be reproducible by neePdfSa() from the hit alone,
 	// and 1/(N*k) is.
@@ -739,9 +772,131 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights)
 	// asymmetry that actually loses energy.
 	float pdfL = dist2 / (float(nLights) * float(k) * cosY); // p_l, sa
 	float pdfB = cosX / PI;                                  // p_b, sa
-	float w = pdfL / (pdfL + pdfB);                          // balance
+	float w = 1.0;
+	if (misOn > 0.5)
+		w = pdfL / (pdfL + pdfB);                        // balance
+	// forensics: this call is about to contribute. Record WHAT it aimed
+	// at and at what grazing angle, in world coords, for views 12/13.
+	g_neeDiag = vec4(1.0, c.y + volumeOrigin.y, cosX, float(li));
+	g_neeDiagK = float(k);
 	// f_r = rho/PI for a Lambertian; estimator = w * f_r * Le * cos_x/p_l
 	return w * (rho / PI) * shle * (cosX / pdfL);
+}
+
+// =====================================================================
+// INSTRUMENT A (roadmap step 1a) — the direct-light referee
+// =====================================================================
+//
+// The defect: claude_nee = 1 converges 2-9% hot by region against photo
+// mode in Cornell (measured.md "CI red/green"). MIS adds TWO estimates
+// of the direct term at every vertex, w_l * (light sample) + w_b * (Le
+// found by the BSDF ray), and the sum is supposed to be exactly one copy
+// of it. Three things can be wrong: the light half, the BSDF half, or
+// the weights. A referee that can only see the SUM cannot say which.
+//
+// So: three claude_view modes, all measuring the SAME scalar per pixel —
+// the direct-light radiance leaving the PRIMARY hit, one bounce, nothing
+// else — by three routes that share as little machinery as possible:
+//
+//   view  9  the light-sampling half alone, w_l forced to 1. This is
+//            neeDirect() itself, one extra argument, so it cannot drift
+//            from the estimator it is judging.
+//   view 10  the BSDF half alone, w_b forced to 1: one cosine-hemisphere
+//            sample from the primary hit, and whatever Le it lands on.
+//            With p_b = cos/PI and f_r = rho/PI the estimator is exactly
+//            `rho * Le(hit)` — no pdf arithmetic at all, which is why it
+//            is the useful partner: it shares no pdf code with view 9.
+//   view 11  ANALYTIC. No rays, no RNG, no light list: Lambert's contour
+//            formula for the irradiance from the Cornell ceiling panel,
+//            times rho/PI. This is the only one of the three that cannot
+//            be wrong in the same way as the other two.
+//
+// CONVERGED, ALL THREE MUST AGREE. Whichever disagrees with 11 names the
+// broken half; if 9 and 10 both match 11, the halves are sound and the
+// bug is in the weights.
+//
+// WHAT VIEW 11 IS BLIND TO (physics-contract §8 clause 3):
+//  * OCCLUSION. It is the unshadowed analytic answer. Cornell's two
+//    gray186 blocks shadow parts of the FLOOR, and views 9 and 10 (which
+//    both trace) will read darker there. The ratio image shows those as
+//    black patches; they are the instrument, not the defect.
+//  * ANY ROOM BUT CORNELL. The rectangle below is a hard-coded world
+//    -space constant taken from util/claude_bridge_gallery.lua.
+//  * A RECEIVER WHOSE HORIZON PLANE CUTS THE PANEL. The contour formula
+//    is exact only for a polygon entirely above the receiver's horizon.
+//    Every interior surface of Cornell satisfies that (the panel sits
+//    inside the x/z span of every wall and above the floor); the SIDE
+//    faces of the two occluder blocks do not, and are wrong there.
+//  * Views 9 and 10 are Monte Carlo and need depth; view 11 is exact at
+//    one sample. A disagreement at low N is noise, not a finding.
+//
+// Views 9-11 IGNORE claudeNee on purpose: they are the halves of the
+// estimator, not the transport dial, and a forgotten claude_nee = 1
+// would otherwise render view 9 silently black — a blind instrument.
+// They also ignore claudeBounces: depth is fixed at one bounce.
+// They ACCUMULATE and tonemap exactly like view 0, deliberately: the
+// quantity is linear radiance, and claude_cornell_check.py's referee
+// inverts precisely that transform, so the region ratios are read by
+// the same instrument that judges every other Cornell frame, with no
+// second code path to keep honest.
+
+// CORNELL-ONLY CONSTANT, and it is flagged everywhere it is used.
+// util/claude_bridge_gallery.lua OPS.cornell at pos (43,8,0), size 7:
+// the 3x3 white_lit panel is FLUSH in the ceiling layer at world nodes
+// x 46..48, y 16, z 3..5. Its one air-exposed downward face is the
+// rectangle x in [46,49], z in [3,6] in the plane y = 16, WORLD node
+// coords — the DDA's cell-index space is that minus volumeOrigin.
+const vec3 PANEL_WMIN = vec3(46.0, 16.0, 3.0);
+const vec3 PANEL_WMAX = vec3(49.0, 16.0, 6.0);
+// A cell of the panel, world node coords, for reading Le off the volume.
+const vec3 PANEL_WCELL = vec3(47.0, 16.0, 4.0);
+
+// THE LAW IS ONE Le (§4): read it out of the same texture through the
+// same cellEmission() the eye ray runs, rather than restating 2.4 here.
+vec3 panelLe()
+{
+	vec3 c = PANEL_WCELL - volumeOrigin;
+	vec4 s = texture3D(claudeVolume, (c + 0.5) / VOL_S);
+	return cellEmission(s.a, cellAlbedo(s.rgb));
+}
+
+// Lambert's contour formula: the irradiance at x with normal n from a
+// uniform-radiance polygon of unit radiance,
+//     E = (1/2) * SUM_i gamma_i * dot(n, Gamma_i)
+// gamma_i = the angle edge i subtends at x, Gamma_i = the unit normal of
+// the plane through x and edge i. Exact for a polygon wholly above the
+// horizon at x (see the blind list above). Vertices are wound so the
+// result is positive for a receiver BELOW a downward-facing rectangle.
+float rectIrradiance(vec3 x, vec3 n, vec3 p0, vec3 p1, vec3 p2, vec3 p3)
+{
+	vec3 r0 = p0 - x, r1 = p1 - x, r2 = p2 - x, r3 = p3 - x;
+	vec3 u0 = normalize(r0), u1 = normalize(r1);
+	vec3 u2 = normalize(r2), u3 = normalize(r3);
+	float e = acos(clamp(dot(u0, u1), -1.0, 1.0))
+			* dot(n, normalize(cross(r0, r1)));
+	e += acos(clamp(dot(u1, u2), -1.0, 1.0))
+			* dot(n, normalize(cross(r1, r2)));
+	e += acos(clamp(dot(u2, u3), -1.0, 1.0))
+			* dot(n, normalize(cross(r2, r3)));
+	e += acos(clamp(dot(u3, u0), -1.0, 1.0))
+			* dot(n, normalize(cross(r3, r0)));
+	return max(0.5 * e, 0.0);
+}
+
+// view 11: rho/PI * E from the Cornell panel. CORNELL ONLY.
+vec3 panelDirect(vec3 x, vec3 nx, vec3 rho)
+{
+	vec3 pmin = PANEL_WMIN - volumeOrigin;
+	vec3 pmax = PANEL_WMAX - volumeOrigin;
+	// the panel emits DOWNWARD only (its -Y face is the exposed one), so
+	// a receiver on or above its plane sees nothing from it
+	if (x.y >= pmin.y)
+		return vec3(0.0);
+	float y = pmin.y;
+	float e = rectIrradiance(x, nx,
+			vec3(pmin.x, y, pmin.z), vec3(pmin.x, y, pmax.z),
+			vec3(pmax.x, y, pmax.z), vec3(pmax.x, y, pmin.z));
+	return (rho / PI) * panelLe() * e;
 }
 
 // ---------------------------------------------------------------------
@@ -772,12 +927,16 @@ void main(void)
 			fract(animationTimer * 91.7) * 1024.0));
 
 	// sub-pixel jitter: free anti-aliasing through the running average.
-	// Off in the diagnostic views, which do not accumulate and would
-	// otherwise flicker along every silhouette.
+	// Off in views 1-5, which do not accumulate and would otherwise
+	// flicker along every silhouette.
 	float j0 = rnd1();
 	float j1 = rnd1();
 	vec2 jit = (vec2(j0, j1) - 0.5) * texelSize0;
-	if (view != 0 && view != 6)
+	// views 1-5 are deterministic ladders and would flicker along every
+	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
+	// and want the free anti-aliasing (and want it identically, so the
+	// three instrument views can be divided pixel by pixel).
+	if (view >= 1 && view <= 5)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -809,6 +968,107 @@ void main(void)
 	vec3 prevX = vec3(0.0);
 	float prevPdfB = 0.0;
 	bool misArmed = false;
+
+	// --- INSTRUMENT A (roadmap 1a): claude_view 9 / 10 / 11 -----------
+	// One primary hit, one direct-light term, no path. Design, and the
+	// list of what each of the three is blind to, above panelDirect().
+	// Nothing here runs at claude_view 0: the truth path is untouched.
+	if (view >= 9 && view <= 16) {
+		vec3 hp, n, alb, le, cell;
+		float tHit;
+		if (march(ro, rd, hp, n, alb, le, tHit, cell)) {
+			primaryHit = true;
+			primaryT = tHit;
+			// the light list, read INDEPENDENTLY of claudeNee: view 9 is
+			// the estimator's own half, not the transport dial, and a
+			// forgotten dial must not render it silently black.
+			int nInstr = min(int(claudeAreaCount + 0.5), AREA_CAP);
+			if (view == 9 || view == 12 || view == 13) {
+				// the light-sampling half, w_l forced to 1
+				if (nInstr > 0)
+					L = neeDirect(hp, n, alb, nInstr, 0.0);
+				// FORENSICS (12/13). Scratch views: they answer "what did
+				// the aimed sampler aim at, from this pixel" when the
+				// answer is not readable off the code. Each channel is a
+				// MEAN over frames, so divide the 2nd and 3rd by the 1st
+				// (the hit rate) to get the mean over SUCCESSFUL samples.
+				//   12 = (hit rate, emitter world y / 64, cos_x)
+				//   13 = (hit rate, slot index / 16, k / 6)
+				if (view == 12)
+					L = vec3(g_neeDiag.x, g_neeDiag.y / 64.0, g_neeDiag.z);
+				else if (view == 13)
+					L = vec3(g_neeDiag.x, g_neeDiag.w / 16.0,
+							g_neeDiagK / 6.0);
+			} else if (view == 10) {
+				// the BSDF half, w_b forced to 1. p_b = cos/PI against
+				// f_r = rho/PI leaves exactly rho: no pdf arithmetic,
+				// which is what makes it an independent witness.
+				float u1 = rnd1();
+				float u2 = rnd1();
+				vec3 wi = cosineHemisphere(n, u1, u2);
+				vec3 shp, shn, shalb, shle, shcell;
+				float sht;
+				if (march(hp, wi, shp, shn, shalb, shle, sht, shcell))
+					L = alb * shle;
+			} else if (view == 16) {
+				// view 10 WITH THE TRAVERSAL TAKEN OUT. Same draws, same
+				// cosineHemisphere(), same rho*Le estimator — but the
+				// "did this ray find the light" question is answered by
+				// intersecting the panel rectangle in closed form
+				// instead of by march(). One variable between 10 and 16.
+				// 16 == 11 and 10 low  =>  the DDA is losing hits.
+				// 16 == 10             =>  the direction sampler is.
+				// CORNELL ONLY, and unshadowed, exactly like view 11.
+				float u1 = rnd1();
+				float u2 = rnd1();
+				vec3 wi = cosineHemisphere(n, u1, u2);
+				vec3 pmin = PANEL_WMIN - volumeOrigin;
+				vec3 pmax = PANEL_WMAX - volumeOrigin;
+				if (wi.y > 1e-6 && hp.y < pmin.y) {
+					float t = (pmin.y - hp.y) / wi.y;
+					vec3 q = hp + wi * t;
+					if (q.x >= pmin.x && q.x <= pmax.x
+							&& q.z >= pmin.z && q.z <= pmax.z)
+						L = alb * panelLe();
+				}
+			} else if (view == 11) {
+				L = panelDirect(hp, n, alb); // CORNELL ONLY
+			} else {
+				// RNG DENSITY (14/15). The BSDF half of MIS estimates
+				// the direct term as rho * Le(cosine-sampled hit), with
+				// NO pdf arithmetic — so if it disagrees with the
+				// analytic answer, either the traversal misses hits or
+				// the DIRECTION SAMPLER's density is wrong. These two
+				// views measure the sampler's own numbers and nothing
+				// else: same draw positions as view 10 (draws 3 and 4 of
+				// the per-pixel chain, straight after the two jitter
+				// draws), each channel scaled so its expected value is a
+				// number in the middle of the display range rather than
+				// a tail that quantisation swallows.
+				//   14 = (5*[u1<0.1], 25*[u1<0.02], 5*[u2<0.1])
+				//        all three EXPECT 0.500 for a uniform draw.
+				//        cos_theta = sqrt(1-u1), so SMALL u1 is the
+				//        zenith — which is where Cornell's panel is from
+				//        the floor, i.e. exactly the tail that decides
+				//        whether the BSDF ray finds the light.
+				//   15 = (u1, sqrt(1-u1), 2*u1*u1)
+				//        EXPECT 0.500, 0.6667 (E[cos] over a cosine
+				//        hemisphere), 0.6667 (2*E[u1^2] = 2/3).
+				float u1 = rnd1();
+				float u2 = rnd1();
+				if (view == 14)
+					L = vec3(u1 < 0.1 ? 5.0 : 0.0,
+							u1 < 0.02 ? 25.0 : 0.0,
+							u2 < 0.1 ? 5.0 : 0.0);
+				else
+					L = vec3(u1, sqrt(max(0.0, 1.0 - u1)),
+							2.0 * u1 * u1);
+			}
+		}
+		// skip the path loop entirely rather than re-indent it: seg 0 is
+		// already past a cap of -1, so the loop below runs zero times.
+		maxBounces = -1;
+	}
 
 	for (int seg = 0; seg <= BOUNCE_CAP; seg++) {
 		if (seg > maxBounces)
@@ -865,7 +1125,7 @@ void main(void)
 		// term at the same vertex it cuts the BSDF half, so claudeBounces
 		// means the same thing under either dial.
 		if (nLights > 0)
-			L += tp * neeDirect(hp, n, alb, nLights);
+			L += tp * neeDirect(hp, n, alb, nLights, 1.0);
 
 		tp *= alb;
 
@@ -901,7 +1161,9 @@ void main(void)
 	// MEAN bounce count is the meaningful quantity. claude_present
 	// passes 1-5 through linearly — no ACES, no gamma. View 6 (clay) is
 	// lit radiance: it skips this block and accumulates/tonemaps as photo.
-	if (view != 0 && view != 6) {
+	// views 1-5 only: 6 (clay) and the 9-11 instruments are radiance
+	// and fall through to the accumulator below.
+	if (view >= 1 && view <= 5) {
 		vec3 dbg = vec3(0.0);
 		if (view == 1) {
 			float g = 0.0;

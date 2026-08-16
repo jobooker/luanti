@@ -801,14 +801,20 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
 	}
 
-	// claude_trace diagnostic view selector, 0..6. 0 (default) = photo:
+	// claude_trace diagnostic view selector, 0..16. 0 (default) = photo:
 	// the truth renderer, untouched by any debug branch. 6 = clay:
-	// photo transport with reflectance clamped to CLAY_RHO.
+	// photo transport with reflectance clamped to CLAY_RHO. 9/10/11 are
+	// roadmap 1a's direct-light referee (the two MIS halves and the
+	// analytic answer) and 12/13/14/15 its forensics; 7 and 8 are unused and
+	// render as photo. The
+	// UPPER BOUND IS A CLAMP, not a validator: getFloat silently pins an
+	// out-of-range value, so a view added in the shader and not widened
+	// here renders as the nearest legal view and nothing says so.
 	static float readView()
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 6.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 16.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.

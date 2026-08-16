@@ -108,6 +108,16 @@ void main(void)
 	// transform. The claude_view == 0 path below is unchanged, byte for
 	// byte — the furnace and Cornell referees invert exactly that
 	// transform.
+	//
+	// SO DO VIEWS 9/10/11 (roadmap 1a's direct-light referee), and that
+	// is deliberate rather than an oversight: what they carry is linear
+	// radiance, not a gray ladder, and the thing that judges them is
+	// claude_cornell_check.py, which inverts EXACTLY the transform below
+	// (aces_inverse then gamma) on the same five region boxes it uses for
+	// every other Cornell frame. Presenting them linearly would need a
+	// second decode path in the referee, i.e. a second thing to keep
+	// honest, for no gain — the direct term in this room peaks around
+	// 0.1 linear, nowhere near the ACES shoulder.
 	if (claudeView > 0.5 && claudeView < 5.5) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
