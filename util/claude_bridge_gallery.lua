@@ -267,6 +267,125 @@ function OPS.scan(p)
              names = names }
 end
 
+-- /warp (roadmap 1b): the second way into every room, "reachable by
+-- jump". The builtin /teleport is coordinates-only, so this reads
+-- util/claude_vantages.json directly -- ONE SOURCE OF TRUTH, the same
+-- file claude_ci.py and claude_lab.py already read -- rather than
+-- keeping a second copy of the vantage list in the world. Not /tp: some
+-- games (mineclonia) alias that chatcommand to their own teleport.
+-- RUN_IN_PLACE=TRUE means the world lives at <repo>/worlds/<name>, so
+-- worldpath/../../util is the repo's util dir on every seat this repo
+-- scripts (environment-laws "Seat / build").
+-- util/claude_vantages.json lives outside the world dir and outside
+-- every mod dir, so the sandboxed `io` refuses it (checkPathWithGamedef
+-- allows read/write under the world path and read-only under mod paths,
+-- nothing else). claude_bridge is listed in secure.trusted_mods
+-- (minetest.conf) for exactly this; request_insecure_environment() hands
+-- back the pre-sandbox globals, whose `io` has no path check at all.
+local claude_ie = core.request_insecure_environment()
+local claude_io = claude_ie and claude_ie.io or io
+
+local function claude_vantages_path()
+    return core.get_worldpath() .. "/../../util/claude_vantages.json"
+end
+
+local function claude_load_vantages()
+    local f = claude_io.open(claude_vantages_path(), "r")
+    if not f then
+        return nil, "cannot open claude_vantages.json (trusted_mods not "
+                .. "set for claude_bridge? see minetest.conf secure.trusted_mods)"
+    end
+    local data = f:read("*a")
+    f:close()
+    local ok, parsed = pcall(core.parse_json, data)
+    if not ok or type(parsed) ~= "table" then
+        return nil, "cannot parse claude_vantages.json"
+    end
+    return parsed
+end
+
+local function claude_save_vantages(t)
+    local f = claude_io.open(claude_vantages_path(), "w")
+    if not f then return false, "cannot open claude_vantages.json for write" end
+    f:write(core.write_json(t, true))
+    f:close()
+    return true
+end
+
+core.register_chatcommand("warp", {
+    params = "<name> | next | prev | list | save <name>",
+    description = "Jump to a saved CI vantage from claude_vantages.json, "
+                  .. "or save the current pose as a new one.",
+    func = function(playername, param)
+        local player = core.get_player_by_name(playername)
+        if not player then return false, "warp: not online" end
+        local vs, err = claude_load_vantages()
+        if not vs then return false, "warp: " .. tostring(err) end
+        local names = {}
+        for k in pairs(vs) do names[#names + 1] = k end
+        table.sort(names)
+
+        local args = {}
+        for w in param:gmatch("%S+") do args[#args + 1] = w end
+        local cmd = args[1]
+
+        local function apply(vname)
+            local v = vs[vname]
+            if not v then
+                return false, "warp: no such vantage: " .. tostring(vname)
+            end
+            -- time BEFORE the teleport (environment-laws: a sky change
+            -- resets the accumulator; freeze/settle is the caller's job,
+            -- this just applies the vantage's own recorded time).
+            if v.time ~= nil then core.set_timeofday(v.time) end
+            player:set_pos({ x = v.pos[1], y = v.pos[2], z = v.pos[3] })
+            if v.yaw then player:set_look_horizontal(math.rad(v.yaw)) end
+            if v.pitch then player:set_look_vertical(math.rad(-v.pitch)) end
+            return true, "warped to " .. vname
+                    .. (v.time ~= nil and (" (time " .. tostring(v.time) .. ")")
+                        or "")
+        end
+
+        if not cmd or cmd == "list" then
+            return true, "vantages (" .. #names .. "): "
+                    .. table.concat(names, ", ")
+        elseif cmd == "save" then
+            local vname = args[2]
+            if not vname then return false, "usage: /warp save <name>" end
+            local pos = player:get_pos()
+            vs[vname] = {
+                set = "gallery",
+                ci = true,
+                pos = { pos.x, pos.y, pos.z },
+                yaw = math.deg(player:get_look_horizontal()) % 360,
+                pitch = -math.deg(player:get_look_vertical()),
+                time = core.get_timeofday(),
+                notes = "saved by /warp save (" .. playername .. ")",
+            }
+            local ok2, werr = claude_save_vantages(vs)
+            if not ok2 then return false, "warp: " .. tostring(werr) end
+            return true, "saved vantage " .. vname .. " at ("
+                    .. string.format("%.2f,%.2f,%.2f", pos.x, pos.y, pos.z)
+                    .. ") -- stand still first, this IS the physics REST "
+                    .. "position now on record"
+        elseif cmd == "next" or cmd == "prev" then
+            if #names == 0 then return false, "warp: no vantages" end
+            local meta = player:get_meta()
+            local cur = meta:get_string("claude_warp_cur")
+            local idx = 1
+            for i, n in ipairs(names) do if n == cur then idx = i end end
+            if cmd == "next" then idx = (idx % #names) + 1
+            else idx = ((idx - 2) % #names) + 1 end
+            local vname = names[idx]
+            meta:set_string("claude_warp_cur", vname)
+            return apply(vname)
+        else
+            player:get_meta():set_string("claude_warp_cur", cmd)
+            return apply(cmd)
+        end
+    end,
+})
+
 -- Camera drift guard (2026-08-15). Turning the camera does NOT reset
 -- the accumulator, so one stray mouse-look inside a 60 s settle blends
 -- two views into one "converged" frame with a perfectly clean dial
