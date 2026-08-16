@@ -364,10 +364,23 @@ core.register_chatcommand("warp", {
             }
             local ok2, werr = claude_save_vantages(vs)
             if not ok2 then return false, "warp: " .. tostring(werr) end
-            return true, "saved vantage " .. vname .. " at ("
+            local msg = "saved vantage " .. vname .. " at ("
                     .. string.format("%.2f,%.2f,%.2f", pos.x, pos.y, pos.z)
                     .. ") -- stand still first, this IS the physics REST "
                     .. "position now on record"
+            -- environment-laws: a moving sun resets the accumulator, so
+            -- an unfrozen time_speed at save time means the RECORDED
+            -- `time` is a snapshot of a value that was already drifting
+            -- -- worth a warning, not a refusal (the position/look are
+            -- still good, and freezing time is the caller's job at
+            -- capture time regardless).
+            local ts = tonumber(core.settings:get("time_speed") or "1")
+            if ts and ts ~= 0 then
+                msg = msg .. " -- WARNING: time_speed=" .. tostring(ts)
+                        .. " (not frozen); the saved time=" .. tostring(vs[vname].time)
+                        .. " was already drifting when this was recorded"
+            end
+            return true, msg
         elseif cmd == "next" or cmd == "prev" then
             if #names == 0 then return false, "warp: no vantages" end
             local meta = player:get_meta()
