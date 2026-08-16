@@ -593,6 +593,59 @@ GALLERY_CLEARED_MARKER = os.path.join(REPO, SEAT_WORLD,
                                       ".claude_gallery_cleared")
 
 
+# Expected room hash right after a fresh deploy (door OPEN — deploy
+# leaves doors open for walkability; set_doors(True) runs later, in
+# cmd_run). Only for rooms with no util/claude_rooms_check.py spec
+# (furnace-050/furnace-073/cornell already get a stronger node-by-node
+# diff via check_room_integrity(), just later in the flow, after the
+# door is shut). Without this, a silent no-op deploy is
+# indistinguishable from real room damage until the NEXT capture, diffed
+# against a golden from a past run — the handoff's own line: "verify by
+# hash, not by faith." Values measured 2026-08-16 on a fresh
+# --skip-clear deploy, one-tracer @ b9e4382df; re-derive if a room
+# builder's own geometry changes on purpose.
+EXPECTED_DEPLOY_HASH = {
+    "cave-skylight": "ad2aaf48",
+    "cave-glass": "57b6fef8",
+    "sky-furnace-050": "93ddf298",
+    "cozy": "af59b2a6",
+    "exterior-ci": "cc32604a",
+}
+
+
+def check_deploy_hashes():
+    """{room: (got, want)} for every EXPECTED_DEPLOY_HASH entry that
+    disagrees, or {} if all match."""
+    bad = {}
+    for room, want in EXPECTED_DEPLOY_HASH.items():
+        got, err = room_hash(room)
+        if got != want:
+            bad[room] = (got, want, err)
+    return bad
+
+
+def verify_deploy_hashes():
+    """None on success, else a message distinct from "room hash mismatch
+    vs golden" (that one compares against a PAST run's capture; this one
+    checks the deploy that just ran against what its own builders are
+    supposed to produce, deterministically, every time)."""
+    bad = check_deploy_hashes()
+    if not bad:
+        return None
+    print("deploy-hash mismatch on first check (%s) — retrying deploy once "
+          "before failing" % ", ".join(bad))
+    deploy_gallery()   # idempotent, --skip-clear; a silent no-op the
+                       # first time looks exactly like a successful build
+    bad2 = check_deploy_hashes()
+    if not bad2:
+        print("deploy-hash mismatch resolved on retry")
+        return None
+    return ("deploy did not produce the expected room(s) after a retry: "
+            + "; ".join("%s want %s got %s%s"
+                       % (r, want, got, (" (%s)" % err) if err else "")
+                       for r, (got, want, err) in bad2.items()))
+
+
 def deploy_gallery():
     """Rebuild the gallery on THIS run's seat, every run. Returns (ok, info).
     Must run AFTER the server/client are up (it talks to the bridge)."""
@@ -894,7 +947,21 @@ def aim_ok(start, now, vantage):
                    p["x"], p["y"], p["z"], dyaw, dpitch, dpos, dmove, dturn))
 
 
-def await_volume(marker, block, tries=3):
+# Rooms that are fully sealed boxes (walls/floor/ceiling close around the
+# camera) get a HIGHER solid-count floor than the universal one below.
+# Measured live 2026-08-16 (fresh Release binary, volume_debug=3,
+# volume_follow=0, one snapshot per vantage): volume_solid ranged
+# 239,200 (furnace-050, the smallest room) to 322,562 (cozy) — the 128^3
+# bubble also picks up the mgflat ground plane and anything else within
+# 64 nodes, so even "exterior-ci" (no build at all) read 269,377. 100,000
+# is comfortably below every measured sealed room and comfortably above
+# what a genuinely broken/near-empty bubble would read.
+SEALED_ROOMS = {"furnace-050", "furnace-073", "cornell", "cozy",
+                 "cave-skylight", "cave-glass"}
+VOLUME_SOLID_FLOOR_SEALED = 100000
+
+
+def await_volume(marker, block, room=None, tries=3):
     """Prove the tracer has something to trace BEFORE the settle starts.
 
     claude_volume_follow = 0 freezes the bubble, which is what a
@@ -912,21 +979,36 @@ def await_volume(marker, block, tries=3):
     read the code, not the memory of intent) — area_total is not a
     general occupancy count, it is the NEE area-LIGHT-cell count
     ("emissive cells the snapshot actually found", ClaudeVolume::
-    area_total, ~game.cpp:142/2540). g_claude_volume.valid is set
-    unconditionally true at the end of a real snapshot walk over loaded
-    map data (~game.cpp:2573), independent of whether any emitter was
-    found. So area_total > 0 was never "is there a volume" — it was "is
-    there a LIT volume", true by coincidence for every room that existed
-    before 1b (all of them had lamps) and false BY DESIGN for a sealed
-    box with none. volume_valid == 1 alone is the honest signal.
+    area_total, game.cpp ~149). So area_total > 0 was never "is there a
+    volume" — it was "is there a LIT volume", true by coincidence for
+    every room that existed before 1b (all of them had lamps) and false
+    BY DESIGN for a sealed box with none.
+
+    FOUND AGAIN 2026-08-16 (Opus review of the 1b diff): volume_valid ==
+    1 alone is a TAUTOLOGY, not just an insufficient-for-unlit-rooms
+    check — game.cpp sets g_claude_volume.valid = true ONCE and never
+    clears it, so after the very first snapshot on a seat, volume_valid
+    reads 1 forever regardless of what a later snapshot actually found.
+    An all-air bubble at a brand-new vantage would pass. Fixed at the
+    source: game.cpp now exports volume_solid (non-air cells the LAST
+    WALK actually found, computed unconditionally every call, before
+    the unchanged-content early return) and volume_snap_seq (increments
+    once per call, so a caller can prove a NEW walk happened rather than
+    reading a stale count from a walk at a different vantage entirely).
     """
+    seq_before = (lab.read_stats() or {}).get("volume_snap_seq")
+    floor = VOLUME_SOLID_FLOOR_SEALED if room in SEALED_ROOMS else 1
     for attempt in range(tries):
         deadline = time.time() + VOLUME_TIMEOUT
         while time.time() < deadline:
             st = lab.read_stats() or {}
-            if st.get("volume_valid") == 1:
+            solid = st.get("volume_solid") or 0
+            if (st.get("volume_valid") == 1 and solid >= floor
+                    and st.get("volume_snap_seq") != seq_before):
                 return {"ok": True, "attempts": attempt + 1,
                         "volume_valid": st.get("volume_valid"),
+                        "volume_solid": solid, "volume_floor": floor,
+                        "volume_snap_seq": st.get("volume_snap_seq"),
                         "area_emitters": st.get("area_emitters"),
                         "area_total": st.get("area_total"),
                         "emitters": st.get("emitters")}
@@ -936,11 +1018,15 @@ def await_volume(marker, block, tries=3):
     st = lab.read_stats() or {}
     return {"ok": False, "attempts": tries,
             "volume_valid": st.get("volume_valid"),
+            "volume_solid": st.get("volume_solid"), "volume_floor": floor,
             "area_emitters": st.get("area_emitters"),
             "area_total": st.get("area_total"),
             "error": "no volume after %d snapshot requests: volume_valid=%s "
-                     "— the tracer would be marching an empty "
-                     "bubble" % (tries, st.get("volume_valid"))}
+                     "volume_solid=%s (floor %s), snap_seq unchanged=%s — "
+                     "the tracer would be marching an empty bubble, or this "
+                     "is a stale read from a different vantage's snapshot"
+                     % (tries, st.get("volume_valid"), st.get("volume_solid"),
+                        floor, st.get("volume_snap_seq") == seq_before)}
 
 
 def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
@@ -965,6 +1051,7 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     light on a coplanar surface". It was this.
     """
     name = shot["name"]
+    room = room_of(vantage_name or shot["name"])
     info = {}
     info["dials_preapplied"] = push_dials(
             dials, "%s_pre_%d" % (name, time.time_ns()))
@@ -979,7 +1066,7 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # the settle clock starts only once the volume is proven present:
     # a snapshot also clamps still_frames, so waiting here costs nothing
     # and a capture over an empty bubble costs everything.
-    info["volume"] = await_volume(marker, block)
+    info["volume"] = await_volume(marker, block, room=room)
     time.sleep(settle)
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
@@ -993,9 +1080,10 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     st = lab.read_stats() or {}
     info["still_frames_at_shutter"] = st.get("still_frames")
     info["stats_at_shutter"] = {k: st.get(k) for k in
-                                ("volume_valid", "area_emitters", "area_total",
-                                 "emitters", "frame_ms_avg", "busy_ms",
-                                 "pass_ms", "accum_alpha")}
+                                ("volume_valid", "volume_solid",
+                                 "volume_snap_seq", "area_emitters",
+                                 "area_total", "emitters", "frame_ms_avg",
+                                 "busy_ms", "pass_ms", "accum_alpha")}
     with open(lab.PATCH, "w") as f:
         f.write("claude_screenshot = %s\n" % marker)
     png = None
@@ -1030,7 +1118,6 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     # in frame for this shutter — not what the deploy intended. Written
     # into both this run's in-memory record and the copied sidecar, so a
     # golden pinned from this run carries its own room hash forward.
-    room = room_of(vantage_name or shot["name"])
     h, herr = room_hash(room)
     info["room"] = room
     info["room_hash"] = h
@@ -1057,22 +1144,35 @@ def park_for(vantage_name, vantages):
 
 # ---------------------------------------------------------------- referees
 
-def run_referee(kind, arg, png, rundir, name, golden_png=None):
+def run_referee(kind, arg, png, rundir, name, golden_png=None,
+                golden_refused=None):
+    """golden_refused, when set, means a golden PNG exists but the room
+    hash gate (the same one diff_against_gated uses for the RMS diff)
+    refused it for this shot -- the --ratio comparison is a pixel
+    comparison against that golden image, exactly like the RMS diff, and
+    was NOT gated on the room hash until Opus's review of the 1b diff
+    caught it: a hash-refused Cornell still printed ratio numbers,
+    quietly comparing pixels from two different rooms. golden_png is
+    dropped from the command in that case, and the refusal reason is
+    carried through to the parsed result so cornell_verdict() can say
+    REFUSED instead of "no golden pinned" (a golden IS pinned; it was
+    refused, a different claim)."""
     script = os.path.join(HERE, "claude_%s_check.py" % kind)
     cmd = [sys.executable, script, png] + ([arg] if arg else [])
     if kind == "furnace" and FURNACE_PATCH:
         cmd += ["--patch"] + [str(v) for v in FURNACE_PATCH]
+    use_golden = golden_png if not golden_refused else None
     if kind == "cornell":
         cmd += ["--regions"]
-        if golden_png:
-            cmd += ["--ratio", golden_png]
+        if use_golden:
+            cmd += ["--ratio", use_golden]
     r = sh(cmd)
     text = (r.stdout or "") + (r.stderr or "")
     with open(os.path.join(rundir, name + ".referee.txt"), "w") as f:
         f.write("$ %s\n\n%s\n[exit %d]\n" % (" ".join(cmd), text, r.returncode))
     out = {"kind": kind, "arg": arg, "returncode": r.returncode,
            "txt": name + ".referee.txt", "stdout": text,
-           "golden_png": golden_png}
+           "golden_png": use_golden, "golden_refused": golden_refused}
     out.update(parse_furnace(text) if kind == "furnace" else parse_cornell(text))
     return out
 
@@ -1142,6 +1242,8 @@ def cornell_verdict(ref):
     step. Without a golden it cannot speak, which is not a pass."""
     if not ref or ref.get("returncode") != 0:
         return "-", "referee could not speak"
+    if ref.get("golden_refused"):
+        return "-", "REFUSED: %s" % ref["golden_refused"]
     ratios = ref.get("region_ratios")
     if not ratios:
         return "-", "no golden pinned (region ratios unmeasurable)"
@@ -1491,6 +1593,10 @@ def bring_up_seat(rundir, run, args):
             return ("gallery deploy failed (rc=%s): %s"
                     % (dep["returncode"], dep["stdout_tail"][-800:]
                        or dep["stderr_tail"][-800:]))
+        deploy_hash_err = verify_deploy_hashes()
+        run["deploy_hash_check"] = deploy_hash_err or "ok"
+        if deploy_hash_err:
+            return deploy_hash_err
 
     run["shader_failures"] = shader_compile_failures()
     run["freeze"] = do_freeze()
@@ -1535,6 +1641,10 @@ def cmd_run(args):
         A.add("gallery-deploy", dep.get("returncode") == 0
               and "MISSING NODE NAMES" not in dep.get("stdout_tail", ""),
               "skip_clear=%s rc=%s" % (dep.get("skip_clear"), dep.get("returncode")))
+        dhc = run.get("deploy_hash_check")
+        A.add("deploy-room-hashes", dhc == "ok",
+              dhc if dhc != "ok" else "%d rooms match EXPECTED_DEPLOY_HASH"
+              % len(EXPECTED_DEPLOY_HASH))
     A.add("shaders-compile", not run["shader_failures"],
           "%d 'Failed to compile' lines in debug.txt"
           % len(run["shader_failures"]))
@@ -1590,12 +1700,11 @@ def cmd_run(args):
                     lab.rpc("lamps", p1=dict(zip("xyz", p1)),
                            p2=dict(zip("xyz", p2)), state="on")
             shot = {"png": os.path.basename(png), "capture": cap}
-            if shot_def["referee"]:
-                kind, arg = shot_def["referee"]
-                shot["referee"] = run_referee(
-                    kind, arg, png, rundir, name,
-                    gold_png if kind == "cornell" else None)
-            shot["verdict"] = list(verdict(shot_def, shot.get("referee")))
+            # Room-hash gate BEFORE the referee runs: the Cornell
+            # --ratio comparison is a pixel diff against golden_png,
+            # exactly like the RMS diff below, and both must be refused
+            # together — a hash-refused room must not print ratio
+            # numbers just because the RMS half of the check ran second.
             this_hash = cap.get("room_hash")
             shot["rms_vs_prev"], prev_refused = diff_against_gated(
                 prev, name, png, this_hash, "prev")
@@ -1605,6 +1714,13 @@ def cmd_run(args):
                 shot["rms_vs_prev"] = {"refused": prev_refused}
             if gold_refused:
                 shot["rms_vs_golden"] = {"refused": gold_refused}
+            if shot_def["referee"]:
+                kind, arg = shot_def["referee"]
+                shot["referee"] = run_referee(
+                    kind, arg, png, rundir, name,
+                    gold_png if kind == "cornell" else None,
+                    golden_refused=gold_refused if kind == "cornell" else None)
+            shot["verdict"] = list(verdict(shot_def, shot.get("referee")))
             run["shots"][name] = shot
             A.add("%s-room-hash" % name, not gold_refused,
                   gold_refused or ("hash %s (room %s)"
@@ -1622,10 +1738,11 @@ def cmd_run(args):
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
             vol = cap.get("volume") or {}
             A.add("%s-volume" % name, vol.get("ok"),
-                  vol.get("error") or "volume_valid=%s area_emitters=%s/%s "
+                  vol.get("error") or "solid=%s (floor %s) area_emitters=%s/%s "
                   "(snapshot attempt %s)"
-                  % (vol.get("volume_valid"), vol.get("area_emitters"),
-                     vol.get("area_total"), vol.get("attempts")))
+                  % (vol.get("volume_solid"), vol.get("volume_floor"),
+                     vol.get("area_emitters"), vol.get("area_total"),
+                     vol.get("attempts")))
             st = (cap.get("stats_at_shutter") or {})
             sf = cap.get("still_frames_at_shutter")
             A.add("%s-converged" % name, (sf or 0) >= CONVERGED_MIN,
@@ -1714,8 +1831,18 @@ def cmd_calibrate(args):
                                            "error": str(ex)})
                     continue
                 kind, arg = shot_def["referee"]
+                # Same room-hash gate as cmd_run, keyed on the room's
+                # PLAIN vantage name (shot_def["name"], e.g. "cornell"),
+                # not the deformed calibrate name ("cornell_bounces1") --
+                # the golden's run.json has no entry under the deformed
+                # name to compare against.
+                this_hash = cap.get("room_hash")
+                _, gold_refused = diff_against_gated(
+                    read_golden(), shot_def["name"], png, this_hash, "golden")
                 ref = run_referee(kind, arg, png, rundir, name,
-                                  gold_png if kind == "cornell" else None)
+                                  gold_png if kind == "cornell" else None,
+                                  golden_refused=gold_refused
+                                  if kind == "cornell" else None)
                 ds = cap.get("dial_state") or {}
                 # every referee that speaks about this frame, by name
                 seen = []
