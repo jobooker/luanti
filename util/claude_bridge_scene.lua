@@ -227,10 +227,17 @@ function OPS.cozy(p)
     for x = 1, 3 do for z = 3, 5 do set(x, 0, z, cobble) end end
     set(2, 1, 4, campfire)
     set(1, 1, 6, furnace, core.dir_to_facedir({ x = 1, y = 0, z = 0 }))
-    -- torch pair on the east wall (attached to +X)
+    -- Torches removed (John 2026-08-15, roadmap 1b): a torch is a small
+    -- flame in a 1m cell, and the tracer's classifier folds a non-full-
+    -- cube emitter into either an invisible cell or a dark cube — never
+    -- a torch. Placing one and calling it "a light" is a documented
+    -- absence pretending to be a feature. They return as the first
+    -- SUB-VOXEL EMITTER (roadmap 7a). Until then the cell is honestly
+    -- air, explicit rather than inherited from whatever was there before
+    -- a rebuild (this room is now rebuilt every CI run).
     local wm_e = core.dir_to_wallmounted({ x = 1, y = 0, z = 0 })
-    set(9, 3, 3, torch_w, wm_e)
-    set(9, 3, 5, torch_w, wm_e)
+    set(9, 3, 3, "air")
+    set(9, 3, 5, "air")
     -- floor lantern by the door
     set(4, 1, 1, lantern)
     -- dark corner (NE): bed + chests, no emitter within 4 m
@@ -247,6 +254,33 @@ function OPS.cozy(p)
         for x = 4, 6 do for z = 3, 5 do set(x, 1, z, carpet) end end
     end
     return { placed = placed, missing = missing }
+end
+
+-- Swap a room's emissive nodes for their unlit twins, or back (roadmap
+-- 1b, cozy-day-dark-ci: "with 2b it must be lit through the windows;
+-- today it is black"). Scans the given box for `from` and rewrites it to
+-- `to` -- generic over which node pair, so it can toggle the cozy
+-- panel's claude_bridge:white_lit <-> claude_bridge:white255 (registered
+-- in claude_bridge_gallery.lua) without knowing the panel's coordinates.
+-- in: { p1={x,y,z}, p2={x,y,z}, state="off"|"on" }
+function OPS.lamps(p)
+    local a, b = p.p1, p.p2
+    local x0, x1 = math.min(a.x, b.x), math.max(a.x, b.x)
+    local y0, y1 = math.min(a.y, b.y), math.max(a.y, b.y)
+    local z0, z1 = math.min(a.z, b.z), math.max(a.z, b.z)
+    local off = p.state == "off"
+    local from = off and "claude_bridge:white_lit" or "claude_bridge:white255"
+    local to = off and "claude_bridge:white255" or "claude_bridge:white_lit"
+    local n = 0
+    for x = x0, x1 do for y = y0, y1 do for z = z0, z1 do
+        local pos = { x = x, y = y, z = z }
+        local node = core.get_node_or_nil(pos)
+        if node and node.name == from then
+            core.set_node(pos, { name = to })
+            n = n + 1
+        end
+    end end end
+    return { swapped = n, state = p.state, from = from, to = to }
 end
 
 -- Cave: chain of overlapping air spheres into a hillside, torches.

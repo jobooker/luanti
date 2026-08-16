@@ -25,8 +25,11 @@ FLOOR = 8          # mgflat surface top; rooms sit on it
 WALK = FLOOR + 1
 
 # Vegetation clear box — light control, per the deployed-gallery record.
+# Widened 2026-08-15 (roadmap 1b) to cover the sky/sun/glass referee
+# cluster (cave pair + sky-furnace pad), which sits >=70 nodes north of
+# the cabin/Cornell line on purpose — see claude_ci.py ROOM_BOXES.
 CLEAR = dict(p1={"x": -56, "y": WALK, "z": -40},
-             p2={"x": 64, "y": 30, "z": 40})
+             p2={"x": 80, "y": 30, "z": 128})
 
 
 def emerge(p1, p2):
@@ -46,7 +49,7 @@ def main():
     # bridge writes into loaded blocks only, and a silent no-op here
     # looks exactly like a successful build.
     print("emerging build region...")
-    emerge({"x": -60, "y": 0, "z": -44}, {"x": 68, "y": 40, "z": 44})
+    emerge({"x": -60, "y": 0, "z": -44}, {"x": 84, "y": 40, "z": 132})
 
     if not args.skip_clear:
         # Clear in y-slabs; OPS.fill caps at 60k nodes per call.
@@ -75,6 +78,26 @@ def main():
     print("hall...")
     print("  ", rpc("hall", y=FLOOR, x0=-2, x1=56,
                     doors=[5, 20, 33, 47], torches=[10, 27, 44]))
+
+    # Sky/sun/glass referee cluster (roadmap 1b, gallery phase 2). North
+    # of the cabin/Cornell line by >=70 nodes on purpose (measured.md
+    # "Rung 2" landmine 2 / the handoff's distance constraint): these
+    # rooms are referees for 2b's sky and sun terms, and must not sit in
+    # the 128^3 bubble of any existing CI vantage, nor let the open
+    # sky-furnace pad show up in the cabin's or Cornell's own capture.
+    # No hall — the mgflat plain between here and the cabin cluster is
+    # already flat and walkable, so nothing needs building to connect
+    # them; each room gets its own walk-in door same as furnace/Cornell.
+    print("cave-skylight @ (10,%d,85), opening glazed..." % FLOOR)
+    print("  ", rpc("skycave", pos={"x": 10, "y": FLOOR, "z": 85},
+                    sx=7, sy=5, sz=7, glazed=True))
+    print("cave-glass @ (30,%d,85), opening plugged (opaque, by design)..."
+          % FLOOR)
+    print("  ", rpc("skycave", pos={"x": 30, "y": FLOOR, "z": 85},
+                    sx=7, sy=5, sz=7, glazed=False))
+    print("sky-furnace-050 pad @ (60,%d,110)..." % FLOOR)
+    print("  ", rpc("skypad", center={"x": 60, "y": FLOOR, "z": 110},
+                    half=12, fence=13))
 
     print("\ndone. vantages: util/claude_vantages.json")
 

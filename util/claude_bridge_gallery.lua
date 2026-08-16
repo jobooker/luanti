@@ -32,6 +32,8 @@ galnode("gray221_lit", "claude_gray221.png", 14) -- furnace B walls
 galnode("red221", "claude_red221.png", 0)        -- Cornell left wall
 galnode("green221", "claude_green221.png", 0)    -- Cornell right wall
 galnode("white_lit", "claude_white255.png", 14)  -- Cornell ceiling emitter
+galnode("white255", "claude_white255.png", 0)    -- white_lit's unlit twin
+                                                  -- (OPS.lamps toggles them)
 
 local function box(p1, p2, name)  -- inclusive solid box fill
     for x = p1.x, p2.x do for y = p1.y, p2.y do for z = p1.z, p2.z do
@@ -92,6 +94,71 @@ function OPS.cornell(p)
     box({ x = mid, y = o.y + 1, z = o.z },
         { x = mid, y = o.y + 2, z = o.z }, "air")
     return { door = { x = mid, y = o.y + 1, z = o.z } }
+end
+
+-- Sealed sky-referee cave (roadmap 1b): a uniform rho=0.50 box like
+-- OPS.furnace but non-cubic (interior sx wide x sy tall x sz deep, no
+-- lamps) with ONE 1x1 ceiling opening at centre -- open (glazed=false
+-- misnomer aside: glazed=true means OPEN, sky-visible) for
+-- cave-skylight, or plugged with the wall node itself for cave-glass
+-- ("glass IS opaque today, so build what it is" -- John 2026-08-15; the
+-- plug becomes an actual glass node only in 2b, as its own change, same
+-- coordinates). Walk-in door as OPS.furnace; plug it with OPS.door
+-- before measuring, same as every referee room.
+-- in: { pos={x,y,z}, sx=7, sy=5, sz=7, glazed=true|false }
+function OPS.skycave(p)
+    local o = p.pos
+    local sx, sy, sz = p.sx or 7, p.sy or 5, p.sz or 7
+    local ex, ey, ez = sx + 1, sy + 1, sz + 1
+    local wall = "claude_bridge:gray186"
+    box({ x = o.x, y = o.y, z = o.z },
+        { x = o.x + ex, y = o.y + ey, z = o.z + ez }, wall)
+    box({ x = o.x + 1, y = o.y + 1, z = o.z + 1 },
+        { x = o.x + sx, y = o.y + sy, z = o.z + sz }, "air")
+    local dx = o.x + 1 + math.floor((sx - 1) / 2)
+    box({ x = dx, y = o.y + 1, z = o.z },
+        { x = dx, y = o.y + 2, z = o.z }, "air")
+    local cx = o.x + 1 + math.floor((sx - 1) / 2)
+    local cz = o.z + 1 + math.floor((sz - 1) / 2)
+    local hole = { x = cx, y = o.y + ey, z = cz }
+    core.set_node(hole, { name = p.glazed and "air" or wall })
+    return { door = { x = dx, y = o.y + 1, z = o.z }, hole = hole,
+             glazed = p.glazed and true or false }
+end
+
+-- Open sky-furnace pad (roadmap 1b): a flat rho=0.50 slab, no walls, no
+-- roof -- the L = rho*L_sky referee once 2b ships a uniform-sky test
+-- dial. A low (1-node) fence at radius >= 12 from centre keeps the
+-- referee's grazing-angle sky occlusion under 1% (measured/derived,
+-- handoff 2026-08-15-gallery-phase2-referees.md) without walling in the
+-- hemisphere the pad needs to see.
+-- in: { center={x,y,z}, half=12, fence=13 }
+function OPS.skypad(p)
+    local o = p.center
+    local half = p.half or 12
+    local fdist = p.fence or 13
+    for x = o.x - half, o.x + half - 1 do
+        for z = o.z - half, o.z + half - 1 do
+            core.set_node({ x = x, y = o.y, z = z },
+                    { name = "claude_bridge:gray186" })
+        end
+    end
+    local fence = (core.registered_nodes["mcl_fences:oak_fence"] and
+                  "mcl_fences:oak_fence")
+            or (core.registered_nodes["mcl_fences:spruce_fence"] and
+               "mcl_fences:spruce_fence")
+            or (core.registered_nodes["default:fence_wood"] and
+               "default:fence_wood")
+            or "claude_bridge:gray186"
+    for x = o.x - fdist, o.x + fdist do
+        core.set_node({ x = x, y = o.y + 1, z = o.z - fdist }, { name = fence })
+        core.set_node({ x = x, y = o.y + 1, z = o.z + fdist }, { name = fence })
+    end
+    for z = o.z - fdist, o.z + fdist do
+        core.set_node({ x = o.x - fdist, y = o.y + 1, z = z }, { name = fence })
+        core.set_node({ x = o.x + fdist, y = o.y + 1, z = z }, { name = fence })
+    end
+    return { ok = true, fence = fence, half = half, fdist = fdist }
 end
 
 -- The connecting hall (phase 1 item 4). Rooms sit in a row along the
