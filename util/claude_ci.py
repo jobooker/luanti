@@ -1418,12 +1418,23 @@ def bring_up_seat(rundir, run, args):
         return "client never became ready after %.0fs" % CLIENT_READY_TIMEOUT
     print("seat: client ready")
 
-    ok, dep = deploy_gallery()
-    run["gallery_deploy"] = dep
-    if not ok:
-        return ("gallery deploy failed (rc=%s): %s"
-                % (dep["returncode"], dep["stdout_tail"][-800:]
-                   or dep["stderr_tail"][-800:]))
+    if getattr(args, "skip_deploy", False):
+        # --skip-deploy: capture the world AS IT SITS, no rebuild first.
+        # Deploy-every-run is the feature that auto-heals a dug node or a
+        # creeper's damage; it also means "dig a hole, then claude_ci
+        # run" can never demonstrate the room-hash REFUSAL, because the
+        # hole is repaired before the capture ever happens. This flag is
+        # how the refusal half of the gate gets tested honestly, on a
+        # deliberately-broken room, without the auto-heal masking it.
+        print("gallery: --skip-deploy, capturing the world as it sits")
+        run["gallery_deploy"] = {"skipped": True}
+    else:
+        ok, dep = deploy_gallery()
+        run["gallery_deploy"] = dep
+        if not ok:
+            return ("gallery deploy failed (rc=%s): %s"
+                    % (dep["returncode"], dep["stdout_tail"][-800:]
+                       or dep["stderr_tail"][-800:]))
 
     run["shader_failures"] = shader_compile_failures()
     run["freeze"] = do_freeze()
@@ -1462,9 +1473,12 @@ def cmd_run(args):
     A.add("build-release", (run.get("build_type") or "").lower() in RELEASE_TYPES,
           "CMAKE_BUILD_TYPE=%s" % run.get("build_type"))
     dep = run.get("gallery_deploy") or {}
-    A.add("gallery-deploy", dep.get("returncode") == 0
-          and "MISSING NODE NAMES" not in dep.get("stdout_tail", ""),
-          "skip_clear=%s rc=%s" % (dep.get("skip_clear"), dep.get("returncode")))
+    if dep.get("skipped"):
+        A.add("gallery-deploy", True, "--skip-deploy: not rebuilt this run")
+    else:
+        A.add("gallery-deploy", dep.get("returncode") == 0
+              and "MISSING NODE NAMES" not in dep.get("stdout_tail", ""),
+              "skip_clear=%s rc=%s" % (dep.get("skip_clear"), dep.get("returncode")))
     A.add("shaders-compile", not run["shader_failures"],
           "%d 'Failed to compile' lines in debug.txt"
           % len(run["shader_failures"]))
@@ -1761,6 +1775,12 @@ def main():
                             "(default %(default)s)")
         p.add_argument("--skip-build", action="store_true",
                        help="capture with the binaries already in ./bin")
+        p.add_argument("--skip-deploy", action="store_true",
+                       help="capture the world AS IT SITS, no gallery "
+                            "rebuild first (scratch/diagnostic only — this "
+                            "is what lets a deliberately-broken room's "
+                            "damage survive to the capture instead of "
+                            "being auto-healed)")
         p.add_argument("--allow-debug", action="store_true",
                        help="capture against a Debug build tree anyway "
                             "(scratch only — environment-laws forbids it)")
