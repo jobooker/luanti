@@ -296,13 +296,6 @@ struct ClaudeTraceGrid
 	float shader_prev_tanx = 1.0f, shader_prev_tany = 1.0f;
 	v3f cur_pos, cur_fwd, cur_rightu, cur_upu;
 	float cur_tanx = 1.0f, cur_tany = 1.0f;
-	// radiance cache (claude_radiance): frame counter drives which 1/8 of
-	// cells the GPU update pass refreshes; reset > 0 makes the pass write
-	// zeros — the cache is grid-local, so an origin shift invalidates it
-	// wholesale (2 frames, to clear both ping-pong targets). Starts at 2
-	// as belt-and-braces over the FBO clear.
-	float radiance_frame = 0.0f;
-	int radiance_reset = 2;
 	// near-ring sub-face atlas (ADR-0006 v2): ring corner in grid-local
 	// cell coords, plus last frame's for cross-shift address remapping
 	v3f near_origin = v3f(48.0f, 48.0f, 48.0f);
@@ -328,6 +321,29 @@ struct ClaudeTraceGrid
 };
 static ClaudeTraceGrid g_claude_grid;
 
+
+// Throw away the running average and start it again, exactly the way a
+// camera move does (see the accum_alpha block in claudeUpdateGrid).
+//
+// A DEBUG KEY THAT CHANGES WHAT IS RENDERED MUST CALL THIS. At a parked
+// camera accum_alpha is ~1/N, so a frame rendered under the old dial
+// state survives in the running average for thousands of frames and the
+// A/B the key exists to perform compares one blend against another. The
+// shader header records the same trap for the debug views (views 1-5
+// write their deterministic image straight into the ping-pong history)
+// and says the way out is to reset the way the CPU already knows how.
+//
+// accum_resets is a COUNTER, not a flag, and it is bumped here for the
+// reason spec/environment-laws.md gives: claude_stats.json is rewritten
+// once per second, so any check that samples still_frames can miss a
+// reset entirely, while two reads of a counter bracket every reset
+// between them.
+static void claudeResetAccumulation()
+{
+	g_claude_grid.accum_alpha = 1.0f;
+	g_claude_grid.still_frames = 0.0f;
+	g_claude_grid.accum_resets++;
+}
 
 class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 {
@@ -401,12 +417,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_skybounce_pixel{"skyBounce"};
 	CachedPixelShaderSetting<float, 1, false> m_sunangle_pixel{"sunAngle"};
 	CachedPixelShaderSetting<float, 1, false> m_nightsky_pixel{"nightSkyGain"};
-	CachedPixelShaderSetting<float, 1, false> m_radiance_pixel{"radianceStrength"};
-	CachedPixelShaderSetting<float, 1, false> m_radiance_frame_pixel{"claudeRadianceFrame"};
-	CachedPixelShaderSetting<float, 1, false> m_radiance_reset_pixel{"claudeRadianceReset"};
 	float m_texture_amount, m_gray, m_bevel, m_relief, m_parallax, m_jitter;
 	float m_pure = 0.0f;
-	float m_skybounce, m_sunangle, m_nightsky, m_moongain, m_radiance;
+	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
 	float m_bounce2 = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce2_pixel{"bounce2Strength"};
 	float m_cache_sky = 0.0f;
@@ -572,7 +585,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_sun_angle",
 		"claude_night_sky",
 		"claude_moon_gain",
-		"claude_radiance",
 		"claude_bounce2",
 		"claude_cache_sky",
 		"claude_bisect",
@@ -744,16 +756,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_skybounce"))
 			return 0.6f;
 		return g_settings->getFloat("claude_skybounce", 0.0f, 2.0f);
-	}
-
-	// Multi-bounce dial: how strongly bounce rays add the world-space
-	// radiance cache's circulating light. 0 disables both the read path
-	// and (via early-out) the GPU update pass. 1 = physical-ish weight.
-	static float readRadiance()
-	{
-		if (!g_settings->exists("claude_radiance"))
-			return 0.0f;
-		return g_settings->getFloat("claude_radiance", 0.0f, 1.0f);
 	}
 
 	// Third bounce: the ambient ray's hit fires ONE more hop at full
@@ -1029,8 +1031,6 @@ public:
 			m_nightsky = readNightSky();
 		if (name == "claude_moon_gain")
 			m_moongain = readMoonGain();
-		if (name == "claude_radiance")
-			m_radiance = readRadiance();
 		if (name == "claude_bounce2")
 			m_bounce2 = readBounce2();
 		if (name == "claude_cache_sky")
@@ -1117,7 +1117,6 @@ public:
 		m_sunangle = readSunAngle();
 		m_nightsky = readNightSky();
 		m_moongain = readMoonGain();
-		m_radiance = readRadiance();
 		m_bounce2 = readBounce2();
 		m_cache_sky = readCacheSky();
 		m_bisect = readBisect();
@@ -1265,13 +1264,6 @@ public:
 			float acount = g_claude_grid.valid
 					? (float)g_claude_grid.area_count : 0.0f;
 			m_area_count_pixel.set(&acount, services);
-			// Radiance cache controls: delivered UNCONDITIONALLY (like the
-			// samplers below) because the claude_radiance update pass runs
-			// every frame regardless of mode and must be able to early-out
-			// on its own uniforms; a value only set when a consumer is on
-			// would leave the pass reading stale state after a toggle-off.
-			float rad = g_claude_grid.valid ? m_radiance : 0.0f;
-			m_radiance_pixel.set(&rad, services);
 			float b2 = g_claude_grid.valid ? m_bounce2 : 0.0f;
 			m_bounce2_pixel.set(&b2, services);
 			m_cache_sky_pixel.set(&m_cache_sky, services);
@@ -1285,12 +1277,6 @@ public:
 			m_face_texels_pixel.set(&m_face_texels, services);
 			m_near_origin_pixel.set(g_claude_grid.near_origin, services);
 			m_near_prev_pixel.set(g_claude_grid.near_prev, services);
-			m_radiance_frame_pixel.set(&g_claude_grid.radiance_frame,
-					services);
-			// the COUNTER (2/1/0), not a flag: 2 = remap frame (apply
-			// origin delta), 1 = carry frame (plain copy of the remap)
-			float rreset = (float)g_claude_grid.radiance_reset;
-			m_radiance_reset_pixel.set(&rreset, services);
 			m_origin_delta_pixel.set(g_claude_grid.origin_delta, services);
 			m_cache_remap_pixel.set(&m_cache_remap, services);
 			m_far_hist_pixel.set(&m_far_hist, services);
@@ -3357,21 +3343,6 @@ static void claudeUpdateAccum(Client *client)
 	// the smoothing); when still, a TRUE running average (weight 1/N)
 	// so the image converges to actual stillness instead of the EMA's
 	// perpetual 5%-new-sample pulse.
-	// radiance cache housekeeping: advance the amortization counter (the
-	// GPU pass refreshes cells whose interleave group == frame mod 8), and
-	// invalidate wholesale on an origin shift — the cache is grid-local,
-	// so rebasing makes every cell wrong. Two reset frames clear both
-	// ping-pong targets. Wrapped at 8 so the float compare in the shader
-	// stays exact forever.
-	// wrapped at 16 (was 8) so coarse light-ladder rungs can ride a
-	// 1/16 wheel; every mod-4/mod-8 consumer divides 16 evenly
-	g_claude_grid.radiance_frame =
-			std::fmod(g_claude_grid.radiance_frame + 1.0f, 16.0f);
-	if (origin_changed)
-		g_claude_grid.radiance_reset = 2;
-	else if (g_claude_grid.radiance_reset > 0)
-		g_claude_grid.radiance_reset--;
-
 	if (origin_changed || moved > 20.0f) {
 		g_claude_grid.accum_alpha = 1.0f;
 		g_claude_grid.still_frames = 0.0f;
@@ -5181,15 +5152,17 @@ void Game::toggleClaudeTrace()
 		m_game_ui->showTranslatedStatusText("Ray tracing OFF (vanilla)");
 }
 
-// G: flip the multi-bounce radiance cache for instant A/B — the tell is
+// G: direct light only vs full transport, for instant A/B — the tell is
 // the wall a torch cannot directly see. (B was taken: hotbar_previous.)
 void Game::toggleClaudeBounce()
 {
-	float cur = g_settings->getFloat("claude_radiance", 0.0f, 1.0f);
-	bool to_on = cur < 0.5f;
-	g_settings->set("claude_radiance", to_on ? "1.0" : "0");
-	if (to_on)
-		m_game_ui->showTranslatedStatusText("Multi-bounce ON");
+	float cur = g_settings->getFloat("claude_bounces", 0.0f, 64.0f);
+	bool to_full = cur < 12.0f;
+	g_settings->set("claude_bounces", to_full ? "24" : "1");
+	claudeResetAccumulation();
+	if (to_full)
+		m_game_ui->showTranslatedStatusText(
+				"Bounces 24 (full transport)");
 	else
 		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
 }
@@ -5274,6 +5247,21 @@ void Game::toggleDebug()
 	if (state >= 3 && !has_debug)
 		state = 0;
 
+//
+// IT USED TO FLIP claude_radiance, WHICH DID NOTHING AT ALL. That dial
+// fed `radianceStrength`, a uniform no shader in this tree declares, so
+// the key printed "Multi-bounce ON" and changed not one pixel — the
+// silent-uniform bug class in spec/environment-laws.md, found by John
+// pressing the key and seeing nothing (2026-08-16). The dial that
+// actually decides how far light bounces is claude_bounces (the shader
+// declares `claudeBounces` and the path loop reads it), so the key now
+// flips that: 1 = direct light only, 24 = the full transport the goldens
+// are taken with.
+//
+// The accumulator is reset here for the same reason the view key resets
+// it: at a parked camera accumAlpha is ~1/N, so the frames taken under
+// the OLD bounce count would survive in the running average for a long
+// time and the A/B would compare a blend against a blend.
 	m_game_ui->m_flags.show_minimal_debug = state > 0;
 	m_game_ui->m_flags.show_basic_debug = state > 0 && has_basic_debug;
 	m_game_ui->m_flags.show_profiler_graph = state == 2;

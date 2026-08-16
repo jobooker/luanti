@@ -53,8 +53,7 @@ claude_subvox = 0
 claude_descend = 1
 claude_denoise = 0
 
-# --- the six that were silently OFF all session (ship values)
-claude_radiance = 1
+# --- the five that were silently OFF all session (ship values)
 claude_face_texels = 2
 claude_pyramid = 1
 claude_cache_remap = 1
