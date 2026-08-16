@@ -3824,11 +3824,39 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 		}
 		if (!follow || !consumer_on) {
 			// Nothing is going to consume the dirty list; drain it so it
-			// cannot grow without bound while the bubble is frozen. The
-			// overflow flag is cleared with it, and the next real
-			// snapshot is a full walk anyway.
+			// cannot grow without bound while the bubble is frozen.
 			std::vector<v3s16> discard;
-			client->takeClaudeDirtyBlocks(discard);
+			bool overflow = client->takeClaudeDirtyBlocks(discard);
+			// ...AND THE DRAIN USED TO LOSE THE EDIT. Found by John
+			// driving, 2026-08-16: he pressed O for the raster view, mined
+			// a wall block, and the traced view still showed the wall. The
+			// old code discarded the list and left V.valid TRUE, so when
+			// the consumer came back the grid was never re-walked and the
+			// hole stayed missing until the next re-centre -- silently,
+			// with no log line and nothing in the stats to read.
+			//
+			// The comment it replaces said "the next real snapshot is a
+			// full walk anyway", which is true and irrelevant: over a
+			// world that has stopped moving, nothing schedules a next
+			// snapshot.
+			//
+			// Invalidating at DRAIN time rather than on the off->on edge
+			// is deliberate. It is the moment we know something was
+			// actually thrown away, so a consumer toggled off and on over
+			// a still world costs nothing, and there is no edge state to
+			// keep in sync with the four settings that make up
+			// consumer_on.
+			//
+			// The overflow flag counts as something thrown away: it means
+			// the list was already not the whole truth.
+			if ((!discard.empty() || overflow) && g_claude_grid.valid) {
+				g_claude_grid.valid = false;
+				actionstream << "[claude_grid] " << discard.size()
+						<< " block(s) changed with no consumer on"
+						<< (overflow ? " (+overflow)" : "")
+						<< "; grid INVALIDATED, next consumer tick walks"
+						<< std::endl;
+			}
 		}
 		if (consumer_on)
 			claudeCascadeUpdate(client);
