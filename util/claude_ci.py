@@ -286,8 +286,20 @@ FURNACE_PATCH = None
 # transport one — reproducible to 0.0002 but not physically meaningful
 # to that precision. Its own history moved with builds (0.733 fp16,
 # 1.068-1.087 mid-day, 1.113 today) and it is a truncation detector.
-FURNACE_PINNED = {"050": 0.982, "073": 1.113}
-FURNACE_TOL = {"050": 0.003, "073": 0.003}
+#
+# -073 RE-DERIVED 2026-08-16 at 060ac10f4, when the counter-based RNG
+# became the default (roadmap 1a) and the renderer got brighter: 1.113 ->
+# 1.053 / 1.069 on two consecutive clean runs. BOTH HALVES OF THAT MOVED:
+# the ratio, and its own reproducibility. The patch is 100% clipped, so
+# the referee is inverting an ACES shoulder — the printed spread was
+# 0.000228 under the old RNG and is 0.016 under the new one, with a
+# per-pixel sigma of 0.6 on a mean of 6.9. So the pin is the mean of the
+# two runs and the tolerance is 3x the observed spread, which is 16x
+# looser than -050's and still 12x tighter than the defects calibrate
+# plants (bounces1 took this room to 0.485, clay to 0.546). It remains a
+# TRUNCATION detector; nothing about it is precise.
+FURNACE_PINNED = {"050": 0.982, "073": 1.061}
+FURNACE_TOL = {"050": 0.003, "073": 0.048}
 # Legacy name kept so old run.json rows still parse.
 FURNACE_RATIO_TOL = 0.15
 
