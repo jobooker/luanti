@@ -444,8 +444,11 @@ def print_curve(rec, tol=0.0025):
               ["worst_dev%", "tile_worst%", "rms_gold"]
         rows = []
         for p in pts:
-            devs = [abs(p["regions"][k] / deep["regions"][k] - 1.0)
-                    for k in keys] if keys else [0.0]
+            # No regions on this arm -> print "-", never 0.000. A
+            # zero in a column that was never measured is the exact
+            # shape of a blind instrument reading as a pass.
+            devs = ([abs(p["regions"][k] / deep["regions"][k] - 1.0)
+                     for k in keys] if keys else None)
             tdev = max(abs(p["tiles"][k] / deep["tiles"][k] - 1.0)
                        for k in tkeys)
             rms = ""
@@ -459,15 +462,16 @@ def print_curve(rec, tol=0.0025):
                          p["still_frames_after_shutter"],
                          round(p.get("fps") or 0, 1)]
                         + ["%.5f" % p["regions"][k] for k in keys]
-                        + ["%.3f" % (100 * max(devs)), "%.3f" % (100 * tdev),
-                           rms])
+                        + ["%.3f" % (100 * max(devs)) if devs else "-",
+                           "%.3f" % (100 * tdev), rms])
         _table(rows, hdr)
         knee = next((p["target"] for p, r in zip(pts, rows)
-                     if float(r[-3]) <= tol * 100), None)
+                     if r[-3] != "-" and float(r[-3]) <= tol * 100), None)
         tknee = next((p["target"] for p, r in zip(pts, rows)
                       if float(r[-2]) <= tol * 100), None)
         print("  knee (regions within %.2f%% of N=%d): %s"
-              % (tol * 100, deep["target"], knee))
+              % (tol * 100, deep["target"],
+                 knee if keys else "n/a (no region referee on this arm)"))
         print("  knee (tiles   within %.2f%% of N=%d): %s"
               % (tol * 100, deep["target"], tknee))
 
