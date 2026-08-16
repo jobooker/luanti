@@ -736,10 +736,30 @@ def await_volume(marker, block, tries=3):
 
 
 def capture(shot, vantage, park, dials, rundir, settle):
-    """park -> vantage (proven reset) -> snapshot -> dials -> settle ->
-    shutter -> N read BEFORE the PNG write -> file it under the arm name."""
+    """dials -> park -> vantage (proven reset) -> snapshot -> re-assert
+    dials -> settle -> shutter -> N read BEFORE the PNG write -> file it
+    under the arm name.
+
+    THE ARM'S DIALS GO ON BEFORE THE ACCUMULATOR IS RESET, and that
+    ordering is not cosmetic. The dial channel is a ~1 Hz poll, so an
+    arm that pushes its dials AFTER the reset renders its first second
+    or two of frames with the PREVIOUS ARM'S dials — and the accumulator
+    is a TRUE 1/N running average with no floor (game.cpp: "no floor...
+    a parked camera must actually converge"), so those M stale frames
+    survive to the shutter as exactly M/N of the image. They never decay
+    out.
+
+    MEASURED 2026-08-16, roadmap 1a: a claude_view 9 frame captured
+    directly after a claude_view 0 frame carried 4.26% of that photo
+    frame — identical to 3 significant figures in all three channels and
+    in both halves of the ceiling box, where the direct-light view's own
+    answer is zero. It read as "the aimed estimator manufactures direct
+    light on a coplanar surface". It was this.
+    """
     name = shot["name"]
     info = {}
+    info["dials_preapplied"] = push_dials(
+            dials, "%s_pre_%d" % (name, time.time_ns()))
     info["reset_error"] = reset_accumulation(vantage, park)
     info["aim_at_start"] = read_aim()
     # with claude_volume_follow = 0 the bubble never re-centres on its
