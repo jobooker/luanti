@@ -243,6 +243,7 @@ struct ClaudeTraceGrid
 	std::vector<std::array<std::vector<u8>, 4>> models;
 	std::unordered_map<content_t, u8> model_of; // content -> 1-based idx
 	bool models_loaded = false;
+	bool models_on = true;   // the claude_models dial the table was built under
 	std::vector<u8> modelids;
 	// v2: per-voxel COLOR + EMISSION. Palette-indexed (the plan's "not
 	// really a map" answer): each model ships 4 pre-rotated 16^3 index
@@ -2019,12 +2020,54 @@ static bool claudeUseR8()
 // run; masks are pre-rotated to the four facedir yaws. Emission and
 // per-voxel color are v2 (the furnace mouth still renders as an
 // uncarved glowing cube until then).
+// claude_models: 1 (default) = the authored 16^3 model table is read from
+// util/claude_models/manifest.json; 0 = the table is left EMPTY, so every
+// node falls through to the next rung of the resolution order
+// (ContentFeatures::node_box, then a plain 1 m cube) and the world renders
+// as stock Luanti geometry only.
+//
+// It exists because of a worry of John's that turned out to be right
+// (2026-08-16): the cosy cabin reads as sub-voxel because ~74 % of its
+// solid nodes carry a HAND-AUTHORED mask -- its walls, floor and roof
+// planks are `planks_oak_baked` and friends -- while the only stock
+// geometry in the room is 88 roof stairs nobody can read as stairs from
+// inside. "Trace stock Luanti first" cannot be judged against a room that
+// is mostly our own authoring, and there was no way to take the authoring
+// away and look. This is that way.
+//
+// An explicit default rather than an absent-key fallback: an unset
+// claude_* dial silently taking a hidden default is a whole bug class in
+// this tree (spec/environment-laws.md, "the hidden-default class").
+static bool claudeModelsEnabled()
+{
+	if (!g_settings->exists("claude_models"))
+		return true;
+	return g_settings->getFloat("claude_models", 0.0f, 1.0f) >= 0.5f;
+}
+
 static void claudeLoadModels(const NodeDefManager *ndef)
 {
 	auto &V = g_claude_grid;
-	if (V.models_loaded)
+	bool want = claudeModelsEnabled();
+	if (V.models_loaded && want == V.models_on)
 		return;
+	// The dial moved (or this is the first walk). Drop whatever is loaded
+	// and answer the dial as it now stands -- a one-shot cache that
+	// ignores its own dial is a dial that does nothing until a restart,
+	// which is the silence this tree keeps finding.
 	V.models_loaded = true; // one attempt; missing files = no models
+	V.models_on = want;
+	V.models.clear();
+	V.model_vox.clear();
+	V.model_pal.clear();
+	V.model_glow.clear();
+	V.model_of.clear();
+	V.model_tex_dirty = true;
+	if (!want) {
+		infostream << "[claude_models] claude_models = 0: authored model "
+				"table left EMPTY (stock geometry only)" << std::endl;
+		return;
+	}
 	std::string dir = porting::path_user + "/util/claude_models";
 	Json::Value manifest;
 	{
@@ -3178,6 +3221,7 @@ static void claudeTraceGridSnapshot(Client *client)
 			// "record the dial state with every capture, not in your
 			// head"). nbox_shapes is the converter's whole working set:
 			// distinct (content, param2) box lists actually seen.
+			<< " models=" << (V.models_on ? 1 : 0)
 			<< " nodebox=" << (V.nodebox_on ? 1 : 0)
 			<< " nbox_shapes=" << V.nbox_masks.size()
 			<< "/" << V.nbox_of.size()
@@ -3746,7 +3790,24 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 				|| setting_on("claude_water_reflections")
 				|| setting_on("claude_gi")
 				|| setting_on("claude_clay");
-		if (follow && !g_claude_grid.valid && consumer_on) {
+		// A GEOMETRY DIAL THAT MOVED NEEDS A FULL RE-WALK, not the
+		// incremental path. claude_models and claude_nodebox decide what
+		// SHAPE every cell in the grid has, and the incremental path only
+		// re-walks blocks the world reported dirty -- so flipping either
+		// of them would repaint the handful of cells that happened to
+		// change and leave the rest of the room built under the old dial,
+		// which reads as a dial that does not work. Checked here rather
+		// than inside the walk, because the walk is the thing that has to
+		// be re-run.
+		bool geom_moved = consumer_on && g_claude_grid.valid
+				&& (claudeModelsEnabled() != g_claude_grid.models_on
+					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on);
+		if (geom_moved) {
+			actionstream << "[claude_grid] geometry dial changed"
+					" (claude_models/claude_nodebox); full re-walk"
+					<< std::endl;
+			claudeTraceGridSnapshot(client);
+		} else if (follow && !g_claude_grid.valid && consumer_on) {
 			claudeTraceGridSnapshot(client);
 		} else if (follow && g_claude_grid.valid) {
 			constexpr s16 H = ClaudeTraceGrid::SIZE / 2;
@@ -4840,6 +4901,8 @@ void Game::processKeyInput()
 		toggleClaudeTrace();
 	} else if (wasKeyPressed(KeyType::TOGGLE_CLAUDE_BOUNCE)) {
 		toggleClaudeBounce();
+	} else if (wasKeyPressed(KeyType::CLAUDE_VIEW_CYCLE)) {
+		claudeCycleView();
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_BACK)) {
 		claudeTimeNudge(-1);
 	} else if (wasKeyPressed(KeyType::CLAUDE_TIME_FWD)) {
@@ -4929,8 +4992,6 @@ void Game::processItemSelection(u16 *new_playeritem)
 	}
 
 	// Clamp selection again in case it wasn't changed but max_item was
-	} else if (wasKeyPressed(KeyType::CLAUDE_VIEW_CYCLE)) {
-		claudeCycleView();
 	*new_playeritem = MYMIN(*new_playeritem, max_item);
 }
 
@@ -5169,6 +5230,49 @@ void Game::toggleClaudeBounce()
 		m_game_ui->showTranslatedStatusText("Multi-bounce OFF (one bounce)");
 }
 
+// U: cycle the diagnostic views, 0 -> 1 -> ... -> 6 -> 0, naming each
+// one in words on the status line.
+//
+// It exists because there was no key at all: to see the normal ladder
+// John had to go Esc -> Settings -> find claude_view -> type a number,
+// which is not a thing anyone does mid-look (2026-08-16).
+//
+// The names are the shader header's own list (claude_trace/
+// opengl_fragment.glsl, "DIAGNOSTIC SUITE"), spelled out rather than
+// numbered, because a status line reading "claude_view 4" tells the
+// reader nothing they did not already type. Views 7 and 8 do not exist,
+// and 9/10/11 are roadmap-1a instrument A, which is a measurement rather
+// than a look-around view; the cycle stops at 6 and those stay reachable
+// by setting the dial.
+//
+// THE RESET IS THE POINT, not politeness. The shader header records it
+// as a known instrument side-effect: views 1-5 write their deterministic
+// image into the ping-pong history, so returning to view 0 at a parked
+// camera leaves that flat frame inside a running average whose alpha is
+// ~1/N -- for thousands of frames. Every step of the cycle resets, not
+// only the ones leaving 1-5: entering a view wants a clean start for the
+// same reason, and a rule with an exception in it is a rule someone gets
+// wrong later.
+void Game::claudeCycleView()
+{
+	static const char *const NAMES[] = {
+		"photo",            // 0
+		"normal ladder",    // 1
+		"albedo",           // 2
+		"emission (Le)",    // 3
+		"distance",         // 4
+		"bounce count",     // 5
+		"clay",             // 6
+	};
+	constexpr int N = (int)(sizeof(NAMES) / sizeof(NAMES[0]));
+	int cur = (int)g_settings->getFloat("claude_view", 0.0f, 16.0f);
+	int next = (cur >= 0 && cur < N - 1) ? cur + 1 : 0;
+	g_settings->set("claude_view", std::to_string(next));
+	claudeResetAccumulation();
+	m_game_ui->showStatusText(utf8_to_wide(
+			"claude_view " + std::to_string(next) + ": " + NAMES[next]));
+}
+
 // P: tap = start/stop time, hold (>0.4s) = fast-forward while held,
 // releasing restores the tap state. The client tracks running/stopped
 // itself (it can't read the server setting), so a manual /set
@@ -5258,49 +5362,6 @@ void Game::toggleDebug()
 // actually decides how far light bounces is claude_bounces (the shader
 // declares `claudeBounces` and the path loop reads it), so the key now
 // flips that: 1 = direct light only, 24 = the full transport the goldens
-// U: cycle the diagnostic views, 0 -> 1 -> ... -> 6 -> 0, naming each
-// one in words on the status line.
-//
-// It exists because there was no key at all: to see the normal ladder
-// John had to go Esc -> Settings -> find claude_view -> type a number,
-// which is not a thing anyone does mid-look (2026-08-16).
-//
-// The names are the shader header's own list (claude_trace/
-// opengl_fragment.glsl, "DIAGNOSTIC SUITE"), spelled out rather than
-// numbered, because a status line reading "claude_view 4" tells the
-// reader nothing they did not already type. Views 7 and 8 do not exist,
-// and 9/10/11 are roadmap-1a instrument A, which is a measurement rather
-// than a look-around view; the cycle stops at 6 and those stay reachable
-// by setting the dial.
-//
-// THE RESET IS THE POINT, not politeness. The shader header records it
-// as a known instrument side-effect: views 1-5 write their deterministic
-// image into the ping-pong history, so returning to view 0 at a parked
-// camera leaves that flat frame inside a running average whose alpha is
-// ~1/N -- for thousands of frames. Every step of the cycle resets, not
-// only the ones leaving 1-5: entering a view wants a clean start for the
-// same reason, and a rule with an exception in it is a rule someone gets
-// wrong later.
-void Game::claudeCycleView()
-{
-	static const char *const NAMES[] = {
-		"photo",            // 0
-		"normal ladder",    // 1
-		"albedo",           // 2
-		"emission (Le)",    // 3
-		"distance",         // 4
-		"bounce count",     // 5
-		"clay",             // 6
-	};
-	constexpr int N = (int)(sizeof(NAMES) / sizeof(NAMES[0]));
-	int cur = (int)g_settings->getFloat("claude_view", 0.0f, 16.0f);
-	int next = (cur >= 0 && cur < N - 1) ? cur + 1 : 0;
-	g_settings->set("claude_view", std::to_string(next));
-	claudeResetAccumulation();
-	m_game_ui->showStatusText(utf8_to_wide(
-			"claude_view " + std::to_string(next) + ": " + NAMES[next]));
-}
-
 // are taken with.
 //
 // The accumulator is reset here for the same reason the view key resets
