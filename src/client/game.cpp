@@ -565,7 +565,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 46> SETTING_CALLBACKS = {
+	// THE SIZE IS DEDUCED, and it has to be. This was
+	// `std::array<const char*, 46>` with the count written by hand, so
+	// deleting one dead dial (claude_radiance, 2026-08-16) left 45
+	// initialisers in a 46-slot array, value-initialising the last
+	// element to NULLPTR -- and the constructor below walks the list
+	// calling registerChangedCallback, which strlen()s the name. The
+	// client segfaulted before it drew a frame, in a function whose only
+	// change was a deletion three hundred lines away. A hand-maintained
+	// count next to a hand-maintained list is the same failure mode this
+	// file already instruments for uniforms.
+	static constexpr const char *SETTING_CALLBACKS[] = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -3849,7 +3859,16 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 			//
 			// The overflow flag counts as something thrown away: it means
 			// the list was already not the whole truth.
-			if ((!discard.empty() || overflow) && g_claude_grid.valid) {
+			//
+			// ONLY WHEN follow IS ON. With claude_grid_follow = 0 the
+			// bubble is frozen on purpose and the `!valid && consumer_on`
+			// branch above will not rebuild it, so invalidating here would
+			// leave the tracer running on NO GRID -- grid_valid 0,
+			// emitters 0, a frame that looks exactly like "ray tracing
+			// off". That is a documented environment law, not a
+			// hypothetical.
+			if (follow && (!discard.empty() || overflow)
+					&& g_claude_grid.valid) {
 				g_claude_grid.valid = false;
 				actionstream << "[claude_grid] " << discard.size()
 						<< " block(s) changed with no consumer on"
