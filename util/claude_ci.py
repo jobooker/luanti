@@ -160,6 +160,14 @@ CANONICAL_DIALS = {
     # silent default (environment-laws, the hidden-default class), and
     # this one decides what the Monte Carlo integrator integrates.
     "claude_rng": 1,
+    # SUB-VOXEL DESCENT (2026-08-16). 1 = march() steps into a class-250
+    # cell's 16^3 mask; 0 = the pre-descend behaviour, where a stair is a
+    # 1 m cube. Pushed EXPLICITLY and recorded in every .capture.json
+    # rather than left to its source default, because this dial decides
+    # what GEOMETRY the goldens are of — the previous sub-voxel dial
+    # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
+    # it, which is exactly the silence this line exists to avoid.
+    "claude_descend": 1,
     "claude_stats": 1,
     # The grid follows the camera again (2026-08-16). This was pinned
     # to 0 from 2026-08-15 because the re-snap ran on a 3 s timer and

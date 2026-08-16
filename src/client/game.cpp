@@ -443,6 +443,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_sky_az_pixel{"claudeSkyAz"};
 	float m_subvox = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_subvox_pixel{"claudeSubvox"};
+	// SUB-VOXEL DESCENT (2026-08-16). 1 (default) = march() steps into a
+	// class-250 cell's 16^3 mask; 0 = the pre-descend behaviour, a 250
+	// cell is an opaque 1 m cube. THE A/B PARTNER for the energy and
+	// cost gates: one variable, no rebuild between arms.
+	//
+	// A NEW NAME rather than reviving claudeSubvox, deliberately. That
+	// dial is in the dead-uniform list AND the seat conf pins it to 0
+	// (util/claude_seat_conf.ref), so wiring descent onto it would have
+	// shipped the whole step switched off, silently, on the one seat
+	// that measures it — the hidden-default class, self-inflicted.
+	float m_descend = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_descend_pixel{"claudeDescend"};
 	float m_refine = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_refine_pixel{"claudeRefine"};
 	float m_denoise = 1.0f;
@@ -539,7 +551,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 45> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 46> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -579,6 +591,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_far_fog",
 		"claude_sky_azimuth",
 		"claude_subvox",
+		"claude_descend",
 		"claude_refine",
 		"claude_denoise",
 		"claude_view",
@@ -894,6 +907,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_subvox", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = march() descends into class-250 cells; 0 = they are
+	// opaque 1 m cubes, the behaviour of every build before 2026-08-16
+	static float readDescend()
+	{
+		if (!g_settings->exists("claude_descend"))
+			return 1.0f;
+		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
+	}
+
 	// 1 (default) = extra rays per pixel while the camera is at rest
 	static float readRefine()
 	{
@@ -1045,6 +1067,8 @@ public:
 			m_sky_az = readSkyAz();
 		if (name == "claude_subvox")
 			m_subvox = readSubvox();
+		if (name == "claude_descend")
+			m_descend = readDescend();
 		if (name == "claude_refine")
 			m_refine = readRefine();
 		if (name == "claude_denoise")
@@ -1112,6 +1136,7 @@ public:
 		m_far_fog = readFarFog();
 		m_sky_az = readSkyAz();
 		m_subvox = readSubvox();
+		m_descend = readDescend();
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -1366,6 +1391,7 @@ public:
 				m_modelatlas_sampler_pixel.set(&matl, services);
 				m_modelpal_sampler_pixel.set(&mpal, services);
 				m_subvox_pixel.set(&m_subvox, services);
+				m_descend_pixel.set(&m_descend, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				// claude_trace's three dials. Delivered here, next to the

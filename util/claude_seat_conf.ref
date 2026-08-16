@@ -45,6 +45,12 @@ claude_face_direct = 0
 claude_tiers = 0
 claude_light_ladder = 0
 claude_subvox = 0
+# SUB-VOXEL DESCENT (2026-08-16): march() steps into a class-250 cell's
+# 16^3 mask, so stairs, slabs, beds and authored models are sub-metre
+# geometry for eye, bounce AND shadow rays. NOT claude_subvox, which is
+# a dead uniform pinned to 0 above and would have shipped this switched
+# off in silence.
+claude_descend = 1
 claude_denoise = 0
 
 # --- the six that were silently OFF all session (ship values)

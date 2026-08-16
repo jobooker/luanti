@@ -132,11 +132,29 @@
 //    motion is handled entirely by accumAlpha (0.5 moving, 1.0 on
 //    teleport/grid-rebase), so motion smears over ~2 frames and rest
 //    converges exactly. Photo mode is a parked-camera instrument.
-//  * cell sizes other than 1 m: rung 1 is 1 m only. Sub-voxel bits
-//    (class 250 / unit 7) and the authored 16^3 models are NOT
-//    traversed; a 250 cell is a plain opaque cube here. This is a
-//    KNOWN §2 contract violation, scheduled for rung 2 — recorded
-//    rather than hidden.
+//  * cell sizes other than 1 m: LANDED 2026-08-16 for the sub-voxel
+//    ring. march() descends into a class-250 cell and continues the
+//    same DDA through its 16^3 mask at 1/16 m (unit 7), so stairs,
+//    slabs, beds and every authored model are real sub-metre geometry
+//    for EVERY ray type — eye, bounce and shadow — because there is
+//    still exactly one traversal. What remains punted:
+//      - outside the ring [48,80)^3 the mask does not exist, so a 250
+//        cell is still a 1 m cube. That is a §2 ladder (a coarser rung
+//        at distance), which §7 permits; it is not a different light
+//        law.
+//      - SUB-VOXEL CELLS EMIT NOTHING. cellEmission() returns zero for
+//        cls >= CLASS_EMIT_HI = 245/255 and 250 is above it, so the
+//        campfire, the lantern and every modelled torch now have their
+//        true SHAPE and no glow. They had no glow before this change
+//        either. The emission data exists (the model palette carries
+//        emit/15 in its alpha) but wiring it in changes the DOMAIN of
+//        the one emission law, and §4 admits exactly one law — that is
+//        a spec decision, not a shader edit. Deliberately not done
+//        here, and deliberately not worked around with a second
+//        emission path.
+//      - per-sub-voxel COLOUR is likewise not read. A sub-voxel hit
+//        takes its cell's stored colour, so a chest is chest-shaped in
+//        one albedo. claudeModelAtlas / claudeModelPal stay unread.
 //  * transmissive materials: water (100), leaves (130), glass (145) are
 //    opaque Lambertian in rung 1. §3 lists them as out of scope.
 //  * the point-light "nub" class (165) is opaque and NON-emissive here:
@@ -192,6 +210,25 @@
 uniform sampler2D history;      // previous frame's accumulated radiance
 uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
                                 // a = class byte / 255
+// THE SUB-VOXEL RING, and until 2026-08-16 nothing read it. unit 7,
+// R8 64x512x512, one bit per 1/16 m voxel for the 32^3 cell ring at
+// grid-local [48,80)^3. Layout is game.cpp claudeTraceGridBakeSubvox,
+// verbatim, and it is the SAME 512-byte mask an authored model and a
+// converted node_box both produce (src/client/claude_nodebox.h):
+//
+//   texel.x = (cell.x-48)*2 + (sx >> 3)      64 wide, one byte = 8 sx
+//   texel.y = (cell.y-48)*16 + sy
+//   texel.z = (cell.z-48)*16 + sz
+//   bit     = 1 << (sx & 7)
+//
+// R8 read as a float and unpacked with floor/mod, NOT a usampler3D:
+// an integer sampler silently kills the Irrlicht material
+// (environment-laws.md, the flat-blue outage).
+uniform sampler3D claudeSubvoxTex;
+// 1 = march() descends into class-250 cells (the default); 0 = the
+// pre-2026-08-16 behaviour, in which a 250 cell is an opaque 1 m cube.
+// The A/B partner for the energy and cost gates.
+uniform float claudeDescend;
 uniform vec2 texelSize0;        // one texel of the trace-res target
 uniform lowp float gridDebug; // pipeline master switch: <2.5 = raster
 
@@ -339,6 +376,31 @@ const float CLASS_AIR_MAX = 0.25;
 // the authored-model class (250).
 const float CLASS_EMIT_LO = 167.5 / 255.0;
 const float CLASS_EMIT_HI = 245.0 / 255.0;
+// THE SUB-VOXEL CLASS, 250: "do not stop at my 1 m wall, look at my real
+// shape". Banded at the half-byte midpoints either side of it for the
+// same reason as the emissive band: 245 sits between the last emissive
+// class (240) and 250, 252.5 between 250 and plain solid (255). A cell
+// in this band and inside the ring has a 16^3 mask; one OUTSIDE the ring
+// has none, and is an opaque cube — see descendCell().
+const float CLASS_SUBVOX_LO = 245.0 / 255.0;
+const float CLASS_SUBVOX_HI = 252.5 / 255.0;
+
+// THE SUB-VOXEL RING. game.cpp ClaudeTraceGrid::NBOX_R0/NBOX_R1, and the
+// same two numbers gate the BAKE — a third copy is how a mask ends up
+// read one cell away from the cell that owns it.
+const float SUBV_R0 = 48.0;
+const float SUBV_R1 = 80.0;
+// Sub-voxels per cell edge. 1/16 m is the rendered detail size (§2).
+const float SUBV = 16.0;
+// The inner walk gets its OWN budget and never spends MARCH_STEPS.
+// A diagonal crossing of a 16^3 cell crosses 3*16 = 48 boundaries, and
+// the first sub-voxel is tested before any crossing, so 49 is the exact
+// worst case; 51 is that plus slack for a ray that enters exactly on a
+// corner. If this bound were taken from the outer budget instead, a ray
+// through a few stairs would exhaust it, march() would return false, and
+// the caller reads false as "escaped the grid" — i.e. BLACK, with no
+// error anywhere. That failure mode is why the two budgets are separate.
+const int SUBV_STEPS = 51;
 
 // THE EMISSION LAW (ADR-0009 #1, claude_accum emitStrength()). ONE Le,
 // used by primary rays, bounce rays and every future consumer:
@@ -519,6 +581,118 @@ vec3 cellEmission(float cls, vec3 albedo)
 // visibility test that compares the first opaque CELL against the
 // emitter cell needs no epsilon and cannot self-shadow the light.
 
+// Is this cell inside the sub-voxel ring? OUTSIDE IT A CLASS-250 CELL
+// HAS NO BITS — the bake only fills [48,80)^3, and game.cpp's
+// authored-model branch tags a cell 250 anywhere in the 128^3 grid. A
+// descent that skipped this test would find an all-zero mask and turn
+// every distant chest, bed and campfire INVISIBLE.
+//
+// This is a §2 ladder — a coarser rung at distance — and it is written
+// down as one: beyond 16 cells from the grid centre a sub-metre shape
+// renders as the 1 m cell it occupies. It is the same ladder game.cpp
+// already applies to point-light models (game.cpp: "outside the subvox
+// ring a class-250 cell has no bits to express").
+bool inSubvoxRing(vec3 cell)
+{
+	return all(greaterThanEqual(cell, vec3(SUBV_R0)))
+			&& all(lessThan(cell, vec3(SUBV_R1)));
+}
+
+// One bit of the ring texture. rc = ring-local cell (cell - 48),
+// sc = sub-voxel index inside it, both already known to be in range.
+bool subvoxSolid(vec3 rc, vec3 sc)
+{
+	vec3 texel = vec3(rc.x * 2.0 + floor(sc.x / 8.0),
+			rc.y * SUBV + sc.y,
+			rc.z * SUBV + sc.z);
+	float raw = texture3D(claudeSubvoxTex,
+			(texel + 0.5) / vec3(64.0, 512.0, 512.0)).r;
+	// +0.5 before floor: an R8 byte comes back as n/255 in float32 and
+	// n/255*255 can land at n - epsilon, which floor() would drop a
+	// whole bit-plane on.
+	float byte = floor(raw * 255.0 + 0.5);
+	float bit = mod(floor(byte / exp2(mod(sc.x, 8.0))), 2.0);
+	return bit >= 0.5;
+}
+
+// ---------------------------------------------------------------------
+// THE DESCENT — the same DDA, one rung finer (§2: "size is a parameter,
+// never a branch")
+// ---------------------------------------------------------------------
+// Entered when the outer walk reaches a class-250 cell inside the ring.
+// Continues the SAME ray through that cell's 16^3 mask at 1/16 m and
+// either hits an occupied sub-voxel or leaves the cell. No acceleration
+// structure here either, for the same reason the outer walk has none.
+//
+// tEnter is the outer walk's parametric distance at the cell boundary,
+// so the ray's position is ro + rd*tEnter. Marching u = u0 + rd*tu in
+// sub-voxel units advances the world point by rd*tu/16, which is why the
+// returned t is tEnter + tu/SUBV and remains comparable with every other
+// t in this file (depth packing, NEE distance, the RR schedule).
+//
+// nEnter is the cell face the ray came through; it is the correct normal
+// only for a hit on the FIRST sub-voxel tested, where no inner boundary
+// has been crossed yet.
+//
+// skipFirst is THE RAY-ORIGIN EXCLUSION, MOVED ONE RUNG DOWN, and it is
+// the whole reason a stair can shadow itself. The outer walk never tests
+// the cell it starts in — that is what keeps a bounce ray off its own
+// surface — and left alone, that rule would mean a ray leaving one
+// sub-voxel escapes the whole 1 m cell it sits in for free: a stair
+// would not self-shadow, a chest lid would not shadow its own body, and
+// sub-metre geometry would look right and light flat. That is §2's first
+// listed violation coming back one rung finer. So the exclusion is
+// narrowed to the SUB-VOXEL the ray starts in: march() descends into its
+// own starting cell (when that cell is 250 and in the ring) and passes
+// skipFirst = true, which drops exactly the sub-voxel containing the
+// origin and tests every other one. The origin sub-voxel is air in any
+// case — SURFACE_EPS pushes the restart 0.16 sub-voxels off the face it
+// left — so this is belt and braces, stated rather than relied upon.
+bool descendCell(vec3 cell, vec3 ro, vec3 rd, float tEnter, vec3 nEnter,
+		bool skipFirst, out vec3 nOut, out float tOut)
+{
+	nOut = nEnter;
+	tOut = tEnter;
+	vec3 rc = cell - vec3(SUBV_R0);
+	// entry point in sub-voxel units, clamped INSIDE the cell: the outer
+	// walk lands exactly on a cell plane and floor() of an exact
+	// boundary can fall either side of it.
+	vec3 u = (ro + rd * tEnter - cell) * SUBV;
+	u = clamp(u, vec3(0.0), vec3(SUBV) - vec3(1.0 / 512.0));
+	vec3 sc = floor(u);
+	vec3 stepDir = sign(rd);
+	vec3 invRd = 1.0 / max(abs(rd), vec3(DDA_MIN_ABS));
+	vec3 sideDist = (stepDir * (sc - u) + stepDir * 0.5 + 0.5) * invRd;
+	float tu = 0.0;
+	int axis = -1;
+
+	for (int i = 0; i < SUBV_STEPS; i++) {
+		if (!(skipFirst && i == 0) && subvoxSolid(rc, sc)) {
+			if (axis == 0) nOut = vec3(-stepDir.x, 0.0, 0.0);
+			else if (axis == 1) nOut = vec3(0.0, -stepDir.y, 0.0);
+			else if (axis == 2) nOut = vec3(0.0, 0.0, -stepDir.z);
+			// axis < 0: no inner boundary crossed yet, so the surface
+			// the ray met is the cell face it entered through
+			tOut = tEnter + tu / SUBV;
+			return true;
+		}
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			tu = sideDist.x; sideDist.x += invRd.x;
+			sc.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			tu = sideDist.y; sideDist.y += invRd.y;
+			sc.y += stepDir.y; axis = 1;
+		} else {
+			tu = sideDist.z; sideDist.z += invRd.z;
+			sc.z += stepDir.z; axis = 2;
+		}
+		if (any(lessThan(sc, vec3(0.0)))
+				|| any(greaterThanEqual(sc, vec3(SUBV))))
+			return false; // left the cell: the outer walk resumes
+	}
+	return false;
+}
+
 bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		out vec3 le, out float tHit, out vec3 cellOut)
 {
@@ -535,6 +709,32 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	vec3 sideDist = (stepDir * (cell - ro) + stepDir * 0.5 + 0.5) * invRd;
 	float t = 0.0;
 	int axis = -1;
+
+	// THE STARTING CELL, and it is tested for exactly one thing. The
+	// loop below never tests the cell the ray starts in, which is what
+	// keeps a bounce ray off its own surface. Once cells have interiors
+	// that rule is too coarse: a ray leaving one sub-voxel would escape
+	// the other 4095 for free. So when the starting cell carries
+	// sub-voxel bits, descend into it with the origin SUB-VOXEL excluded
+	// (descendCell's skipFirst) and leave every other class alone. A 255
+	// cell, an emitter, air: unchanged, not tested, exactly as before.
+	if (claudeDescend > 0.5 && inSubvoxRing(cell)) {
+		vec4 s0 = texture3D(claudeTraceGrid, (cell + 0.5) / GRID_S);
+		if (s0.a > CLASS_SUBVOX_LO && s0.a < CLASS_SUBVOX_HI) {
+			vec3 sn;
+			float st;
+			if (descendCell(cell, ro, rd, 0.0, vec3(0.0, 1.0, 0.0),
+					true, sn, st)) {
+				n = sn;
+				hp = ro + rd * st + n * SURFACE_EPS;
+				alb = cellAlbedo(s0.rgb);
+				le = cellEmission(s0.a, alb);
+				tHit = st;
+				cellOut = cell;
+				return true;
+			}
+		}
+	}
 
 	for (int i = 0; i < MARCH_STEPS; i++) {
 		// advance to the next cell boundary, then test the cell we
@@ -559,12 +759,34 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		if (s.a <= CLASS_AIR_MAX)
 			continue; // air
 
-		// every other class is one thing: an opaque Lambertian surface
-		// with a cardinal normal, which may also emit
 		n = vec3(0.0);
 		if (axis == 0) n.x = -stepDir.x;
 		else if (axis == 1) n.y = -stepDir.y;
 		else n.z = -stepDir.z;
+
+		// CLASS 250 SAYS "DO NOT STOP AT MY 1 M WALL". Step into the
+		// cell's 16^3 mask at 1/16 m; a hit there is an ordinary hit
+		// with a cardinal normal, and a miss means the ray passed
+		// THROUGH this cell and the outer walk resumes with its DDA
+		// state untouched. Ring-gated, because outside [48,80)^3 a 250
+		// cell has no mask and must stay the cube it is today.
+		//
+		// Shadow and bounce rays get this for free and that is the
+		// point: §2 forbids a voxel that exists for eye rays but not
+		// for shadow rays, and one traversal is the cheapest way never
+		// to commit it. There is no lighter copy of this walk.
+		if (claudeDescend > 0.5 && s.a > CLASS_SUBVOX_LO
+				&& s.a < CLASS_SUBVOX_HI && inSubvoxRing(cell)) {
+			vec3 sn;
+			float st;
+			if (!descendCell(cell, ro, rd, t, n, false, sn, st))
+				continue; // no bits on this line: keep walking
+			n = sn;
+			t = st;
+		}
+
+		// every other class is one thing: an opaque Lambertian surface
+		// with a cardinal normal, which may also emit
 		hp = ro + rd * t + n * SURFACE_EPS;
 		alb = cellAlbedo(s.rgb);
 		le = cellEmission(s.a, alb);
