@@ -372,6 +372,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// bug in the estimator, never a reason to retune the truth (§6).
 	float m_nee = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_nee_pixel{"claudeNee"};
+	// claude_trace RNG source. 0 (default) = the rung-1 sine-free hash
+	// CHAIN (g_rngState = hash11(g_rngState + phi)); 1 = a counter-based
+	// PCG keyed on (pixel, frame, draw index). INSTRUMENT B of roadmap
+	// step 1a: an iterated float hash is not a random number generator,
+	// and its successive-draw structure biases a Monte Carlo estimator
+	// DETERMINISTICALLY — which is the shape of the defect (identical to
+	// four decimals across seats). One dial, one variable, both modes
+	// measurable in the same run.
+	float m_rng = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_rng_pixel{"claudeRng"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
@@ -431,7 +441,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false>
 		m_volumetric_light_strength_pixel{"volumetricLightStrength"};
 
-	static constexpr std::array<const char*, 44> SETTING_CALLBACKS = {
+	static constexpr std::array<const char*, 45> SETTING_CALLBACKS = {
 		"exposure_compensation",
 		"golden_hour_strength",
 		"ssao_strength",
@@ -476,6 +486,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_view",
 		"claude_bounces",
 		"claude_nee",
+		"claude_rng",
 	};
 
 	static float readGoldenHourStrength()
@@ -836,6 +847,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_nee", 0.0f, 1.0f);
 	}
 
+	// claude_trace RNG source, 0/1. 0 (default) = the rung-1 hash chain,
+	// which is what every number in measured.md was taken with. 1 = the
+	// counter-based PCG. See m_rng.
+	static float readRng()
+	{
+		if (!g_settings->exists("claude_rng"))
+			return 0.0f;
+		return g_settings->getFloat("claude_rng", 0.0f, 1.0f);
+	}
+
 
 	static float readClay()
 	{
@@ -936,6 +957,8 @@ public:
 			m_bounces = readBounces();
 		if (name == "claude_nee")
 			m_nee = readNee();
+		if (name == "claude_rng")
+			m_rng = readRng();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -996,6 +1019,7 @@ public:
 		m_view = readView();
 		m_bounces = readBounces();
 		m_nee = readNee();
+		m_rng = readRng();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -1254,6 +1278,7 @@ public:
 				m_view_pixel.set(&m_view, services);
 				m_bounces_pixel.set(&m_bounces, services);
 				m_nee_pixel.set(&m_nee, services);
+				m_rng_pixel.set(&m_rng, services);
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;

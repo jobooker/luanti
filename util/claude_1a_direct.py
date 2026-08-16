@@ -97,12 +97,29 @@ ARMS = [
     {"name": "v16-bsdf-exact", "dials": {"claude_view": 16, "claude_nee": 1},
      "what": "view 10 with the DDA replaced by a closed-form panel hit",
      "forensic": True},
+    # INSTRUMENT B: the same arms with the counter-based RNG. One
+    # variable against their claude_rng = 0 twins.
+    {"name": "v10-bsdf-rng1",
+     "dials": {"claude_view": 10, "claude_nee": 1, "claude_rng": 1},
+     "what": "BSDF half, counter-based RNG", "forensic": True},
+    {"name": "v09-aimed-rng1",
+     "dials": {"claude_view": 9, "claude_nee": 1, "claude_rng": 1},
+     "what": "aimed half, counter-based RNG", "forensic": True},
+    {"name": "photo-rng1",
+     "dials": {"claude_view": 0, "claude_nee": 0, "claude_rng": 1},
+     "what": "PHOTO MODE with the counter-based RNG — if this moves, "
+             "photo mode was never the truth", "forensic": True},
+    {"name": "nee1-rng1",
+     "dials": {"claude_view": 0, "claude_nee": 1, "claude_rng": 1},
+     "what": "the estimator with the counter-based RNG", "forensic": True},
 ]
 DEFAULT_ARMS = [a["name"] for a in ARMS if not a.get("forensic")]
 # Pairs judged as ratio images + region ratios. (this, golden-ish).
 PAIRS = [("v09-aimed", "v11-analytic"), ("v10-bsdf", "v11-analytic"),
          ("v09-aimed", "v10-bsdf"), ("v16-bsdf-exact", "v11-analytic"),
-         ("v16-bsdf-exact", "v10-bsdf")]
+         ("v16-bsdf-exact", "v10-bsdf"), ("v10-bsdf-rng1", "v11-analytic"),
+         ("v09-aimed-rng1", "v11-analytic"), ("v10-bsdf-rng1", "v10-bsdf"),
+         ("photo-rng1", "photo"), ("nee1-rng1", "photo-rng1")]
 
 RATIO_MID = 0.5      # mid-gray in the ratio image == ratio 1.000
 RATIO_SPAN = 2.0     # gray 1.0 == ratio 2.0, gray 0.0 == ratio 0.0

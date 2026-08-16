@@ -233,6 +233,16 @@ uniform float claudeBounces;
 // sampling, no MIS weight, not one extra RNG draw). 1 = next-event
 // estimation with multiple importance sampling. See the rung-2 header.
 uniform float claudeNee;
+// RNG SOURCE — INSTRUMENT B of roadmap step 1a. 0 (default) = the rung-1
+// hash CHAIN below, which is what every number in measured.md was taken
+// with. 1 = a counter-based PCG keyed on (pixel, frame, draw index).
+// An iterated float hash is not a random number generator: whatever
+// structure its successive outputs carry becomes a DETERMINISTIC bias in
+// every estimator that consumes them, which is exactly the shape of the
+// 1a defect (reproducible to four decimals on two seats). This dial is
+// the one variable that separates "the estimator is wrong" from "the
+// numbers it is fed are not random".
+uniform float claudeRng;
 
 // AREA-EMITTER LIST for next-event estimation (game.cpp
 // claudeVolumeSnapshot, ClaudeVolume::area). One emissive CELL per slot:
@@ -421,11 +431,31 @@ float hash13(vec3 p3)
 
 float g_rngState;
 
+// --- counter-based alternative (claudeRng = 1) ------------------------
+// PCG output-permuted LCG on a 32-bit word. Unlike the chain above, the
+// draw index enters as DATA rather than as iteration count, so draw n
+// and draw n+1 are two hashes of two different inputs and share no
+// trajectory. Integer ops only, no float round-off in the state.
+uint g_rngKey;   // per pixel, per frame
+uint g_rngCtr;   // draw index within this pixel-frame
+
+uint pcgHash(uint v)
+{
+	uint st = v * 747796405u + 2891336453u;
+	uint wd = ((st >> ((st >> 28u) + 4u)) ^ st) * 277803737u;
+	return (wd >> 22u) ^ wd;
+}
+
 // NOTE: every call site assigns to a named local first. GLSL does not
 // define the evaluation order of constructor/function arguments, so
 // vec2(rnd1(), rnd1()) would be a real (silent, driver-specific) bug.
 float rnd1()
 {
+	if (claudeRng > 0.5) {
+		g_rngCtr += 1u;
+		return float(pcgHash(g_rngKey ^ pcgHash(g_rngCtr)))
+				* (1.0 / 4294967296.0);
+	}
 	// The golden-ratio increment spreads successive states across the
 	// hash's input range instead of walking one neighbourhood.
 	g_rngState = hash11(g_rngState + 0.61803398875);
@@ -925,6 +955,11 @@ void main(void)
 			// irrational multiplier so consecutive frames land far
 			// apart in the hash's domain and no frame rate aliases it
 			fract(animationTimer * 91.7) * 1024.0));
+	// the counter-based key, seeded from the same three facts
+	g_rngKey = pcgHash(uint(gl_FragCoord.x)
+			^ (uint(gl_FragCoord.y) << 11u)
+			^ (uint(fract(animationTimer * 91.7) * 65536.0) << 22u));
+	g_rngCtr = 0u;
 
 	// sub-pixel jitter: free anti-aliasing through the running average.
 	// Off in views 1-5, which do not accumulate and would otherwise

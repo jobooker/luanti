@@ -103,6 +103,12 @@ CANONICAL_DIALS = {
     "claude_volume_debug": 3,
     "claude_nee": 0,            # PHOTO MODE IS THE TRUTH (§6). The
                                 # estimator gets its own arm below.
+    # RNG source: 0 = the rung-1 hash chain, which is what every number
+    # in measured.md was taken with. Pushed EXPLICITLY and proven, like
+    # the rest — an unset claude_* dial is a silent default
+    # (environment-laws, the hidden-default class), and this one decides
+    # what the Monte Carlo integrator is actually integrating.
+    "claude_rng": 0,
     "claude_stats": 1,
     # freeze the volume bubble: the periodic re-snap is a ~295 ms hitch
     # every 3 s and a silent scene change under a settling accumulator.
@@ -131,7 +137,7 @@ CANONICAL_DIALS = {
 # The dials proven per capture. The rest are pushed but not asserted;
 # these three are the ones that have silently invalidated measurements.
 PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
-                "claude_volume_debug")
+                "claude_volume_debug", "claude_rng")
 
 # Pinned capture resolution AND frame pacing. Luanti SAVES its window
 # size back into minetest.conf on exit, so one manual resize silently
