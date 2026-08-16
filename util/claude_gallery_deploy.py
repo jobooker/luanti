@@ -41,6 +41,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-clear", action="store_true",
                     help="leave surface vegetation alone (faster re-runs)")
+    ap.add_argument("--emerge-only", action="store_true",
+                    help="force-load the build region and stop -- no "
+                         "clear, no room rebuilds. For a fresh server "
+                         "that has nothing loaded yet (claude_ci "
+                         "--skip-deploy): a bridge op like OPS.door "
+                         "silently no-ops on an unloaded chunk, and after "
+                         "a server restart NOTHING is loaded until "
+                         "something forces it.")
     args = ap.parse_args()
 
     print("ping:", rpc("ping"))
@@ -50,6 +58,10 @@ def main():
     # looks exactly like a successful build.
     print("emerging build region...")
     emerge({"x": -60, "y": 0, "z": -44}, {"x": 84, "y": 40, "z": 132})
+
+    if args.emerge_only:
+        print("\n--emerge-only: chunks loaded, stopping (no clear, no rebuild)")
+        return
 
     if not args.skip_clear:
         # Clear in y-slabs; OPS.fill caps at 60k nodes per call.

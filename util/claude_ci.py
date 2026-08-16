@@ -1426,8 +1426,20 @@ def bring_up_seat(rundir, run, args):
         # hole is repaired before the capture ever happens. This flag is
         # how the refusal half of the gate gets tested honestly, on a
         # deliberately-broken room, without the auto-heal masking it.
-        print("gallery: --skip-deploy, capturing the world as it sits")
-        run["gallery_deploy"] = {"skipped": True}
+        #
+        # Still emerge (force-load) the build region, though: bring_up_seat
+        # just restarted the server, which starts with NOTHING loaded, and
+        # a bridge op like OPS.door silently no-ops on an unloaded chunk --
+        # confirmed live (2026-08-15): furnace-050/furnace-073's doors
+        # stayed OPEN and Cornell scanned 369 "unloaded" nodes on a
+        # --skip-deploy run with no emerge, which is a SECOND variable
+        # riding along with the deliberately-broken node and has nothing
+        # to do with the room-hash mechanism being tested.
+        print("gallery: --skip-deploy, emerging only (no rebuild)")
+        er = sh([sys.executable, GALLERY_DEPLOY, "--emerge-only"])
+        run["gallery_deploy"] = {"skipped": True, "emerge_only": True,
+                                 "returncode": er.returncode,
+                                 "stdout_tail": (er.stdout or "")[-2000:]}
     else:
         ok, dep = deploy_gallery()
         run["gallery_deploy"] = dep
