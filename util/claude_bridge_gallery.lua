@@ -414,3 +414,42 @@ function OPS.aim(p)
              yaw = math.deg(pl:get_look_horizontal()) % 360,
              pitch = -math.deg(pl:get_look_vertical()) }
 end
+
+-- Put the measurement seat back on its feet after a bad teleport
+-- (2026-08-16). A harness that parks the camera by offsetting a vantage
+-- can drop the player into a wall or off a roof, and a DEAD player is
+-- not a recoverable state from this side of the channel: the death
+-- formspec is client-side, `hp = 0` persists in the player file, and
+-- rejoining does not clear it — a restarted client came back dead and
+-- rendered "You died" over the capture. Mineclonia registers no heal
+-- command, so there was no way back at all without this op.
+--
+-- Full HP and a teleport to a named position in one call, because those
+-- are the two halves of "the seat is usable again". Idempotent.
+-- AND THE DEATH SCREEN IS A SECOND, INDEPENDENT PROBLEM. Restoring hp
+-- server-side does NOT take the "You died / Respawn" formspec off the
+-- client: that dialog is client-side and closes when the client sends a
+-- respawn, which a headless seat never does. Measured 2026-08-16: a
+-- four-arm A/B ran to completion, printed stable numbers to four
+-- decimals, and every one of its frames was a flat gray dialog over the
+-- scene — `hp` read 20 the whole time. So respawn() FIRST (it is what
+-- dismisses the dialog), then set_hp, then the teleport.
+--
+-- This is the "eyes on an actual frame before any number is believed"
+-- law in its purest form: nothing in the stats, the dials or the conf
+-- said anything was wrong.
+function OPS.revive(p)
+    local name = p.player or ADMIN
+    local pl = core.get_player_by_name(name)
+    if not pl then error("not online: " .. tostring(name)) end
+    if pl:get_hp() <= 0 and pl.respawn then
+        pl:respawn()
+    end
+    pl:set_hp(pl:get_properties().hp_max or 20, { type = "set_hp",
+                                                  reason = "claude_bridge revive" })
+    core.close_formspec(name, "")
+    if p.pos then
+        pl:set_pos(vector.new(p.pos.x, p.pos.y, p.pos.z))
+    end
+    return { hp = pl:get_hp(), pos = pl:get_pos() }
+end
