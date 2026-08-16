@@ -280,12 +280,27 @@ GOLDEN_REF_SHOT = "cornell"
 # open door leaks the sky into an analytic furnace. Plugged before the
 # vantage loop (so the last scene churn precedes every settle), reopened
 # on the way out so the gallery stays walkable.
-CI_DOORS = [{"pos": {"x": 20, "y": 9, "z": 0}, "name": None},   # furnace-050
-            {"pos": {"x": 33, "y": 9, "z": 0}, "name": None},   # furnace-073
+# name is ALWAYS explicit now (found 2026-08-15, roadmap 1b gate): a
+# None here falls back to OPS.door reading the NEIGHBOUR node's name at
+# shut time, which races map generation for a freshly-emerged region —
+# caught live when cave-glass's door was sealed with "ignore" (the
+# engine's not-yet-generated placeholder) instead of its wall material,
+# because the neighbour cell hadn't finished generating when set_doors()
+# ran early in a run. The golden this shipped from had an unsealed
+# referee room and was re-cut. furnace-050/furnace-073 never showed the
+# symptom (their area is long-cached), but the race is the same one
+# either way, so all five doors get an explicit plug now, not just
+# Cornell's (which always had one).
+CI_DOORS = [{"pos": {"x": 20, "y": 9, "z": 0},
+             "name": "claude_bridge:gray186_lit"},               # furnace-050
+            {"pos": {"x": 33, "y": 9, "z": 0},
+             "name": "claude_bridge:gray221_lit"},               # furnace-073
             {"pos": {"x": 47, "y": 9, "z": 0},
-             "name": "claude_bridge:gray221"},                  # cornell
-            {"pos": {"x": 14, "y": 9, "z": 85}, "name": None},  # cave-skylight
-            {"pos": {"x": 34, "y": 9, "z": 85}, "name": None}]  # cave-glass
+             "name": "claude_bridge:gray221"},                   # cornell
+            {"pos": {"x": 14, "y": 9, "z": 85},
+             "name": "claude_bridge:gray186"},                   # cave-skylight
+            {"pos": {"x": 34, "y": 9, "z": 85},
+             "name": "claude_bridge:gray186"}]                   # cave-glass
 
 # Room hash (roadmap 1b): "the gate that proves rebuild determinism".
 # One dug node at (47,11,8) leaked daylight through Cornell for an
