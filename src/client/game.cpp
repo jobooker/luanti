@@ -1541,6 +1541,12 @@ public:
 			float volumetric_light_strength = lighting.volumetric_light_strength;
 			m_volumetric_light_strength_pixel.set(&volumetric_light_strength, services);
 		}
+
+		// STEP 0 OF THE DESCEND HANDOFF, and it protects every step
+		// after it: ask GL which of the uniforms we just set the linked
+		// program actually declares, and say the dead ones out loud
+		// once. See shader.h. Free after it has fired.
+		claudeUniformCensusReport();
 	}
 
 	void onSetMaterial(const video::SMaterial &material) override

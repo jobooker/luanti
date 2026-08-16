@@ -89,6 +89,34 @@ public:
 	multiple different shaders. But you probably don't want to anyway.
 */
 
+// ---------------------------------------------------------------------
+// THE STARTUP UNIFORM CENSUS (claude, 2026-08-16)
+// ---------------------------------------------------------------------
+// environment-laws.md: "A TEXTURE BOUND TO A UNIFORM THE SHADER DOES NOT
+// DECLARE IS SILENT." getPixelShaderConstantID() returns -1 for a name
+// the linked program does not have, setPixelShaderConstant(-1, ...)
+// returns false, nobody checks it, and the CPU happily bakes, uploads
+// and binds a whole subsystem to a shader that never reads it. That
+// silence hid the entire sub-voxel path for the life of the project
+// (spec/measured.md, "The uniform census": 60 of 103 names dead).
+//
+// The check lives HERE rather than in a hand-written list in game.cpp on
+// purpose: every uniform anyone sets goes through set() below, so the
+// census cannot rot when a uniform is added or renamed, and it reports
+// what GL actually answered rather than what a grep of the .glsl files
+// guessed. Cost is one bool test per set() once the report has fired.
+//
+// "Resolved" is aggregated across ALL programs — a name is dead only if
+// NO linked program declares it. Note the blindness (§8.3): a uniform is
+// only sampled when its set() call is reached, and a program is only
+// sampled once it has been linked and drawn, so the report is a
+// statement about the programs that ran in the first seconds, not about
+// the shader tree on disk.
+extern bool g_claude_uniform_census;
+void claudeUniformSeen(const char *name, bool resolved);
+// Called every frame from the game's uniform setter; flushes once.
+void claudeUniformCensusReport();
+
 template <typename T, std::size_t count, bool cache>
 class CachedShaderSetting {
 	const char *m_name;
@@ -104,10 +132,17 @@ public:
 	{
 		if (cache && has_been_set && std::equal(m_sent, m_sent + count, value))
 			return;
-		if (is_pixel)
-			services->setPixelShaderConstant(services->getPixelShaderConstantID(m_name), value, count);
-		else
-			services->setVertexShaderConstant(services->getVertexShaderConstantID(m_name), value, count);
+		if (is_pixel) {
+			s32 id = services->getPixelShaderConstantID(m_name);
+			if (g_claude_uniform_census)
+				claudeUniformSeen(m_name, id >= 0);
+			services->setPixelShaderConstant(id, value, count);
+		} else {
+			s32 id = services->getVertexShaderConstantID(m_name);
+			if (g_claude_uniform_census)
+				claudeUniformSeen(m_name, id >= 0);
+			services->setVertexShaderConstant(id, value, count);
+		}
 
 		if (cache) {
 			std::copy(value, value + count, m_sent);
@@ -200,10 +235,17 @@ public:
 		for (std::size_t i = 0; i < count; i++) {
 			std::string uniform_name = std::string(m_name) + "." + m_fields[i];
 
-			if (is_pixel)
-				services->setPixelShaderConstant(services->getPixelShaderConstantID(uniform_name.c_str()), value + i, 1);
-			else
-				services->setVertexShaderConstant(services->getVertexShaderConstantID(uniform_name.c_str()), value + i, 1);
+			if (is_pixel) {
+				s32 id = services->getPixelShaderConstantID(uniform_name.c_str());
+				if (g_claude_uniform_census)
+					claudeUniformSeen(uniform_name.c_str(), id >= 0);
+				services->setPixelShaderConstant(id, value + i, 1);
+			} else {
+				s32 id = services->getVertexShaderConstantID(uniform_name.c_str());
+				if (g_claude_uniform_census)
+					claudeUniformSeen(uniform_name.c_str(), id >= 0);
+				services->setVertexShaderConstant(id, value + i, 1);
+			}
 		}
 
 		if (cache) {

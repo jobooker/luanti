@@ -21,6 +21,79 @@
 #include "client/tile.h"
 
 #include <mt_opengl.h>
+#include "porting.h"
+#include <map>
+
+// =====================================================================
+// THE STARTUP UNIFORM CENSUS — see shader.h for why this exists
+// =====================================================================
+// Loud, once, on warningstream. It is an INSTRUMENT, not a dial: there
+// is nothing to configure and nothing to switch off, because the failure
+// it detects is by construction invisible everywhere else.
+
+bool g_claude_uniform_census = true;
+
+namespace {
+// name -> "some linked program declared it". A name is dead only if no
+// program ever answered for it, which is the same definition
+// spec/measured.md's static census used.
+std::map<std::string, bool> g_claude_uniform_resolved;
+// The clock starts on the first REPORT call, not the first set(): the
+// report is only called from the in-game uniform setter, so this waits
+// for the game's programs rather than the main menu's.
+u64 g_claude_census_start_ms = 0;
+// Long enough for every material the game draws in a normal frame to
+// have been linked and drawn at least once. Shorter and a program that
+// links late is falsely accused; longer and the answer arrives after
+// the first captures.
+const u64 CLAUDE_CENSUS_DELAY_MS = 10000;
+}
+
+void claudeUniformSeen(const char *name, bool resolved)
+{
+	auto it = g_claude_uniform_resolved.find(name);
+	if (it == g_claude_uniform_resolved.end())
+		g_claude_uniform_resolved[name] = resolved;
+	else if (resolved)
+		it->second = true;
+}
+
+void claudeUniformCensusReport()
+{
+	if (!g_claude_uniform_census)
+		return;
+	u64 now = porting::getTimeMs();
+	if (!g_claude_census_start_ms) {
+		g_claude_census_start_ms = now;
+		return;
+	}
+	if (now - g_claude_census_start_ms < CLAUDE_CENSUS_DELAY_MS)
+		return;
+	g_claude_uniform_census = false; // one report, then one bool test
+
+	std::vector<std::string> dead;
+	for (const auto &kv : g_claude_uniform_resolved)
+		if (!kv.second)
+			dead.push_back(kv.first);
+	size_t total = g_claude_uniform_resolved.size();
+
+	warningstream << "[claude_uniforms] CENSUS after "
+			<< (CLAUDE_CENSUS_DELAY_MS / 1000) << " s: " << total
+			<< " uniform names were SET, " << (total - dead.size())
+			<< " resolved in at least one linked program, "
+			<< dead.size() << " resolved in NONE." << std::endl;
+	if (!dead.empty())
+		warningstream << "[claude_uniforms] A set to a name below is"
+				" SILENT: setPixelShaderConstant(-1, ...) returns false"
+				" and nobody checks it. If you expected one of these to"
+				" be live, the shader does not declare it, the name is"
+				" misspelled, or the compiler stripped it as unused"
+				" (a DECLARED but never-READ uniform is stripped and"
+				" reports here too)." << std::endl;
+	for (const std::string &n : dead)
+		warningstream << "[claude_uniforms] DEAD '" << n << "'"
+				<< std::endl;
+}
 
 /*
 	A cache from shader name to shader path
