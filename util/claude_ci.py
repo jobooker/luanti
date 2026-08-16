@@ -859,15 +859,28 @@ def await_volume(marker, block, tries=3):
     marching an empty bubble, and the frame looks like the tracer is
     off (John, from the screen, 2026-08-15 — and he was right). Each
     capture therefore triggers its own snapshot after the teleport, and
-    this waits for the client to say it took. A snapshot fired before
-    the map arrived at the new vantage snaps an EMPTY bubble, so
-    area_total is checked too, not just validity.
+    this waits for the client to say it took.
+
+    FOUND 2026-08-15 (roadmap 1b, cave-skylight/cave-glass): this used
+    to also require area_total > 0, on the theory that a snapshot fired
+    before the map arrived would show up as an empty bubble. Read
+    game.cpp before trusting that theory further (debugging discipline:
+    read the code, not the memory of intent) — area_total is not a
+    general occupancy count, it is the NEE area-LIGHT-cell count
+    ("emissive cells the snapshot actually found", ClaudeVolume::
+    area_total, ~game.cpp:142/2540). g_claude_volume.valid is set
+    unconditionally true at the end of a real snapshot walk over loaded
+    map data (~game.cpp:2573), independent of whether any emitter was
+    found. So area_total > 0 was never "is there a volume" — it was "is
+    there a LIT volume", true by coincidence for every room that existed
+    before 1b (all of them had lamps) and false BY DESIGN for a sealed
+    box with none. volume_valid == 1 alone is the honest signal.
     """
     for attempt in range(tries):
         deadline = time.time() + VOLUME_TIMEOUT
         while time.time() < deadline:
             st = lab.read_stats() or {}
-            if st.get("volume_valid") == 1 and (st.get("area_total") or 0) > 0:
+            if st.get("volume_valid") == 1:
                 return {"ok": True, "attempts": attempt + 1,
                         "volume_valid": st.get("volume_valid"),
                         "area_emitters": st.get("area_emitters"),
@@ -882,9 +895,8 @@ def await_volume(marker, block, tries=3):
             "area_emitters": st.get("area_emitters"),
             "area_total": st.get("area_total"),
             "error": "no volume after %d snapshot requests: volume_valid=%s "
-                     "area_total=%s — the tracer would be marching an empty "
-                     "bubble" % (tries, st.get("volume_valid"),
-                                 st.get("area_total"))}
+                     "— the tracer would be marching an empty "
+                     "bubble" % (tries, st.get("volume_valid"))}
 
 
 def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
