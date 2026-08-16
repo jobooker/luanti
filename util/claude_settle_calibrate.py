@@ -51,7 +51,7 @@ import claude_ci as ci              # noqa: E402
 import claude_cornell_check as cornell  # noqa: E402
 
 OUT_ROOT = os.path.join(REPO, "screenshots", "settle")
-DEFAULT_TARGETS = [250, 500, 1000, 2000, 4000, 8000, 16000]
+DEFAULT_TARGETS = [250, 500, 1000, 2000, 4000, 8000]
 # Arms: the tightest-tolerance / highest-variance referee arm, and the
 # general scene. cornell runs claude_nee = 0 with 24 bounces off a small
 # panel, so it is the noise floor of the whole set by construction.
@@ -63,7 +63,13 @@ POLL = 0.25            # s between still_frames reads (stats file is 1 Hz)
 # there is no noise floor to allow for. The clamp is to 10, which from a
 # shallow point is a small drop, so a slack window would miss exactly the
 # early resets that matter most.
-ARM_ATTEMPTS = 3       # a world change mid-curve costs the whole arm
+# A world change mid-curve costs the rest of that curve. Mineclonia's
+# grass ABM fires somewhere in the 128^3 bubble every ~30-180 s
+# (measured here: 5 resets across 8 arm attempts), and a full curve
+# needs ~120 s of uninterrupted stillness, so retries are NORMAL, not an
+# error condition. Each attempt is recorded either way -- the reset log
+# is itself the flake-rate measurement.
+ARM_ATTEMPTS = 6
 CURVE_TIMEOUT = 900.0  # s per arm attempt
 
 
@@ -155,11 +161,34 @@ def shutter(outdir, label):
     return dst, sf_after
 
 
-def start_arm(arm, vantages, dials):
-    """dials -> reset -> snapshot -> volume proven. Same order as
-    claude_ci.capture(), for the same reasons (the dial channel is a
-    ~1 Hz poll, and frames rendered with the previous arm's dials never
-    decay out of a 1/N running mean)."""
+def start_arm(arm, vantages, dials, log):
+    """dials -> reset -> snapshot -> volume proven -> RESET AGAIN -> walk.
+
+    The second reset is the whole reason this function is not just
+    claude_ci.capture()'s preamble. Getting a genuinely SHALLOW first
+    point needs the accumulator zeroed close in time to the first stats
+    read, and everything between the two is bridge round trips: an aim
+    RPC, a ~1 Hz dial poll, a snapshot, and a stats file rewritten once
+    per second. Measured: the walk's first read landed at still_frames
+    443 (cornell) and 2,486 (cozy-ci) with the reset first, so targets
+    of 250 and 500 were simply unreachable and the instrument was
+    reporting its own latency as the answer.
+
+    The first thing tried instead was a second snapshot request, on the
+    theory that a snapshot clamps still_frames to 10. IT DOES NOT, on
+    the second one: game.cpp claudeVolumeSnapshot takes an
+    unchanged-content early return ("do NOT disturb the converged
+    accumulation") before the clamp, so asking twice about an unchanged
+    world clamps nothing and the wait timed out in silence -- a blind
+    instrument, and the second miss on this one question. Read the code,
+    do not theorise about it.
+
+    What the code says DOES reset the accumulator unconditionally is
+    camera motion (game.cpp: moved > 0.05 || turned > 1e-4 -> zero). So
+    the last thing before the walk is a teleport away and back, which
+    reset_accumulation already performs AND PROVES by polling. The
+    residual is one goto sleep plus one stats window, ~2 s.
+    """
     v, park = vantages[arm], ci.park_for(arm, vantages)
     ci.push_dials(dials, "%s_pre_%d" % (arm, time.time_ns()))
     reset_err = ci.reset_accumulation(v, park)
@@ -170,40 +199,12 @@ def start_arm(arm, vantages, dials):
     ci.push_dials(block, marker)
     vol = ci.await_volume(marker, block, room=ci.room_of(arm),
                           seq_before=seq0)
-    sync = sync_clamp(dials)
-    return v, aim0, {"reset_error": reset_err, "volume": vol, "sync": sync}
-
-
-SYNC_TIMEOUT = 20.0
-
-
-def sync_clamp(dials):
-    """Put a known, SHALLOW still_frames under the start of the walk.
-
-    Without this the walk's first stats read already sits at 400-2,500
-    frames: reset -> aim rpc -> dial push -> volume proof is 5-30 s of
-    bridge round trips, and the accumulator has been climbing through
-    all of it. The low end of the curve is then simply unreachable and
-    the instrument silently reports its own latency as the answer.
-
-    So: ask for one more snapshot (which clamps still_frames to <= 10 --
-    game.cpp claudeVolumeSnapshot, the same clamp every capture already
-    takes) and poll until the DROP is visible. The walk then starts
-    within one stats window of a known floor. Nothing else is touched;
-    this is the same operation the capture path already performs.
-    """
-    st0 = lab.read_stats() or {}
-    before = st0.get("still_frames")
-    marker = "sync_%d" % time.time_ns()
-    ci.push_dials(dict(dials, claude_volume_snapshot=marker), marker)
-    deadline = time.time() + SYNC_TIMEOUT
-    while time.time() < deadline:
-        sf = (lab.read_stats() or {}).get("still_frames")
-        if sf is not None and before is not None and sf < before:
-            return {"ok": True, "before": before, "after": sf}
-        time.sleep(0.2)
-    return {"ok": False, "before": before,
-            "after": (lab.read_stats() or {}).get("still_frames")}
+    reset_err2 = ci.reset_accumulation(v, park)
+    sf0 = (lab.read_stats() or {}).get("still_frames")
+    log("    volume ok=%s solid=%s; walk starts at still_frames %s"
+        % (vol.get("ok"), vol.get("volume_solid"), sf0))
+    return v, aim0, {"reset_error": reset_err, "reset_error_2": reset_err2,
+                     "volume": vol, "still_frames_at_walk_start": sf0}
 
 
 def walk_to(targets, outdir, prefix, log, with_regions):
@@ -217,6 +218,7 @@ def walk_to(targets, outdir, prefix, log, with_regions):
     over.
     """
     points, last, deadline = [], -1, time.time() + CURVE_TIMEOUT
+    t0 = time.time()
     todo = list(targets)
     while todo and time.time() < deadline:
         st = lab.read_stats() or {}
@@ -226,6 +228,7 @@ def walk_to(targets, outdir, prefix, log, with_regions):
             continue
         if last >= 0 and sf < last:
             return points, {"at_still_frames": last, "dropped_to": sf,
+                            "after_s": round(time.time() - t0, 1),
                             "targets_done": [p["target"] for p in points]}
         last = sf
         if sf >= todo[0]:
@@ -290,7 +293,7 @@ def run_arms(a, out, rec, targets, prefix_of, log):
                 for attempt in range(ARM_ATTEMPTS):
                     log("  %s rep %d attempt %d" % (arm, rep + 1, attempt + 1))
                     t0 = time.time()
-                    v, aim0, meta = start_arm(arm, vs, dials)
+                    v, aim0, meta = start_arm(arm, vs, dials, log)
                     pts, reset = walk_to(targets, out,
                                          prefix_of(arm, rep), log,
                                          arm in REGION_ARMS)
@@ -310,6 +313,13 @@ def run_arms(a, out, rec, targets, prefix_of, log):
                         log("    AIM DRIFT: %s; discarding" % detail)
                         rec["arms"][arm].append(entry)
                         continue
+                    lo = meta["still_frames_at_walk_start"] or 0
+                    entry["floor_missed"] = lo > targets[0]
+                    if entry["floor_missed"]:
+                        log("    NOTE: walk started at still_frames %d, "
+                            "above the shallowest target %d — the low end "
+                            "of this curve is harness latency, not data"
+                            % (lo, targets[0]))
                     entry["accepted"] = True
                     rec["arms"][arm].append(entry)
                     break
