@@ -211,20 +211,44 @@ DIAL_HEADER = ("# claude_dial.conf: console-set client dials (/dial),\n"
                "# CLEARED at seat start by claude_ci.pin_conf.\n")
 
 
+# THE SAME BUG, ONE CHANNEL OVER — and this one had never been closed.
+# claude_settings_patch.conf persists in path_user across seat restarts,
+# and claudeApplyPatchFile() applies it on the FIRST poll of a fresh
+# client, because the client's "have I applied this already" memory
+# starts empty. So whatever the last session happened to leave in that
+# file silently reconfigures the next seat, and minetest.conf — which
+# every instrument in this repo reads — does not show it.
+#
+# Cost, 2026-08-16: a leftover `claude_volume_follow = 0` from a baseline
+# arm pushed itself onto a fresh seat that had been started explicitly to
+# measure follow ON. The conf said 1, the client ran 0, and the only
+# evidence was one ACTION line in debug.txt. This is exactly the
+# environment-laws "/set shadows the conf" law, arriving through a file
+# instead of a chat command.
+PATCH_HEADER = ("# claude_settings_patch.conf: the live client dial\n"
+                "# channel, polled by pollSettingsPatch() at ~1 Hz.\n"
+                "# CLEARED at seat start by claude_ci.pin_conf -- a file\n"
+                "# left here by the previous session applies itself to the\n"
+                "# next client's FIRST poll and shows up in no conf.\n")
+
+
 def clear_dial_file():
-    """Empty the /dial channel so a human's leftover dial cannot shadow a
-    run's own dials. See DIAL_HEADER for why this is not optional."""
-    path = os.path.join(REPO, SEAT_WORLD, "claude_dial.conf")
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w").write(DIAL_HEADER)
-    except Exception as e:
-        print("WARNING: could not clear the dial file: %s" % e)
+    """Empty BOTH live dial channels so a leftover setting from another
+    session cannot shadow a run's own dials. See DIAL_HEADER and
+    PATCH_HEADER for what each one cost."""
+    for path, header in (
+            (os.path.join(REPO, SEAT_WORLD, "claude_dial.conf"), DIAL_HEADER),
+            (os.path.join(REPO, "claude_settings_patch.conf"), PATCH_HEADER)):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write(header)
+        except Exception as e:
+            print("WARNING: could not clear %s: %s" % (path, e))
 
 
 def pin_conf():
     """Force PINNED_CONF keys into minetest.conf (idempotent), and clear
-    the /dial channel. Both are seat hygiene: a key missing here is a
+    the live dial channels. Both are seat hygiene: a key missing here is a
     channel silently off, and a dial left there is a setting silently on."""
     clear_dial_file()
     path = os.path.join(REPO, "minetest.conf")

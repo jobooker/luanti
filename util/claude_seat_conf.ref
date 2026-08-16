@@ -97,3 +97,14 @@ mobs_spawn = false
 # util/claude_vantages.json, which sits outside the world dir and every
 # mod dir, so the sandboxed `io` refuses it without this.
 secure.trusted_mods = claude_bridge
+
+# --- LIVE DIAL CHANNELS: clear them, they are not in any conf ----------
+# claude_settings_patch.conf (path_user) and the claude_dial_file above
+# both persist across seat restarts, and the client applies each on its
+# FIRST poll -- so a line either of them still holds from the last
+# session silently reconfigures a fresh seat while this file, and every
+# instrument that reads it, says otherwise (2026-08-16: a leftover
+# claude_volume_follow = 0 ran a whole "follow ON" seat with follow off).
+# claude_ci.pin_conf empties both at seat start; a hand-assembled seat
+# must do the same:
+#     : > claude_settings_patch.conf ; : > worlds/gallery/claude_dial.conf
