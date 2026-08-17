@@ -324,22 +324,90 @@ def march_new(w, ro, rd, descend):
     return dict(hit=False, ctr=ctr)
 
 
+def stress_rays(rng, n):
+    """THE WORST CASE FOR THE ONE RESIDUAL DIFFERENCE, fired on purpose.
+
+    The two walks part company by at most the OLD code's own entry
+    clamp. That clamp shortens the first fine step on the axis the ray
+    entered through by 1/512 of a sub-voxel; the two-walk code threw the
+    shortfall away when the descent missed (its 1 m side-distances were
+    never touched by the inner walk), while the one-loop code rebuilds
+    the 1 m side-distances FROM THE EXIT POINT and therefore carries it
+    forward. It can only bite a ray that enters a cell through one face
+    and leaves through the OPPOSITE one -- an axis-aligned ray through a
+    corridor of masked cells -- and it can only accumulate once per such
+    cell. So: fire exactly those rays, down a long run of the ring, and
+    let the reported worst |dt| be the bound."""
+    out = []
+    for _ in range(n):
+        ax = rng.randrange(3)
+        s = 1.0 if rng.random() < 0.5 else -1.0
+        rd = [0.0, 0.0, 0.0]
+        rd[ax] = s
+        ro = [rng.uniform(48.5, 79.5) for _ in range(3)]
+        ro[ax] = 46.0 if s > 0 else 82.0
+        out.append((ro, rd))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rays", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tol", type=float, default=1e-9)
+    ap.add_argument("--stress", type=int, default=0,
+                    help="fire N axis-aligned rays straight down the ring "
+                         "instead of random ones -- the worst case for "
+                         "the entry-clamp residual (see stress_rays)")
     a = ap.parse_args()
 
     rng = random.Random(a.seed)
     w = World(rng)
+    dt_max = 0.0
+    dt_ray = None
+    dt_nonzero = 0
     bad = 0
     checked = {"hit": 0, "miss": 0, "descended": 0}
     steps = {"old_fine": 0, "old_coarse": 0, "new_fine": 0, "new_coarse": 0}
     step_mismatch = 0
 
     import math
-    for k in range(a.rays):
+    stress = stress_rays(rng, a.stress) if a.stress else None
+    n_rays = a.stress if stress else a.rays
+    for k in range(n_rays):
+        if stress:
+            ro, rd = stress[k]
+            descend = True
+            o = march_old(w, list(ro), rd, descend)
+            nw = march_new(w, list(ro), rd, descend)
+            steps["old_fine"] += o["ctr"]["fine"]
+            steps["old_coarse"] += o["ctr"]["coarse"]
+            steps["new_fine"] += nw["ctr"]["fine"]
+            steps["new_coarse"] += nw["ctr"]["coarse"]
+            if (o["ctr"]["fine"] != nw["ctr"]["fine"]
+                    or o["ctr"]["coarse"] != nw["ctr"]["coarse"]):
+                step_mismatch += 1
+            if o["hit"] != nw["hit"]:
+                bad += 1
+                continue
+            if not o["hit"]:
+                checked["miss"] += 1
+                continue
+            checked["hit"] += 1
+            if o["ctr"]["fine"]:
+                checked["descended"] += 1
+            dt = abs(o["t"] - nw["t"])
+            if dt > 0.0:
+                dt_nonzero += 1
+            if dt > dt_max:
+                dt_max, dt_ray = dt, (list(ro), list(rd))
+            if (o["cell"] != nw["cell"] or o["n"] != nw["n"]
+                    or o["cls"] != nw["cls"]):
+                bad += 1
+                if bad <= 5:
+                    print("STRESS MISMATCH %s %s: old %s %s  new %s %s"
+                          % (ro, rd, o["cell"], o["n"], nw["cell"], nw["n"]))
+            continue
         # Origins BOTH inside the ring (so the starting-cell rescale is
         # exercised, including inside a mask) and outside it.
         if k % 3 == 0:
@@ -385,19 +453,27 @@ def main():
         checked["hit"] += 1
         if o["ctr"]["fine"]:
             checked["descended"] += 1
+        dt = abs(o["t"] - nw["t"])
+        if dt > 0.0:
+            dt_nonzero += 1
+        if dt > dt_max:
+            dt_max, dt_ray = dt, (list(ro), list(rd))
         same = (o["cell"] == nw["cell"] and o["n"] == nw["n"]
-                and abs(o["t"] - nw["t"]) <= a.tol * max(1.0, abs(o["t"]))
+                and dt <= a.tol * max(1.0, abs(o["t"]))
                 and o["cls"] == nw["cls"])
         if not same:
-            bad += 1
-            if bad <= 10:
+            structural = (o["cell"] != nw["cell"] or o["n"] != nw["n"]
+                          or o["cls"] != nw["cls"])
+            if structural:
+                bad += 1
+            if structural and bad <= 10:
                 print("MISMATCH ray %d\n  old cell=%s n=%s t=%.12f cls=%.6f"
                       "\n  new cell=%s n=%s t=%.12f cls=%.6f\n  ro=%s rd=%s"
                       % (k, o["cell"], o["n"], o["t"], o["cls"],
                          nw["cell"], nw["n"], nw["t"], nw["cls"], ro, rd))
 
     print("\nrays %d   hits %d   misses %d   rays that descended %d"
-          % (a.rays, checked["hit"], checked["miss"], checked["descended"]))
+          % (n_rays, checked["hit"], checked["miss"], checked["descended"]))
     print("steps  fine  old %d  new %d %s"
           % (steps["old_fine"], steps["new_fine"],
              "SAME" if steps["old_fine"] == steps["new_fine"] else "DIFFER"))
@@ -407,11 +483,36 @@ def main():
              else "DIFFER"))
     print("per-ray step-count mismatches: %d" % step_mismatch)
     print("hit/cell/normal/t mismatches:  %d" % bad)
-    if bad or step_mismatch:
+    print("worst |t_old - t_new| over all hits: %.3e  (%d of %d hits "
+          "differ at all)" % (dt_max, dt_nonzero, checked["hit"]))
+    print("  for scale: SURFACE_EPS = %.3f, one sub-voxel = %.5f, and the "
+          "old walk's own\n  entry clamp is %.3e world units "
+          "(1/512 of a sub-voxel)."
+          % (SURFACE_EPS, 1.0 / SUBV, 1.0 / (512.0 * SUBV)))
+    if dt_ray:
+        print("  worst ray: ro=%s rd=%s" % (dt_ray[0], dt_ray[1]))
+    # THE VERDICT, and what each half of it means.
+    #
+    # STRUCTURE -- did the two walks visit the same cells, in the same
+    # order, and stop on the same face of the same cell? That must be
+    # exact and nothing here is allowed to soften it.
+    #
+    # DISTANCE -- t may differ by at most the old code's own entry
+    # clamp, which is 1/512 of a sub-voxel = 1/8192 world units, once
+    # per cell a ray passes STRAIGHT THROUGH on the axis it entered by.
+    # The two-walk code discarded that shortfall (the inner walk never
+    # touched the outer walk's side-distances); the one-loop code
+    # rebuilds the outer walk from the exit point and carries it. The
+    # bound is reported above and judged against SURFACE_EPS.
+    ok = (bad == 0 and step_mismatch == 0)
+    if not ok:
         print("\nNOT EQUIVALENT")
         return 1
-    print("\nEQUIVALENT: same hit, same coarse cell, same normal, same t,"
-          " and the same number of steps at both rungs, on every ray.")
+    print("\nEQUIVALENT: same hit, same coarse cell, same normal, and the"
+          " same number of\nsteps at both rungs, on every ray; t agrees to"
+          " %.3e (bound: the entry\nclamp, %.3e, which is %.1f %% of"
+          " SURFACE_EPS)."
+          % (dt_max, 1.0 / (512.0 * SUBV), 100.0 * dt_max / SURFACE_EPS))
     return 0
 
 

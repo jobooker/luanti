@@ -484,8 +484,50 @@ def build_twowalk(_src_ignored):
     return (TWO_HDR % (PRE_DESCEND_COMMIT, sha(t)[:16])) + t
 
 
+CHEAP_BIT = """	// CHEAP-BIT CONTROL (measurement variant, lean-descend 2026-08-17).
+	// The one-loop rewrite deleted the second DDA's entire live state
+	// and did NOT move the present-but-off tax (spec/measured.md,
+	// "lean-descend experiment"). So the tax is not the second copy of
+	// the walk's registers, and the next suspect in the same block of
+	// code is this function's ARITHMETIC: a coarse step is one fetch
+	// and two compares, while a sub-voxel test fetches and then digs a
+	// bit out with floor(raw*255+0.5), exp2(mod(sc.x,8)) and mod(.,2).
+	// This arm keeps the address maths and the fetch and throws the
+	// bit extraction away. THE IMAGE IS WRONG HERE ON PURPOSE -- every
+	// sub-voxel whose byte is nonzero reads as solid -- so this arm is
+	// only ever timed with claude_descend = 0, where nothing in it
+	// runs and the only thing being measured is what compiling it in
+	// costs.
+	return texture3D(claudeSubvoxTex,
+			(texel + 0.5) / vec3(64.0, 512.0, 512.0)).r > 0.5;
+"""
+
+
+def build_cheapbit(src):
+    """The live walk with subvoxSolid()'s bit extraction removed."""
+    i = src.index("bool subvoxSolid(")
+    j = src.index("{", i)
+    k = src.index("\n}\n", j)
+    body_start = src.index("\tfloat raw = texture3D(claudeSubvoxTex,", j)
+    t = src[:body_start] + CHEAP_BIT + src[k + 1:]   # keeps the "}\n"
+    # CODE lines only -- this variant's own comment quotes the maths it
+    # deletes, and a guard that cannot tell code from comment would trip
+    # on the sentence explaining itself.
+    live = [l for l in t.splitlines()
+            if not l.lstrip().startswith("//")
+            and ("exp2(mod(sc.x" in l or "float byte = floor(raw" in l)]
+    if live:
+        raise SystemExit("cheapbit still EXTRACTS the bit:\n  "
+                         + "\n  ".join(live))
+    return (HDR % ("claude_trace/opengl_fragment.glsl", sha(TRACE),
+                   "subvoxSolid() BIT EXTRACTION REMOVED -- fetch kept, "
+                   "maths dropped. Cost arm only; the image is wrong."
+                   )) + t
+
+
 VARIANTS = {
     "nodescend": {"trace": build_nodescend},
+    "cheapbit": {"trace": build_cheapbit},
     "twowalk": {"trace": build_twowalk},
     "sampleronly": {"trace": build_sampleronly},
     "counters": {"trace": build_counters, "present": build_present_counters},

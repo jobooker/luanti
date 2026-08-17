@@ -72,6 +72,7 @@ ROOMS = ["cornell", "cozy-ci"]
 VARIANT_ARM = {"live": [("off", 0), ("on", 1)],
                "nodescend": [("absent", 0)],
                "twowalk": [("old-off", 0), ("old-on", 1)],
+               "cheapbit": [("cheapbit-off", 0)],
                "sampleronly": [("absent+sampler", 0)]}
 
 # The photo state every reading is taken in. Identical to CI's
