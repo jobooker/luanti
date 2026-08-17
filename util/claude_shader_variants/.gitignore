@@ -1,0 +1,3 @@
+# Which variant is currently copied over the live shader path. Runtime
+# state of one session, never a fact about the tree.
+.installed.json
