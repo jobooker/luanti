@@ -114,12 +114,51 @@
 // and useful combination — uniform rho makes a bad MIS weight glaring.
 //
 // ---------------------------------------------------------------------
+// THE SKY IS A MISS FUNCTION (roadmap coverage 3, 2026-08-17)
+// ---------------------------------------------------------------------
+// skyRadiance(direction) is ONE function with TWO roles, and §4's one-Le
+// law is why it may not be two:
+//
+//   1. BACKGROUND — what a camera ray sees when it leaves the 128^3 grid.
+//   2. LIGHT      — what a bounce ray collects when it leaves, and what
+//                   NEE importance-samples like any other emitter.
+//
+// The sky a camera ray sees and the sky a shadow ray samples are the same
+// evaluation of the same function, so the image cannot be inconsistent
+// with its own lighting. Until today the DDA's escape branch returned
+// BLACK: there was no sun, no sky dome, no ambient, and volumeSunDir was
+// consumed zero times by this shader. Outdoors rendered night.
+//
+// IT IS FED FROM LUANTI'S OWN SKY, not from an analytic stand-in
+// (game.cpp, src/client/sky.cpp): the horizon and zenith colours the Sky
+// class computes for this time of day, the sun's and the moon's real
+// directions, their real drawn angular sizes, and — for the moon — the
+// game's own sprite, which under Mineclonia is mcl_moon's phase-correct
+// 8-frame sheet seeded from the world seed. THE BLUE-SUN INCIDENT is why
+// (claude_present carried the note until today): substituting an analytic
+// disc drew the moon as a blue SUN, because at night the engine's
+// "sun direction" IS the moon's and the disc reused the sun's multiplier.
+// A sun and a moon are two bodies here, with two directions, two sizes,
+// two radiances and one of them textured — never one body with a dial.
+//
+// WHAT IS STILL ABSENT, and it is an absence rather than a hack (§3):
+//  * CLOUDS AND STARS. They were never lights and they are not drawn.
+//    Before today claude_present pasted the raster sky (clouds, stars,
+//    sunrise glow) wherever raster depth was empty; that composite is
+//    gone, because a background the trace does not own is a second sky.
+//  * THE FAR FIELD past 128^3 is one number, skyGroundCol: a flat
+//    Lambertian ground at a typical terrain albedo, lit by this frame's
+//    dome and body. No shape, no colour variation, no distance. It
+//    exists because black below the horizon drew a black band across the
+//    horizon of every outdoor frame, and because the ground really does
+//    bounce light back up.
+//  * Aerial perspective / scattering along the ray: §3, out of scope.
+//
+// ---------------------------------------------------------------------
 // THE PUNT LIST — documented absences, not quiet hacks (§3)
 // ---------------------------------------------------------------------
-//  * sun/sky: DOCUMENTED PUNT, RUNG 1. A ray that leaves the 128^3
-//    grid returns black. There is no sun, no sky dome, no ambient.
-//    Rung 1's target scenes are a SEALED Cornell box and a SEALED
-//    furnace room, where no ray escapes; outdoors this renders night.
+//  * sun/sky: LANDED 2026-08-17, see the block above. What remains is
+//    listed there (clouds, stars, the below-horizon half, scattering).
 //  * NEE beyond 16 area emitters: the uniform list is capped (game.cpp
 //    ClaudeTraceGrid::AREA_CAP). Past that, emitters are lit by being HIT,
 //    which is correct and noisier — see the weights above.
@@ -229,6 +268,49 @@ uniform sampler3D claudeSubvoxTex;
 // pre-2026-08-16 behaviour, in which a 250 cell is an opaque 1 m cube.
 // The A/B partner for the energy and cost gates.
 uniform float claudeDescend;
+
+// --- THE SKY, as Luanti's own Sky class computes it this frame ---------
+// All colours are LINEAR radiance. game.cpp linearises the engine's
+// stored sky bytes with the SAME (c/255)^2.2 law cellAlbedo() uses for a
+// cell's colour — this renderer has exactly one colour-byte law, and the
+// sky does not get a second one.
+uniform vec3 skyHorizonCol;  // Sky::getBgColor(),  the dome at y = 0
+uniform vec3 skyZenithCol;   // Sky::getSkyColor(), the dome at y = 1
+// THE FAR FIELD, below the horizon, and it is the crudest one there is:
+// a flat Lambertian ground of a typical terrain albedo, lit by the dome
+// and the body, computed CPU-side so it cannot disagree with them. It is
+// not decoration — the 128^3 grid ends long before the world does, so
+// every ray that leaves it heading even slightly downward was returning
+// BLACK and painting a black band along the horizon of every outdoor
+// frame. Zero under the uniform test sky, which keeps the analytic
+// referee exact.
+uniform vec3 skyGroundCol;
+// The two BODIES. Each is a cone about its direction; cos = 2.0 is the
+// "not in the sky" sentinel (no direction can satisfy dot >= 2), so a
+// body below the horizon or switched off by the game costs one compare
+// and contributes nothing — no branch keyed on time of day lives here.
+uniform vec3 skySunDir;
+uniform vec3 skySunCol;
+uniform float skySunCos;
+uniform vec3 skyMoonDir;
+uniform vec3 skyMoonCol;
+uniform float skyMoonCos;
+// The moon quad's tangent frame (Sky::place_sky_body's own rotation), so
+// the sprite can be sampled in the right orientation and the phase reads
+// as a phase.
+uniform vec3 skyMoonU;
+uniform vec3 skyMoonV;
+uniform float skyMoonTexOn;  // 1 = claudeMoonTex is live, 0 = flat disc
+uniform sampler2D claudeMoonTex; // unit 19: the game's current moon sprite
+// TEST DIAL (claude_sky_uniform). > 0 replaces the whole sky with a
+// CONSTANT radiance of this value in every direction — no sun, no moon,
+// no gradient. It exists for one referee: an unoccluded Lambertian plane
+// under a uniform sky reads L = rho * L_sky exactly, an ANALYTIC number,
+// and it is the only instrument in this repo that can see a constant
+// factor error in sky radiance (sealed rooms see no sky at all, and a
+// uniformly hot outdoors just looks like a bright day).
+uniform float claudeSkyUniform;
+
 uniform vec2 texelSize0;        // one texel of the trace-res target
 uniform lowp float gridDebug; // pipeline master switch: <2.5 = raster
 
@@ -254,6 +336,9 @@ uniform lowp float accumAlpha; // CPU: 1.0 hard reset, 0.5 moving,
 //   uniform albedo shows pure transport (the ray-traced "wireframe").
 //   Emission keeps its true Le; only rho is clamped. Accumulates and
 //   tonemaps exactly like view 0.
+//   17: THE SKY ITSELF — skyRadiance() charted over the full sphere as
+//   a lat-long image, no geometry and no transport. The isolating
+//   instrument for anything that goes wrong with the miss function.
 //   9/10/11: INSTRUMENT A of roadmap step 1a — three independent
 //   estimates of ONE quantity, the DIRECT-light radiance leaving the
 //   primary hit. See the block above panelDirect() for the whole design.
@@ -464,6 +549,18 @@ const int AREA_CAP = 16;
 // integers, so half a cell separates any two of them.
 const float CELL_MATCH_EPS = 0.5;
 
+// SKY DOME SHAPE. The dome is a one-parameter blend from the horizon
+// colour to the zenith colour in the ray's elevation. The exponent is
+// below 1 so the horizon band stays NARROW and most of the visible dome
+// reads as the zenith colour, which is the shape Luanti's own raster
+// skybox has; at 1.0 the whole upper hemisphere is a smooth ramp and the
+// horizon glow spreads halfway to the top. It is a named number because
+// it changes an image (see "NO HIDDEN CONSTANTS" above).
+const float SKY_DOME_POW = 0.5;
+// The sentinel that means "this body is not in the sky". No unit vector
+// pair has a dot product of 2, so the cone test can never fire.
+const float SKY_BODY_OFF = 1.5; // any cos above this is the sentinel
+
 // Grazing floor on cos_y at the light. p_l carries a 1/cos_y, so a face
 // seen exactly edge-on drives it to infinity and inf/inf is a NaN in the
 // balance weight. Declining those directions costs NO energy, because
@@ -549,6 +646,33 @@ float rnd1()
 	return g_rngState;
 }
 
+// --- THE SKY SAMPLER'S OWN STREAM, and it is disjoint on purpose -------
+// The sky light sampler (neeSky() below) is a NEW consumer of random
+// numbers at every vertex. Drawing from the main chain would shift every
+// subsequent draw in the path by two, which changes every scattered
+// direction in every scene — including the SEALED rooms, where the sky
+// is provably a no-op and the goldens must not move. Gate 1 of this step
+// is exactly that claim, so the sampler is given its own counter range
+// instead: draw index SKY_CTR_BASE + n, which the main chain (a few
+// hundred draws per pixel at most) can never reach. The key is the same,
+// so it is still one generator per pixel-frame; only the sub-stream is
+// reserved. This is the whole reason the sealed arms come back
+// BIT-IDENTICAL rather than merely within tolerance.
+//
+// It always uses the counter-based PCG, never the claudeRng = 0 hash
+// chain: that dial is the A/B partner for the DIRECTION sampler's bias
+// (measured.md "1a"), and an iterated chain has no disjoint sub-stream to
+// give.
+const uint SKY_CTR_BASE = 1u << 24u;
+uint g_skyCtr;
+
+float rndSky()
+{
+	g_skyCtr += 1u;
+	return float(pcgHash(g_rngKey ^ pcgHash(SKY_CTR_BASE + g_skyCtr)))
+			* (1.0 / 4294967296.0);
+}
+
 // ---------------------------------------------------------------------
 // MATERIAL
 // ---------------------------------------------------------------------
@@ -577,6 +701,89 @@ vec3 cellEmission(float cls, vec3 albedo)
 		return vec3(0.0);
 	float e = clamp((cls - EMIT_E_BIAS) / EMIT_E_SPAN, 0.0, 1.0);
 	return albedo * (EMIT_BASE + EMIT_GAIN * e);
+}
+
+// ---------------------------------------------------------------------
+// THE MISS FUNCTION — sky(direction) -> radiance
+// ---------------------------------------------------------------------
+// ONE function, TWO roles (background on escape, and light), because §4
+// admits one emission law and the sky is an emitter. Every caller in this
+// file goes through skyRadiance(): the camera ray's escape, a bounce
+// ray's escape, and the NEE shadow ray that misses. There is no second
+// formula and no CPU-side copy of the answer.
+//
+// The moon's SHAPE is its sprite, sampled from the texture the game is
+// already drawing (Mineclonia: mcl_moon's 8-phase sheet, seeded from the
+// world seed and swapped as the days pass). A moon rendered as a flat
+// disc of moon-coloured light is a dim sun with a different colour, which
+// is the exact defect the blue-sun note in claude_present recorded.
+//
+// The sun is a flat disc: its sprite carries no information a phase-less
+// glowing circle does not, and one sampler is cheaper than two. Stated
+// rather than left to be discovered.
+float skyBodyMask(vec3 d, vec3 bdir, float bcos, vec3 bu, vec3 bv)
+{
+	if (skyMoonTexOn < 0.5)
+		return 1.0;
+	// The body is a quad at unit distance; the ray crosses its plane at
+	// p = d / dot(d, bdir). r = tan(angular radius) is the quad's half
+	// extent, recovered from the cone the sampler and the pdf both use,
+	// so the drawn shape and the sampled region cannot drift apart.
+	float ct = max(dot(d, bdir), 1e-6);
+	float r = sqrt(max(1.0 - bcos * bcos, 0.0)) / max(bcos, 1e-6);
+	vec3 p = d / ct;
+	vec2 q = vec2(dot(p, bu), dot(p, bv)) / r;
+	vec4 t = texture2D(claudeMoonTex, q * 0.5 + 0.5);
+	// The sprite is premultiplied by nothing: alpha is the cut-out and rgb
+	// is the lit side. Luminance-weighted so the crescent's terminator is
+	// a brightness edge, not a hue edge (John is colorblind).
+	return t.a * dot(t.rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// THE DOME half: everything the light sampler does NOT aim at. Split out
+// for one reason, and it is a requirement of MIS rather than a
+// convenience: the balance weight is per LIGHT, so a direction that lands
+// on the sun carries w_b for the sun AND the full dome radiance behind
+// it. skyRadiance() below is still the one function every caller sees;
+// the two halves exist so that dome + body is exactly it, always.
+vec3 skyDome(vec3 d)
+{
+	if (claudeSkyUniform > 0.0)
+		return vec3(claudeSkyUniform);
+	// Below the horizon: the far field. The split is the horizontal
+	// plane, the same plane the dome is measured from -- one
+	// discriminator, no blend band, because a blend would be a third
+	// thing to justify.
+	if (d.y <= 0.0)
+		return skyGroundCol;
+	return mix(skyHorizonCol, skyZenithCol, pow(d.y, SKY_DOME_POW));
+}
+
+// THE BODY half: the sun's disc or the moon's sprite. Zero everywhere
+// else. The uniform test sky has no body at all, which is what makes
+// L = rho * L_sky exact for the analytic referee.
+vec3 skyBody(vec3 d)
+{
+	if (claudeSkyUniform > 0.0)
+		return vec3(0.0);
+	vec3 L = vec3(0.0);
+	// dot >= cos(angular radius) IS the disc; the sentinel keeps a body
+	// that is below the horizon or switched off by the game out of both
+	// the image and the pdf, with no second flag to keep in agreement.
+	if (dot(d, skySunDir) >= skySunCos)
+		L += skySunCol;
+	if (dot(d, skyMoonDir) >= skyMoonCos)
+		L += skyMoonCol
+				* skyBodyMask(d, skyMoonDir, skyMoonCos, skyMoonU, skyMoonV);
+	return L;
+}
+
+// THE MISS FUNCTION ITSELF. Every consumer that wants "the sky in this
+// direction" — the camera ray, the debug view, any future one — calls
+// this and nothing else.
+vec3 skyRadiance(vec3 d)
+{
+	return skyDome(d) + skyBody(d);
 }
 
 // ---------------------------------------------------------------------
@@ -1107,6 +1314,126 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
 }
 
 // =====================================================================
+// NEE FOR THE SKY — the sun/moon disc as a sampled light
+// =====================================================================
+//
+// The sky is a light, so NEE samples it. Without this, the only way a
+// path finds the sun is for a cosine-sampled bounce to land inside a
+// cone of a few square degrees carrying hundreds of times the dome's
+// radiance — the textbook high-variance case, and outdoors it is the
+// whole image.
+//
+// IT IS A SEPARATE LIGHT, NOT A SEVENTEENTH SLOT IN THE AREA LIST, and
+// that is what keeps this step's gate 1 honest. The direct-lighting
+// integral splits by light:
+//
+//     L_direct = SUM_j INT f * L_j * cos dwi
+//
+// and each light j is MIS-combined with BSDF sampling on its own:
+// w_{j,l} = p_{j,l} / (p_{j,l} + p_b) at the light sample, and
+// w_{j,b} = p_b / (p_b + p_{j,l}) when the BSDF ray lands on light j.
+// So adding a light does not touch any other light's weights: the area
+// list's pdf, its k, its faces and its MIS weight are all EXACTLY what
+// they were before today. Folding the sky into the uniform-over-N
+// selection instead would have divided every emitter's p_A by (N+1) and
+// moved every sealed room's estimator — the rooms whose whole job this
+// week is to prove they did not move.
+//
+// The sampled light is the BODY only (skyBody). The dome is a light with
+// no light-sampling technique, so its weight is 1 wherever a BSDF ray
+// finds it — which is correct and is why skyDome and skyBody are two
+// functions that sum to the one miss function.
+//
+// The technique is UNGATED by the receiver's normal on purpose. It emits
+// directions uniformly in the body's cone whatever the surface faces; a
+// direction pointing into the surface is rejected by cos_x <= 0 BEFORE
+// the shadow ray, so it costs two random numbers and no traversal. That
+// makes p_sky a function of the DIRECTION alone, which means the escape
+// branch can price it without carrying the previous vertex's normal.
+//
+// Cost when it runs to completion: two draws from the reserved sky
+// stream and one shadow march.
+
+// Which body is the sampler aiming at? At most one: the sun and the moon
+// are antipodal in Luanti (sky.cpp differs only 90 vs 270), so when both
+// carry a live cone it is a horizon crossing and the sun is the brighter.
+// A body the game has switched off, or one below the horizon, arrives
+// with the SKY_BODY_OFF sentinel in its cos and is not aimed at.
+bool skyNeeBody(out vec3 bdir, out float bcos)
+{
+	bdir = skySunDir;
+	bcos = skySunCos;
+	// The uniform TEST sky has no body, so the technique has no pdf.
+	// Answered here rather than at the two call sites, so the sampler and
+	// the pdf cannot disagree about whether the technique exists.
+	if (claudeSkyUniform > 0.0)
+		return false;
+	if (bcos >= SKY_BODY_OFF) {
+		bdir = skyMoonDir;
+		bcos = skyMoonCos;
+	}
+	return bcos < SKY_BODY_OFF;
+}
+
+// p_sky(wi) in SOLID ANGLE: uniform over the body's cone. Zero outside
+// it, and that zero is load bearing exactly as neePdfSa()'s is — it makes
+// w_b = 1 for every direction the sky sampler cannot produce, so the dome
+// and any second body arrive at full strength through BSDF sampling.
+float skyPdfSa(vec3 wi)
+{
+	vec3 bdir;
+	float bcos;
+	if (!skyNeeBody(bdir, bcos))
+		return 0.0;
+	if (dot(wi, bdir) < bcos)
+		return 0.0;
+	// solid angle of a cone of half-angle acos(bcos)
+	return 1.0 / (PI2 * (1.0 - bcos));
+}
+
+// One sky-light sample at vertex (x, nx) with reflectance rho. Returns
+// the MIS-weighted direct contribution WITHOUT the path throughput.
+vec3 neeSky(vec3 x, vec3 nx, vec3 rho)
+{
+	vec3 bdir;
+	float bcos;
+	if (!skyNeeBody(bdir, bcos))
+		return vec3(0.0);
+
+	// uniform on the cone
+	float u1 = rndSky();
+	float u2 = rndSky();
+	float cosT = 1.0 - u1 * (1.0 - bcos);
+	float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+	float phi = PI2 * u2;
+	vec3 ta = abs(bdir.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = normalize(cross(ta, bdir));
+	vec3 ty = cross(bdir, tx);
+	vec3 wi = normalize(tx * (sinT * cos(phi)) + ty * (sinT * sin(phi))
+			+ bdir * cosT);
+
+	float cosX = dot(nx, wi);
+	if (cosX <= 0.0)
+		return vec3(0.0); // the body is behind this surface: no march
+
+	// VISIBILITY through the one traversal (§2: no lighter copy of the
+	// walk for shadow rays). The sky is visible iff the ray LEAVES the
+	// grid — march() returning false is exactly that test, and it is the
+	// same false the escape branch in main() reads.
+	vec3 shp, shn, shalb, shle, shcell;
+	float sht;
+	if (march(x, wi, shp, shn, shalb, shle, sht, shcell))
+		return vec3(0.0); // occluded
+
+	// THE LAW: one sky. skyBody() here is the same evaluation the camera
+	// ray's escape runs — there is no second radiance for the shadow ray.
+	float pdfL = 1.0 / (PI2 * (1.0 - bcos)); // p_sky, sa
+	float pdfB = cosX / PI;                  // p_b, sa
+	float w = pdfL / (pdfL + pdfB);          // balance heuristic
+	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL);
+}
+
+// =====================================================================
 // INSTRUMENT A (roadmap step 1a) — the direct-light referee
 // =====================================================================
 //
@@ -1242,6 +1569,11 @@ void main(void)
 	// that merely look alike.
 	int nLights = claudeNee > 0.5
 			? min(int(claudeAreaCount + 0.5), AREA_CAP) : 0;
+	// The sky's own light-sampling technique rides the SAME dial and
+	// nothing else. It is deliberately NOT gated on nLights: outdoors
+	// there are frequently no listed emitters at all, and that is exactly
+	// the scene where sampling the sun matters most.
+	bool skyNee = claudeNee > 0.5;
 
 	g_rngState = hash13(vec3(gl_FragCoord.xy,
 			// animationTimer is unbounded seconds; wrapped by an
@@ -1253,6 +1585,7 @@ void main(void)
 			^ (uint(gl_FragCoord.y) << 11u)
 			^ (uint(fract(animationTimer * 91.7) * 65536.0) << 22u));
 	g_rngCtr = 0u;
+	g_skyCtr = 0u;
 
 	// sub-pixel jitter: free anti-aliasing through the running average.
 	// Off in views 1-5, which do not accumulate and would otherwise
@@ -1296,6 +1629,34 @@ void main(void)
 	vec3 prevX = vec3(0.0);
 	float prevPdfB = 0.0;
 	bool misArmed = false;
+
+	// --- INSTRUMENT: claude_view 17, THE WHOLE SKY IN ONE FRAME -------
+	// skyRadiance() alone, over the FULL SPHERE, with no geometry, no
+	// camera and no transport: the screen is a lat-long chart of the miss
+	// function. x is azimuth 0..360 deg, y is elevation -90 (bottom) to
+	// +90 (top), so the horizon is the middle row and the zenith is the
+	// top edge.
+	//
+	// It exists BEFORE it is needed, on purpose. The two-miss rule says
+	// two failed fixes on one sky bug and no third patch until an
+	// isolating instrument exists; this is that instrument, built with
+	// the feature rather than after the second miss. It answers "what
+	// does the sky function actually return" without a scene, a settle or
+	// a shadow ray in the way — and because it is the SAME function the
+	// path calls, it cannot measure a private copy.
+	//
+	// Read it as BRIGHTNESS, not colour: the sun is the small blown-out
+	// spot, the moon the smaller one opposite, the dome a vertical ramp,
+	// and the bottom half is black because a ray below the horizon leaves
+	// with nothing.
+	if (view == 17) {
+		float az = uv.x * PI2;
+		float el = (uv.y - 0.5) * PI;
+		float ce = cos(el);
+		vec3 d = vec3(ce * sin(az), sin(el), ce * cos(az));
+		gl_FragColor = vec4(skyRadiance(d), 1.0);
+		return;
+	}
 
 	// --- INSTRUMENT A (roadmap 1a): claude_view 9 / 10 / 11 -----------
 	// One primary hit, one direct-light term, no path. Design, and the
@@ -1404,8 +1765,27 @@ void main(void)
 
 		vec3 hp, n, alb, le, cell;
 		float tHit;
-		if (!march(p, dir, hp, n, alb, le, tHit, cell))
-			break; // escaped the grid: nothing to add
+		if (!march(p, dir, hp, n, alb, le, tHit, cell)) {
+			// ESCAPED THE GRID — and since 2026-08-17 that is not black.
+			// The ray sees the sky, through the same skyRadiance() the
+			// camera ray and the NEE shadow ray use.
+			//
+			// The dome and the body carry DIFFERENT MIS weights and that
+			// is not a special case, it is the per-light rule: the body
+			// is a light the sampler aims at, so a BSDF ray that lands on
+			// it gets w_b = p_b/(p_b + p_sky); the dome is a light with
+			// no sampler, so it gets 1. misArmed is false on the camera
+			// ray, so a directly-VIEWED sky is added at full strength in
+			// both modes — nothing aimed at it on the eye's behalf.
+			float misW = 1.0;
+			if (misArmed && skyNee) {
+				float pdfL = skyPdfSa(dir);
+				float denom = prevPdfB + pdfL;
+				misW = denom > 0.0 ? prevPdfB / denom : 1.0;
+			}
+			L += tp * (skyDome(dir) + misW * skyBody(dir));
+			break;
+		}
 
 		// clay: march computed le from the TRUE albedo above; clamping
 		// rho afterward changes reflectance only, never the lights
@@ -1454,6 +1834,11 @@ void main(void)
 		// means the same thing under either dial.
 		if (nLights > 0)
 			L += tp * neeDirect(hp, n, alb, nLights, 1.0);
+		// The sky's own light sample, at the same vertex and under the
+		// same depth cap, drawing from the RESERVED counter range so the
+		// path's own random sequence is untouched (see rndSky()).
+		if (skyNee)
+			L += tp * neeSky(hp, n, alb);
 
 		tp *= alb;
 
@@ -1476,7 +1861,12 @@ void main(void)
 		// untouched, and the weights are densities.
 		prevX = hp;
 		prevPdfB = max(dot(n, dir), 0.0) / PI;
-		misArmed = nLights > 0;
+		// Armed when ANY light sampler ran at this vertex: the area list,
+		// the sky, or both. Outdoors the list is often empty and the sky
+		// is the only light there is — leaving this at `nLights > 0`
+		// would have given the sun's BSDF half a weight of 1 while the
+		// sky sampler was also paying it, i.e. the double count.
+		misArmed = nLights > 0 || skyNee;
 		p = hp;
 		pathBounces += 1.0;
 	}

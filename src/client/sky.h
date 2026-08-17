@@ -72,6 +72,34 @@ public:
 	void setMoonScale(f32 moon_scale) { m_moon_params.scale = moon_scale; }
 	v3f getMoonDirection();
 
+	// --- what claude_trace's sky miss function reads ---------------------
+	// The path tracer owns the sky since 2026-08-17: skyRadiance(direction)
+	// is one function serving both the background a camera ray sees and
+	// the light a shadow ray samples, and it is fed from THIS class rather
+	// than from an analytic stand-in. These accessors exist so game.cpp
+	// can hand the shader the same sun, the same moon and the same
+	// angular sizes the rasteriser draws.
+	//
+	// getMoonTexture() is the one that matters most: under Mineclonia it
+	// is mcl_moon's phase-correct sprite (8 frames, seeded from the world
+	// seed). Substituting an analytic disc for it drew the moon as a blue
+	// SUN once already, because at night the engine's "sun direction" IS
+	// the moon's; the incident is recorded in claude_present.
+	video::ITexture *getMoonTexture() const { return m_moon_texture; }
+	// The sprite's NAME, e.g. "mcl_moon_moon_phases.png^[sheet:4x2:1,0".
+	// It is the moon's identity, and claude_stats.json reports it: the
+	// frame is chosen from the world's day count, so a night golden shot
+	// on a different in-game day is a picture of a different moon, and
+	// nothing else in the harness would say so.
+	const std::string &getMoonTextureName() const
+	{
+		return m_moon_params.texture;
+	}
+	f32 getSunScale() const { return m_sun_params.scale; }
+	f32 getMoonScale() const { return m_moon_params.scale; }
+	f32 getBodyOrbitTilt() const { return m_sky_params.body_orbit_tilt; }
+	f32 getTimeOfDay() const { return m_time_of_day; }
+
 	void setStarsVisible(bool stars_visible) { m_star_params.visible = stars_visible; }
 	void setStarCount(u16 star_count);
 	void setStarColor(video::SColor star_color) { m_star_params.starcolor = star_color; }

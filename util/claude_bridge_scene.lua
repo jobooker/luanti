@@ -240,6 +240,18 @@ function OPS.cozy(p)
     set(9, 3, 5, "air")
     -- floor lantern by the door
     set(4, 1, 1, lantern)
+    -- ONE STAIR ON THE FLOOR, in front of the lantern and dead centre of
+    -- the cozy-day-ci frame (John, 2026-08-17, after driving the seat:
+    -- "even just a silly little stair block in the cabin would work for
+    -- our test"). The 88 stairs already in this world are ALL the gable
+    -- roof: high up, lit from below, presenting a flat 1 m underside --
+    -- so the sub-voxel step line has never been photographable, and the
+    -- descend work landed with no arm that could see its main feature.
+    -- Facing -Z so the step rises AWAY from the camera at (7,9,6): the
+    -- tread faces up toward the vault panel and the riser faces the
+    -- camera away from it, which is what makes the step a brightness
+    -- edge rather than a colour one (John is colorblind).
+    set(4, 1, 2, stair, face_s)
     -- dark corner (NE): bed + chests, no emitter within 4 m
     set(8, 1, 6, bed_b, face_n)
     set(8, 1, 7, bed_t, face_n)

@@ -77,6 +77,7 @@ sys.path.insert(0, HERE)
 import claude_lab as lab  # noqa: E402  (same dir; shares the file-RPC channel)
 import claude_cornell_check as cornell  # noqa: E402  (the region referee)
 import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
+import claude_regions as regions  # noqa: E402  (differential region means)
 
 # ---------------------------------------------------------------- constants
 # Nothing below this line is allowed to hide in the body of the script.
@@ -221,6 +222,17 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which
+    # is what every arm but one is judged under. > 0 replaces the whole
+    # sky with a constant radiance in every direction, and skyfurnace-050
+    # is the arm that uses it: an unoccluded Lambertian plane under a
+    # uniform sky reads L = rho * L_sky EXACTLY, an analytic number, and
+    # it is the only referee in this harness that can see a
+    # constant-factor error in sky radiance -- the sealed rooms see no
+    # sky at all, and a uniformly hot outdoors just looks like a bright
+    # day. Pushed explicitly on every arm, like every other claude_ dial,
+    # because an unset one is a silent default (environment-laws).
+    "claude_sky_uniform": 0,
     "claude_stats": 1,
     # The grid follows the camera again (2026-08-16). This was pinned
     # to 0 from 2026-08-15 because the re-snap ran on a 3 s timer and
@@ -261,7 +273,7 @@ CANONICAL_DIALS = {
 # The dials proven per capture. The rest are pushed but not asserted;
 # these three are the ones that have silently invalidated measurements.
 PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
-                "claude_grid_debug", "claude_rng")
+                "claude_grid_debug", "claude_rng", "claude_sky_uniform")
 
 # Pinned capture resolution AND frame pacing. Luanti SAVES its window
 # size back into minetest.conf on exit, so one manual resize silently
@@ -414,6 +426,14 @@ CI_TAG = "ci"              # the key that marks a vantage as part of this set
 # estimator can be judged against the truth on the same seat, same
 # build, same settle — §6 says an estimator must agree with photo mode
 # in expectation, so this pair is the test of the whole rung.
+# The test sky's radiance for skyfurnace-050. 1.0 makes the analytic
+# answer numerically equal to the pad's albedo, which puts a rho = 0.50
+# pad at 0.494 linear -- comfortably below the ACES shoulder, so the
+# referee inverts an unclipped transform (the furnace-073 lesson: a
+# saturated patch makes a referee a truncation detector, not a precision
+# one).
+SKY_UNIFORM_L = 1.0
+
 CI_SHOTS = [
     {"name": "furnace-050", "vantage": "furnace-050",
      "referee": ("furnace", "050")},
@@ -433,7 +453,21 @@ CI_SHOTS = [
     # black) until 2b lands the sky/sun terms; see spec/measured.md "1b —
     # Gallery phase 2" for which is which.
     {"name": "exterior-ci", "vantage": "exterior-ci", "referee": None},
-    {"name": "skyfurnace-050", "vantage": "skyfurnace-050", "referee": None},
+    # THE ANALYTIC SKY REFEREE (roadmap coverage 3, 2026-08-17). A flat
+    # rho = 0.50 pad, unoccluded, under a CONSTANT-radiance test sky:
+    # L = rho * L_sky, a number computed rather than a golden pinned, in
+    # the same family as the furnace ratio that has caught two defects.
+    # It is the only arm that can see a constant factor in sky radiance.
+    {"name": "skyfurnace-050", "vantage": "skyfurnace-050",
+     "referee": ("skyfurnace", "050"),
+     "dials": {"claude_sky_uniform": SKY_UNIFORM_L}},
+    # ... and the same pad under the same test sky with the ESTIMATOR on.
+    # Sky NEE must not change the answer, only the variance (the 1a law),
+    # and here "the answer" is known analytically rather than by
+    # comparison with the other arm.
+    {"name": "skyfurnace-050-nee1", "vantage": "skyfurnace-050",
+     "referee": ("skyfurnace", "050"),
+     "dials": {"claude_sky_uniform": SKY_UNIFORM_L, "claude_nee": 1}},
     {"name": "cave-skylight-noon", "vantage": "cave-skylight-noon",
      "referee": None},
     {"name": "cave-skylight-night", "vantage": "cave-skylight-night",
@@ -547,6 +581,7 @@ VANTAGE_ROOM = {
     "cave-skylight-noon": "cave-skylight", "cave-skylight-night": "cave-skylight",
     "cave-glass": "cave-glass",
     "skyfurnace-050": "sky-furnace-050",
+    "skyfurnace-050-nee1": "sky-furnace-050",
     "exterior-ci": "exterior-ci",
 }
 
@@ -652,6 +687,32 @@ FURNACE_PATCH = None
 # looser than -050's and still 12x tighter than the defects calibrate
 # plants (bounces1 took this room to 0.485, clay to 0.546). It remains a
 # TRUNCATION detector; nothing about it is precise.
+# SKYFURNACE. L = rho * L_sky on an unoccluded Lambertian plane under a
+# uniform sky -- analytic, and the only instrument here that can see a
+# constant factor in sky radiance. The IDEAL ratio is 1.0000; the pad is
+# not ideal, because its 1-node fence 13 nodes out occludes a sliver of
+# the hemisphere near the horizon (and bounces a little back), so the pin
+# is the MEASURED value and the tolerance is 3x the spread across two
+# consecutive clean Release runs -- exactly how furnace-050's 0.982 /
+# 0.003 was derived, and for the same reason: a tolerance taken from the
+# room's own reproducibility is a sharper instrument than a percentage of
+# the ideal.
+# DERIVED 2026-08-17 (see spec/measured.md "Sky miss function"):
+#   run 20260817-222023  skyfurnace-050      R/G/B 0.9882 0.9881 0.9881
+#                        skyfurnace-050-nee1 R/G/B 0.9882 0.9881 0.9880
+#   run 20260817-222644  skyfurnace-050      R/G/B 0.9881 0.9881 0.9881
+#                        skyfurnace-050-nee1 R/G/B 0.9881 0.9881 0.9881
+# Twelve readings, min 0.9880, max 0.9882 -> spread 0.0002, 3x = 0.0006,
+# which is above the 3 x 0.0001 print-resolution floor. The 1.19 % the
+# pad falls short of the ideal 1.0000 is the fence: a 1-node rail 13
+# nodes out subtends ~4.4 deg, and sin^2 of that is 0.6 % of the
+# cosine-weighted hemisphere, with the rest from the patch sitting
+# off-centre where the fence subtends more. If this ever proves flaky,
+# the honest fix is a third clean run and a re-derivation, not a wider
+# number.
+SKYFURNACE_PINNED = {"050": 0.9881}
+SKYFURNACE_TOL = {"050": 0.0006}
+
 FURNACE_PINNED = {"050": 0.982, "073": 1.061}
 FURNACE_TOL = {"050": 0.003, "073": 0.048}
 # Legacy name kept so old run.json rows still parse.
@@ -856,6 +917,27 @@ def start_seat(rundir):
 
 
 GALLERY_DEPLOY = os.path.join(HERE, "claude_gallery_deploy.py")
+# THE BRIDGE MOD IS ASSEMBLED FROM FRAGMENTS, and until 2026-08-17
+# nothing in this script did the assembling. util/claude_seat_assemble.sh
+# concatenates a base with claude_bridge_scene.lua and
+# claude_bridge_gallery.lua into mods/claude_bridge/init.lua, so an edit
+# to a room BUILDER never reached the running seat unless a human
+# remembered to run it -- and the deploy-hash gate could not tell,
+# because the unchanged room hashed to the value the table still
+# expected. That is the environment-laws "fixed in the repo and running
+# on the seat are different claims" law, arriving through the one door
+# nobody had shut. It runs BEFORE the seat starts, because the server
+# reads the mod once at load.
+SEAT_ASSEMBLE = os.path.join(HERE, "claude_seat_assemble.sh")
+
+
+def assemble_bridge():
+    """(ok, info) for re-assembling mods/claude_bridge/init.lua from the
+    fragments in util/. Idempotent."""
+    r = sh(["sh", SEAT_ASSEMBLE])
+    return r.returncode == 0, {"returncode": r.returncode,
+                               "stdout": (r.stdout or "")[-2000:],
+                               "stderr": (r.stderr or "")[-2000:]}
 # Marker of "vegetation has been cleared on this world at least once".
 # The clear step (claude_gallery_deploy.CLEAR) walks a large box in
 # y-slabs and is slow; the ROOM BUILDS are cheap idempotent box-fills and
@@ -883,7 +965,10 @@ EXPECTED_DEPLOY_HASH = {
     "cave-skylight": "ad2aaf48",
     "cave-glass": "57b6fef8",
     "sky-furnace-050": "93ddf298",
-    "cozy": "af59b2a6",
+    # 9e352f88 since 2026-08-17: one stair node added on the cabin floor
+    # at (4,9,2), in front of the lantern, so the sub-voxel step line is
+    # photographable at all (every other stair in this world is roof).
+    "cozy": "9e352f88",
     "exterior-ci": "cc32604a",
 }
 
@@ -1655,6 +1740,11 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
     cmd = [sys.executable, script, png] + ([arg] if arg else [])
     if kind == "furnace" and FURNACE_PATCH:
         cmd += ["--patch"] + [str(v) for v in FURNACE_PATCH]
+    if kind == "skyfurnace":
+        # the test sky's radiance comes from THE SAME constant the arm's
+        # dial is pushed from, so the referee cannot be judging a
+        # different sky from the one the capture was taken under
+        cmd += ["--lsky", str(SKY_UNIFORM_L)]
     use_golden = golden_png if not golden_refused else None
     if kind == "cornell":
         cmd += ["--regions"]
@@ -1667,7 +1757,12 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
     out = {"kind": kind, "arg": arg, "returncode": r.returncode,
            "txt": name + ".referee.txt", "stdout": text,
            "golden_png": use_golden, "golden_refused": golden_refused}
-    out.update(parse_furnace(text) if kind == "furnace" else parse_cornell(text))
+    if kind == "furnace":
+        out.update(parse_furnace(text))
+    elif kind == "skyfurnace":
+        out.update(parse_skyfurnace(text))
+    else:
+        out.update(parse_cornell(text))
     return out
 
 
@@ -1676,6 +1771,21 @@ def parse_furnace(t):
     out = {"ratio_analytic": {}}
     for ch, ratio in re.findall(
             r"^([RGB])\s+measured\s+[-\d.]+.*?analytic Le/\(1-rho\)\s+[-\d.]+"
+            r"\s+\(ratio\s+([-\d.]+)\)", t, re.M):
+        out["ratio_analytic"][ch] = float(ratio)
+    m = re.search(r"clipped\s+([-\d.]+)%", t)
+    if m:
+        out["clipped_pct"] = float(m.group(1))
+    return out
+
+
+def parse_skyfurnace(t):
+    """Headline: measured/(rho*L_sky) per channel. 1.000 would be an
+    unoccluded pad; the fence takes about 1% off, so the PIN is the
+    measured value and not the ideal (see SKYFURNACE_PINNED)."""
+    out = {"ratio_analytic": {}}
+    for ch, ratio in re.findall(
+            r"^([RGB])\s+measured\s+[-\d.]+.*?analytic rho\*L_sky\s+[-\d.]+"
             r"\s+\(ratio\s+([-\d.]+)\)", t, re.M):
         out["ratio_analytic"][ch] = float(ratio)
     m = re.search(r"clipped\s+([-\d.]+)%", t)
@@ -1730,6 +1840,32 @@ def furnace_verdict(ref, variant):
         worst, pin, tol)
 
 
+def skyfurnace_verdict(ref, variant):
+    """PASS/FAIL on measured/(rho*L_sky) against the pad's own pinned
+    ratio. Same shape as furnace_verdict and for the same reason: the
+    IDEAL is 1.000, the pad is not ideal (its fence occludes a little of
+    the hemisphere and bounces a little back), and a tolerance derived
+    from the room's own run-to-run spread is a sharper instrument than a
+    blanket percentage of the ideal."""
+    if not ref or ref.get("returncode") != 0:
+        return "-", "referee could not speak"
+    r = ref.get("ratio_analytic") or {}
+    if len(r) != 3:
+        return "-", "unparsed"
+    pin, tol = SKYFURNACE_PINNED[variant], SKYFURNACE_TOL[variant]
+    if pin is None or tol is None:
+        # The DERIVATION run: the pin is taken from two consecutive clean
+        # runs of this room, so on the run that produces them there is
+        # nothing to compare against yet. '-' counts as RED, which is the
+        # honest verdict -- a referee that cannot speak is not a pass.
+        return "-", ("no pin derived yet; measured %s"
+                     % {k: round(v, 4) for k, v in sorted(r.items())})
+    worst = max(r.values(), key=lambda v: abs(v - pin))
+    ok = all(abs(v - pin) <= tol for v in r.values())
+    return ("PASS" if ok else "FAIL"), "ratio %.4f (pinned %.4f +/- %.4f)" % (
+        worst, pin, tol)
+
+
 def cornell_verdict(ref):
     """PASS/FAIL on the five region ratios vs the pinned photo golden.
     This is the measurement that convicted NEE — the whole point of the
@@ -1756,7 +1892,11 @@ def verdict(shot_def, ref):
     kind, arg = shot_def["referee"]
     if not ref:
         return "-", "no referee output"
-    return furnace_verdict(ref, arg) if kind == "furnace" else cornell_verdict(ref)
+    if kind == "furnace":
+        return furnace_verdict(ref, arg)
+    if kind == "skyfurnace":
+        return skyfurnace_verdict(ref, arg)
+    return cornell_verdict(ref)
 
 
 # ---------------------------------------------------------------- assertions
@@ -1815,6 +1955,20 @@ def read_golden():
 
 
 CAMERA_TOL_NODES = 0.02
+
+
+def golden_moon(name):
+    """The moon sprite the pinned golden was shot under, or None. Same
+    shape as golden_camera(): read it off the golden's own sidecar rather
+    than writing a value down here, so it survives a re-pin."""
+    rid = read_golden()
+    if not rid:
+        return None
+    try:
+        cap = json.load(open(os.path.join(CI_DIR, rid, name + ".capture.json")))
+    except Exception:
+        return None
+    return ((cap.get("stats") or {}).get("moon_sprite")) or None
 
 
 def golden_camera(name):
@@ -2093,6 +2247,12 @@ def bring_up_seat(rundir, run, args):
 
     print("seat: stopping any running luanti...")
     run["seat_clean_stop"] = stop_seat()
+    # Re-assemble the bridge mod from its fragments BEFORE the server
+    # starts (the server reads the mod once, at load). See SEAT_ASSEMBLE.
+    asm_ok, asm = assemble_bridge()
+    run["bridge_assemble"] = asm
+    if not asm_ok:
+        return "bridge mod assembly failed: %s" % asm.get("stderr")
     pin_conf()
     run["pinned_conf"] = PINNED_CONF
     print("seat: starting server + client on port %d" % SEAT_PORT)
@@ -2185,6 +2345,10 @@ def cmd_run(args):
     A.add("models-no-holes", holes is None,
           "every full-solid-node 16^3 model is opaque on x, y and z"
           if holes is None else holes)
+    asm = run.get("bridge_assemble") or {}
+    A.add("bridge-assembled", asm.get("returncode") == 0,
+          (asm.get("stdout") or "").strip().replace("\n", " | ")
+          or "no output")
     dep = run.get("gallery_deploy") or {}
     if dep.get("skipped"):
         A.add("gallery-deploy", True, "--skip-deploy: not rebuilt this run")
@@ -2309,6 +2473,42 @@ def cmd_run(args):
                     gold_png if kind == "cornell" else None,
                     golden_refused=gold_refused if kind == "cornell" else None)
             shot["verdict"] = list(verdict(shot_def, shot.get("referee")))
+            # NAMED REGION MEANS, in linear radiance, for the arms whose
+            # gate is DIFFERENTIAL rather than analytic (the three cave
+            # rooms against each other; the cabin's stair tread against
+            # its riser). Recorded, never scored -- claude_regions is a
+            # reporter, and the only analytic verdict in this family is
+            # claude_skyfurnace_check. Cheap enough to run on every arm
+            # that has boxes, and a number in run.json is a number a
+            # later session can compare against without re-shooting.
+            try:
+                rg = regions.measure(png, name)
+                if rg:
+                    shot["regions"] = rg
+                    for rn in sorted(rg):
+                        print("  region %-16s %-14s lum %.6f"
+                              % (name, rn, rg[rn]["lum"]))
+            except Exception as ex:
+                shot["regions"] = {"error": str(ex)}
+            # WHICH MOON THIS FRAME WAS SHOT UNDER, and it is a
+            # REPRODUCIBILITY fact rather than trivia. mcl_moon picks its
+            # sprite from the world's DAY COUNT, so a night arm shot on a
+            # different in-game day is a picture of a different moon, and
+            # since 2026-08-17 the tracer draws that sprite -- observed
+            # changing between two sessions on this seat the same day the
+            # sky landed. It is a WARNING and not an assertion on
+            # purpose: refusing every night diff whose phase advanced
+            # would make the night arms undiffable most days, which is
+            # worse than useless. Pinning the phase for the night arms is
+            # the real fix and is written into the roadmap.
+            gm = golden_moon(name)
+            tm = ((cap.get("stats") or {}).get("moon_sprite")) or ""
+            shot["moon_sprite"] = tm
+            if gm and tm and gm != tm:
+                print("  WARNING %s: moon sprite differs from the golden's "
+                      "(%s vs %s) -- mcl_moon advances with the world's day "
+                      "count, so this arm's night sky is not the golden's"
+                      % (name, tm, gm))
             shot["shot_s"] = rtl.mark("shot_" + name)
             run["shots"][name] = shot
             A.add("%s-room-hash" % name, not gold_refused,

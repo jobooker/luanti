@@ -289,6 +289,16 @@ struct ClaudeTraceGrid
 	float accum_alpha = 1.0f;
 	v3f prev_light_dir;          // last frame's sun/moon direction
 	v3f prev_light_col;          // last frame's sun/moon colour
+	// last frame's SKY DOME, for the same reason: now that the tracer
+	// owns the sky, a change in the dome's colour changes the image and
+	// must reset the running average exactly as a camera move does
+	v3f prev_sky_horizon = v3f(-1.0f, -1.0f, -1.0f);
+	v3f prev_sky_zenith = v3f(-1.0f, -1.0f, -1.0f);
+	// and the values themselves, for claude_stats.json: Sky's colours
+	// depend on whether the PLAYER can see the sky (Sky::update takes
+	// sunlight_seen), so a capture taken deep underground would be lit by
+	// the "indoors" sky and nothing else would say so.
+	v3f sky_horizon, sky_zenith;
 	int light_body = 0;          // 0 none, 1 sun, 2 moon (for stats)
 	float still_frames = 0.0f;
 	// last frame's ray-camera basis (grid-local), for reprojection:
@@ -319,8 +329,102 @@ struct ClaudeTraceGrid
 		u32 solid = 0;
 		float ms = 0.0f;         // last build+upload cost (stats)
 	} casc[5];                   // [0]=2m [1]=4m [2]=8m [3]=16m [4]=32m
+	// THE EFFECTIVE PIPELINE STATE, as last DELIVERED to the shader --
+	// not what minetest.conf says, and not what a settings read says
+	// either. Written in the uniform setter beside the .set() calls and
+	// read by claudeWriteStats().
+	//
+	// It exists because of a specific incident (2026-08-17): the planning
+	// seat quoted "135 fps, trace pass 0.44 ms" off a live seat and wrote
+	// a mechanism for it into the roadmap. The tracer had been switched
+	// OFF with the G key, which flips the dial at runtime and never
+	// writes the conf -- so the conf still read claude_grid_debug = 3,
+	// and grid_valid (which reports the GRID is populated, and stays true
+	// with the tracer off) was taken as confirmation. A whole paragraph
+	// of milliseconds was attributed to a renderer that was not running.
+	// STANDING RULE: no timing number from a live seat is quotable unless
+	// the same sample says what pipeline produced it.
+	float dial_grid_debug = 0.0f;
+	float dial_nee = 0.0f;
+	float dial_descend = 0.0f;
+	float dial_view = 0.0f;
+	float dial_bounces = 0.0f;
+	float dial_sky_uniform = 0.0f;
+	bool dials_seen = false;     // has the setter run even once?
+	// The moon sprite claude_trace samples as the sky's moon: OUR copy of
+	// the texture the rasteriser is drawing, uploaded to unit 19 when the
+	// game swaps it (mcl_moon changes phase once a day). `moon_src` is
+	// the engine texture it was copied from, and is the only change
+	// detector -- comparing phases would need this file to know what a
+	// phase is.
+	u32 moon_tex = 0;
+	const void *moon_src = nullptr;
+	int moon_w = 0, moon_h = 0;
+	std::string moon_name;       // the sprite's identity, for the stats
 };
 static ClaudeTraceGrid g_claude_grid;
+
+// Copy the game's current moon sprite into a texture claude_trace can
+// sample (unit 19). Called from the uniform setter, which is the only
+// place that knows the Sky; a no-op on every frame but the few where the
+// game hands us a different texture.
+//
+// It goes through IImage rather than reaching for the engine texture's GL
+// name: ITexture::lock() is public API and createImageFromData() converts
+// whatever colour format the driver chose, whereas getOpenGLTextureName()
+// lives in a driver-private header. The sprite is 16-64 px on a side, so
+// the per-pixel conversion costs nothing on the once-a-day path.
+static void claudeUploadMoonSprite(video::ITexture *tex)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	if (!tex) {
+		V.moon_src = nullptr;
+		return;
+	}
+	if (V.moon_src == (const void *)tex && V.moon_tex)
+		return;
+	void *bits = tex->lock(video::ETLM_READ_ONLY);
+	if (!bits)
+		return;
+	auto *driver = RenderingEngine::get_video_driver();
+	video::IImage *img = driver->createImageFromData(tex->getColorFormat(),
+			tex->getSize(), bits);
+	tex->unlock();
+	if (!img)
+		return;
+	const core::dimension2du sz = img->getDimension();
+	std::vector<u8> rgba((size_t)sz.Width * sz.Height * 4);
+	for (u32 y = 0; y < sz.Height; y++) {
+		for (u32 x = 0; x < sz.Width; x++) {
+			video::SColor c = img->getPixel(x, y);
+			size_t i = ((size_t)y * sz.Width + x) * 4;
+			rgba[i + 0] = c.getRed();
+			rgba[i + 1] = c.getGreen();
+			rgba[i + 2] = c.getBlue();
+			rgba[i + 3] = c.getAlpha();
+		}
+	}
+	img->drop();
+	if (!V.moon_tex)
+		GL.GenTextures(1, &V.moon_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 19);
+	GL.BindTexture(GL.TEXTURE_2D, V.moon_tex);
+	// NEAREST and CLAMP_TO_EDGE, like every other texture this renderer
+	// owns: the sprite is pixel art, and a bilinear tap across the
+	// crescent's terminator would soften the one edge that carries the
+	// phase.
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, sz.Width, sz.Height, 0,
+			GL.RGBA, GL.UNSIGNED_BYTE, rgba.data());
+	V.moon_src = (const void *)tex;
+	V.moon_w = (int)sz.Width;
+	V.moon_h = (int)sz.Height;
+	infostream << "[claude_grid] moon sprite uploaded: " << sz.Width << "x"
+			<< sz.Height << std::endl;
+}
 
 
 // Throw away the running average and start it again, exactly the way a
@@ -521,6 +625,28 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 3, false> m_volume_sun_dir_pixel{"volumeSunDir"};
 	CachedPixelShaderSetting<float, 3, false> m_volume_light_col_pixel{"volumeLightCol"};
 	CachedPixelShaderSetting<float, 2, false> m_volume_depth_range_pixel{"volumeDepthRange"};
+	// --- THE SKY MISS FUNCTION (roadmap coverage 3, 2026-08-17) --------
+	// claude_trace's skyRadiance() reads exactly these. They are Luanti's
+	// own Sky state for this frame, linearised; the shader adds no sky
+	// data of its own, which is what makes "the sky a camera ray sees and
+	// the sky a shadow ray samples are the same function" checkable.
+	CachedPixelShaderSetting<float, 3, false> m_sky_horizon_pixel{"skyHorizonCol"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_zenith_pixel{"skyZenithCol"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_ground_pixel{"skyGroundCol"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_sun_dir_pixel{"skySunDir"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_sun_col_pixel{"skySunCol"};
+	CachedPixelShaderSetting<float, 1, false> m_sky_sun_cos_pixel{"skySunCos"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_moon_dir_pixel{"skyMoonDir"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_moon_col_pixel{"skyMoonCol"};
+	CachedPixelShaderSetting<float, 1, false> m_sky_moon_cos_pixel{"skyMoonCos"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_moon_u_pixel{"skyMoonU"};
+	CachedPixelShaderSetting<float, 3, false> m_sky_moon_v_pixel{"skyMoonV"};
+	CachedPixelShaderSetting<float, 1, false> m_sky_moon_texon_pixel{"skyMoonTexOn"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_moon_sampler_pixel{"claudeMoonTex"};
+	// Test dial: a constant-radiance sky, the only instrument that can
+	// see a constant-factor error in sky radiance (see the shader).
+	float m_sky_uniform = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_sky_uniform_pixel{"claudeSkyUniform"};
 	CachedPixelShaderSetting<float> m_water_refl_pixel{"waterReflStrength"};
 	CachedPixelShaderSetting<float> m_gi_strength_pixel{"giStrength"};
 	CachedPixelShaderSetting<float> m_gi_split_pixel{"giSplit"};
@@ -621,6 +747,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bounces",
 		"claude_nee",
 		"claude_rng",
+		"claude_sky_uniform",
 	};
 
 	static float readGoldenHourStrength()
@@ -945,7 +1072,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
 	}
 
-	// claude_trace diagnostic view selector, 0..16. 0 (default) = photo:
+	// claude_trace diagnostic view selector, 0..17. 17 is the SKY chart:
+	// skyRadiance() alone over the full sphere, the isolating instrument
+	// for the miss function. 0 (default) = photo:
 	// the truth renderer, untouched by any debug branch. 6 = clay:
 	// photo transport with reflectance clamped to CLAY_RHO. 9/10/11 are
 	// roadmap 1a's direct-light referee (the two MIS halves and the
@@ -958,7 +1087,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 16.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 17.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -988,6 +1117,235 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_rng"))
 			return 1.0f;
 		return g_settings->getFloat("claude_rng", 0.0f, 1.0f);
+	}
+
+	// claude_trace TEST SKY. 0 (default) = the real sky. > 0 replaces the
+	// whole sky with a CONSTANT radiance of that value in every
+	// direction, no sun and no moon — the only configuration in which
+	// L = rho * L_sky is an exact analytic answer for an unoccluded
+	// Lambertian plane, and therefore the only referee that can see a
+	// constant-factor error in sky radiance. Sealed rooms cannot: no ray
+	// escapes them. A uniformly hot outdoors cannot: it looks like a
+	// bright day. This is a MEASUREMENT dial, not a look.
+	//
+	// The upper bound is generous rather than tuned: the referee arm
+	// drives it at 1.0, and a value is only ever meaningful next to the
+	// albedo it is multiplied by.
+	static float readSkyUniform()
+	{
+		if (!g_settings->exists("claude_sky_uniform"))
+			return 0.0f;
+		return g_settings->getFloat("claude_sky_uniform", 0.0f, 100.0f);
+	}
+
+	// =================================================================
+	// THE SKY MISS FUNCTION's data (roadmap coverage 3, 2026-08-17)
+	// =================================================================
+	// claude_trace's skyRadiance(direction) is ONE function serving both
+	// the background a camera ray sees and the light a shadow ray
+	// samples. Everything it needs comes from HERE, from Luanti's own Sky
+	// object, so there is no analytic stand-in to drift from what the
+	// game believes the sky is.
+	//
+	// THE COLOUR LAW IS THE ONE THIS RENDERER ALREADY HAS. A sky colour
+	// arrives as a display byte, exactly like a cell's colour, and it is
+	// linearised by the same (c/255)^2.2 the shader's cellAlbedo() uses.
+	// A second colour law for the sky would be a second thing to keep
+	// honest, and the furnace referee's rho depends on this one.
+	static v3f skyLinear(video::SColor c)
+	{
+		return v3f(std::pow(c.getRed() / 255.0f, 2.2f),
+				std::pow(c.getGreen() / 255.0f, 2.2f),
+				std::pow(c.getBlue() / 255.0f, 2.2f));
+	}
+
+	// Sky::getSkyBodyPosition, generalised to any start vector so a
+	// body's TANGENT FRAME rotates with it. Kept identical to sky.cpp's
+	// three rotations in the same order: a frame built any other way
+	// would draw the moon's phase mirrored or rolled, and a mirrored
+	// crescent is exactly the kind of wrong that looks fine.
+	static v3f skyBodyRotate(v3f v, float horizon_position,
+			float day_position, float orbit_tilt)
+	{
+		v.rotateXZBy(horizon_position);
+		v.rotateXYBy(day_position);
+		v.rotateYZBy(orbit_tilt);
+		return v;
+	}
+
+	void pushSky(video::IMaterialRendererServices *services)
+	{
+		// THE DOME. Sky::getBgColor() is the horizon, getSkyColor() the
+		// zenith; both already carry the game's time-of-day brightness
+		// ramp, which is why day and night differ here without this file
+		// owning a single time-of-day branch.
+		v3f horizon(0.0f, 0.0f, 0.0f), zenith(0.0f, 0.0f, 0.0f);
+		if (m_sky) {
+			horizon = skyLinear(m_sky->getBgColor());
+			zenith = skyLinear(m_sky->getSkyColor());
+		}
+		m_sky_horizon_pixel.set(horizon, services);
+		m_sky_zenith_pixel.set(zenith, services);
+
+		// THE DOME'S IRRADIANCE on a horizontal surface, exactly, for the
+		// dome the shader actually evaluates:
+		//   L(h) = mix(H, Z, h^SKY_DOME_POW),  h = the direction's y
+		//   E    = INT L(h) h dw = 2pi INT_0^1 L(h) h dh
+		//        = pi * (0.2 H + 0.8 Z)   at SKY_DOME_POW = 0.5
+		// It is computed rather than guessed because the BODIES are
+		// scaled RELATIVE to it (see below), so this number decides the
+		// sun/sky balance and nothing else does.
+		const v3f dome_e = (horizon * 0.2f + zenith * 0.8f) * (float)M_PI;
+
+		// THE ONE FREE NUMBER IN THE SKY MODEL, and it is named because
+		// it changes an image. A body's NORMAL IRRADIANCE is this
+		// multiple of the dome's horizontal irradiance. Clear-sky
+		// daylight is about 9:1 and full overcast is 0:1; 4 keeps a
+		// rho = 0.5 surface in full sun near the top of the ACES range
+		// without clipping, and it is ONE constant for BOTH bodies, so
+		// the whole day/night difference comes from Sky's own colours
+		// rather than from a second dial. Anything that wants to move the
+		// sun/sky balance moves this and nothing else.
+		const float BODY_TO_DOME_E = 4.0f;
+
+		// The angular sizes are LUANTI'S OWN drawn sizes, taken from
+		// Sky::draw_sun / draw_moon (sunsize 0.07 * 1.7, moonsize
+		// 0.04 * 1.9, each times the game's scale) and expressed as the
+		// half extent of a quad at unit distance, i.e. tan(angular
+		// radius). Deliberately NOT the real sun's 0.265 deg: the rule
+		// for this step is to consume the real sky data, and a world that
+		// sets sun_scale then gets a light matching what it draws. It
+		// does mean soft shadows -- a 6.8 deg source gives a penumbra
+		// about a quarter of the occluder distance -- and that number is
+		// in spec/measured.md rather than hidden here.
+		const float sun_half = 0.07f * 1.7f
+				* (m_sky ? m_sky->getSunScale() : 1.0f);
+		const float moon_half = 0.04f * 1.9f
+				* (m_sky ? m_sky->getMoonScale() : 1.0f);
+
+		// Tints. The magnitude is set by BODY_TO_DOME_E above; these only
+		// say what COLOUR a body is, normalised to unit mean so a tint
+		// cannot smuggle in a brightness. Sun: game.cpp's own traced
+		// light colour, which this file already had. Moon: sky.cpp's
+		// mooncolor_f, the colour the rasteriser draws it with.
+		const v3f SUN_TINT(1.00f, 0.95f, 0.82f);
+		const v3f MOON_TINT(0.50f, 0.57f, 0.65f);
+
+		// SKY_BODY_OFF in the shader: no pair of unit vectors has a dot
+		// product of 2, so a body that is not in the sky costs one
+		// compare and appears in neither the image nor the NEE pdf.
+		const float OFF = 2.0f;
+		float sun_cos = OFF, moon_cos = OFF;
+		v3f sun_dir(0.0f, 1.0f, 0.0f), moon_dir(0.0f, -1.0f, 0.0f);
+		v3f sun_col(0.0f, 0.0f, 0.0f), moon_col(0.0f, 0.0f, 0.0f);
+		v3f moon_u(1.0f, 0.0f, 0.0f), moon_v(0.0f, 1.0f, 0.0f);
+
+		if (m_sky) {
+			// WHICH BODY IS UP is decided by geometry, never by the
+			// visible flags: Mineclonia leaves getSunVisible() true all
+			// night, and the block below this one already paid for that
+			// lesson once. The moon is exactly antipodal to the sun.
+			sun_dir = m_sky->getSunDirection();
+			moon_dir = m_sky->getMoonDirection();
+			sun_dir.normalize();
+			moon_dir.normalize();
+			if (m_sky->getSunVisible() && sun_dir.Y > 0.0f) {
+				sun_cos = 1.0f / std::sqrt(1.0f + sun_half * sun_half);
+				float omega = 2.0f * (float)M_PI * (1.0f - sun_cos);
+				v3f t = SUN_TINT * (3.0f / (SUN_TINT.X + SUN_TINT.Y
+						+ SUN_TINT.Z));
+				sun_col = v3f(dome_e.X * t.X, dome_e.Y * t.Y,
+						dome_e.Z * t.Z) * (BODY_TO_DOME_E / omega);
+			}
+			if (m_sky->getMoonVisible() && moon_dir.Y > 0.0f) {
+				moon_cos = 1.0f / std::sqrt(1.0f + moon_half * moon_half);
+				float omega = 2.0f * (float)M_PI * (1.0f - moon_cos);
+				v3f t = MOON_TINT * (3.0f / (MOON_TINT.X + MOON_TINT.Y
+						+ MOON_TINT.Z));
+				moon_col = v3f(dome_e.X * t.X, dome_e.Y * t.Y,
+						dome_e.Z * t.Z) * (BODY_TO_DOME_E / omega);
+				// The moon quad's TEXTURE-SPACE axes. sky.cpp winds the
+				// quad so texture u grows toward -x_local and v toward
+				// -y_local (draw_sky_body: the (p1,p1) vertex carries uv
+				// (1,1)), so these are the rotated NEGATED axes and the
+				// shader maps a direction straight to a texel.
+				float day = getWickedTimeOfDay(m_sky->getTimeOfDay())
+						* 360.0f - 90.0f;
+				float tilt = m_sky->getBodyOrbitTilt();
+				moon_u = skyBodyRotate(v3f(-1.0f, 0.0f, 0.0f), -90.0f,
+						day, tilt);
+				moon_v = skyBodyRotate(v3f(0.0f, -1.0f, 0.0f), -90.0f,
+						day, tilt);
+			}
+			claudeUploadMoonSprite(m_sky->getMoonTexture());
+			g_claude_grid.moon_name = m_sky->getMoonTextureName();
+		}
+		m_sky_sun_dir_pixel.set(sun_dir, services);
+		m_sky_sun_col_pixel.set(sun_col, services);
+		m_sky_sun_cos_pixel.set(&sun_cos, services);
+		m_sky_moon_dir_pixel.set(moon_dir, services);
+		m_sky_moon_col_pixel.set(moon_col, services);
+		m_sky_moon_cos_pixel.set(&moon_cos, services);
+		m_sky_moon_u_pixel.set(moon_u, services);
+		m_sky_moon_v_pixel.set(moon_v, services);
+		float moon_on = g_claude_grid.moon_tex ? 1.0f : 0.0f;
+		m_sky_moon_texon_pixel.set(&moon_on, services);
+		SamplerLayer_t moonl = 19;
+		m_moon_sampler_pixel.set(&moonl, services);
+		m_sky_uniform_pixel.set(&m_sky_uniform, services);
+
+		// THE FAR FIELD. Everything past the 128^3 grid is one flat
+		// Lambertian ground of this albedo, lit by the dome and by
+		// whichever body is up:
+		//   L_ground = rho_g * (E_dome + E_body * max(bodyDir.y, 0)) / pi
+		// 0.2 is a typical terrain albedo (grass ~0.25, bare soil ~0.17)
+		// and it is the ONLY number here that is a choice; everything
+		// else is the sky's own irradiance, so the far field cannot
+		// disagree with the sky above it. Zero under the uniform test
+		// sky, which is what keeps the analytic referee exact.
+		const float GROUND_RHO = 0.2f;
+		v3f ground(0.0f, 0.0f, 0.0f);
+		if (m_sky_uniform <= 0.0f) {
+			v3f e = dome_e;
+			if (sun_cos < 1.5f)
+				e += v3f(sun_col.X, sun_col.Y, sun_col.Z)
+						* (2.0f * (float)M_PI * (1.0f - sun_cos)
+								* std::max(sun_dir.Y, 0.0f));
+			if (moon_cos < 1.5f)
+				e += v3f(moon_col.X, moon_col.Y, moon_col.Z)
+						* (2.0f * (float)M_PI * (1.0f - moon_cos)
+								* std::max(moon_dir.Y, 0.0f));
+			ground = e * (GROUND_RHO / (float)M_PI);
+		}
+		m_sky_ground_pixel.set(ground, services);
+		g_claude_grid.sky_horizon = horizon;
+		g_claude_grid.sky_zenith = zenith;
+
+		// A MOVED SKY IS A MOVED CAMERA, and it is now more than the
+		// light direction: the DOME's colour and the body's radiance are
+		// part of the image too, so a change in either must invalidate
+		// the running average the same way. Without this a sunset would
+		// smear its whole colour ramp into one converged frame.
+		if ((horizon - g_claude_grid.prev_sky_horizon).getLength() > 1e-5f
+				|| (zenith - g_claude_grid.prev_sky_zenith).getLength()
+						> 1e-5f) {
+			g_claude_grid.still_frames = 0.0f;
+			g_claude_grid.accum_resets++;
+			g_claude_grid.accum_alpha =
+					std::max(g_claude_grid.accum_alpha, 0.5f);
+		}
+		g_claude_grid.prev_sky_horizon = horizon;
+		g_claude_grid.prev_sky_zenith = zenith;
+
+		// THE EFFECTIVE PIPELINE STATE, recorded where it is DELIVERED.
+		// See ClaudeTraceGrid::dial_* for the incident that put it here.
+		g_claude_grid.dial_grid_debug = m_grid_debug;
+		g_claude_grid.dial_nee = m_nee;
+		g_claude_grid.dial_descend = m_descend;
+		g_claude_grid.dial_view = m_view;
+		g_claude_grid.dial_bounces = m_bounces;
+		g_claude_grid.dial_sky_uniform = m_sky_uniform;
+		g_claude_grid.dials_seen = true;
 	}
 
 
@@ -1092,6 +1450,8 @@ public:
 			m_nee = readNee();
 		if (name == "claude_rng")
 			m_rng = readRng();
+		if (name == "claude_sky_uniform")
+			m_sky_uniform = readSkyUniform();
 	}
 
 	static void settingsCallback(const std::string &name, void *userdata)
@@ -1153,6 +1513,7 @@ public:
 		m_bounces = readBounces();
 		m_nee = readNee();
 		m_rng = readRng();
+		m_sky_uniform = readSkyUniform();
 		m_bloom_enabled = g_settings->getBool("enable_bloom");
 		m_volumetric_light_enabled = g_settings->getBool("enable_volumetric_lighting") && m_bloom_enabled;
 		m_crack_animation_length_i = game->crack_animation_length;
@@ -1351,6 +1712,13 @@ public:
 					GL.ActiveTexture(GL.TEXTURE7);
 					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.subvox_tex);
 				}
+				// unit 19: the sky's moon sprite. Re-bound every frame
+				// like every other unit here -- the upload binds it once,
+				// but any other draw may have taken the unit since.
+				if (g_claude_grid.moon_tex) {
+					GL.ActiveTexture(GL.TEXTURE0 + 19);
+					GL.BindTexture(GL.TEXTURE_2D, g_claude_grid.moon_tex);
+				}
 				if (g_claude_grid.model_ids_tex) {
 					GL.ActiveTexture(GL.TEXTURE0 + 16);
 					GL.BindTexture(GL.TEXTURE_3D,
@@ -1518,6 +1886,13 @@ public:
 				auto cn = camera->getCameraNode();
 				float range[2] = {cn->getNearValue(), cn->getFarValue()};
 				m_volume_depth_range_pixel.set(range, services);
+				// THE SKY MISS FUNCTION's data, in the same block as
+				// the camera basis on purpose: these are what
+				// claude_trace needs to answer "what is out there in
+				// direction d", and they must arrive on the frames the
+				// camera does or the background and the lighting would
+				// be one frame apart.
+				pushSky(services);
 			}
 		}
 
@@ -3525,6 +3900,38 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"light_lum\": " << (g_claude_grid.prev_light_col.X
 					+ g_claude_grid.prev_light_col.Y
 					+ g_claude_grid.prev_light_col.Z) / 3.0f
+			// THE EFFECTIVE PIPELINE, as last DELIVERED to the shader --
+			// not what minetest.conf says. A dial flipped with the G or
+			// O key never reaches the conf, and on 2026-08-17 a whole
+			// paragraph of milliseconds was attributed to a renderer
+			// that was not running because the conf still said 3. Any
+			// timing number quoted off a live seat must be able to say
+			// what pipeline produced it, and this is that sentence.
+			// dials_seen distinguishes "the tracer reports 0" from "the
+			// uniform setter has never run", which are different claims.
+			<< ", \"dials_seen\": " << (g_claude_grid.dials_seen ? 1 : 0)
+			<< ", \"claude_grid_debug\": " << g_claude_grid.dial_grid_debug
+			<< ", \"claude_nee\": " << g_claude_grid.dial_nee
+			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
+			<< ", \"claude_view\": " << g_claude_grid.dial_view
+			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces
+			<< ", \"claude_sky_uniform\": "
+					<< g_claude_grid.dial_sky_uniform
+			// Which moon sprite the sky miss function is sampling. It is
+			// a REPRODUCIBILITY fact, not a curiosity: mcl_moon picks the
+			// frame from the world's day count, so a night golden shot on
+			// a different in-game day is a picture of a different moon.
+			<< ", \"moon_sprite\": \"" << g_claude_grid.moon_name << "\""
+			// The sky the miss function is actually evaluating, linear.
+			// Sky::update() takes sunlight_seen, so these move when the
+			// PLAYER goes underground -- a capture lit by the "indoors"
+			// sky would otherwise look like a capture lit by the sky.
+			<< ", \"sky_horizon\": [" << g_claude_grid.sky_horizon.X << ","
+					<< g_claude_grid.sky_horizon.Y << ","
+					<< g_claude_grid.sky_horizon.Z << "]"
+			<< ", \"sky_zenith\": [" << g_claude_grid.sky_zenith.X << ","
+					<< g_claude_grid.sky_zenith.Y << ","
+					<< g_claude_grid.sky_zenith.Z << "]"
 			<< ", \"still_frames\": " << g_claude_grid.still_frames
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
