@@ -225,6 +225,26 @@ uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
 // an integer sampler silently kills the Irrlicht material
 // (environment-laws.md, the flat-blue outage).
 uniform sampler3D claudeSubvoxTex;
+// THE SUB-BRICK SUMMARY (2026-08-17). unit 14, R8 32x128x128 = 512 KB
+// beside the mask's 16 MB. Same ring, one rung coarser: each cell's
+// 16^3 mask is cut into 4^3 sub-bricks of 4^3 sub-voxels, and each
+// sub-brick is summarised in TWO BITS — "any sub-voxel solid" and "all
+// sub-voxels solid" — so the walk can cross an empty brick in one
+// 1/4 m step, stop on a full one in one test, and pay 1/16 m steps only
+// inside a MIXED brick. A BAKE, not a runtime reduction: game.cpp's
+// claudeTraceGridBakeSubvox writes it in the same loop that writes the
+// bits, over the same box, which is what makes an incremental re-snap
+// unable to leave it stale.
+//
+//   texel.x = (cell.x-48)                    32 wide, one byte = 4 bx
+//   texel.y = (cell.y-48)*4 + by
+//   texel.z = (cell.z-48)*4 + bz
+//   bits    = (byte >> (2*bx)) & 3   ->  0 EMPTY, 1 MIXED, 3 FULL
+//
+// (2 would be "all but not any" and cannot occur.) R8 read as a float
+// for the same reason as the mask: an integer sampler silently kills
+// the Irrlicht material.
+uniform sampler3D claudeSubbrickTex;
 // 1 = march() descends into class-250 cells (the default); 0 = the
 // pre-2026-08-16 behaviour, in which a 250 cell is an opaque 1 m cube.
 // The A/B partner for the energy and cost gates.
@@ -392,10 +412,20 @@ const float SUBV_R0 = 48.0;
 const float SUBV_R1 = 80.0;
 // Sub-voxels per cell edge. 1/16 m is the rendered detail size (§2).
 const float SUBV = 16.0;
-// THE TWO RUNGS, as the walk carries them: the size of one cell of the
-// rung, in world units. march() holds exactly one of these at a time in
-// a variable and rescales between them; 1/16 is a power of two, so the
-// rescale round-trips bit-exactly.
+// Sub-BRICKS per cell edge, and sub-voxels per sub-brick edge. Both 4,
+// and 4 * 4 = SUBV: the summary tiles the mask exactly. game.cpp
+// ClaudeTraceGrid::SUBB is the same number and there are only these two
+// copies of it.
+const float SUBB = 4.0;
+const float SUBB_EDGE = SUBV / SUBB;   // 4 sub-voxels per brick edge
+// THE THREE RUNGS, as the walk carries them: the size of one cell of
+// the current rung, in world units. march() holds exactly one of these
+// at a time in a variable and rescales between them; every ratio here
+// is a power of two, so every rescale round-trips bit-exactly.
+//   1 m  ->  1/4 m   (a sub-brick)  ->  1/16 m  (a sub-voxel)
+// RUNG_MID / RUNG_FINE are the multipliers applied to `delta` on the
+// way DOWN; SUBB and SUBB_EDGE are the same steps on the way up.
+const float RUNG_MID = 1.0 / SUBB;
 const float RUNG_FINE = 1.0 / SUBV;
 
 // THE STEP BUDGET, and it is ONE budget because there is now ONE loop.
@@ -407,15 +437,25 @@ const float RUNG_FINE = 1.0 / SUBV;
 // code gave the inner walk a separate budget.
 //
 // So the single bound is the PRODUCT, not a shared pool. The walk
-// visits at most MARCH_STEPS coarse cells. Inside one of them a
-// diagonal crossing of a 16^3 mask crosses 3*16 = 48 boundaries, and
-// the entry sub-voxel is tested by the rescale itself rather than by an
-// iteration, so 49 iterations is the exact worst case per cell;
-// SUBV_ITERS is that plus slack for a ray entering exactly on a corner.
-// Every coarse cell may therefore cost 1 + SUBV_ITERS iterations, and
-// WALK_STEPS = 384 * 52 = 19,968 is as unreachable as MARCH_STEPS = 384
-// was on its own. The guarantee is preserved; only its arithmetic moved.
-const int SUBV_ITERS = 51;
+// visits at most MARCH_STEPS coarse cells, and every iteration of the
+// loop takes exactly ONE DDA step at whatever rung it is on — so the
+// interior cost of one coarse cell is (mid-rung steps) + (fine-rung
+// steps) inside it, and both are bounded by geometry:
+//
+//   fine  a diagonal crossing of a 16^3 mask crosses 3*16 = 48
+//         sub-voxel boundaries, whichever bricks they fall in, and the
+//         entry sub-voxel of each descent is tested by the rescale
+//         rather than by an iteration:  <= 49
+//   mid   a diagonal crossing of the 4^3 brick grid crosses 3*4 = 12
+//         brick boundaries, entry brick tested by the rescale: <= 13
+//
+// 62 is therefore the exact worst case per cell and SUBV_ITERS is that
+// plus slack for a ray entering exactly on a corner. Every coarse cell
+// may cost 1 + SUBV_ITERS iterations, so WALK_STEPS = 384 * 66 = 25,344
+// is as unreachable as MARCH_STEPS = 384 was on its own. The guarantee
+// is preserved; only its arithmetic moved. (It was 51 while the walk had
+// two rungs; the mid rung's own crossings are what grew it.)
+const int SUBV_ITERS = 65;
 const int WALK_STEPS = MARCH_STEPS * (SUBV_ITERS + 1);
 
 // THE EMISSION LAW (ADR-0009 #1, claude_accum emitStrength()). ONE Le,
@@ -622,40 +662,84 @@ bool subvoxSolid(vec3 rc, vec3 sc)
 	return bit >= 0.5;
 }
 
+// ONE SUB-BRICK OF THE SUMMARY, one fetch. rc = ring-local cell
+// (cell - 48), bi = brick index in [0,4)^3, both already known to be in
+// range. Returns the two bits as a small float:
+//
+//   0  EMPTY  no sub-voxel in this 4^3 brick is solid — cross it in one
+//             1/4 m step and test nothing
+//   1  MIXED  some are — descend to 1/16 m and walk it
+//   3  FULL   all 64 are — the brick face just crossed IS the surface
+//
+// 2 ("all but not any") cannot occur; the test below is written as
+// `< 0.5`, `< 2.5` so a corrupt byte lands on MIXED, which is the slow
+// and CORRECT answer rather than the fast and wrong one.
+float brickState(vec3 rc, vec3 bi)
+{
+	vec3 texel = vec3(rc.x, rc.y * SUBB + bi.y, rc.z * SUBB + bi.z);
+	float raw = texture3D(claudeSubbrickTex,
+			(texel + 0.5) / vec3(32.0, 128.0, 128.0)).r;
+	// +0.5 before floor for the same reason as the mask: n/255*255 in
+	// float32 can land at n - epsilon.
+	float byte = floor(raw * 255.0 + 0.5);
+	return mod(floor(byte / exp2(bi.x * 2.0)), 4.0);
+}
+
 // ---------------------------------------------------------------------
 // THE WALK — ONE 3D-DDA, and the cell size is a PARAMETER of it
 // ---------------------------------------------------------------------
 // §2 of the physics contract: "size is a parameter, never a branch. One
 // traversal, one lighting law, one emission law, one material law,
 // regardless of cell size." Taken literally, that is this function: one
-// loop, one index, one set of side-distances, one step budget. On
-// entering a class-250 cell inside the ring the walk RESCALES ITSELF by
-// 16 — the same variables, now measured in 1/16 m — and on leaving the
-// cell it rescales back and carries on. There is no second walk, no
-// second position, no second side-distance triple and no callee holding
-// its own copy of the four things the walk already has.
+// loop, one index, one set of side-distances, one step budget. It walks
+// at THREE sizes — 1 m, 1/4 m and 1/16 m — and the size is a variable,
+// not a branch: on entering a class-250 cell inside the ring the walk
+// RESCALES ITSELF, and on leaving a brick or a cell it rescales back.
+// There is no second walk, no second position, no second side-distance
+// triple and no callee holding its own copy of what the walk already
+// has.
 //
 // (Until 2026-08-17 the descent was a separate function, `descendCell()`,
 // running a second DDA with its own locals live alongside these. The
 // cost instrument measured what that cost: +36 % in Cornell and +49 % in
 // the cabin with the dial OFF and not one instruction of it executing —
-// see spec/measured.md "Descend cost instrument". This is the fix that
-// section ranked first, and it is the same algorithm, not a new one.)
+// see spec/measured.md "Descend cost instrument". Folding it into this
+// loop was the fix that section ranked first; the 1/4 m rung below is
+// the fix it ranked second, aimed at the other half of the bill.)
+//
+// WHY A MIDDLE RUNG EXISTS. Measured, cosy cabin, 2026-08-16: 91 % of
+// primary rays enter a cell with a mask, 62 % of them resolve in ONE
+// sub-voxel step — and the whole path's fine-step count has p90 59, p99
+// 113 and a worst case of 309. The median pixel was never the problem;
+// the tail is, and the tail is grazing rays crawling 1/16 m at a time
+// through mostly-empty masks. So the mask carries a baked summary of
+// itself at 4^3 (claudeSubbrickTex): an EMPTY brick is crossed in one
+// 1/4 m step, a FULL brick stops the ray in one test, and only a MIXED
+// brick is walked at 1/16 m. It is the sparse-octree reading of the
+// class byte (physics-contract §2, observation 1) taken one level down —
+// all-empty and all-solid are leaves, only mixed has children — and it
+// is an ACCELERATION STRUCTURE, so the image it produces must be the
+// image without it.
 //
 // THE RUNG lives in exactly three variables:
 //   delta   world t to cross one cell of the current rung, per axis
-//           (= 1/|rd| at 1 m, /16 at 1/16 m — an exact power-of-two
-//           rescale, so it round-trips)
-//   lim     the index bound of the rung: GRID_S coarse, SUBV fine. It
-//           is also the flag that says WHICH rung the walk is on.
-//   ci      the index at the current rung: the 1 m cell, or the
-//           sub-voxel inside cellHi.
-// cellHi is the 1 m cell the walk is inside while it is on the fine
-// rung — the mask's owner, and the cell a fine hit reports as cellOut.
+//           (= 1/|rd| at 1 m, /4 at 1/4 m, /16 at 1/16 m — exact
+//           power-of-two rescales, so they round-trip)
+//   lim     the index bound of the rung: GRID_S coarse, SUBB mid, SUBV
+//           fine. It is also the flag that says WHICH rung the walk is
+//           on, and the three values are far enough apart to test with
+//           inequalities.
+//   ci      the index at the current rung: the 1 m cell, the sub-brick
+//           inside cellHi, or the sub-voxel inside cellHi.
+// cellHi is the 1 m cell the walk is inside while it is below 1 m — the
+// mask's owner, and the cell any sub-metre hit reports as cellOut. blo
+// is the current sub-brick's corner IN SUB-VOXEL UNITS, live only on
+// the fine rung, and it is what says when the ray has left the brick and
+// should climb back to 1/4 m.
 //
-// t is world parametric distance THROUGHOUT, at both rungs. That is
+// t is world parametric distance THROUGHOUT, at all three rungs. That is
 // what keeps every t in this file comparable (depth packing, NEE
-// distance, the RR schedule) without a conversion at the boundary.
+// distance, the RR schedule) without a conversion at any boundary.
 //
 // Returns true on an opaque hit and fills hp / n / alb / le / tHit /
 // cellOut. False = the ray left the grid (or ran out of steps, which
@@ -667,24 +751,21 @@ bool subvoxSolid(vec3 rc, vec3 sc)
 // is to have exactly one traversal. cellOut exists for those rays: a
 // visibility test that compares the first opaque CELL against the
 // emitter cell needs no epsilon and cannot self-shadow the light — so
-// cellOut is the COARSE cell of the hit at both rungs.
+// cellOut is the COARSE cell of the hit at every rung.
 //
-// THE RESCALE, both ways, is the only arithmetic that is new. For a
-// world point p on the ray at parametric distance t, a rung of size h,
-// and the index ci of the cell containing p measured from the corner of
-// the 1 m cell (0 at the coarse rung, the sub-voxel index at the fine
-// one), the distance to the next boundary on each axis is
+// THE RESCALE, both ways. For a world point p on the ray at parametric
+// distance t, a rung of size h, and the index ci of the cell containing
+// p measured from the corner of the 1 m cell, the distance to the next
+// boundary on each axis is
 //
 //   sideDist = t + (stepDir*(ci*h - pl) + (stepDir*0.5 + 0.5)*h) / |rd|
 //
 // with pl = p - cellHi. At h = 1, ci = 0 that is the walk's own opening
-// line; at h = 1/16 it is exactly what the old inner walk computed in
-// sub-voxel units and then divided by 16. Rescaling DOWN keeps the
-// coarse state nowhere, and rescaling UP rebuilds it from the exit
-// point — which is why nothing has to be saved across a descent. The
-// two are equivalent because the fine walk leaves the cell through the
-// same face, at the same t, on the same axis, as the coarse step it
-// replaces.
+// line. Rescaling DOWN keeps the coarser state nowhere, and rescaling UP
+// rebuilds it from the exit point — which is why nothing has to be saved
+// across a descent, at either boundary. The two are equivalent because
+// the finer walk leaves the brick (or the cell) through the same face,
+// at the same t, on the same axis, as the coarser step it replaces.
 bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		out vec3 le, out float tHit, out vec3 cellOut)
 {
@@ -699,6 +780,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	vec3 delta = 1.0 / max(abs(rd), vec3(DDA_MIN_ABS));
 	vec3 ci = floor(ro);
 	vec3 cellHi = ci;
+	vec3 blo = vec3(0.0);
 	vec3 sideDist = (stepDir * (ci - ro) + stepDir * 0.5 + 0.5) * delta;
 	vec4 s = vec4(0.0);
 	float t = 0.0;
@@ -720,6 +802,13 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	// origin sub-voxel is air in any case, since SURFACE_EPS pushes the
 	// restart 0.16 sub-voxels off the face it left; this is belt and
 	// braces, stated rather than relied upon.)
+	//
+	// IT GOES STRAIGHT TO THE FINE RUNG, never to the mid one, and that
+	// is not an optimisation left on the table. The exclusion has to be
+	// one SUB-VOXEL wide; starting on the 1/4 m rung would make it one
+	// BRICK wide, because the loop only ever tests what it steps into —
+	// and a ray leaving one sub-voxel would then escape the other 63 in
+	// its own brick for free. Same violation, one rung up.
 	if (claudeDescend > 0.5 && inSubvoxRing(cellHi)) {
 		s = texture3D(claudeTraceGrid, (cellHi + 0.5) / GRID_S);
 		if (s.a > CLASS_SUBVOX_LO && s.a < CLASS_SUBVOX_HI) {
@@ -734,6 +823,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 			vec3 pu = clamp((ro - cellHi) * SUBV, vec3(0.0),
 					vec3(SUBV - 1.0 / 512.0));
 			ci = floor(pu);
+			blo = floor(ci * RUNG_MID) * SUBB_EDGE;
 			delta *= RUNG_FINE;
 			sideDist = (stepDir * (ci - pu) + stepDir * 0.5 + 0.5) * delta;
 			lim = SUBV;
@@ -742,10 +832,10 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 
 	for (int i = 0; i < WALK_STEPS; i++) {
 		// ONE STEP OF THE WALK, at whatever size the walk is currently
-		// set to. These are the same three lines at 1 m and at 1/16 m;
-		// the rung is in delta and lim, not in a branch. Advance first,
-		// then test what was entered: the cell the ray starts in is
-		// never tested, which is what keeps a bounce ray off its own
+		// set to. These are the same three lines at 1 m, at 1/4 m and at
+		// 1/16 m; the rung is in delta and lim, not in a branch. Advance
+		// first, then test what was entered: the cell the ray starts in
+		// is never tested, which is what keeps a bounce ray off its own
 		// surface.
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
 			t = sideDist.x; sideDist.x += delta.x;
@@ -761,11 +851,81 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		bool escaped = any(lessThan(ci, vec3(0.0)))
 				|| any(greaterThanEqual(ci, vec3(lim)));
 
+		// The two sub-metre rungs, written as a LADDER the walk falls
+		// down: leaving a sub-brick lands on the 1/4 m block below,
+		// leaving a cell lands on the 1 m arrival below that, and a
+		// single iteration may do both. lim is the rung — GRID_S, SUBB
+		// (4) and SUBV (16) are far enough apart to test with `<`.
 		if (lim < GRID_S) {
-			// ---- the walk is on the 1/16 m rung, inside cellHi ----
+			if (lim > SUBB + 0.5) {
+				// ---- the walk is on the 1/16 m rung, inside brick
+				// blo of cellHi ----
+				// Leaving the BRICK is the event, not leaving the cell:
+				// blo + 4 never exceeds 16, so this test subsumes the
+				// cell bound above.
+				if (!(escaped || any(lessThan(ci, blo))
+						|| any(greaterThanEqual(ci, blo + SUBB_EDGE)))) {
+					if (!subvoxSolid(cellHi - vec3(SUBV_R0), ci))
+						continue; // this sub-voxel is empty: step again
+					n = vec3(0.0);
+					if (axis == 0) n.x = -stepDir.x;
+					else if (axis == 1) n.y = -stepDir.y;
+					else n.z = -stepDir.z;
+					hp = ro + rd * t + n * SURFACE_EPS;
+					alb = cellAlbedo(s.rgb);
+					le = cellEmission(s.a, alb);
+					tHit = t;
+					cellOut = cellHi;   // the COARSE cell, for neeDirect
+					return true;
+				}
+				// LEFT THE BRICK. The face just crossed is also the
+				// 1/4 m face the mid rung would have crossed, at the
+				// same t and on the same axis — so rescale up, put the
+				// walk in the neighbouring brick, rebuild sideDist from
+				// the exit point and fall into the 1/4 m block below.
+				// Nothing was saved and nothing is restored.
+				delta *= SUBB_EDGE;
+				ci = blo * RUNG_MID;
+				if (axis == 0) ci.x += stepDir.x;
+				else if (axis == 1) ci.y += stepDir.y;
+				else ci.z += stepDir.z;
+				lim = SUBB;
+				vec3 pb = (ro + rd * t - cellHi) * SUBB;
+				sideDist = t + (stepDir * (ci - pb)
+						+ stepDir * 0.5 + 0.5) * delta;
+				escaped = any(lessThan(ci, vec3(0.0)))
+						|| any(greaterThanEqual(ci, vec3(SUBB)));
+			}
+
+			// ---- the walk is on the 1/4 m rung, inside cellHi ----
 			if (!escaped) {
-				if (!subvoxSolid(cellHi - vec3(SUBV_R0), ci))
-					continue; // this sub-voxel is empty: step again
+				// ONE FETCH DECIDES A 4^3 BLOCK OF SUB-VOXELS.
+				float bs = brickState(cellHi - vec3(SUBV_R0), ci);
+				if (bs < 0.5)
+					continue;   // EMPTY: a 1/4 m jump, nothing tested
+				if (bs < 2.5) {
+					// MIXED: descend to 1/16 m. The sub-voxel the ray
+					// enters through is tested HERE, by the rescale,
+					// for the same reason the cell-entry block tests
+					// one: the loop only tests what it stepped into and
+					// no step has been taken inside the brick yet.
+					vec3 pu = clamp((ro + rd * t - cellHi) * SUBV,
+							vec3(0.0), vec3(SUBV - 1.0 / 512.0));
+					vec3 bl = ci * SUBB_EDGE;
+					vec3 su = clamp(floor(pu), bl,
+							bl + (SUBB_EDGE - 1.0));
+					if (!subvoxSolid(cellHi - vec3(SUBV_R0), su)) {
+						delta *= RUNG_MID;
+						sideDist = t + (stepDir * (su - pu)
+								+ stepDir * 0.5 + 0.5) * delta;
+						ci = su;
+						blo = bl;
+						lim = SUBV;
+						continue;
+					}
+				}
+				// FULL, or MIXED whose entry sub-voxel is solid: the
+				// surface the ray met is the 1/4 m face it just crossed.
 				n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
@@ -774,18 +934,14 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 				alb = cellAlbedo(s.rgb);
 				le = cellEmission(s.a, alb);
 				tHit = t;
-				cellOut = cellHi;   // the COARSE cell, for neeDirect
+				cellOut = cellHi;
 				return true;
 			}
-			// LEFT THE CELL. The face just crossed is also the 1 m face
-			// the coarse walk would have crossed, at the same t and on
-			// the same axis — so rescale the walk back to 1 m, put it in
-			// the neighbour across that face, rebuild sideDist from the
-			// exit point, and fall straight into the arrival test below.
-			// Nothing was saved across the descent and nothing is
-			// restored: the state is recomputed, which is why the fine
-			// rung costs no live registers of its own.
-			delta *= SUBV;
+
+			// LEFT THE CELL. Same argument one rung up: the face just
+			// crossed is the 1 m face the coarse walk would have
+			// crossed, at the same t and on the same axis.
+			delta *= SUBB;
 			if (axis == 0) cellHi.x += stepDir.x;
 			else if (axis == 1) cellHi.y += stepDir.y;
 			else cellHi.z += stepDir.z;
@@ -800,10 +956,10 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		if (escaped)
 			return false; // escaped: contributes nothing (sky is punted)
 
-		// ARRIVAL AT A 1 M CELL. s stays live across a descent — a fine
-		// hit takes its colour and its class from the cell that owns
-		// the mask — and it is only ever written here, on the coarse
-		// rung, where nothing is depending on the old value.
+		// ARRIVAL AT A 1 M CELL. s stays live across a descent — a
+		// sub-metre hit takes its colour and its class from the cell
+		// that owns the mask — and it is only ever written here, on the
+		// coarse rung, where nothing is depending on the old value.
 		s = texture3D(claudeTraceGrid, (ci + 0.5) / GRID_S);
 		if (s.a <= CLASS_AIR_MAX)
 			continue; // air
@@ -814,15 +970,14 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		else n.z = -stepDir.z;
 
 		// CLASS 250 SAYS "DO NOT STOP AT MY 1 M WALL". Rescale the walk
-		// to 1/16 m and keep going, against this cell's 16^3 mask. The
-		// sub-voxel the ray enters through is tested here, by the
-		// rescale, because the loop only ever tests what it stepped INTO
-		// and no step has been taken inside the cell yet; if it is
-		// solid, the surface the ray met is the 1 m face it came
-		// through and n already holds that face's normal. A miss means
-		// the ray passed THROUGH this cell and the walk resumes at 1 m
-		// from the far face. Ring-gated, because outside [48,80)^3 a 250
-		// cell has no mask and must stay the cube it is today.
+		// and keep going, against this cell's baked shape. Which rung it
+		// lands on is the summary's answer for the brick the ray enters:
+		// FULL stops here (the 1 m face IS the surface, and n already
+		// holds that face's normal), EMPTY starts the walk at 1/4 m, and
+		// MIXED tests the entry sub-voxel and starts it at 1/16 m. A
+		// miss means the ray passed THROUGH this brick and the walk
+		// carries on. Ring-gated, because outside [48,80)^3 a 250 cell
+		// has no mask and no summary and must stay the cube it is today.
 		//
 		// Shadow and bounce rays get this for free and that is the
 		// point: §2 forbids a voxel that exists for eye rays but not
@@ -833,17 +988,38 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 			cellHi = ci;
 			// entry point in SUB-VOXEL units, clamped INSIDE the cell
 			// (see the starting-cell block for why the clamp is on the
-			// position rather than on the index)
+			// position rather than on the index). The brick index is
+			// taken FROM the clamped sub-voxel index rather than
+			// computed beside it, so the two rungs cannot disagree
+			// about which brick the ray entered.
 			vec3 pu = clamp((ro + rd * t - cellHi) * SUBV, vec3(0.0),
 					vec3(SUBV - 1.0 / 512.0));
 			vec3 su = floor(pu);
-			if (!subvoxSolid(cellHi - vec3(SUBV_R0), su)) {
-				delta *= RUNG_FINE;
-				sideDist = t + (stepDir * (su - pu)
-						+ stepDir * 0.5 + 0.5) * delta;
-				ci = su;
-				lim = SUBV;
-				continue;
+			vec3 bi = floor(su * RUNG_MID);
+			float bs = brickState(cellHi - vec3(SUBV_R0), bi);
+			if (bs < 2.5) {
+				if (bs < 0.5) {
+					// EMPTY entry brick: start on the 1/4 m rung. pu is
+					// already the position in sub-voxel units, so the
+					// brick-unit position is an exact quarter of it.
+					vec3 pb = pu * RUNG_MID;
+					delta *= RUNG_MID;
+					sideDist = t + (stepDir * (bi - pb)
+							+ stepDir * 0.5 + 0.5) * delta;
+					ci = bi;
+					lim = SUBB;
+					continue;
+				}
+				// MIXED entry brick: the entry sub-voxel decides
+				if (!subvoxSolid(cellHi - vec3(SUBV_R0), su)) {
+					delta *= RUNG_FINE;
+					sideDist = t + (stepDir * (su - pu)
+							+ stepDir * 0.5 + 0.5) * delta;
+					ci = su;
+					blo = bi * SUBB_EDGE;
+					lim = SUBV;
+					continue;
+				}
 			}
 		}
 

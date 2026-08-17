@@ -235,6 +235,33 @@ struct ClaudeTraceGrid
 	// extraction.
 	u32 subvox_tex = 0;
 	std::vector<u8> subvox;
+	// THE SUB-BRICK SUMMARY: one rung of hierarchy INSIDE the 16^3 mask,
+	// so the walk does not have to step every 1/16 m through empty space.
+	// Each ring cell's mask is cut into 4^3 = 64 sub-bricks of 4^3
+	// sub-voxels, and each sub-brick is summarised as EMPTY / FULL /
+	// MIXED — two bits, "any bit set" and "all bits set".
+	//
+	// It is a BAKE, not a runtime effect (spec/README): the shader never
+	// derives it, it reads it. And it is DERIVED FROM V.subvox, in the
+	// same loop, over the same box, which is how "the incremental
+	// re-snap path updates it too" is true by construction instead of by
+	// assertion — there is no way to re-bake a cell's bits without
+	// re-baking its summary.
+	//
+	// Layout, R8 32x128x128 = 512 KB (the mask ring next to it is 16 MB,
+	// so this is +3 %): one byte per (ring cell, brick y, brick z),
+	// holding the four bricks along x as 2 bits each — bit 2*bx = any,
+	// bit 2*bx+1 = all. So a byte is 0x00 for four empty bricks and 0xFF
+	// for four full ones. Same R8-plus-float-bit-maths reason as the
+	// mask: integer samplers silently kill the Irrlicht material.
+	u32 subbrick_tex = 0;
+	std::vector<u8> subbrick;
+	// FNV-1a over the whole 512 KB, recomputed at the end of every bake.
+	// Exported in claude_stats.json so a harness can prove the
+	// incremental path converges to the full walk on THIS array, which
+	// grid_hash cannot do — grid_hash hashes node content, and a bake
+	// that forgot to update the summary would leave it untouched.
+	u64 subbrick_hash = 0;
 	// AUTHORED MODELS (phase 4.5, ADR-0005/0010): 16^3 occupancy masks
 	// loaded from <path_user>/util/claude_models/*.json per the
 	// manifest, pre-rotated to the four facedir yaws (512 bytes each,
@@ -273,6 +300,16 @@ struct ClaudeTraceGrid
 	// node stays an honest 1 m cube, exactly as it is today.
 	static constexpr int NBOX_R0 = 48, NBOX_R1 = 80;
 	static constexpr int NBOX_RING = NBOX_R1 - NBOX_R0;
+	// The sub-brick rung: 4 bricks per cell edge, 4 sub-voxels per brick
+	// edge, 4 * 4 = 16 = the mask's edge. ONE definition; the shader's
+	// SUBB is the same number and util/claude_walk_equiv.py holds both
+	// walks against each other, because two copies of "4" is how a
+	// summary ends up read for the wrong brick.
+	static constexpr int SUBB = 4;
+	static constexpr int SUBB_EDGE = 16 / SUBB;  // sub-voxels per brick edge
+	static constexpr int SUBB_TEX_X = NBOX_RING;          // 32
+	static constexpr int SUBB_TEX_Y = NBOX_RING * SUBB;   // 128
+	static constexpr int SUBB_TEX_Z = NBOX_RING * SUBB;   // 128
 	static constexpr size_t NBOX_CAP = 4096; // distinct shapes; 2 MB
 	bool nodebox_on = true;
 	std::vector<u16> nbox_ids;                   // RING^3, 0 = none
@@ -507,6 +544,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_rng = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_rng_pixel{"claudeRng"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
+	// The sub-brick summary, unit 14. Declared here BECAUSE THE SHADER
+	// SAMPLES IT — environment-laws: a sampler declared and never read
+	// is stripped by the compiler and reports DEAD in the startup
+	// census, exactly like a misspelled name, which is how you teach the
+	// next reader to distrust the instrument.
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subbrick_sampler_pixel{"claudeSubbrickTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
@@ -1351,6 +1394,11 @@ public:
 					GL.ActiveTexture(GL.TEXTURE7);
 					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.subvox_tex);
 				}
+				if (g_claude_grid.subbrick_tex) {
+					GL.ActiveTexture(GL.TEXTURE14);
+					GL.BindTexture(GL.TEXTURE_3D,
+							g_claude_grid.subbrick_tex);
+				}
 				if (g_claude_grid.model_ids_tex) {
 					GL.ActiveTexture(GL.TEXTURE0 + 16);
 					GL.BindTexture(GL.TEXTURE_3D,
@@ -1383,6 +1431,8 @@ public:
 				m_matparams_sampler_pixel.set(&player, services);
 				SamplerLayer_t svlayer = 7;
 				m_subvox_sampler_pixel.set(&svlayer, services);
+				SamplerLayer_t sblayer = 14;
+				m_subbrick_sampler_pixel.set(&sblayer, services);
 				SamplerLayer_t midl = 16, matl = 17, mpal = 18;
 				m_modelids_sampler_pixel.set(&midl, services);
 				m_modelatlas_sampler_pixel.set(&matl, services);
@@ -2762,6 +2812,11 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 	auto &sv = V.subvox;
 	if (sv.empty())
 		sv.assign((size_t)64 * 512 * 512, 0);
+	auto &sb = V.subbrick;
+	if (sb.empty())
+		sb.assign((size_t)ClaudeTraceGrid::SUBB_TEX_X
+				* ClaudeTraceGrid::SUBB_TEX_Y
+				* ClaudeTraceGrid::SUBB_TEX_Z, 0);
 	int lx = std::max(x0, R0), hx = std::min(x0 + w, R1);
 	int ly = std::max(y0, R0), hy = std::min(y0 + h, R1);
 	int lz = std::max(z0, R0), hz = std::min(z0 + d, R1);
@@ -2787,18 +2842,73 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 		}
 		// a <= 230 is air / water / glass / nub: no bits
 		u8 fill = (a > 230 && !mm) ? 0xFF : 0x00;
+		// THE SUB-BRICK SUMMARY, accumulated in the same pass that
+		// writes the bits. 4^3 bricks per cell; a brick spans 4 x-bits,
+		// which is one NIBBLE of the mask's 2-byte x row — bx 0 and 2
+		// are the low nibble of bytes 0 and 1, bx 1 and 3 the high
+		// nibble. `orv` collects "any bit set", `andv` "all bits set",
+		// over the 4 y rows x 4 z rows of the brick.
+		u8 orv[ClaudeTraceGrid::SUBB][ClaudeTraceGrid::SUBB]
+				[ClaudeTraceGrid::SUBB] = {};
+		u8 andv[ClaudeTraceGrid::SUBB][ClaudeTraceGrid::SUBB]
+				[ClaudeTraceGrid::SUBB];
+		memset(andv, 0x0F, sizeof(andv));
 		for (int sz2 = 0; sz2 < 16; sz2++)
 		for (int sy2 = 0; sy2 < 16; sy2++) {
 			size_t row = ((size_t)(rz * 16 + sz2) * 512
 					+ (ry * 16 + sy2)) * 64 + (size_t)rx * 2;
 			if (mm) {
-				sv[row] = mm[(size_t)(sz2 * 16 + sy2) * 2];
-				sv[row + 1] = mm[(size_t)(sz2 * 16 + sy2) * 2 + 1];
+				u8 b0 = mm[(size_t)(sz2 * 16 + sy2) * 2];
+				u8 b1 = mm[(size_t)(sz2 * 16 + sy2) * 2 + 1];
+				sv[row] = b0;
+				sv[row + 1] = b1;
+				u8 nib[4] = {(u8)(b0 & 0x0F), (u8)(b0 >> 4),
+						(u8)(b1 & 0x0F), (u8)(b1 >> 4)};
+				int by = sy2 >> 2, bz = sz2 >> 2;
+				for (int bx = 0; bx < ClaudeTraceGrid::SUBB; bx++) {
+					orv[bz][by][bx] |= nib[bx];
+					andv[bz][by][bx] &= nib[bx];
+				}
 			} else {
 				sv[row] = fill;
 				sv[row + 1] = fill;
 			}
 		}
+		// One byte per (cell, brick y, brick z), four bricks along x at
+		// 2 bits each: bit 2*bx = any, bit 2*bx+1 = all. A uniform cell
+		// (no mask: solid or air) needs no scan at all — every brick is
+		// 0b11 or 0b00, so the byte is 0xFF or 0x00.
+		for (int bz = 0; bz < ClaudeTraceGrid::SUBB; bz++)
+		for (int by = 0; by < ClaudeTraceGrid::SUBB; by++) {
+			u8 byte = 0;
+			if (!mm) {
+				byte = fill ? 0xFF : 0x00;
+			} else {
+				for (int bx = 0; bx < ClaudeTraceGrid::SUBB; bx++) {
+					if (orv[bz][by][bx])
+						byte |= (u8)(1u << (2 * bx));
+					if (andv[bz][by][bx] == 0x0F)
+						byte |= (u8)(2u << (2 * bx));
+				}
+			}
+			sb[((size_t)(rz * ClaudeTraceGrid::SUBB + bz)
+					* ClaudeTraceGrid::SUBB_TEX_Y
+					+ (ry * ClaudeTraceGrid::SUBB + by))
+					* ClaudeTraceGrid::SUBB_TEX_X + rx] = byte;
+		}
+	}
+	// FNV-1a over the finished summary. Recomputed on EVERY bake, full
+	// or incremental, so `subbrick_hash` in claude_stats.json answers
+	// "did the incremental path maintain this array" — the question
+	// grid_hash cannot answer, because grid_hash is node content and a
+	// bake that forgot the summary would leave it identical.
+	{
+		u64 hsh = 14695981039346656037ULL;
+		for (u8 b : sb) {
+			hsh ^= b;
+			hsh *= 1099511628211ULL;
+		}
+		V.subbrick_hash = hsh;
 	}
 }
 
@@ -2990,6 +3100,31 @@ static void claudeTraceGridUploadFull()
 		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 64, 512, 512,
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
 				GL.UNSIGNED_BYTE, V.subvox.data());
+		// the sub-brick summary rides beside the mask it summarises, on
+		// unit 14, and is uploaded by the same two paths
+		if (!V.subbrick.empty()) {
+			bool fresh_sb = !V.subbrick_tex;
+			if (fresh_sb)
+				GL.GenTextures(1, &V.subbrick_tex);
+			GL.ActiveTexture(GL.TEXTURE14);
+			GL.BindTexture(GL.TEXTURE_3D, V.subbrick_tex);
+			if (fresh_sb) {
+				claudeTraceGridTexParams3D();
+				GL.TexImage3D(GL.TEXTURE_3D, 0,
+						claudeUseR8() ? GL.R8 : GL_LUMINANCE8,
+						ClaudeTraceGrid::SUBB_TEX_X,
+						ClaudeTraceGrid::SUBB_TEX_Y,
+						ClaudeTraceGrid::SUBB_TEX_Z, 0,
+						claudeUseR8() ? GL.RED : GL_LUMINANCE,
+						GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0,
+					ClaudeTraceGrid::SUBB_TEX_X,
+					ClaudeTraceGrid::SUBB_TEX_Y,
+					ClaudeTraceGrid::SUBB_TEX_Z,
+					claudeUseR8() ? GL.RED : GL_LUMINANCE,
+					GL.UNSIGNED_BYTE, V.subbrick.data());
+		}
 		bool fresh_ids = !V.model_ids_tex;
 		if (fresh_ids)
 			GL.GenTextures(1, &V.model_ids_tex);
@@ -3113,6 +3248,25 @@ static bool claudeTraceGridUploadBox(int x0, int y0, int z0, int w, int h, int d
 					tw, th, td, staging);
 			GL.ActiveTexture(GL.TEXTURE7);
 			GL.BindTexture(GL.TEXTURE_3D, V.subvox_tex);
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, tx, ty, tz, tw, th, td,
+					fmt, GL.UNSIGNED_BYTE, staging.data());
+		}
+		// THE SUMMARY GOES UP WITH THE MASK, over the same cell box.
+		// If this block is ever missing, a dug node leaves the walk
+		// reading a stale EMPTY/FULL for a brick that has changed — the
+		// mask says one thing and the hierarchy above it says another,
+		// which reads as a hole or a phantom wall and nothing logs it.
+		// It is in the SAME `if` as the mask upload for that reason.
+		if (lx < hx && ly < hy && lz < hz && !V.subbrick.empty()) {
+			constexpr int SB = ClaudeTraceGrid::SUBB;
+			int tx = lx - R0, tw = hx - lx;
+			int ty = (ly - R0) * SB, th = (hy - ly) * SB;
+			int tz = (lz - R0) * SB, td = (hz - lz) * SB;
+			claudePackBox(V.subbrick.data(), ClaudeTraceGrid::SUBB_TEX_X,
+					ClaudeTraceGrid::SUBB_TEX_Y, 1, tx, ty, tz,
+					tw, th, td, staging);
+			GL.ActiveTexture(GL.TEXTURE14);
+			GL.BindTexture(GL.TEXTURE_3D, V.subbrick_tex);
 			GL.TexSubImage3D(GL.TEXTURE_3D, 0, tx, ty, tz, tw, th, td,
 					fmt, GL.UNSIGNED_BYTE, staging.data());
 		}
@@ -3513,6 +3667,16 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// two paths by construction rather than by luck.
 			<< ", \"grid_hash\": \"" << std::hex << std::setw(16)
 			<< std::setfill('0') << g_claude_grid.content_hash
+			<< std::dec << std::setfill(' ') << "\""
+			// The same question, asked of the BAKED sub-brick summary
+			// rather than of node content. grid_hash cannot answer it:
+			// a bake that forgot to re-summarise a dirty block leaves
+			// node content untouched and grid_hash identical, while the
+			// hierarchy the walk reads is stale. Edit a node, put it
+			// back, force a full snapshot: this must return to the value
+			// it had, and must equal what a full walk produces.
+			<< ", \"subbrick_hash\": \"" << std::hex << std::setw(16)
+			<< std::setfill('0') << g_claude_grid.subbrick_hash
 			<< std::dec << std::setfill(' ') << "\""
 			<< ", \"emitters\": " << g_claude_grid.emitter_count
 			// the two numbers that explain a noisy room: how many area

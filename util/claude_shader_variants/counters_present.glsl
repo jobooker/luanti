@@ -43,10 +43,10 @@ void main(void)
 		return;
 	}
 
-	// STEP COUNTER VIEWS (12-16, measurement variant): one
+	// STEP COUNTER VIEWS (10-16, measurement variant): one
 	// nearest tap, no bilateral blend, no sky pass-through, no
 	// tone map. The value IS the message and it is an integer.
-	if (claudeView > 11.5) {
+	if (claudeView > 9.5) {
 		gl_FragColor = vec4(clamp(texture2D(accum, uv).rgb,
 				0.0, 1.0), 1.0);
 		return;

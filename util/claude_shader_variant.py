@@ -35,7 +35,12 @@ VARIANTS
 
   live       the committed shader, unmodified (the "present" arm; the
              dial then chooses off/on)
-  twowalk    the SHADER THIS REWRITE REPLACED, verbatim, pinned at the
+  twoscale   the TWO-RUNG walk (1 m and 1/16 m, no sub-brick summary),
+             verbatim, pinned at TWO_SCALE_COMMIT. The arm the sub-brick
+             hierarchy has to beat. Same reason as `twowalk` below: the
+             seat drifts ~7 % overnight, so old and new must be timed in
+             ONE client session or the comparison is worthless.
+  twowalk    the shader the ONE-LOOP rewrite replaced, verbatim, pinned at the
              commit (PRE_DESCEND_COMMIT). march() plus a separate
              descendCell() holding a second DDA's worth of locals. It is
              here so "did folding the two walks into one pay" can be
@@ -56,12 +61,16 @@ VARIANTS
              joint-bilateral upsample, because a blended byte plane is
              not a number.
 
-COUNTER VIEWS (counters variant only). These numbers REPLACE the NEE
-forensics/RNG-density views 12-16 that the committed shader puts there;
-the variant is a throwaway measuring shader, not a new instrument in the
-engine, so it reuses the numbers rather than needing a C++ range change
-(`claude_view` is clamped to 0..16 in game.cpp).
+COUNTER VIEWS (counters variant only). These numbers REPLACE the
+instrument-A / NEE-forensics / RNG-density views 10-16 that the
+committed shader puts there; the variant is a throwaway measuring
+shader, not a new instrument in the engine, so it reuses the numbers
+rather than needing a C++ range change (`claude_view` is clamped to
+0..16 in game.cpp, and that clamp is why the sub-brick rung had to take
+10 and 11 rather than 17 and 18 -- see spec/measured.md "Owed").
 
+  10  PRIMARY ray: R/G = sub-brick (1/4 m) steps, 16-bit
+  11  WHOLE PATH: R/G = sub-brick steps, 16-bit
   12  PRIMARY ray: R = fine steps low byte, G = fine steps high byte,
       B = 1.0 if the primary ray descended into any class-250 cell
   13  PRIMARY ray: R/G = coarse (1 m) steps, 16-bit little-endian
@@ -103,7 +112,7 @@ STATE = os.path.join(VDIR, ".installed.json")
 # not a warning: the anchors below are line-for-line assumptions about
 # these files, and silently transforming a shader they no longer
 # describe is how a measurement gets taken of something nobody wrote.
-TRACE_SHA = "652f04699fe0a77043096a01069cdd2dc6ed9c46319c4175998a73980b161181"
+TRACE_SHA = "f38548cbca11735d1a6cf645b1c25db0d006e0ff8c323e0de8abda62dbcc11c1"
 PRESENT_SHA = "9c3bd80a9a83f1fb441f2d7a55064b36ff8d5b79d0d04a7495e03e9f4d353f25"
 
 
@@ -252,12 +261,23 @@ def build_nodescend(_src_ignored):
 #            escaped the grid; so the increment sits at that junction,
 #            which a coarse-rung step reaches directly and a rescale
 #            back to 1 m reaches after the same face crossing.
+#   g_mid    one per SUB-BRICK VISIT, and it has no counterpart in the
+#            older tables because the rung did not exist. It counts the
+#            same event g_fine counts, one rung up: a brick the walk
+#            landed on and asked the summary about, plus the entry brick
+#            each cell rescale tests. So g_mid is the number of 1/4 m
+#            steps, and (g_fine + g_mid) is the number of sub-metre
+#            fetches the walk made -- which is the number to compare
+#            against the two-rung shader's g_fine, since that is what
+#            the hierarchy is trading.
 COUNTER_GLOBALS = """
 // --- STEP COUNTERS (measurement variant only) ------------------------
 // g_fine   1/16 m sub-voxel visits, all rays, all depths
+// g_mid    1/4 m sub-brick visits, all rays, all depths
 // g_coarse 1 m steps of the walk, all rays, all depths
 // g_desc   1.0 once any march() has descended into a class-250 cell
 float g_fine = 0.0;
+float g_mid = 0.0;
 float g_coarse = 0.0;
 float g_desc = 0.0;
 
@@ -273,12 +293,16 @@ vec2 pack16(float n)
 
 COUNTER_VIEWS = """
 	// --- STEP COUNTER VIEWS 12-16 (measurement variant only) ---------
-	// These REPLACE the committed shader's NEE-forensics and
-	// RNG-density views at the same numbers. See the header of
+	// These REPLACE the committed shader's instrument-A, NEE-forensics
+	// and RNG-density views at the same numbers. See the header of
 	// util/claude_shader_variant.py for the encoding.
-	if (view >= 12 && view <= 16) {
+	if (view >= 10 && view <= 16) {
 		vec3 dbg = vec3(0.0);
-		if (view == 12)
+		if (view == 10)
+			dbg = vec3(pack16(g_primMid), 0.0);
+		else if (view == 11)
+			dbg = vec3(pack16(g_mid), 0.0);
+		else if (view == 12)
 			dbg = vec3(pack16(g_primFine), g_primDesc);
 		else if (view == 13)
 			dbg = vec3(pack16(g_primCoarse), 0.0);
@@ -311,12 +335,29 @@ def build_counters(src):
         + "bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, "
           "out vec3 alb,",
         "counter globals")
-    # a sub-voxel visit on the fine rung
+    # a sub-voxel visit on the 1/16 m rung: the block that runs when the
+    # step landed INSIDE the current brick
     t = replace_once(
         t,
-        "\t\t\tif (!escaped) {\n",
-        "\t\t\tif (!escaped) {\n\t\t\t\tg_fine += 1.0;\n",
+        "\t\t\t\t\tif (!subvoxSolid(cellHi - vec3(SUBV_R0), ci))\n",
+        "\t\t\t\t\tg_fine += 1.0;\n"
+        "\t\t\t\t\tif (!subvoxSolid(cellHi - vec3(SUBV_R0), ci))\n",
         "fine step counter")
+    # a sub-brick visit on the 1/4 m rung
+    t = replace_once(
+        t,
+        "\t\t\t\tfloat bs = brickState(cellHi - vec3(SUBV_R0), ci);\n",
+        "\t\t\t\tg_mid += 1.0;\n"
+        "\t\t\t\tfloat bs = brickState(cellHi - vec3(SUBV_R0), ci);\n",
+        "mid step counter, in-loop")
+    # the entry brick a cell rescale tests, and the entry sub-voxel a
+    # MIXED brick tests on the way down from 1/4 m
+    t = replace_once(
+        t,
+        "\t\t\t\t\tvec3 su = clamp(floor(pu), bl,\n",
+        "\t\t\t\t\tg_fine += 1.0;\n"
+        "\t\t\t\t\tvec3 su = clamp(floor(pu), bl,\n",
+        "fine entry visit, mid-rung descend")
     # the 1 m step / escape junction
     t = replace_once(
         t,
@@ -333,10 +374,19 @@ def build_counters(src):
         "descend flag + entry visit, starting cell")
     t = replace_once(
         t,
-        "\t\t\tvec3 su = floor(pu);\n",
-        "\t\t\tvec3 su = floor(pu);\n"
-        "\t\t\tg_fine += 1.0;\n\t\t\tg_desc = 1.0;\n",
-        "descend flag + entry visit, in-loop")
+        "\t\t\tvec3 bi = floor(su * RUNG_MID);\n",
+        "\t\t\tvec3 bi = floor(su * RUNG_MID);\n"
+        "\t\t\tg_mid += 1.0;\n\t\t\tg_desc = 1.0;\n",
+        "descend flag + entry brick visit, in-loop")
+    # the entry SUB-VOXEL is only tested when that brick is MIXED
+    # anchored on the comment above it, because the bare `if` line is a
+    # SUBSTRING of the deeper-indented one in the mid-rung descend
+    t = replace_once(
+        t,
+        "\t\t\t\t// MIXED entry brick: the entry sub-voxel decides\n",
+        "\t\t\t\t// MIXED entry brick: the entry sub-voxel decides\n"
+        "\t\t\t\tg_fine += 1.0;\n",
+        "fine entry visit, cell entry")
     # per-pixel primary snapshot, declared alongside the other primary*
     t = replace_once(
         t,
@@ -347,6 +397,7 @@ def build_counters(src):
         "\t// the camera ray alone cost\" and another \"what did the\n"
         "\t// whole path cost\".\n"
         "\tfloat g_primFine = 0.0;\n"
+        "\tfloat g_primMid = 0.0;\n"
         "\tfloat g_primCoarse = 0.0;\n"
         "\tfloat g_primDesc = 0.0;\n",
         "primary counter locals")
@@ -354,7 +405,8 @@ def build_counters(src):
     t = replace_once(
         t,
         "\t// --- the path ----------------------------------------------------\n",
-        "\tg_fine = 0.0;\n\tg_coarse = 0.0;\n\tg_desc = 0.0;\n"
+        "\tg_fine = 0.0;\n\tg_mid = 0.0;\n\tg_coarse = 0.0;\n"
+        "\tg_desc = 0.0;\n"
         "\t// --- the path ----------------------------------------------------\n",
         "counter reset")
     # snapshot after the primary march returns
@@ -363,6 +415,7 @@ def build_counters(src):
         "\t\tif (seg == 0) {\n\t\t\tprimaryHit = true;\n",
         "\t\tif (seg == 0) {\n"
         "\t\t\tg_primFine = g_fine;\n"
+        "\t\t\tg_primMid = g_mid;\n"
         "\t\t\tg_primCoarse = g_coarse;\n"
         "\t\t\tg_primDesc = g_desc;\n"
         "\t\t\tprimaryHit = true;\n",
@@ -376,6 +429,7 @@ def build_counters(src):
         "\tfloat tPack = primaryHit\n",
         "\tif (!primaryHit) {\n"
         "\t\tg_primFine = g_fine;\n"
+        "\t\tg_primMid = g_mid;\n"
         "\t\tg_primCoarse = g_coarse;\n"
         "\t\tg_primDesc = g_desc;\n"
         "\t}\n"
@@ -387,15 +441,17 @@ def build_counters(src):
         COUNTER_VIEWS
         + "\t// --- diagnostic views --------------------------------------------\n",
         "counter view block")
-    # The 9-16 instrument block would otherwise swallow views 12-16
-    # before the path ever runs. Narrow it to 9-11 in this variant.
+    # The 9-16 instrument block would otherwise swallow views 10-16
+    # before the path ever runs. Narrow it to 9 alone in this variant --
+    # 10 and 11 became the sub-brick views when the walk grew a third
+    # rung and there was no room left under game.cpp's clamp of 16.
     t = replace_once(
         t,
         "\tif (view >= 9 && view <= 16) {\n",
-        "\tif (view >= 9 && view <= 11) {\n",
+        "\tif (view == 9) {\n",
         "narrow instrument-A range")
     return (HDR % ("claude_trace/opengl_fragment.glsl", sha(TRACE),
-                   "STEP COUNTERS + views 12-16. SLOWER than the shader "
+                   "STEP COUNTERS + views 10-16. SLOWER than the shader "
                    "it counts for: never take a timing number here."
                    )) + t
 
@@ -406,17 +462,17 @@ def build_present_counters(src):
     The committed present upsamples the half-resolution traced buffer
     with a 4-tap joint-bilateral filter -- correct for radiance, fatal
     for a byte plane, since the average of two byte codes is a third
-    byte code that nobody counted. So views >= 11.5 take ONE nearest tap
+    byte code that nobody counted. So views >= 9.5 take ONE nearest tap
     (the accum sampler is already NEAREST) and skip the sky
     pass-through, which would otherwise paste the raster image over
     every sky pixel's step count."""
     t = replace_once(
         src,
         "\t// full-res raster depth -> linear distance in node units.\n",
-        "\t// STEP COUNTER VIEWS (12-16, measurement variant): one\n"
+        "\t// STEP COUNTER VIEWS (10-16, measurement variant): one\n"
         "\t// nearest tap, no bilateral blend, no sky pass-through, no\n"
         "\t// tone map. The value IS the message and it is an integer.\n"
-        "\tif (claudeView > 11.5) {\n"
+        "\tif (claudeView > 9.5) {\n"
         "\t\tgl_FragColor = vec4(clamp(texture2D(accum, uv).rgb,\n"
         "\t\t\t\t0.0, 1.0), 1.0);\n"
         "\t\treturn;\n"
@@ -476,6 +532,47 @@ TWO_HDR = ("// GENERATED by util/claude_shader_variant.py -- DO NOT EDIT.\n"
            "// Body sha256 %s\n")
 
 
+# The LEAN-DESCEND shader: one loop, two rungs (1 m and 1/16 m). It is
+# what `one-tracer` shipped before the sub-brick rung, and it is pinned
+# for exactly the reason `twowalk` is -- so "did the hierarchy pay" can
+# be asked inside ONE client session, against the shader it replaced,
+# rather than across days on a seat that drifts 7 % overnight.
+TWO_SCALE_COMMIT = "f731209f9"
+
+
+def two_scale_source():
+    """The two-rung shader as committed, straight out of git."""
+    import subprocess
+    r = subprocess.run(["git", "show", "%s:client/shaders/claude_trace/"
+                        "opengl_fragment.glsl" % TWO_SCALE_COMMIT],
+                       cwd=REPO, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit("cannot read the pinned two-rung shader at %s:\n%s"
+                         % (TWO_SCALE_COMMIT, r.stderr))
+    return r.stdout
+
+
+TWO_SCALE_HDR = (
+    "// GENERATED by util/claude_shader_variant.py -- DO NOT EDIT.\n"
+    "// Measurement-only variant of "
+    "client/shaders/claude_trace/opengl_fragment.glsl\n"
+    "// PINNED: the TWO-RUNG walk at %s (1 m and 1/16 m, no sub-brick\n"
+    "// summary). The arm the sub-brick hierarchy has to beat, installed\n"
+    "// verbatim so both can be timed in one client session. sha %s\n")
+
+
+def build_twoscale(_src_ignored):
+    """The pre-hierarchy one-loop shader, unmodified, as an arm."""
+    t = two_scale_source()
+    if "claudeSubbrickTex" in t:
+        raise SystemExit("the pinned two-rung shader already has the "
+                         "sub-brick summary in it -- wrong commit")
+    if "float lim = GRID_S;" not in t:
+        raise SystemExit("the pinned two-rung shader is not the one-loop "
+                         "walk -- wrong commit")
+    return (TWO_SCALE_HDR % (TWO_SCALE_COMMIT, sha(t)[:16])) + t
+
+
 def build_twowalk(_src_ignored):
     """The pre-rewrite shader, unmodified, as a measurement arm."""
     t = pre_descend_source()
@@ -510,10 +607,15 @@ def build_cheapbit(src):
     k = src.index("\n}\n", j)
     body_start = src.index("\tfloat raw = texture3D(claudeSubvoxTex,", j)
     t = src[:body_start] + CHEAP_BIT + src[k + 1:]   # keeps the "}\n"
-    # CODE lines only -- this variant's own comment quotes the maths it
-    # deletes, and a guard that cannot tell code from comment would trip
-    # on the sentence explaining itself.
-    live = [l for l in t.splitlines()
+    # CODE lines only, and only INSIDE subvoxSolid() -- this variant's
+    # own comment quotes the maths it deletes, and brickState() next
+    # door unpacks its byte the same way and is not what this arm
+    # removes. A guard that cannot tell code from comment trips on the
+    # sentence explaining itself; one that cannot tell one function from
+    # another trips on its neighbour.
+    fi = t.index("bool subvoxSolid(")
+    fj = t.index("\n}\n", fi)
+    live = [l for l in t[fi:fj].splitlines()
             if not l.lstrip().startswith("//")
             and ("exp2(mod(sc.x" in l or "float byte = floor(raw" in l)]
     if live:
@@ -529,6 +631,7 @@ VARIANTS = {
     "nodescend": {"trace": build_nodescend},
     "cheapbit": {"trace": build_cheapbit},
     "twowalk": {"trace": build_twowalk},
+    "twoscale": {"trace": build_twoscale},
     "sampleronly": {"trace": build_sampleronly},
     "counters": {"trace": build_counters, "present": build_present_counters},
 }
