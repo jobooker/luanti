@@ -90,6 +90,18 @@
     "time": 0.73,
     "yaw": 90
   },
+  "cozy-holes": {
+    "notes": "JOHN'S OWN VANTAGE, 2026-08-16, standing inside the cosy cabin at the west end of the aisle looking WEST (yaw 268.5) at the far plank wall, with the lit furnace room on the other side of it. This is the frame that found the holes: with claude_descend = 1 the wall showed bright specks in horizontal rows that moved with the camera -- the furnace room seen through 1/16 m tunnels in the plank model (roadmap \"HOLES IN THE WALL\"; the original frame is screenshots/screenshot_20260816_184259.png, HUD on, nee 1). NOT a CI arm: it is a defect vantage, kept so the bake floor can be re-judged by eye at the exact pose that found the defect. Feet at 8.5, the physics REST height, so the seat does not fall or slide.",
+    "pitch": -0.7,
+    "pos": [
+      0.9,
+      8.5,
+      5.0
+    ],
+    "set": "gallery",
+    "time": 0.5,
+    "yaw": 268.5
+  },
   "cozy-midday": {
     "notes": "south wall+door; zenith sun (south glass never gets direct sun)",
     "pitch": -8,

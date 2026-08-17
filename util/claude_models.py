@@ -524,6 +524,116 @@ def model_cobble():
                            albedo=ALBEDO_TARGET["cobble"])
 
 
+# ---- the bake floor: no model may be see-through ---------------------
+# Found 2026-08-16 (roadmap "HOLES IN THE WALL"). John, looking at the
+# cosy cabin's far wall after the walker learned to descend into 16^3
+# cells: bright specks, in horizontal rows, that move as the camera
+# moves. They were the lit furnace room seen through 1/16 m tunnels in
+# the plank model. A cabin wall is ONE node thick, so a straight line of
+# air through the model IS a hole through the wall.
+#
+# The tunnels are not a bug in any one carve; they are what carving with
+# no floor produces. Two ways in, both seen in the data:
+#   * one face carves a whole row -- a plank's groove line is dark all
+#     the way across the tile, so the entire outer layer along that row
+#     goes to air (planks_oak_baked, top face, y=15 z=7);
+#   * two faces carve the same cells -- an edge row belongs to both the
+#     -y and -z face, and between them they cover all 16 (planks_*, the
+#     y=0/z=0 corner rows).
+# The rule below is written against the RESULT, not against either
+# cause, so it also catches the third way in that nobody has thought of.
+#
+# THE RULE: in a model that represents a FULL SOLID NODE, no line of
+# cells through the model on any axis may be all air -- minimum
+# thickness >= 1 sub-voxel along x, y and z.
+#
+# FILL POLICY, and why: plug the CENTRE-MOST cell of the offending line
+# (index 7 of 0..15) with the model's base material -- the modal solid
+# palette entry, which for a texture bake is the interior fill colour
+# the bake already uses. One cell, not the whole line, because the line
+# is 1/16 m wide: a ray can only traverse it end to end by staying
+# inside it, so a single plug blocks every ray the tunnel could carry,
+# and refilling the rest would erase the groove that the texture asked
+# for. Centre-most rather than at a face because plugs at index 0/15
+# land on the node seam, where the neighbouring node's plug sits one
+# cell away and the pair reads as a 2-voxel lump; a centre plug is as
+# deep inside the node as the geometry allows.
+#
+# Applied ONLY to SOLID_NODE_MODELS. A bed, a lantern, a campfire, a
+# carpet, a torch and a flowerpot are see-through on purpose and any
+# "fix" to them would be a defect.
+
+SOLID_NODE_MODELS = frozenset((
+    # texture-derived cube bakes
+    "furnace_baked", "crafting_baked", "bookshelf_baked",
+    "planks_oak_baked", "planks_spruce_baked", "log_oak_baked",
+    "cobble_baked",
+    # hand-authored full-cube nodes
+    "furnace_custom", "crafting_custom",
+))
+# NOT here, and each for a reason: chest_custom (a chest body is inset
+# from its cell -- it is a full node in the map but not a full cube of
+# geometry), bed_red_foot/head, lantern_floor, campfire_lit,
+# carpet_white, flowerpot_poppy, torch_baked.
+
+PLUG_AT = 7          # centre-most index of 0..15, tie broken low
+
+
+def through_lines(v):
+    """Every all-air line through a 16^3 mask, as (axis, a, b) with
+    v indexed [z][y][x]:
+        ("x", z, y)  ->  v[z, y, :]
+        ("y", z, x)  ->  v[z, :, x]
+        ("z", y, x)  ->  v[:, y, x]
+    Empty list == the model is opaque along every axis."""
+    s = np.asarray(v) > 0
+    out = []
+    for a in range(N):
+        for b in range(N):
+            if not s[a, b, :].any():
+                out.append(("x", a, b))
+            if not s[a, :, b].any():
+                out.append(("y", a, b))
+            if not s[:, a, b].any():
+                out.append(("z", a, b))
+    return out
+
+
+def base_material_index(pal, v):
+    """The model's base material: the most common non-air palette
+    index. For a texture bake that is the interior fill the bake
+    already writes, so a plug is made of the same stuff as the
+    node's inside."""
+    counts = np.bincount(np.asarray(v).ravel(),
+                         minlength=len(pal)).astype(np.int64)
+    counts[0] = 0
+    if counts.sum() == 0:
+        return 1
+    return int(counts.argmax())
+
+
+def enforce_min_thickness(name, pal, v):
+    """Apply the bake floor. Returns (v, report); v is modified in
+    place. report = dict(before=n, after=n, plugs=[(axis,a,b,x,y,z)]).
+    """
+    v = np.asarray(v)
+    before = through_lines(v)
+    mat = base_material_index(pal, v)
+    plugs = []
+    for axis, a, b in before:
+        if axis == "x":
+            z, y, x = a, b, PLUG_AT
+        elif axis == "y":
+            z, y, x = a, PLUG_AT, b
+        else:
+            z, y, x = PLUG_AT, a, b
+        v[z, y, x] = mat
+        plugs.append((axis, a, b, x, y, z))
+    after = through_lines(v)
+    return v, dict(before=len(before), after=len(after), plugs=plugs,
+                   material=mat)
+
+
 def extrude_cutout(name, path, thick=2, emit_level=12):
     """Torch-class bake: a mostly-transparent 16x16 tile extruded into
     a `thick`-voxel standing model centered in the cell. Bright warm
@@ -663,6 +773,7 @@ def main():
         os.path.join(os.path.dirname(os.path.abspath(__file__)),
                      "claude_models")
     os.makedirs(outdir, exist_ok=True)
+    print("outdir: %s" % outdir)
     with open(os.path.join(outdir, "manifest.json"), "w") as f:
         json.dump(dict(rotate_param2=True, nodes=MANIFEST), f,
                   indent=1)
@@ -674,6 +785,15 @@ def main():
                model_flowerpot, model_planks_oak, model_planks_spruce,
                model_log_oak, model_cobble):
         name, pal, v = fn()
+        if name in SOLID_NODE_MODELS:
+            v, floor = enforce_min_thickness(name, pal, v)
+            holes = "  holes %d->%d" % (floor["before"], floor["after"])
+            if floor["after"]:
+                raise SystemExit(
+                    "BAKE FLOOR FAILED on %s: %d through-line(s) survived "
+                    "the plug pass" % (name, floor["after"]))
+        else:
+            holes = "  (see-through by design)"
         data = dict(name=name,
                     palette=[None] + [dict(rgb=list(p["rgb"]),
                                            emit=p["emit"])
@@ -688,8 +808,8 @@ def main():
         solid = int((v > 0).sum())
         emis = int(sum((v == i).sum() for i, p in enumerate(pal)
                        if p and p["emit"] > 0))
-        print("%-16s solid %4d/4096  emissive %3d  -> %s , %s"
-              % (name, solid, emis, jp, pp))
+        print("%-20s solid %4d/4096  emissive %3d%s"
+              % (name, solid, emis, holes))
 
 
 if __name__ == "__main__":

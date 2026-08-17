@@ -769,6 +769,26 @@ def binary_staleness():
     return None
 
 
+MODEL_HOLE_CHECK = os.path.join(HERE, "claude_model_holes.py")
+
+
+def model_holes():
+    """None if every full-solid-node 16^3 model is opaque on all three
+    axes, else the checker's own report.
+
+    Static, costs ~0.3 s, and runs on the SHIPPED JSON. The engine
+    reads util/claude_models/*.json at runtime, so a mask edited by
+    hand or left stale by a skipped re-bake reaches the seat without
+    passing through a build — there is no compile step that could have
+    caught it. A see-through solid model is a hole through a
+    one-node-thick wall (roadmap "HOLES IN THE WALL", 2026-08-16: John
+    saw the lit furnace room through the cosy cabin's plank wall)."""
+    r = sh([sys.executable, MODEL_HOLE_CHECK])
+    if r.returncode == 0:
+        return None
+    return ((r.stdout or "") + (r.stderr or "")).strip()[-2000:]
+
+
 def build_type():
     """CMAKE_BUILD_TYPE as the configured build tree states it, or None.
     Copied from claude_nee_sweep: the build COMMAND and the build CACHE
@@ -2133,6 +2153,11 @@ def cmd_run(args):
           "./bin/luanti is up to date with src/" if not stale else
           "./bin/luanti is OLDER than %s by %.0f s — this run would "
           "measure a binary that is not this source tree" % stale)
+    holes = model_holes()
+    run["model_holes"] = holes
+    A.add("models-no-holes", holes is None,
+          "every full-solid-node 16^3 model is opaque on x, y and z"
+          if holes is None else holes)
     dep = run.get("gallery_deploy") or {}
     if dep.get("skipped"):
         A.add("gallery-deploy", True, "--skip-deploy: not rebuilt this run")
