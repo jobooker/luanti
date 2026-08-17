@@ -158,7 +158,8 @@
 // THE PUNT LIST — documented absences, not quiet hacks (§3)
 // ---------------------------------------------------------------------
 //  * sun/sky: LANDED 2026-08-17, see the block above. What remains is
-//    listed there (clouds, stars, the below-horizon half, scattering).
+//    listed there: clouds, stars, aerial perspective, and a far field
+//    that is one flat number instead of a world.
 //  * NEE beyond 16 area emitters: the uniform list is capped (game.cpp
 //    ClaudeTraceGrid::AREA_CAP). Past that, emitters are lit by being HIT,
 //    which is correct and noisier — see the weights above.
