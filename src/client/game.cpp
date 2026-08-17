@@ -1087,7 +1087,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 17.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 18.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.

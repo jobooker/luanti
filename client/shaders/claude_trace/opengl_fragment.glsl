@@ -1630,6 +1630,74 @@ void main(void)
 	float prevPdfB = 0.0;
 	bool misArmed = false;
 
+	// --- INSTRUMENT: claude_view 18, DOES A BOUNCE RAY START INSIDE A
+	// SOLID CELL? ----------------------------------------------------
+	// Built 2026-08-17 for a defect the sky REVEALED rather than caused:
+	// cave-glass, a sealed 7x5x7 box whose golden is black, leaks a few
+	// hundred pixels of sky. Measured, one variable at a time, at
+	// claude_sky_uniform = 50:
+	//   claudeBounces 0  -> 0 leaking pixels, from twelve directions.
+	//                       No EYE ray escapes; the room is sealed.
+	//   claudeBounces 1  -> it leaks. So it is the FIRST BOUNCE.
+	//   claudeDescend 0  -> unchanged. Not the sub-voxel walk.
+	//   leak is LINEAR in sky radiance, so it is rays getting out.
+	//
+	// The remaining suspect is the one thing a bounce ray does that an
+	// eye ray does not: it starts ON A SURFACE. march() restarts it at
+	// hit + n * SURFACE_EPS and then never tests the cell it starts in
+	// (that exclusion is what keeps a bounce ray off its own face). If a
+	// grazing hit ever puts that restart point inside a SOLID cell, the
+	// walk begins inside the wall, the exclusion waves it through, and it
+	// marches out of the room.
+	//
+	// This view asks exactly that question and nothing else: take the
+	// primary hit, draw one cosine-hemisphere bounce the way the path
+	// loop does, and report whether the cell that ray STARTS in is solid.
+	// White = yes. A black frame would have killed the hypothesis; it
+	// did not. MEASURED 2026-08-17, per-pixel rate over 40 s:
+	//   cave-glass  3.6e-07 mean, 784 pixels ever positive
+	//   cornell     9.7e-07 mean, 1812 pixels
+	//   cozy-day-ci 3.3e-03 mean, 963124 pixels
+	// The two plain-cube rooms are the evidence, and cave-glass's 784 is
+	// the same order as the 444 pixels of sky it leaks.
+	//
+	// WHAT THIS INSTRUMENT IS BLIND TO, and it matters for the third row:
+	// a CLASS-250 cell is "solid" to this test and is not a defect. The
+	// walk is SUPPOSED to be inside one -- that is what descending means
+	// -- so every sub-voxel hit reports positive, which is why the cabin,
+	// full of authored models, reads 46 % of the frame. Read this view
+	// only in rooms built from plain cubes until it learns to ask the
+	// 16^3 mask the same question.
+	if (view == 18) {
+		vec3 hp, n, alb, le, cell;
+		float tHit;
+		float bad = 0.0;
+		if (march(ro, rd, hp, n, alb, le, tHit, cell)) {
+			float u1 = rnd1();
+			float u2 = rnd1();
+			vec3 wi = cosineHemisphere(n, u1, u2);
+			// the walk's own opening line, verbatim
+			vec3 c0 = floor(hp);
+			if (all(greaterThanEqual(c0, vec3(0.0)))
+					&& all(lessThan(c0, vec3(GRID_S)))) {
+				vec4 s0 = texture3D(claudeTraceGrid, (c0 + 0.5) / GRID_S);
+				if (s0.a > CLASS_AIR_MAX)
+					bad = 1.0;
+			}
+			// wi is drawn but unused except to keep the RNG consumption
+			// identical to the path loop's, so the two see the same
+			// directions at the same pixels.
+			bad *= (dot(wi, n) >= 0.0) ? 1.0 : 1.0;
+		}
+		// Accumulates like view 5, so the per-pixel MEAN over frames is
+		// the RATE -- the number worth having for an event this rare.
+		// x1000 because a rate of 1e-6 would otherwise land below the
+		// first display step; divide the inverted linear value by 1000
+		// to read the rate back.
+		L = vec3(bad * 1000.0);
+		maxBounces = -1;
+	}
+
 	// --- INSTRUMENT: claude_view 17, THE WHOLE SKY IN ONE FRAME -------
 	// skyRadiance() alone, over the FULL SPHERE, with no geometry, no
 	// camera and no transport: the screen is a lat-long chart of the miss
