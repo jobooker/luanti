@@ -724,6 +724,51 @@ def git_state():
             "dirty": dirty, "tag": sha + ("-dirty" if dirty else "")}
 
 
+BINARY = os.path.join(REPO, "bin", "luanti")
+BINARY_SRC_DIRS = ("src", "client/shaders")
+BINARY_SRC_EXT = (".cpp", ".h", ".hpp", ".glsl", ".txt", ".cmake")
+
+
+def binary_staleness():
+    """(newest_source, age_seconds) when ./bin/luanti is OLDER than a
+    source file, else None.
+
+    --skip-build exists so a measurement does not pay for a no-op build,
+    and it is a loaded gun. MEASURED 2026-08-16, the hard way: a bisect
+    left the tree at an old commit, `git checkout HEAD -- src/` put the
+    new sources back, and three full CI runs were then taken with the
+    OLD BINARY and reported as evidence for the new one. Every assertion
+    passed, because every assertion was about the harness. The only tell
+    was a log line missing a field the new code adds.
+
+    The check is a file mtime, which is exactly as strong a claim as
+    "the build system would have rebuilt this", and no stronger -- it
+    cannot see a source edited and reverted, and it does not know what
+    was compiled INTO the binary. It is here because it costs a stat()
+    and would have caught the real failure immediately.
+    """
+    try:
+        bt = os.path.getmtime(BINARY)
+    except OSError:
+        return ("(no ./bin/luanti at all)", 0.0)
+    newest, newest_t = None, 0.0
+    for d in BINARY_SRC_DIRS:
+        for root, _dirs, files in os.walk(os.path.join(REPO, d)):
+            for f in files:
+                if not f.endswith(BINARY_SRC_EXT):
+                    continue
+                fp = os.path.join(root, f)
+                try:
+                    t = os.path.getmtime(fp)
+                except OSError:
+                    continue
+                if t > newest_t:
+                    newest, newest_t = os.path.relpath(fp, REPO), t
+    if newest_t > bt:
+        return (newest, round(newest_t - bt, 1))
+    return None
+
+
 def build_type():
     """CMAKE_BUILD_TYPE as the configured build tree states it, or None.
     Copied from claude_nee_sweep: the build COMMAND and the build CACHE
@@ -2082,6 +2127,12 @@ def cmd_run(args):
     rtl.mark("seat_up")
     A.add("build-release", (run.get("build_type") or "").lower() in RELEASE_TYPES,
           "CMAKE_BUILD_TYPE=%s" % run.get("build_type"))
+    stale = binary_staleness()
+    run["binary_stale"] = stale
+    A.add("binary-current", stale is None,
+          "./bin/luanti is up to date with src/" if not stale else
+          "./bin/luanti is OLDER than %s by %.0f s — this run would "
+          "measure a binary that is not this source tree" % stale)
     dep = run.get("gallery_deploy") or {}
     if dep.get("skipped"):
         A.add("gallery-deploy", True, "--skip-deploy: not rebuilt this run")
@@ -2117,12 +2168,25 @@ def cmd_run(args):
     # Restored in the finally beside the doors, and never written to any
     # conf file, so a measurement run cannot leave a gameplay seat with
     # its world silently frozen.
+    abm_mark = _log_size()
     try:
         run["claude_abm"] = lab.rpc("abm", on=False).get("claude_abm")
     except Exception as e:
         run["claude_abm"] = "error: %s" % e
-    A.add("abm-stilled", run["claude_abm"] is False,
-          "claude_abm = %s (asked the server)" % run["claude_abm"])
+    # The setting alone is NOT the assertion. core.settings:set_bool
+    # succeeds on any server, including one whose engine has never heard
+    # of claude_abm -- so reading the value back proves the bridge wrote
+    # it and nothing else. MEASURED 2026-08-16: three runs passed this
+    # check against a binary that predated the feature. The ENGINE's own
+    # transition line is the proof that something consumed it.
+    abm_log = _await_log(abm_mark,
+                         "[claude_abm] active block modifiers DISABLED",
+                         3.0, poll=0.2)
+    A.add("abm-stilled", run["claude_abm"] is False and abm_log is not None,
+          "claude_abm = %s (asked the server); engine transition line %s"
+          % (run["claude_abm"],
+             "seen" if abm_log is not None else
+             "NOT SEEN — the setting was written but no engine read it"))
     run["doors_shut"] = set_doors(True)
     rtl.mark("doors_shut")
     run["room_integrity"] = check_room_integrity()
