@@ -126,7 +126,7 @@ import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
 #    noise floor for this arm (3.26-6.21, environment-laws). At 250 it is
 #    6.64 and at 125 it is 7.97, i.e. outside it. 500 is the shallowest
 #    depth at which the number a human looks at first is still noise.
-SETTLE_FRAMES = 2000
+SETTLE_FRAMES = 500
 SETTLE_SECONDS_WAS = 60.0  # what SETTLE_FRAMES replaced, 2026-08-16
 # Ceiling, so an arm whose world never stops changing cannot wedge a
 # run. exterior-ci is unsealed and map blocks keep arriving there, each
@@ -2101,6 +2101,28 @@ def cmd_run(args):
                                               run["freeze"].get("time_speed")))
 
     vs = lab.load_vantages()
+    # STILL THE WORLD. Mineclonia's grass ABM changes a node inside the
+    # cosy bubble every 30-180 s; the client's trace grid correctly folds
+    # that in, and folding it in correctly clamps the accumulator, so the
+    # settle restarts. Measured 2026-08-16 (util/claude_still_world.py):
+    # 2 grid folds in 421 s with ABMs live at the cosy vantage, 0 with
+    # claude_abm = 0, and the golden run's own client.log carries four of
+    # them inside cozy-ci alone -- the arm that then failed to reach its
+    # settle target at all.
+    #
+    # ASSERTED, not set: the value comes back from the SERVER in the same
+    # call. Grepping a conf is a blind instrument here twice over -- this
+    # is a server setting and the conf is scratch.
+    #
+    # Restored in the finally beside the doors, and never written to any
+    # conf file, so a measurement run cannot leave a gameplay seat with
+    # its world silently frozen.
+    try:
+        run["claude_abm"] = lab.rpc("abm", on=False).get("claude_abm")
+    except Exception as e:
+        run["claude_abm"] = "error: %s" % e
+    A.add("abm-stilled", run["claude_abm"] is False,
+          "claude_abm = %s (asked the server)" % run["claude_abm"])
     run["doors_shut"] = set_doors(True)
     rtl.mark("doors_shut")
     run["room_integrity"] = check_room_integrity()
@@ -2234,6 +2256,10 @@ def cmd_run(args):
                       shot["verdict"][0] == "PASS", shot["verdict"][1])
     finally:
         run["doors_reopened"] = set_doors(False)
+        try:
+            run["claude_abm_restored"] = lab.rpc("abm", on=True).get("claude_abm")
+        except Exception as e:
+            run["claude_abm_restored"] = "error: %s" % e
         rtl.mark("doors_reopened")
         run["timeline"] = rtl.done()
     return finish(run, rundir, A)
