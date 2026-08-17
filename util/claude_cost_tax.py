@@ -23,10 +23,20 @@ one world, one session:
   off      the committed shader, claude_descend = 0
   on       the committed shader, claude_descend = 1
 
+and, from 2026-08-17, a fourth and fifth:
+
+  old-off  the TWO-WALK shader this repo shipped until 2026-08-17
+  old-on   (march() + a separate descendCell()), pinned at its commit
+           and installed verbatim -- so "did folding the two walks into
+           one pay" is answered on ONE binary, ONE server and ONE
+           parked camera instead of across two days. The seat drifts
+           about 5 % between sessions and that drift lands entirely on
+           a cross-session comparison, which is why this arm exists.
+
 crossed with two rooms: `cornell` (no class-250 cell exists, so `on` and
 `off` must agree) and `cozy-ci` (95.6 % of its solid cells are class
-250). Six cells. The number reported for each is the claude_trace GPU
-pass in milliseconds, min/median/max over the reps.
+250). The number reported for each is the claude_trace GPU pass in
+milliseconds, min/median/max over the reps.
 
 HOW TO READ THE ANSWER, decided before the run:
   * absent FAST and off SLOW in Cornell  ->  hypothesis (a) survives:
@@ -61,6 +71,7 @@ ROOMS = ["cornell", "cozy-ci"]
 # costs" from "the extra 3D sampler costs".
 VARIANT_ARM = {"live": [("off", 0), ("on", 1)],
                "nodescend": [("absent", 0)],
+               "twowalk": [("old-off", 0), ("old-on", 1)],
                "sampleronly": [("absent+sampler", 0)]}
 
 # The photo state every reading is taken in. Identical to CI's

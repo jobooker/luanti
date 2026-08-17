@@ -208,11 +208,23 @@ def main():
     ap.add_argument("--no-descend0-arm", dest="descend0_arm",
                     action="store_false",
                     help="skip the claude_descend = 0 control arm")
+    # RE-CHECKING A FLOOR THAT ALREADY LANDED. Once the floored masks
+    # are committed, the interesting question stops being "did the floor
+    # work" and becomes "did something ELSE put the specks back" -- a
+    # shader change to the walk being the obvious candidate, since a
+    # speck is a ray that got through a mask. This runs the floored arms
+    # only: no mask swap, nothing installed over the working tree, and
+    # the number to compare is the recorded 0-4 bright pixels in
+    # spec/measured.md "Bake floor".
+    ap.add_argument("--after-only", action="store_true",
+                    help="skip the pre-floor arm; just re-count specks "
+                         "with the masks that are in the tree")
     args = ap.parse_args()
 
     before_dir = os.path.join(REPO, "screenshots", "_bakefloor_before")
     after_dir = os.path.join(REPO, "screenshots", "_bakefloor_after")
-    git_models(args.before_ref, before_dir)
+    if not args.after_only:
+        git_models(args.before_ref, before_dir)
     # snapshot the working tree's masks so the arms can be re-run in
     # either order without the "before" copy overwriting them.
     os.makedirs(after_dir, exist_ok=True)
@@ -220,7 +232,8 @@ def main():
 
     runs = []
     try:
-        runs.append(arm(args.vantage, before_dir, "before", args.frames))
+        if not args.after_only:
+            runs.append(arm(args.vantage, before_dir, "before", args.frames))
         runs.append(arm(args.vantage, after_dir, "after", args.frames))
         # THIRD ARM, and it is not a spare: the floored masks left ONE
         # dim speck where the pre-floor frame had six bright ones. This
@@ -245,6 +258,28 @@ def main():
     #   * the installed mask sets differ (md5 below), and
     #   * the client logged "[claude_models] N models" after each
     #     reload, i.e. it re-read the table from disk.
+    if args.after_only:
+        # No swap happened, so the two guards below have nothing to
+        # guard. Say that out loud rather than printing a "same_world"
+        # that was never at risk.
+        a = runs[0]
+        out = {"vantage": args.vantage, "after_only": True,
+               "frames": args.frames, "runs": runs,
+               "backup_files": install_dir_backup,
+               "verdict": "AFTER ONLY (no mask swap): bright pixels >%d "
+                          "in the wall box = %d, max luma %.1f. "
+                          "spec/measured.md \"Bake floor\" recorded 4 and "
+                          "0 over two runs."
+                          % (BRIGHT[0], a["bright_over_%d" % BRIGHT[0]],
+                             a["wall_max"])}
+        dest = os.path.join(REPO, "screenshots",
+                            "bakefloor_after_%s.json" % args.vantage)
+        with open(dest, "w") as f:
+            json.dump(out, f, indent=1)
+        print(json.dumps(out, indent=1))
+        print("\nwrote %s" % dest)
+        return
+
     same_world = (runs[0].get("grid_hash") == runs[1].get("grid_hash"))
     masks_differ = runs[0].get("models_md5") != runs[1].get("models_md5")
     b, a = runs[0], runs[1]
