@@ -101,7 +101,7 @@ def region_means(png, rows=4, cols=4):
     return round(float(lum.mean()), 4), out
 
 
-def arm(vantage, descend, tag, frames):
+def arm(vantage, descend, tag, frames, dial="claude_descend"):
     vs = lab.load_vantages()
     v = vs[vantage]
     # park at another REST position, then come back: game.cpp resets the
@@ -119,7 +119,7 @@ def arm(vantage, descend, tag, frames):
     # were lost to it on 2026-08-16. revive() is idempotent, so it costs
     # one RPC per arm and closes the only failure the numbers cannot see.
     lab.rpc("revive", player="claude")
-    lab.doorway(claude_descend=descend)
+    lab.doorway(**{dial: descend})
     lab.goto(away)
     time.sleep(1.0)
     lab.goto(v)
@@ -129,6 +129,7 @@ def arm(vantage, descend, tag, frames):
     png = lab.shot("%s_d%d" % (tag, descend), settle=0.5)
     mean, regions = region_means(png)
     return {
+        "dial": dial,
         "descend": descend,
         "png": png,
         "hp": (lab.rpc("players") or [{}])[0].get("hp"),
@@ -153,7 +154,25 @@ def main():
     ap.add_argument("--vantage", default="cozy-ci")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--frames", type=int, default=2000)
+    # WHICH DIAL. Default claude_descend, which is what this script was
+    # written for and what spec/measured.md "Walker descend" records.
+    # claude_models is the second customer (2026-08-16): it empties the
+    # authored-model table so the room renders as stock geometry only.
+    #
+    # The two differ in ONE important way and it is asserted, not
+    # assumed. claude_descend is shader-side, so both its arms must see
+    # the SAME baked grid and a second grid_hash means the world moved
+    # under the measurement. claude_models changes what the CPU BAKES,
+    # so its arms MUST see two hashes -- one hash there would mean the
+    # dial did nothing. --grid says which answer is the pass.
+    ap.add_argument("--dial", default="claude_descend")
+    ap.add_argument("--grid", choices=("same", "moved"), default=None,
+                    help="expected grid_hash behaviour across arms; "
+                         "defaults to `same` for a shader-side dial and "
+                         "`moved` for claude_models")
     a = ap.parse_args()
+    if a.grid is None:
+        a.grid = "moved" if a.dial == "claude_models" else "same"
 
     lab.doorway(claude_view=0, claude_nee=0, claude_bounces=24,
                 claude_grid_debug=3, claude_rng=1, claude_grid_follow=1,
@@ -163,16 +182,20 @@ def main():
     runs = []
     for r in range(a.reps):
         for d in (1, 0):
-            runs.append(arm(a.vantage, d, "ab%d" % r, a.frames))
-            print("rep %d descend=%d  mean %.4f  still %s  frame_ms %.2f"
-                  % (r, d, runs[-1]["mean_luma"], runs[-1]["still_frames"],
-                     runs[-1]["frame_ms_avg"] or -1), flush=True)
+            runs.append(arm(a.vantage, d, "ab%d" % r, a.frames, a.dial))
+            print("rep %d %s=%d  mean %.4f  still %s  frame_ms %.2f  grid %s"
+                  % (r, a.dial, d, runs[-1]["mean_luma"],
+                     runs[-1]["still_frames"],
+                     runs[-1]["frame_ms_avg"] or -1,
+                     runs[-1]["grid_hash"]), flush=True)
 
     on = [x["mean_luma"] for x in runs if x["descend"] == 1]
     off = [x["mean_luma"] for x in runs if x["descend"] == 0]
     hashes = sorted({x["grid_hash"] for x in runs})
     out = {
+        "dial": a.dial,
         "vantage": a.vantage,
+        "grid_expectation": a.grid,
         "runs": runs,
         "mean_on": on,
         "mean_off": off,
@@ -183,10 +206,12 @@ def main():
         # under the measurement and the numbers are not comparable.
         "grid_hashes": hashes,
         "one_grid": len(hashes) == 1,
+        "grid_as_expected": (len(hashes) == 1) == (a.grid == "same"),
         "same_arm_spread_on": max(on) - min(on),
         "same_arm_spread_off": max(off) - min(off),
     }
-    dst = os.path.join(lab.SHOTS, "descend_ab_%s.json" % a.vantage)
+    dst = os.path.join(lab.SHOTS, "%s_ab_%s.json"
+                       % (a.dial.replace("claude_", ""), a.vantage))
     open(dst, "w").write(json.dumps(out, indent=1))
     print(json.dumps({k: v for k, v in out.items() if k != "runs"}, indent=1))
     print("written: %s" % dst)

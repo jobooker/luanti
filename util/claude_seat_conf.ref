@@ -9,8 +9,18 @@ screen_w = 1920
 screen_h = 1080
 fullscreen = false
 invert_mouse = true
-fast_move = true
-free_move = true
+# A MEASUREMENT SEAT IS NOT FLOWN. Every vantage but cozy-ci stores an
+# integer y and relies on the player FALLING the half node to the floor;
+# with free_move on it hangs at the teleported y instead, half a node
+# high, and reframes every capture (measured 2026-08-16: the cornell
+# floor region ratio goes to 0.783 and its purity to 0.83). The aim
+# guard allows the fall, so both heights pass it. These were `true`
+# here until then, which is why one driving session that pressed K
+# could silently invalidate a day of captures.
+fast_move = false
+free_move = false
+noclip = false
+pitch_move = false
 viewing_range = 120
 enable_dynamic_shadows = false
 enable_bloom = false

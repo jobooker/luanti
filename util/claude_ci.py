@@ -256,7 +256,38 @@ PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                # confirmation renders on the client's screen and proves
                # nothing). It was in claude_seat_conf.ref all along, but
                # nothing installs that file.
-               "claude_dial_file": SEAT_WORLD + "/claude_dial.conf"}
+               "claude_dial_file": SEAT_WORLD + "/claude_dial.conf",
+               # A MEASUREMENT SEAT IS NOT FLOWN, and this cost a session
+               # (2026-08-16). Every vantage except cozy-ci stores an
+               # INTEGER y and relies on the player FALLING the half node
+               # onto the floor: cornell's vantage is (47,9,1) and the
+               # camera the goldens were shot from is at y = 8.5. With
+               # free_move on the player does not fall -- it hangs at
+               # exactly the y the teleport asked for.
+               #
+               # Half a node of camera height reframes the whole room.
+               # MEASURED at the cornell vantage, same commit, same room
+               # hash, one variable: y = 8.50 puts the ceiling seam at
+               # image row 153 and the floor seam at 886 (the golden reads
+               # 152 / 887); y = 9.00 puts them at 197 and 955. Every
+               # Cornell region ratio moves -- floor to 0.783, and its
+               # purity to 0.83 because the box slides off the floor.
+               #
+               # AND THE AIM GUARD CANNOT SEE IT. aim_ok allows
+               # -AIM_REST_DROP (0.6) of drop below the vantage precisely
+               # so the fall is legal, so BOTH heights pass -- and the
+               # flying one passes more cleanly, because it matches the
+               # vantage exactly. The only tell is in the pixels.
+               #
+               # These four are client settings that a HUMAN toggles with
+               # K, J, H and a menu, and the client writes its runtime
+               # state back into minetest.conf on exit. So one driving
+               # session that pressed K silently reframes every capture
+               # from then on. That is the "minetest.conf is scratch" law
+               # arriving through the one channel nobody had pinned.
+               # claude_seat_conf.ref had free_move = true all along.
+               "free_move": "false", "fast_move": "false",
+               "noclip": "false", "pitch_move": "false"}
 
 # The dial file is a HUMAN's channel and it persists in the world dir
 # across sessions, so a leftover /dial from yesterday would be applied
@@ -1593,6 +1624,49 @@ def read_golden():
     return rid or None
 
 
+CAMERA_TOL_NODES = 0.02
+
+
+def golden_camera(name):
+    """Where the pinned golden's camera actually STOOD for this arm.
+
+    aim_ok answers "is the camera where the vantage says", and the answer
+    is yes in both of the two positions the seat can end up in -- because
+    every vantage but cozy-ci stores an integer y and relies on the
+    player FALLING the half node onto the floor, so aim_ok has to allow
+    AIM_REST_DROP (0.6) of drop and therefore allows the un-fallen
+    position too. It allows the un-fallen one MORE cleanly, since that
+    one matches the vantage exactly.
+
+    So the harness could ask "is the camera where I asked for" and could
+    not ask "is the camera where the golden's camera was", which is the
+    question a pixel comparison against that golden actually depends on.
+    This is that question. It reads the golden run's own recorded
+    position rather than a number written down here, so it stays true
+    across a re-pin without anyone remembering to edit it.
+
+    Returns (x, y, z) or None when the golden predates the record.
+    """
+    rid = read_golden()
+    if not rid:
+        return None
+    try:
+        cap = json.load(open(os.path.join(CI_DIR, rid, name + ".capture.json")))
+    except Exception:
+        cap = {}
+    pos = (cap.get("aim_at_start") or {}).get("pos")
+    if not pos:
+        try:
+            run = json.load(open(os.path.join(CI_DIR, rid, "run.json")))
+            pos = (((run.get("shots") or {}).get(name) or {})
+                   .get("capture", {}).get("aim_at_start", {}) or {}).get("pos")
+        except Exception:
+            pos = None
+    if not pos:
+        return None
+    return (pos["x"], pos["y"], pos["z"])
+
+
 def golden_png():
     """The pinned golden run's PHOTO Cornell frame, or None."""
     rid = read_golden()
@@ -2015,6 +2089,23 @@ def cmd_run(args):
             A.add("%s-traced" % name, ok, detail)
             aim = cap.get("aim_at_shutter") or {}
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
+            # ...and the half-node question aim_ok cannot ask.
+            gcam = golden_camera(name)
+            here = (cap.get("aim_at_start") or {}).get("pos")
+            if gcam and here:
+                d = max(abs(here["x"] - gcam[0]), abs(here["y"] - gcam[1]),
+                        abs(here["z"] - gcam[2]))
+                A.add("%s-camera-vs-golden" % name, d <= CAMERA_TOL_NODES,
+                      "(%.2f,%.2f,%.2f) vs golden (%.2f,%.2f,%.2f), "
+                      "worst axis %.3f nodes (tol %.2f)%s"
+                      % (here["x"], here["y"], here["z"], gcam[0], gcam[1],
+                         gcam[2], d, CAMERA_TOL_NODES,
+                         "" if d <= CAMERA_TOL_NODES else
+                         " — the goldens were shot from a different height; "
+                         "check free_move/noclip (PINNED_CONF)"))
+            else:
+                A.add("%s-camera-vs-golden" % name, True,
+                      "golden run records no camera position for this arm")
             vol = cap.get("grid") or {}
             A.add("%s-grid" % name, vol.get("ok"),
                   vol.get("error") or "solid=%s (floor %s) area_emitters=%s/%s "

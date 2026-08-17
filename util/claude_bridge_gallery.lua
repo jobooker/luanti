@@ -517,3 +517,37 @@ function OPS.dig(p)
     return { dug = core.get_node(pos).name == "air", was = node.name,
              now = core.get_node(pos).name }
 end
+
+-- Everything about the player that can move a camera, in one answer.
+--
+-- Written 2026-08-16 after a Cornell capture came back framed ~3 degrees
+-- differently from the golden at the SAME COMMIT, the same vantage, the
+-- same room hash and the same server-reported pitch. The aim guard reads
+-- pitch, yaw and position and nothing else, so a change in eye height,
+-- physics override or player size is invisible to it -- and the client
+-- owns the camera, which is the environment-laws trap in a new place.
+-- properties.eye_height is the one a mod can move without touching a
+-- single number the harness already prints.
+function OPS.player_full(p)
+    local name = p and p.player or ADMIN
+    local pl = core.get_player_by_name(name)
+    if not pl then error("not online: " .. tostring(name)) end
+    local pr = pl:get_properties()
+    local o1, o3 = pl:get_eye_offset()
+    return {
+        name = name,
+        pos = pl:get_pos(),
+        hp = pl:get_hp(),
+        look_vertical = pl:get_look_vertical(),
+        look_horizontal = pl:get_look_horizontal(),
+        eye_height = pr.eye_height,
+        collisionbox = pr.collisionbox,
+        visual_size = pr.visual_size,
+        eye_offset_first = o1,
+        eye_offset_third = o3,
+        physics = pl:get_physics_override(),
+        attached = pl:get_attach() ~= nil,
+        attributes = pl:get_meta():to_table().fields,
+        timeofday = core.get_timeofday(),
+    }
+end
