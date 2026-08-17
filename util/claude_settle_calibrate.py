@@ -514,6 +514,63 @@ def print_repeat(rec, tol=0.0025):
               % [p["still_frames_read"] for p in pts])
 
 
+def print_tolerance(rec):
+    """THE TABLE THAT DECIDES SETTLE_FRAMES, in the form measured.md uses.
+
+    The knee rule -- "the smallest N whose region means are within 0.25 %
+    of the deepest" -- has no answer here, and the reason is in
+    measured.md: the deepest point is not converged either, so the rule
+    compares one unconverged number against another. What CI actually
+    enforces is CORNELL_RATIO_TOL: 1 % on the WORST of the five region
+    ratios against the pinned golden. So that is the quantity tabulated,
+    per N, across every accepted walk:
+
+      worst   the worst |ratio - 1| over the five regions, per walk
+      sigma   the sample sd of that quantity across walks
+      1% is   how many sigma of headroom the enforced tolerance has
+
+    A settle depth is defensible when its headroom is no worse than the
+    depth it replaces. That is a comparison between two rows of this
+    table and nothing else -- no tolerance moves, and none may.
+    """
+    gold = golden_for("cornell")
+    if not gold:
+        print("no golden pinned; nothing to take a ratio against")
+        return
+    gstats = cornell.region_stats(gold)
+    print("\ngolden: %s" % gold)
+    for arm in rec["arms"]:
+        acc = accepted(rec, arm)
+        if not acc or arm not in REGION_ARMS:
+            continue
+        print("\n=== %s: worst region ratio vs golden, %d accepted walk(s) ==="
+              % (arm, len(acc)))
+        by_n = {}
+        for e in acc:
+            for p in e["points"]:
+                r = p.get("regions")
+                if not r:
+                    continue
+                worst = max(abs(r[k] / gstats[k][0] - 1.0) for k in gstats)
+                by_n.setdefault(p["target"], []).append(
+                    (worst, p["still_frames_read"],
+                     max(gstats, key=lambda k: abs(r[k] / gstats[k][0] - 1.0))))
+        rows = []
+        for n in sorted(by_n):
+            vals = [v[0] for v in by_n[n]]
+            m = sum(vals) / len(vals)
+            sd = (sum((v - m) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5 \
+                if len(vals) > 1 else 0.0
+            worst = max(vals)
+            rows.append([n, "/".join(str(v[1]) for v in by_n[n]),
+                         "  ".join("%.3f" % (100 * v) for v in vals),
+                         "%.3f" % (100 * worst), "%.3f" % (100 * sd),
+                         "%.1f" % ((0.01 - m) / sd) if sd > 0 else "-",
+                         ",".join(sorted({v[2] for v in by_n[n]}))])
+        _table(rows, ["N", "sf_read", "per-walk worst|r-1| %", "worst %",
+                      "sigma %", "1% is Nsig", "worst region"])
+
+
 def cmd_analyse(args):
     path = args.path
     if os.path.isdir(path):
@@ -527,6 +584,8 @@ def cmd_analyse(args):
         return 1
     (print_repeat if rec.get("kind") == "repeat" else print_curve)(
         rec, tol=args.tol)
+    if rec.get("kind") == "curve":
+        print_tolerance(rec)
     return 0
 
 
