@@ -121,7 +121,7 @@ def _rpc_locked(op, **kw):
     deadline = time.time() + 30
     outp = os.path.join(WORLD, "claude_out.json")
     while time.time() < deadline:
-        time.sleep(0.3)
+        time.sleep(0.1)   # was 0.3; pure quantisation on every RPC
         try:
             with open(outp) as f:
                 out = json.load(f)

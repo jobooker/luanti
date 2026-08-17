@@ -207,7 +207,11 @@ core.register_chatcommand("dial", {
 
 core.register_globalstep(function(dtime)
     timer = timer + dtime
-    if timer < 0.5 then return end
+    -- 0.5 -> 0.2 (2026-08-16). Every bridge call costs a poll wait, and
+    -- a CI capture makes five of them, thirteen times a run. Reading a
+    -- small JSON file five times a second on a measurement seat is free;
+    -- the quantisation it removes is not.
+    if timer < 0.2 then return end
     timer = 0
     local f = io.open(CMD, "r")
     if not f then return end

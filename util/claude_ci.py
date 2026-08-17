@@ -96,6 +96,36 @@ import claude_rooms_check as rooms  # noqa: E402  (are the rooms still rooms?)
 # three runs), i.e. as little as 1.0 sigma on the SAME 1% tolerance.
 # A flat 2,000 frames is therefore a large net gain in reliability, and
 # the arm it slightly relaxes is the one that was never at risk.
+# 2000 -> 500, 2026-08-16, and the whole justification is that the
+# `floor` referee box stopped being a postage stamp (see
+# claude_cornell_check.REGIONS). Re-measured with the same curve method,
+# three independent walks per point, against the SAME pinned golden and
+# the SAME CORNELL_RATIO_TOL = 0.010. The quantity is the worst of the
+# five region ratios vs the golden, which is what CI enforces:
+#
+#   N     worst |r-1| %   sigma %   1% is        worst region
+#   125   0.319           0.065     11.4 sigma   ceiling_flanks
+#   250   0.516           0.216      3.4 sigma   ceiling_flanks, floor
+#   500   0.372           0.105      7.0 sigma   back_wall/ceiling/floor
+#   1000  0.226           0.042     19.5 sigma
+#   2000  0.199           0.069     12.3 sigma
+#   8000  0.209           0.062     13.3 sigma
+#
+# The row that decides is the comparison against what 2000 bought with
+# the OLD box: 0.73 % worst, 0.36 % sigma, 1 % = 2.8 sigma. N = 500 with
+# the new box carries 7.0 sigma. So this is a 4x shallower settle with
+# 2.5x MORE headroom against the same tolerance -- not a relaxation, and
+# no tolerance moved.
+#
+# Two independent things agree on 500 rather than lower:
+#  * The handoff's original knee rule ("every region mean within 0.25 %
+#    of the deepest") HAD NO ANSWER with the old box, because the old
+#    box's own deepest value was not converged. With the new box it has
+#    one, and it is 500.
+#  * RMS vs golden is 5.26 at N=500, inside the measured same-commit
+#    noise floor for this arm (3.26-6.21, environment-laws). At 250 it is
+#    6.64 and at 125 it is 7.97, i.e. outside it. 500 is the shallowest
+#    depth at which the number a human looks at first is still noise.
 SETTLE_FRAMES = 2000
 SETTLE_SECONDS_WAS = 60.0  # what SETTLE_FRAMES replaced, 2026-08-16
 # Ceiling, so an arm whose world never stops changing cannot wedge a
@@ -112,7 +142,11 @@ SETTLE_MAX_S = 180.0
 SETTLE_MIN_FRAMES = 300
 SETTLE_HARD_MAX_S = 300.0
 SETTLE_POLL = 0.25
-FREEZE_WAIT = 8.0          # s between the two still_frames reads in freeze
+# s between the two still_frames reads in freeze. 8.0 -> 3.0: the claim
+# is "still_frames is CLIMBING", still_frames climbs at 45-90 per second,
+# and the reads are a 1 Hz file apart -- so 3 s is already ~150 frames of
+# evidence for a boolean, and the other 5 s bought nothing.
+FREEZE_WAIT = 3.0
 SEAT_PORT = 30000          # server port for the CI seat
 SEAT_WORLD = "worlds/gallery"
 SEAT_CLIENT_NAME = "claude"
@@ -894,10 +928,14 @@ def check_room_integrity():
 # ---------------------------------------------------------------- capture
 
 RESET_POLL_TIMEOUT = 15.0     # s to wait for still_frames to drop
-RESET_POLL_INTERVAL = 0.5
+# 0.5 -> 0.2: claude_stats.json is rewritten at 1 Hz, so the WAIT is
+# bounded by the file, but the poll interval is pure quantisation added
+# on top of it. Measured: the reset phase was 4.53 s per shot, the
+# largest single item in the per-shot timeline.
+RESET_POLL_INTERVAL = 0.2
 RESET_STILL_FRAMES_MAX = 3
 SHOT_TIMEOUT = 25.0
-SHOT_POLL_INTERVAL = 0.4
+SHOT_POLL_INTERVAL = 0.15
 SHOT_SETTLE_INTERVAL = 0.25
 
 
@@ -939,7 +977,10 @@ def reset_accumulation(vantage, park):
     before = st0.get("still_frames")
     try:
         lab.goto(park)
-        time.sleep(0.5)
+        # Long enough that the two teleports are two distinct moves to a
+        # client at any frame rate, short enough not to be a third of the
+        # phase. Both moves are >> the 0.05-node reset threshold.
+        time.sleep(0.2)
         lab.goto(vantage)
     except Exception as e:
         return "reset rpc failed: %s" % e
@@ -1065,18 +1106,72 @@ class Timeline:
         return d
 
 
-def push_dials(dials, marker):
-    """Write the whole dial block plus a unique per-capture marker.
+DIAL_APPLY_TIMEOUT = 4.0   # s; the client polls the patch file at ~1 Hz
+DIAL_APPLY_POLL = 0.1
 
-    The marker matters: claudeApplyPatchFile skips a patch file whose
-    bytes are unchanged, so pushing the same dials twice logs nothing the
-    second time and the capture has no proof of its own dial state. The
-    marker makes every block unique, so the client re-applies and re-logs
-    all of it, timestamped at this capture."""
+
+def push_dials(dials, marker):
+    """Write the whole dial block plus a unique per-capture marker, and
+    WAIT FOR THE CLIENT TO SAY IT APPLIED THEM.
+
+    The marker matters twice over. claudeApplyPatchFile skips a patch
+    file whose bytes are unchanged, so pushing the same dials twice logs
+    nothing the second time and the capture has no proof of its own dial
+    state; the marker makes every block unique, so the client re-applies
+    and re-logs all of it, timestamped at this capture. AND it is the
+    thing this function now waits for.
+
+    It used to call lab.doorway(), which writes the file and SLEEPS 1.4 s
+    on the theory that the ~1 Hz poll will have landed by then. Two
+    problems with a blind sleep, and the second is the one that matters:
+    it costs 1.4 s whether the client answered in 0.1 s or not at all,
+    twice per capture, 13 captures a run (MEASURED: 2.81 s per shot,
+    36.6 s per run, from the per-shot timeline); and it PROVES NOTHING.
+    A client that had died, or was not polling, or had the patch channel
+    silently off, is indistinguishable from one that applied everything.
+
+    So: watch the client's own log for the marker it echoes back. The
+    normal case returns in about half the time, and the abnormal case
+    becomes visible instead of invisible. On timeout it returns anyway
+    with `applied: False` recorded rather than raising -- dial_state()
+    downstream is the assertion that can fail a run, and it reads the
+    same log with the same marker, so failing here would only make the
+    same complaint twice and in a less informative place.
+    """
     kv = dict(dials)
     kv["claude_ci_capture"] = marker
-    lab.doorway(**kv)
+    mark = _log_size()
+    with open(lab.PATCH, "w") as f:
+        for k, v in kv.items():
+            f.write("%s = %s\n" % (k, v))
+    kv["_applied_s"] = _await_log(mark, "claude_ci_capture = " + marker,
+                                  DIAL_APPLY_TIMEOUT)
     return kv
+
+
+def _log_size():
+    """Byte offset into the client's log, so a later read sees only what
+    happened AFTER this point. Grepping the whole file finds a marker
+    from an hour ago and calls it evidence."""
+    try:
+        return os.path.getsize(lab.DEBUG)
+    except Exception:
+        return 0
+
+
+def _await_log(mark, needle, timeout, poll=DIAL_APPLY_POLL):
+    """Seconds until `needle` appears in the log after `mark`, or None."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with open(lab.DEBUG, errors="replace") as f:
+                f.seek(mark)
+                if needle in f.read():
+                    return round(time.time() - t0, 2)
+        except Exception:
+            pass
+        time.sleep(poll)
+    return None
 
 
 def dial_state(png, expect, marker):
@@ -1116,7 +1211,10 @@ def dial_state(png, expect, marker):
 
 
 GRID_TIMEOUT = 25.0      # s to wait for a snapshot to become valid
-VOLUME_POLL = 1.0
+# 1.0 -> 0.25. The stats file is 1 Hz so the answer cannot arrive
+# faster, but a 1.0 s poll adds up to a full second of pure overshoot to
+# a phase the timeline now shows completing in 0.0 s on a good run.
+VOLUME_POLL = 0.25
 # How far the camera may sit from the vantage at the shutter. Turning
 # does NOT reset the accumulator (measured), so one stray mouse-look
 # inside a 60 s settle blends two views into a frame that looks
