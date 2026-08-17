@@ -47,6 +47,17 @@ VARIANTS
              a DEAD uniform in the startup census. That is expected for
              this arm and is not a defect (environment-laws: "a uniform
              that is declared but never read is stripped").
+  dwK        DEAD WEIGHT, K = 4/8/16/32: the committed shader plus K
+             extra vec4 locals and K dependent reads of claudeTraceGrid
+             inside the walk's loop, behind `if (claudeDescend > 5.0)` --
+             a branch no pixel can ever take, because game.cpp clamps
+             that setting to [0,1]. The result reaches gl_FragColor as
+             an exact +0.0 so the compiler cannot delete it. This is the
+             one arm in this file that can FALSIFY the occupancy story
+             rather than merely fail to confirm it: if trace-pass ms does
+             not grow with K, a bigger shader is not a slower one here.
+  dwreg16    the same, registers only (no texture reads)
+  dwfetch16  the same, texture reads only (one live accumulator)
   counters   the committed shader PLUS per-pixel step counters, exposed
              through five debug views. THIS VARIANT IS SLOWER THAN THE
              SHADER IT MEASURES and must never be used for a timing
@@ -525,6 +536,154 @@ def build_cheapbit(src):
                    )) + t
 
 
+
+# --- the dead-weight variants (cost probe 2, 2026-08-17) --------------
+#
+# WHY THEY EXIST. Three attempts have now failed to explain the
+# present-but-off tax by REMOVING things: deleting the second walk's
+# whole live state moved it 0 % (lean-descend), removing subvoxSolid()'s
+# bit extraction accounts for at most 25 % of it in Cornell and nothing
+# in the cabin (cheapbit), and the extra 3D sampler is 14 %
+# (sampleronly). Every one of those arms could only ever come back
+# "still unexplained". This is the opposite arm, and it is the first one
+# that can come back NEGATIVE: instead of taking weight out, PUT WEIGHT
+# IN, and watch whether the tax grows with it.
+#
+# The occupancy story predicts that it must. A GPU keeps many rays in
+# flight at once and keeps fewer of them when the program needs more
+# scratch registers per ray; below some threshold everything the shader
+# does gets slower, including work that never executes. If that is the
+# mechanism, a shader carrying K more vec4s and K more texture reads --
+# in a block no pixel ever enters -- must cost more as K grows. If the
+# curve is FLAT, occupancy is dead too and the tax is something nobody
+# has looked at yet.
+#
+# HOW THE WEIGHT IS MADE INERT WITHOUT LETTING THE COMPILER DELETE IT.
+# Three properties, all of them necessary:
+#   1. NEVER EXECUTED. The guard is `claudeDescend > 5.0` and
+#      game.cpp reads that setting as
+#      `g_settings->getFloat("claude_descend", 0.0f, 1.0f)` -- CLAMPED
+#      to [0,1], so the branch is unreachable at run time for every
+#      pixel, in every room, at every dial setting. (The existing
+#      `sampleronly` arm uses > 1.5 for the same reason; > 5.0 leaves
+#      that one alone and is further outside the clamp.)
+#   2. NOT FOLDABLE. `claudeDescend` is a uniform. A GLSL compiler may
+#      not assume a uniform's value, so it must emit the block and must
+#      allocate for it.
+#   3. THE RESULT ESCAPES. The block accumulates into the global `g_dw`,
+#      and main() adds `g_dw.rgb` to the colour it writes. At run time
+#      g_dw is exactly vec4(0.0) and x + 0.0 is x bit-for-bit, so the
+#      image cannot move; but the compiler cannot prove that and cannot
+#      dead-code-eliminate the block.
+# The block sits INSIDE the walk's loop, not before it, so its locals
+# are live at the same program points as the walk's own state -- which
+# is where register pressure is decided.
+#
+# THREE SHAPES, so a positive result can be attributed rather than just
+# noticed:
+#   dwK        K vec4 locals from K DEPENDENT texture reads (each
+#              coordinate depends on the previous read's result, so they
+#              cannot be batched or hoisted), all summed at the END so
+#              all K are nominally live at once. Registers AND traffic.
+#   dwregK     K vec4 locals from a cheap ALU chain, NO texture reads.
+#              Registers only.
+#   dwfetchK   K dependent texture reads accumulated immediately into
+#              ONE accumulator, so at most two vec4s are live. Traffic
+#              only.
+# Declared locals are not registers -- a compiler coalesces,
+# rematerialises and spills -- so these are three DIRECTIONS, not three
+# register counts. There is no GPU profiler for OpenGL on macOS.
+
+DW_GLOBAL = """
+// --- DEAD WEIGHT ACCUMULATOR (measurement variant only) --------------
+// Always exactly vec4(0.0) at run time: the only writes to it are
+// inside a branch guarded by a uniform that game.cpp clamps to [0,1]
+// and tested against 5.0. main() adds its rgb to the colour it writes,
+// which is what stops the compiler deleting the block; adding 0.0 is
+// bit-exact, which is what stops the image moving.
+vec4 g_dw = vec4(0.0);
+
+"""
+
+
+def _wrap_sum(names, indent):
+    """`w0 + w1 + ...` over several lines, four terms to a line."""
+    out, line = [], ""
+    for i, n in enumerate(names):
+        piece = n if i == 0 else " + " + n
+        if i and i % 4 == 0:
+            out.append(line)
+            line = indent + "\t\t+ " + n
+        else:
+            line += piece
+    out.append(line)
+    return "\n".join(out)
+
+
+def _dw_block(k, kind):
+    """The inert block, as GLSL. `kind` is 'both', 'reg' or 'fetch'."""
+    i = "\t\t"
+    L = [i + "// DEAD WEIGHT, K = %d (%s). Never executed: game.cpp"
+         % (k, {"both": "registers + texture reads",
+                "reg": "registers only, no texture reads",
+                "fetch": "texture reads only, minimal live registers"}[kind]),
+         i + "// clamps claude_descend to [0,1] and this asks for > 5.",
+         i + "// It cannot be folded away (claudeDescend is a uniform) and",
+         i + "// it cannot be dead-stripped (g_dw reaches gl_FragColor).",
+         i + "if (claudeDescend > 5.0) {"]
+    b = i + "\t"
+    if kind == "fetch":
+        L.append(b + "vec4 w = g_dw;")
+        for _ in range(k):
+            L.append(b + "w = texture3D(claudeTraceGrid,")
+            L.append(b + "\t\t(ci + vec3(0.5) + w.xyz) / GRID_S);")
+            L.append(b + "g_dw += w;")
+    else:
+        for j in range(k):
+            if kind == "reg":
+                src = "g_dw" if j == 0 else "w%d" % (j - 1)
+                L.append(b + "vec4 w%d = %s * 1.0009765625 + vec4(%d.5);"
+                         % (j, src, j))
+            else:
+                src = "g_dw" if j == 0 else "w%d" % (j - 1)
+                L.append(b + "vec4 w%d = texture3D(claudeTraceGrid," % j)
+                L.append(b + "\t\t(ci + vec3(0.5) + %s.xyz) / GRID_S);" % src)
+        if k:
+            L.append(b + "g_dw += " + _wrap_sum(["w%d" % j for j in range(k)],
+                                                b) + ";")
+    L.append(i + "}")
+    return "\n".join(L) + "\n"
+
+
+# The anchor: the top of the loop body's arrival test, reached once per
+# step of the walk at whatever rung it is on. Inside the loop on
+# purpose -- see the note above.
+DW_ANCHOR = "\t\tbool escaped = any(lessThan(ci, vec3(0.0)))\n"
+DW_OUT_OLD = "\tgl_FragColor = vec4(mix(prev, fresh, a), tPack);\n"
+DW_OUT_NEW = ("\t// + g_dw.rgb: always exactly zero at run time (see the\n"
+              "\t// accumulator's own comment). It is here so the inert\n"
+              "\t// block above cannot be dead-stripped.\n"
+              "\tgl_FragColor = vec4(mix(prev, fresh, a) + g_dw.rgb, tPack);\n")
+
+
+def make_deadweight(k, kind):
+    def build(src):
+        t = replace_once(
+            src,
+            "bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,",
+            DW_GLOBAL
+            + "bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, "
+              "out vec3 alb,",
+            "dead-weight accumulator")
+        t = replace_once(t, DW_ANCHOR, _dw_block(k, kind) + DW_ANCHOR,
+                         "dead-weight block")
+        t = replace_once(t, DW_OUT_OLD, DW_OUT_NEW, "dead-weight escape")
+        return (HDR % ("claude_trace/opengl_fragment.glsl", sha(TRACE),
+                       "DEAD WEIGHT K=%d (%s): inert, unreachable, "
+                       "un-foldable. Timing arm only." % (k, kind))) + t
+    return build
+
+
 VARIANTS = {
     "nodescend": {"trace": build_nodescend},
     "cheapbit": {"trace": build_cheapbit},
@@ -532,6 +691,22 @@ VARIANTS = {
     "sampleronly": {"trace": build_sampleronly},
     "counters": {"trace": build_counters, "present": build_present_counters},
 }
+
+# K = 0 is deliberately NOT generated: it is the committed shader, which
+# the `live` arm already times. Generating a byte-different K = 0 would
+# spend a client restart proving that a banner comment is free.
+DEADWEIGHT_K = [4, 8, 16, 32]
+# The registers-only / reads-only pair is generated at BOTH 16 and 32.
+# 16 was the first guess; the measurement then found the cost is a CLIFF
+# and not a slope -- nothing at all up to K = 16, and a step at K = 32 --
+# so the split has to be taken at 32 or it is being asked on the flat
+# part of the curve, where neither half can show anything.
+DEADWEIGHT_SPLIT_K = [16, 32]
+for _k in DEADWEIGHT_K:
+    VARIANTS["dw%d" % _k] = {"trace": make_deadweight(_k, "both")}
+for _k in DEADWEIGHT_SPLIT_K:
+    VARIANTS["dwreg%d" % _k] = {"trace": make_deadweight(_k, "reg")}
+    VARIANTS["dwfetch%d" % _k] = {"trace": make_deadweight(_k, "fetch")}
 
 
 def check_sources():
