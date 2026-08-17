@@ -35,8 +35,27 @@ commit change?) and against the pinned golden (has quality drifted by
 inches?). Pin one with `golden`; without a pin the second column is —
 and the Cornell region assertions cannot run at all.
 
+THE DAY-TO-DAY RUN IS THE SCORED FOUR; A GOLDEN NEEDS ALL THIRTEEN.
+Changed 2026-08-17 (John's call). `run` now shoots only the four arms
+that carry a pass/fail verdict — furnace-050, furnace-073, cornell,
+cornell-nee1 — because they are the only arms that can turn a run red,
+and the run whose job is "did I break it" should cost what those four
+cost. `run --all` shoots all thirteen: the other nine are captured,
+diffed and put in the gallery, and they are how a HUMAN sees a
+regression every referee is blind to — the cosy rooms are where every
+geometry change has actually shown itself.
+
+That asymmetry is the whole reason `golden` REFUSES to pin a default
+run. A golden is the image every later run is measured against, so
+pinning one that is missing nine of its thirteen images would silently
+delete those nine comparisons from every run that follows, and nothing
+would go red to say so. Use `--all` for a re-pin, for any change that
+touches rendering, and before believing "nothing moved"; use the default
+for the inner loop.
+
 Quickstart:
-  python3 util/claude_ci.py run                  # build, seat, 5 shots
+  python3 util/claude_ci.py run                  # build, seat, 4 scored arms
+  python3 util/claude_ci.py run --all            # all 13 — REQUIRED to re-pin
   python3 util/claude_ci.py run --skip-build     # reuse ./bin/luanti
   python3 util/claude_ci.py calibrate            # can the referees fail?
   open screenshots/ci/index.html                 # the master gallery
@@ -434,27 +453,35 @@ CI_SHOTS = [
 GOLDEN_REF_SHOT = "cornell"
 
 
+def scored_only(args):
+    """Is this a SCORED-ONLY run? True unless --all was asked for.
+
+    One reader for the flag, because three places need the same answer
+    and disagreeing about it is how a scored run gets pinned as a golden.
+    """
+    return not bool(getattr(args, "all", False))
+
+
 def shots_for(args):
-    """The arms this invocation will shoot. ALL THIRTEEN unless --scored.
+    """The arms this invocation will shoot. THE SCORED FOUR unless --all.
 
     Only four arms carry a pass/fail verdict -- furnace-050, furnace-073,
     cornell, cornell-nee1 -- because they are the only ones with a
     referee. The other nine are captured, diffed against their goldens
     and PUT IN THE GALLERY, but `A.add` is never called with an image
     comparison for them, so no pixel they contain can turn a run red.
-    --scored shoots only the four.
 
-    THE DEFAULT DOES NOT MOVE, and that is deliberate rather than
-    cautious. John's standing rule from the settle calibration is "no arm
-    dropped", and the nine unscored arms are how a human sees a
-    regression the referees are blind to -- the cosy rooms are where
-    every geometry change has actually shown itself. --scored is a fast
-    inner loop for someone iterating on Cornell, not a cheaper CI. What
-    it costs in coverage is written into DECISIONS.md with the numbers
-    attached; whether it should ever be the default is not this session's
-    call to make.
+    THE DEFAULT MOVED 2026-08-17, John's call: the day-to-day run is the
+    scored four, and `--all` buys the other nine. The reasoning that used
+    to live here -- "no arm dropped", the nine are how a human sees what
+    the referees are blind to -- is not wrong and has not been repealed;
+    it has been moved to where it is actually load-bearing. It is a claim
+    about what a GOLDEN must contain, not about what every iteration must
+    cost. So `cmd_golden` refuses to pin a default run (see its message),
+    and a rendering change is judged with `--all`; an edit to a util
+    script is not.
     """
-    if getattr(args, "scored", False):
+    if scored_only(args):
         return [d for d in CI_SHOTS if d["referee"]]
     return list(CI_SHOTS)
 
@@ -2132,7 +2159,7 @@ def cmd_run(args):
     base = dict(CANONICAL_DIALS)
     base["claude_nee"] = args.nee
     run = dict(git, run_id=run_id, settle=args.settle,
-               scored_only=bool(getattr(args, "scored", False)),
+               scored_only=scored_only(args),
                started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                dials=base, shots={}, assertions=[])
     A = Assertions()
@@ -2370,8 +2397,9 @@ def finish(run, rundir, A):
                                 .get("verdict", ["-"])[0])
                      for d in CI_SHOTS)
     if run.get("scored_only"):
-        print("!! --scored: %d of %d arms shot. This run proves LESS than a "
-              "full one and must not be pinned as a golden."
+        print("!! scored-only (the default): %d of %d arms shot. This run "
+              "proves LESS than a full one and cannot be pinned as a golden "
+              "-- re-run with --all for that, or for any rendering change."
               % (len(run.get("shots") or {}), len(CI_SHOTS)))
     tl = run.get("timeline") or {}
     if tl:
@@ -2522,10 +2550,12 @@ def cmd_golden(args):
               % (rid, run.get("build_type")))
         return 1
     if run.get("scored_only"):
-        print("REFUSING: %s was a --scored run (%d of %d arms). A golden "
+        print("REFUSING: %s was a scored-only run (%d of %d arms). A golden "
               "every later run is measured against cannot be missing nine "
-              "of its images." % (rid, len(run.get("shots") or {}),
-                                  len(CI_SHOTS)))
+              "of its images -- pinning it would delete those nine "
+              "comparisons from every run that follows, silently. Re-run "
+              "`claude_ci.py run --all` and pin that."
+              % (rid, len(run.get("shots") or {}), len(CI_SHOTS)))
         return 1
     if (run.get("dials") or {}).get("claude_nee") not in (0, "0"):
         print("REFUSING: %s is not a PHOTO run (claude_nee=%s). The golden "
@@ -2610,13 +2640,22 @@ def main():
         p.add_argument("--allow-debug", action="store_true",
                        help="capture against a Debug build tree anyway "
                             "(scratch only — environment-laws forbids it)")
-        p.add_argument("--scored", action="store_true",
-                       help="shoot ONLY the four arms that carry a "
-                            "pass/fail verdict (furnace-050, furnace-073, "
-                            "cornell, cornell-nee1). NOT the default and "
-                            "not a cheaper CI -- the nine it drops are how "
-                            "a human sees what the referees are blind to. "
-                            "A fast inner loop for Cornell work.")
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--all", action="store_true",
+                       help="shoot ALL THIRTEEN arms, not just the four "
+                            "scored ones. REQUIRED before `golden` will "
+                            "pin a run, and wanted for any change that "
+                            "touches rendering: the nine unscored arms "
+                            "cannot turn a run red, but they are how a "
+                            "human sees a regression the referees are "
+                            "blind to, and a golden missing them deletes "
+                            "those comparisons from every later run.")
+        g.add_argument("--scored", action="store_true",
+                       help="shoot only the four scored arms "
+                            "(furnace-050, furnace-073, cornell, "
+                            "cornell-nee1). This is now the DEFAULT "
+                            "(2026-08-17); the flag is kept so old "
+                            "command lines still mean what they said.")
         p.add_argument("--nee", type=int, default=0, choices=(0, 1),
                        help="claude_nee for the base arms: 0 = the photo "
                             "path, the truth mode (default). The cornell-nee1 "
