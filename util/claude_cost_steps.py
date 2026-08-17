@@ -13,9 +13,17 @@ stair, or running along a groove, spends dozens.
 
 So this script counts, per pixel, and reports the distribution:
 
-  fine steps    1/16 m steps inside descendCell()
+  fine steps    1/16 m sub-voxel visits
+  mid steps     1/4 m sub-brick visits -- the rung the `subbrick` branch
+                added, and 0 on any shader that predates it
   coarse steps  1 m steps in march()'s outer DDA
   descended     did the primary ray step inside a class-250 cell at all
+
+A note on reading fine vs mid. On the two-rung walk every sub-metre
+fetch was a fine step. On the three-rung walk a sub-metre fetch is
+either a fine step or a mid step, so the number to compare against the
+old table's "fine steps" is (fine + mid) -- that is the total sub-metre
+work -- while `fine` alone says how much of it stayed at 1/16 m.
 
 for the PRIMARY (camera) ray alone, and for the WHOLE PATH -- every
 bounce and every shadow/next-event ray the pixel spent. `cornell` is the
@@ -57,7 +65,8 @@ sys.path.insert(0, HERE)
 import claude_lab as lab            # noqa: E402
 import claude_cost_seat as cs       # noqa: E402
 
-VIEWS = {12: "primary_fine", 13: "primary_coarse",
+VIEWS = {10: "primary_mid", 11: "path_mid",
+         12: "primary_fine", 13: "primary_coarse",
          14: "path_fine", 15: "path_coarse", 16: "ladder"}
 
 BASE_DIALS = {
