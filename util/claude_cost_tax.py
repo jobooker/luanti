@@ -23,15 +23,18 @@ one world, one session:
   off      the committed shader, claude_descend = 0
   on       the committed shader, claude_descend = 1
 
-and, from 2026-08-17, a fourth and fifth:
+and, from 2026-08-17, further pinned arms -- each one a shader this
+repo actually shipped, installed verbatim from its commit, so that
+"did that change pay" is answered on ONE binary, ONE server and ONE
+parked camera instead of across two days. The seat drifts about 5-7 %
+between sessions and that drift lands entirely on a cross-session
+comparison, which is the whole reason these arms exist:
 
-  old-off  the TWO-WALK shader this repo shipped until 2026-08-17
-  old-on   (march() + a separate descendCell()), pinned at its commit
-           and installed verbatim -- so "did folding the two walks into
-           one pay" is answered on ONE binary, ONE server and ONE
-           parked camera instead of across two days. The seat drifts
-           about 5 % between sessions and that drift lands entirely on
-           a cross-session comparison, which is why this arm exists.
+  old-off       the TWO-WALK shader (march() + a separate
+  old-on        descendCell()), pinned at 64b005975.
+  twoscale-off  the ONE-LOOP, TWO-RUNG walk (1 m and 1/16 m, no
+  twoscale-on   sub-brick summary), pinned at f731209f9. This is the
+                arm the sub-brick hierarchy has to beat.
 
 crossed with two rooms: `cornell` (no class-250 cell exists, so `on` and
 `off` must agree) and `cozy-ci` (95.6 % of its solid cells are class
@@ -71,6 +74,7 @@ ROOMS = ["cornell", "cozy-ci"]
 # costs" from "the extra 3D sampler costs".
 VARIANT_ARM = {"live": [("off", 0), ("on", 1)],
                "nodescend": [("absent", 0)],
+               "twoscale": [("twoscale-off", 0), ("twoscale-on", 1)],
                "twowalk": [("old-off", 0), ("old-on", 1)],
                "cheapbit": [("cheapbit-off", 0)],
                "sampleronly": [("absent+sampler", 0)]}
