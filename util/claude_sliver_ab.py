@@ -52,6 +52,13 @@ DIAL = os.path.join(REPO, "worlds/gallery/claude_dial.conf")
 STATS = os.path.join(REPO, "claude_stats.json")
 VANTS = os.path.join(REPO, "util/claude_vantages.json")
 CROP = (300, 880, 200, 1700)   # y0,y1,x0,x1 -- excludes HUD text and hotbar
+# The client's own screenshot is the 1920x1080 render target rather than
+# the window's Retina backing store, and its hotbar starts at row 861 --
+# so the window CROP's bottom edge clips into it and the reference stops
+# being uniform. Same wall, 25 rows shorter. Kept as a SECOND constant
+# rather than by shrinking the first, so every number this probe reported
+# through the window path is still reproducible exactly as it was taken.
+CROP_CLIENT = (300, 855, 200, 1700)
 
 
 def window_id():
@@ -68,6 +75,37 @@ for w in wl:
         print(w.get('kCGWindowNumber')); break
 """], capture_output=True, text=True)
     return out.stdout.strip()
+
+
+# HOW THE FRAME GETS HERE, and why there are two ways.
+#
+# `screencapture -l <window>` needs macOS SCREEN RECORDING permission,
+# which a non-interactive session does not have -- it returns a fully
+# black image and rc 1, which is indistinguishable from a black frame if
+# nobody checks (2026-08-18: it did exactly that). The client can take
+# its own screenshot through the same channel claude_ci uses, needs no
+# permission at all, and is the same pixels.
+#
+# The window path stays the default so every number this probe has ever
+# reported is still reproducible the way it was taken. THE BLINDNESS
+# GUARD COVERS THE DIFFERENCE: the two paths frame slightly differently
+# (window capture is the Retina backing store, the client's is the render
+# target), so if CROP lands somewhere that is not a flat wall, the
+# descend = 0 reference stops being uniform and this probe refuses to
+# report a number rather than reporting a wrong one.
+def take_shot(wid, path):
+    if wid:
+        r = subprocess.run(["screencapture", "-x", "-o", "-l", wid, path],
+                           capture_output=True)
+        if r.returncode == 0:
+            return "window"
+    # a UNIQUE token per shot: the client ignores a repeat of the one it
+    # already served, so a fixed token gives you the first frame twice.
+    png = L.shot(token="sliver%d" % int(time.time() * 1000), settle=0.0,
+                 record=False)
+    import shutil
+    shutil.copy2(png, path)
+    return "client"
 
 
 def arm(view, descend, target, wid, path):
@@ -90,8 +128,8 @@ def arm(view, descend, target, wid, path):
                 and int(float(d.get("claude_view", -1))) == view):
             break
         time.sleep(0.4)
-    subprocess.run(["screencapture", "-x", "-o", "-l", wid, path])
-    return json.load(open(STATS)).get("still_frames", 0)
+    how = take_shot(wid, path)
+    return json.load(open(STATS)).get("still_frames", 0), how
 
 
 def main():
@@ -101,18 +139,16 @@ def main():
     a = ap.parse_args()
     import numpy as np
     from PIL import Image
-    wid = window_id()
-    if not wid:
-        sys.exit("no Luanti window found -- start util/claude_look.sh")
-    y0, y1, x0, x1 = CROP
+    wid = window_id()   # empty is fine: take_shot() falls back to the client
     res = {}
     for tag, dsc in (("off", 0), ("on", 1)):
         p = "/tmp/sliver_%s.png" % tag
-        n = arm(a.view, dsc, a.target, wid, p)
+        n, how = arm(a.view, dsc, a.target, wid, p)
+        y0, y1, x0, x1 = CROP if how == "window" else CROP_CLIENT
         img = np.asarray(Image.open(p).convert("L"), dtype=np.int16)[y0:y1, x0:x1]
         res[tag] = img
-        print("descend=%d samples=%-5d mean=%7.3f max=%3d"
-              % (dsc, n, img.mean(), img.max()))
+        print("descend=%d samples=%-5d mean=%7.3f max=%3d  (%s shot)"
+              % (dsc, n, img.mean(), img.max(), how))
     ref = res["off"]
     if ref.max() != ref.min():
         print("WARNING: the descend=0 reference is NOT uniform (%d..%d). "
