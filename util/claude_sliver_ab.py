@@ -11,9 +11,17 @@ MEASURED 2026-08-17 (M4 Air, one-tracer @ 475d84a92+):
                    descend 1 -> mean 70.139  max 186
     view 1 normal  descend 0 -> mean 108.520 max 115   (all -X faces)
                    descend 1 -> mean 112.713 max 255   (+Y faces appear)
-A +Y (up) normal inside a -X (west-facing) wall is the "impossible
-geometry": the ray is passing through and hitting a horizontal surface
-somewhere beyond.
+A +Y (up) normal inside a -X (west-facing) wall LOOKS like impossible
+geometry and is not: every building block in this world carries baked
+16^3 relief, and the floor of a groove is an up-facing face inside a
+west-facing wall. See the note on view 1 below.
+
+FIXED 2026-08-17 (one-tracer b945042ee), in the BAKE, not the renderer:
+    view 2 albedo  descend 1 -> mean 70.000  max  70   -- 3096 px -> 0
+The masks themselves carried tunnels that crossed a node seam; every air
+cell of a full-solid model now sits in exactly one face's carve shell,
+which makes the node opaque to any straight ray. Goldens re-pinned to
+run 20260818-034432_b945042ee, CI GREEN 116/116.
 
 Why this rather than screenshots of the photo view:
   * the CROSSHAIR is drawn over the defect and claude_show_hud = 0 does
