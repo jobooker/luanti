@@ -59,11 +59,29 @@ import claude_lab as L  # noqa: E402
 # is a constant on BOTH sides on purpose: this instrument scores the
 # interface arithmetic, not the palette upload.
 IOR = 1.52
+# Water's, for the palette strip below. It is NOT drawn as a ladder --
+# the arithmetic is index-agnostic, so a second set of bands would
+# measure the same four lines again -- but it IS the number the shader
+# must have received, and the strip is where that is checked.
+IOR_WATER = 1.333
 
 # Rows sampled well inside each band. The trace runs at half resolution
 # and claude_present bilinearly upsamples it, so a band boundary is
-# blurred across ~2 screen rows; the middle of a band is not.
-BAND_FRACS = (0.125, 0.375, 0.625, 0.875)
+# blurred across ~2 screen rows; the middle of a band is not. The four
+# bands occupy the top seven eighths of the frame; the bottom eighth is
+# the palette strip.
+BAND_FRACS = (0.1094, 0.3281, 0.5469, 0.7656)
+PAL_FRAC = 0.94          # inside the palette strip
+
+# The two material indices this renderer's transmissive materials land
+# on. claudeMatIndex(kind, fine, light) = 1 + ((kind-1)*2 + fine)*15 +
+# light with kinds air=0, solid=1, liquid=2, leaves=3, glass=4, nub=5 --
+# so unlit glass is 1 + (3*2)*15 = 91 and unlit liquid is 1 + (1*2)*15 =
+# 31. Written out rather than imported because the point of reading them
+# HERE is to check the number that reached the GPU, and a check that
+# recomputes the thing it is checking is not one.
+PAL_GLASS = 91
+PAL_WATER = 31
 
 # Columns near uv.x = 0 are grazing incidence, where R has a vertical
 # tangent; columns at uv.x = 1 are the right edge, where the upsample has
@@ -224,13 +242,40 @@ def main():
               "Check claude_view reached the client and that the traced "
               "pipeline is on.")
         return 2
+    # ---- the palette's own IOR column, read through the same shader ---
+    # The four bands above are drawn at a CONSTANT in the shader, so on
+    # their own they prove the arithmetic and nothing about what game.cpp
+    # uploaded. This strip is the other half: column i is the palette's
+    # ior/2 where its transmission column says the material is a
+    # dielectric, and black where it does not.
+    strip = np.nanmean(gray[int(h * PAL_FRAC) - 3:int(h * PAL_FRAC) + 3, :],
+                       axis=0)
+
+    def pal_ior(i):
+        x0 = int(round(i * w / 256.0))
+        x1 = int(round((i + 1) * w / 256.0))
+        return float(strip[(x0 + x1) // 2]) * 2.0
+
+    lit = [i for i in range(256)
+           if pal_ior(i) > 0.02]
+    print()
+    print("  palette IOR column: %d of 256 materials are dielectric"
+          % len(lit))
+    print("  glass (index %d) reads %.4f, water (index %d) reads %.4f"
+          % (PAL_GLASS, pal_ior(PAL_GLASS), PAL_WATER, pal_ior(PAL_WATER)))
+    pal_tol = 3.0 / 255.0 * 2.0     # 3 display steps, doubled by the /2
+    pal_ok = (abs(pal_ior(PAL_GLASS) - IOR) <= pal_tol
+              and abs(pal_ior(PAL_WATER) - IOR_WATER) <= pal_tol)
+    print("  against %.3f and %.3f, tolerance %.4f: %s"
+          % (IOR, IOR_WATER, pal_tol, "PASS" if pal_ok else "FAIL"))
+
     if crit_meas is None:
         print("\nBLIND: band 3 has no dark region, so total internal "
               "reflection is not being drawn at all and the geometry half "
               "of this screen is meaningless.")
         return 2
 
-    ok = worst_all <= TOL
+    ok = worst_all <= TOL and pal_ok
     print("\nWORST DISAGREEMENT ACROSS ALL FOUR BANDS: %.5f (tol %.5f)"
           % (worst_all, TOL))
     print("PASS -- the interface arithmetic matches the closed form" if ok

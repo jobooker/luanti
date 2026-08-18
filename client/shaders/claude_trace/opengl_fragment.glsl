@@ -2053,8 +2053,29 @@ void main(void)
 	// (claude_present) — the values ARE the message and ACES would bend
 	// them.
 	if (view == 20) {
+		// THE BOTTOM EIGHTH IS THE PALETTE'S OWN IOR COLUMN, and it is
+		// what stops the four bands above from being an instrument that
+		// measures a constant. They are drawn at IOR_LADDER, a constant
+		// in this file, so they say nothing about what game.cpp actually
+		// uploaded -- and a palette of zeros would leave every real
+		// interface at IOR 0 while the ladder still read perfect.
+		//
+		// 256 columns, column i painted (ior/2) where the material's
+		// transmission column says it is a dielectric, and BLACK where it
+		// does not. So the strip is dark almost everywhere and lights up
+		// exactly on the glass and liquid rows: brightness 0.76 for
+		// glass's 1.52 and 0.667 for water's 1.333, which are 24 display
+		// steps apart and cannot be confused for one another.
+		if (uv.y < 0.125) {
+			float col = floor(uv.x * 256.0);
+			vec4 mp = matPalIdx(col);
+			float v = (mp.b > 0.5) ? (mp.a * 0.5) : 0.0;
+			gl_FragColor = vec4(vec3(clamp(v, 0.0, 1.0)), 1.0);
+			return;
+		}
 		float ci = clamp(uv.x, 0.001, 1.0);   // cos(theta_i)
-		float band = min(floor((1.0 - uv.y) * 4.0), 3.0);
+		// the four bands live in the TOP seven eighths now
+		float band = min(floor(((1.0 - uv.y) / 0.875) * 4.0), 3.0);
 		float eta = (band == 0.0 || band == 2.0)
 				? (1.0 / IOR_LADDER) : IOR_LADDER;
 		float v;
