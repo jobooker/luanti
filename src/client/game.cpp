@@ -361,8 +361,161 @@ struct ClaudeTraceGrid
 	const void *moon_src = nullptr;
 	int moon_w = 0, moon_h = 0;
 	std::string moon_name;       // the sprite's identity, for the stats
+	// THE MATERIAL PALETTE (2026-08-18). unit 20: 256x1 RGBA32F, one
+	// texel per material index; unit 21: the 256-value round-trip probe,
+	// read only by claude_view 19. See the block below g_claude_grid.
+	u32 matpal_tex = 0, matprobe_tex = 0;
+	int matpal_roundtrip = -1;   // 256 = every index survived; -1 = not run
+	std::string matpal_roundtrip_err;
 };
 static ClaudeTraceGrid g_claude_grid;
+
+// ---------------------------------------------------------------------
+// THE MATERIAL PALETTE — what the per-cell byte means
+// ---------------------------------------------------------------------
+// Until 2026-08-18 the grid's alpha byte was a set of arithmetic BANDS
+// with hand-placed edges (0 air, 100 liquid, 130 leaves, 145 glass, 165
+// nub, 170 + light_source*5 emissive, 250 sub-voxel, 255 solid). The
+// bands were mutually exclusive, so a cell could be emissive OR
+// fine-shaped and never both — which is why the cabin's campfire and
+// torches had their exact shape and emitted nothing.
+//
+// The byte is now a MATERIAL INDEX and this table says what the material
+// IS. The shader reads the index, looks the material up, and decodes
+// nothing: there are no bands, no midpoints and no arithmetic on the
+// class byte beyond the unorm -> byte conversion.
+//
+// THE INDEX IS A DETERMINISTIC FUNCTION OF THE KEY, not an
+// append-on-first-sight intern. That matters for a reason this project
+// has already paid for once: the block hash mixes the cell's byte, and a
+// hash whose value depended on the order rooms were walked in would make
+// the room-hash gate refuse diffs at random. Same key, same index, every
+// run, on every machine.
+enum ClaudeMatKind : u8 {
+	MATK_AIR = 0,
+	MATK_SOLID = 1,   // an opaque 1 m cube
+	MATK_LIQUID = 2,
+	MATK_LEAVES = 3,  // NDT_ALLFACES
+	MATK_GLASS = 4,   // the NDT_GLASSLIKE family
+	MATK_NUB = 5,     // the small-emitter stub (the old class 165)
+	MATK_COUNT = 6
+};
+// Luanti's light_source is 0..14, so 15 levels is the whole range.
+static constexpr int CLAUDE_MAT_LIGHTS = 15;
+static constexpr int CLAUDE_MAT_COUNT =
+		1 + (MATK_COUNT - 1) * 2 * CLAUDE_MAT_LIGHTS;   // 151
+static_assert(CLAUDE_MAT_COUNT <= 256,
+		"the material key space no longer fits one byte: fall back to "
+		"7 bits of index plus an explicit fine bit (handoff gate 4)");
+
+struct ClaudeMat {
+	u8 kind = MATK_AIR;
+	u8 fine = 0;    // 1 = this material has a 16^3 sub-voxel shape
+	u8 light = 0;   // Luanti light_source, 0..14
+};
+
+// The one place a key becomes an index. Index 0 is air and nothing else.
+static inline u8 claudeMatIndex(u8 kind, u8 fine, u8 light)
+{
+	if (kind == MATK_AIR)
+		return 0;
+	return (u8)(1 + (((kind - 1) * 2 + (fine ? 1 : 0)) * CLAUDE_MAT_LIGHTS
+			+ std::min<int>(light, CLAUDE_MAT_LIGHTS - 1)));
+}
+static inline u8 claudeMatIndex(const ClaudeMat &m)
+{
+	return claudeMatIndex(m.kind, m.fine, m.light);
+}
+
+// THE EMISSION COLUMN, and it is the ONLY thing that changes when the
+// torches become lights.
+//
+// Preserved bit-for-bit from the band era so the vocabulary change
+// cannot move the image: cellEmission() answered only for classes
+// strictly inside (167.5, 245)/255, so the nub (165) and the sub-voxel
+// class (250) emitted nothing however bright the node was. The two
+// guards below are that band, stated as what it actually meant.
+//
+//     Le = albedo * (EMIT_BASE + EMIT_GAIN * e),
+//     e  = clamp((class/255 - 0.65) / 0.29, 0, 1),  class = 170 + 5*light
+//
+// EMIT_BASE and EMIT_GAIN are the law (ADR-0009 #1, and
+// util/claude_furnace_check.py asserts exactly le = rho * (0.4 + 2.0*e)).
+// The 0.65 / 0.29 pair are NOT: they exist solely to undo the 170 + 5*n
+// packing, and they die with it the moment the emission law is rewritten
+// in its own commit.
+static constexpr float CLAUDE_EMIT_BASE = 0.4f;
+static constexpr float CLAUDE_EMIT_GAIN = 2.0f;
+static float claudeMatEmission(const ClaudeMat &m)
+{
+	if (m.light == 0 || m.fine || m.kind == MATK_NUB)
+		return 0.0f;
+	float cls = (170.0f + 5.0f * (float)std::min<int>(m.light, 14)) / 255.0f;
+	float e = std::min(std::max((cls - 0.65f) / 0.29f, 0.0f), 1.0f);
+	return CLAUDE_EMIT_BASE + CLAUDE_EMIT_GAIN * e;
+}
+
+// The palette texel, and it holds ONLY what a shader reads. Declaring
+// roughness/metallic/ior here before anything samples them would be the
+// dead-uniform trap in its data form: four channels that look like a
+// material model and are provably never consulted.
+//
+//   R = emission scale (multiplies albedo; 0 = not an emitter)
+//   G = 1 if this material has a 16^3 sub-voxel shape (the old class 250)
+//   B = transmission — reserved for the transparency step, 0 today
+//   A = reserved
+struct ClaudeMatTexel { float emit, fine, transmit, reserved; };
+
+static ClaudeMat g_claude_mattab[256];
+static ClaudeMatTexel g_claude_matpal[256];
+static bool g_claude_mattab_built = false;
+
+// Build the whole table once. Every reachable key gets an entry, so the
+// palette is TOTAL: there is no index the shader can be handed that the
+// table does not answer for.
+static void claudeMatTableBuild()
+{
+	if (g_claude_mattab_built)
+		return;
+	g_claude_mattab_built = true;
+	for (int i = 0; i < 256; i++) {
+		g_claude_mattab[i] = ClaudeMat();
+		g_claude_matpal[i] = ClaudeMatTexel{0.0f, 0.0f, 0.0f, 0.0f};
+	}
+	for (int k = 1; k < MATK_COUNT; k++)
+	for (int f = 0; f < 2; f++)
+	for (int l = 0; l < CLAUDE_MAT_LIGHTS; l++) {
+		ClaudeMat m;
+		m.kind = (u8)k; m.fine = (u8)f; m.light = (u8)l;
+		u8 idx = claudeMatIndex(m);
+		g_claude_mattab[idx] = m;
+		g_claude_matpal[idx] = ClaudeMatTexel{claudeMatEmission(m),
+				m.fine ? 1.0f : 0.0f, 0.0f, 0.0f};
+	}
+}
+
+// Does this material emit? The one question the area-emitter list used to
+// answer with `170 <= cls <= 240`, now asked of the same table the shader
+// reads. Two copies of that band was the 1a failure class waiting to
+// happen: change the encoding, forget the filter, and next-event
+// estimation aims at a different set of emitters than the transport sees
+// while every picture stays plausible.
+static inline bool claudeMatEmits(u8 idx)
+{
+	return g_claude_matpal[idx].emit > 0.0f;
+}
+
+// Does this material get sub-voxel bits baked for it? The old `a > 230`,
+// which meant "class 250 or class 255" and nothing else: a fine cell
+// takes its authored/derived mask, a plain 1 m solid takes 4,096 ones,
+// and air, water, glass, leaves, the nub and every emissive full cube
+// take none. Stated as the question rather than as a number, because the
+// number was a band edge and the bands are gone.
+static inline bool claudeMatBakesBits(u8 idx)
+{
+	const ClaudeMat &m = g_claude_mattab[idx];
+	return m.fine || (m.kind == MATK_SOLID && m.light == 0);
+}
 
 // Copy the game's current moon sprite into a texture claude_trace can
 // sample (unit 19). Called from the uniform setter, which is the only
@@ -614,6 +767,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
+	// THE MATERIAL PALETTE (unit 20) and its round-trip probe (unit 21).
+	// Both ARE sampled by claude_trace — the palette on every surface hit,
+	// the probe by claude_view 19 — so both must resolve in the census.
+	// A sampler declared and not read is stripped by the compiler and
+	// reports as DEAD exactly like a misspelled name (environment-laws).
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matpal_sampler_pixel{"claudeMatPal"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matprobe_sampler_pixel{"claudeMatProbe"};
 	CachedPixelShaderSetting<float, 3, false> m_origin_delta_pixel{"claudeOriginDelta"};
 	CachedPixelShaderSetting<float, 3, false> m_near_origin_pixel{"claudeNearOrigin"};
 	CachedPixelShaderSetting<float, 3, false> m_near_prev_pixel{"claudeNearPrev"};
@@ -1087,7 +1247,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 18.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 19.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -1719,6 +1879,16 @@ public:
 					GL.ActiveTexture(GL.TEXTURE0 + 19);
 					GL.BindTexture(GL.TEXTURE_2D, g_claude_grid.moon_tex);
 				}
+				// units 20/21: the material palette and its round-trip
+				// probe. Re-bound every frame like every other unit here.
+				if (g_claude_grid.matpal_tex) {
+					GL.ActiveTexture(GL.TEXTURE0 + 20);
+					GL.BindTexture(GL.TEXTURE_2D,
+							g_claude_grid.matpal_tex);
+					GL.ActiveTexture(GL.TEXTURE0 + 21);
+					GL.BindTexture(GL.TEXTURE_3D,
+							g_claude_grid.matprobe_tex);
+				}
 				if (g_claude_grid.model_ids_tex) {
 					GL.ActiveTexture(GL.TEXTURE0 + 16);
 					GL.BindTexture(GL.TEXTURE_3D,
@@ -1755,6 +1925,9 @@ public:
 				m_modelids_sampler_pixel.set(&midl, services);
 				m_modelatlas_sampler_pixel.set(&matl, services);
 				m_modelpal_sampler_pixel.set(&mpal, services);
+				SamplerLayer_t mtpal = 20, mtprobe = 21;
+				m_matpal_sampler_pixel.set(&mtpal, services);
+				m_matprobe_sampler_pixel.set(&mtprobe, services);
 				m_subvox_pixel.set(&m_subvox, services);
 				m_descend_pixel.set(&m_descend, services);
 				m_refine_pixel.set(&m_refine, services);
@@ -2780,9 +2953,11 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 					|| f.drawtype == NDT_TORCHLIKE))
 			continue;
 
-		// alpha = occupancy class: 0 air, 100 water, 130 leaves (partial
-		// transmission), 145 glass (see-through), 170..240 emissive
-		// (170 + light_source*5, so shaders recover brightness), 255 solid
+		// alpha = the MATERIAL INDEX (2026-08-18). It used to be a set of
+		// arithmetic bands; it is now an index into g_claude_matpal, and
+		// the drawtype zoo below is the ONE place Luanti's NDT_* names are
+		// translated into {kind, fine, light}. The shader learns none of
+		// them.
 		// Invisible light nodes (wielded_light's airlike emitters) should
 		// light the world without rendering as a glowing cube.
 		// Invisible light nodes are wielded_light's raster-era workaround
@@ -2792,7 +2967,13 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		if (f.light_source > 0 && f.drawtype == NDT_AIRLIKE)
 			continue;
 
-		u8 acls = 255;
+		// The cell's material, built up by the drawtype chain below and
+		// turned into one index at the bottom. `light` is carried whether
+		// or not the material ends up emitting: whether it does is the
+		// PALETTE's answer (claudeMatEmission), not this walk's.
+		ClaudeMat mat;
+		mat.kind = MATK_SOLID;
+		mat.light = (u8)std::min<int>(f.light_source, 14);
 		// THE VOXEL LAW (John, 2026-08-13): "we render voxels. some
 		// voxels are 1/16m, some are 1m. period." A 1m voxel is never
 		// carved at runtime. Class 250 (sub-voxel geometry) is granted
@@ -2833,11 +3014,16 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 					occ[i * 4 + 0] = col.getRed();
 					occ[i * 4 + 1] = col.getGreen();
 					occ[i * 4 + 2] = col.getBlue();
-					occ[i * 4 + 3] = 250;
+					// A shaped emitter: fine = 1, and the light level is
+					// carried even though the palette gives it no Le
+					// today — that is the campfire-and-torches defect,
+					// and it now lives in ONE column of ONE table.
+					u8 midx = claudeMatIndex(MATK_SOLID, 1, mat.light);
+					occ[i * 4 + 3] = midx;
 					// ROTATION IS SHAPE (2026-08-16). See the general
 					// path below for why param2 has to reach the hash.
 					hash = hash * 1099511628211ULL
-							+ (u64)i * 7919 + 250
+							+ (u64)i * 7919 + midx
 							+ (u64)g_claude_grid.modelids[i] * 31;
 					solid++;
 					continue;
@@ -2858,14 +3044,19 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 					std::min<int>(f.light_source, 14) / 14.0f,
 					0.08f}); // nub: assume a small flame
 			occ[i * 4 + 0] = 255; occ[i * 4 + 1] = 220; occ[i * 4 + 2] = 150;
-			occ[i * 4 + 3] = 165;
-			hash = hash * 1099511628211ULL + (u64)i * 7919 + 165;
+			u8 nubidx = claudeMatIndex(MATK_NUB, 0, mat.light);
+			occ[i * 4 + 3] = nubidx;
+			hash = hash * 1099511628211ULL + (u64)i * 7919 + nubidx;
 			solid++;
 			continue;
 		}
 		if (f.light_source > 0) {
-			// emissive beats liquid: lava must GLOW, not mirror
-			acls = 170 + (u8)std::min<int>(f.light_source, 14) * 5;
+			// emissive beats liquid: lava must GLOW, not mirror. The kind
+			// stays SOLID here on purpose — in the band era an emissive
+			// node took class 170 + 5*n whatever its drawtype, so giving
+			// lava kind = LIQUID would be a second variable riding a
+			// vocabulary change. It is the obvious thing to fix the day
+			// transmission stops being 0 for every material.
 			// NEE list is for POINT lights only (ADR-0009 #4). Full-cube
 			// area emitters were ALSO pushed here, double-counting them:
 			// once as geometry the path hits, once as an aimed point
@@ -2873,14 +3064,18 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 			// cells became extra lights. Area emitters are barn doors
 			// the ambient ray can't miss; they get no aimed slot.
 		} else if (f.isLiquid())
-			acls = 100;
+			mat.kind = MATK_LIQUID;
 		else if (f.drawtype == NDT_ALLFACES
 				|| f.drawtype == NDT_ALLFACES_OPTIONAL)
-			acls = 130;
+			mat.kind = MATK_LEAVES;
 		else if (f.drawtype == NDT_GLASSLIKE
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED_OPTIONAL)
-			acls = 145;
+			mat.kind = MATK_GLASS;
+		// "a plain opaque 1 m cube": the old class 255, and the only
+		// class the two sub-voxel branches below were ever allowed to
+		// take over.
+		bool plain_solid = (mat.kind == MATK_SOLID && mat.light == 0);
 		// authored model: tag the cell and join the micro class so
 		// every path carves it. v2: emissive full-cube nodes (the lit
 		// furnace) join too — their fire voxels render via the palette
@@ -2889,11 +3084,11 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// Sub-cube point lights (torch/lantern/campfire, class 165)
 		// keep their existing nub+NEE treatment.
 		if (!g_claude_grid.model_of.empty()
-				&& (acls >= 250 || (f.light_source > 0
+				&& (plain_solid || (f.light_source > 0
 					&& f.drawtype == NDT_NORMAL))) {
 			auto mit = g_claude_grid.model_of.find(c);
 			if (mit != g_claude_grid.model_of.end()) {
-				acls = 250;
+				mat.fine = 1;
 				u8 rot = n.getParam2() & 3;
 				g_claude_grid.modelids[i] =
 						(u8)((mit->second << 2) | rot);
@@ -2908,22 +3103,23 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// branch on purpose: a hand-made model beats an extracted box
 		// list, so model_of stays the override it has always been.
 		//
-		// Gated to acls == 255 (a plain opaque solid): water, glass,
+		// Gated to a plain opaque solid (the old class 255): water, glass,
 		// leaves and every emissive class keep the classification they
 		// have today, and NODEBOX_REGULAR cannot reach here at all
 		// because claudeNodeBoxConvertible() refuses it (handoff gate 2).
-		if (V.nodebox_on && nbring >= 0 && acls == 255
+		if (V.nodebox_on && nbring >= 0 && plain_solid
 				&& V.modelids[i] == 0
 				&& f.drawtype == NDT_NODEBOX
 				&& claudeNodeBoxConvertible(f.node_box)) {
 			nbid = claudeNodeBoxMaskId(ndef, n, c, f);
 			if (nbid) {
-				acls = 250;              // "this cell has sub-voxel bits"
+				mat.fine = 1;            // "this cell has sub-voxel bits"
 				V.nbox_ids[nbring] = nbid;
 			}
 		}
-		occ[i * 4 + 3] = acls;
-		hash = hash * 1099511628211ULL + (u64)i * 7919 + acls + col.getRed();
+		u8 midx = claudeMatIndex(mat);
+		occ[i * 4 + 3] = midx;
+		hash = hash * 1099511628211ULL + (u64)i * 7919 + midx + col.getRed();
 		// SHAPE IS PART OF THE CONTENT, and until 2026-08-16 it was not.
 		//
 		// The hash decides whether a re-walked block gets baked and
@@ -3030,16 +3226,20 @@ static void claudeTraceGridFinishEmitters()
 	// ---- AREA EMITTERS: the list claude_trace's NEE samples -------------
 	// A second pass over the finished occupancy, not a push during the
 	// fill loop, for two reasons: the face mask needs neighbours the fill
-	// loop has not written yet, and the class byte is not final until the
-	// authored-model branch has had its say (an emissive full cube that
-	// gets a model becomes class 250, which cellEmission() does NOT
-	// answer for — it must not appear here, or the light sampler would
-	// aim at a cell with no Le and the MIS weights would disagree with
-	// the transport).
+	// loop has not written yet, and the material index is not final until
+	// the authored-model branch has had its say (an emissive full cube
+	// that gets a model becomes a fine material, which the palette gives
+	// no Le — it must not appear here, or the light sampler would aim at
+	// a cell with no Le and the MIS weights would disagree with the
+	// transport).
 	//
-	// The band is exactly the shader's: CLASS_EMIT_LO/HI bracket 170..240
-	// at the half-byte midpoints, so 170..240 inclusive here is the same
-	// set of cells, with no 8-bit round-trip on either side.
+	// THE FILTER AND THE SHADER NOW READ THE SAME TABLE. It used to be
+	// `170 <= cls <= 240` here against CLASS_EMIT_LO/HI there — two
+	// copies of one band, and the 1a failure class waiting to happen:
+	// change the encoding, miss one copy, and next-event estimation
+	// samples a different set of emitters than the transport sees while
+	// every picture stays plausible. claudeMatEmits() asks
+	// g_claude_matpal, which is the texture the shader samples.
 	{
 		const u8 *occ = V.occ.data();
 		std::vector<std::array<float, 4>> areas;
@@ -3057,7 +3257,7 @@ static void claudeTraceGridFinishEmitters()
 		for (s16 y = 0; y < S; y++)
 		for (s16 x = 0; x < S; x++) {
 			u8 cls = occ[((((size_t)z * S + y) * S + x)) * 4 + 3];
-			if (cls < 170 || cls > 240)
+			if (!claudeMatEmits(cls))
 				continue;
 			int mask = 0;
 			if (is_air(x + 1, y, z)) mask |= 1;
@@ -3146,12 +3346,13 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 		int rx = vx - R0, ry = vy - R0, rz = vz - R0;
 		size_t vi = (size_t)(vz * S + vy) * S + vx;
 		u8 a = V.occ[vi * 4 + 3];
-		u8 mtag = a > 230 ? V.modelids[vi] : 0;
+		bool bakes = claudeMatBakesBits(a);
+		u8 mtag = bakes ? V.modelids[vi] : 0;
 		const u8 *mm = nullptr;
 		if (mtag >> 2) {
 			// authored model: its pre-rotated mask IS the cell
 			mm = V.models[(mtag >> 2) - 1][mtag & 3].data();
-		} else if (a > 230 && !V.nbox_ids.empty()) {
+		} else if (bakes && !V.nbox_ids.empty()) {
 			// NODE-DEFINITION GEOMETRY (stairs, slabs, beds). Same
 			// 512-byte layout, same consumer, one rung below an authored
 			// model in priority. rx/ry/rz are already ring-local.
@@ -3160,8 +3361,8 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 			if (nb)
 				mm = V.nbox_masks[nb - 1].data();
 		}
-		// a <= 230 is air / water / glass / nub: no bits
-		u8 fill = (a > 230 && !mm) ? 0xFF : 0x00;
+		// air / water / glass / leaves / nub / emissive full cube: no bits
+		u8 fill = (bakes && !mm) ? 0xFF : 0x00;
 		for (int sz2 = 0; sz2 < 16; sz2++)
 		for (int sy2 = 0; sy2 < 16; sy2++) {
 			size_t row = ((size_t)(rz * 16 + sz2) * 512
@@ -3239,6 +3440,117 @@ static void claudeTraceGridTexParams3D()
 	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
 	GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+}
+
+// THE MATERIAL PALETTE TEXTURE (unit 20) and THE ROUND-TRIP PROBE (21).
+//
+// The palette is 256x1 RGBA32F, not RGBA8, and that is not a luxury: the
+// emission column carries values like 0.5149425 that the band era
+// computed in float on the GPU, and an 8-bit channel would quantise them
+// by ~0.4 % — on the same order as the Cornell referee's 1 % tolerance,
+// on a commit whose whole gate is "the image does not move". Floats make
+// the refactor exact instead of merely close. 4 KB, sampled once per
+// surface hit rather than once per step.
+//
+// The probe is 256x1x1 RGBA8 3D — deliberately the SAME internal format,
+// the same texture target and the same NEAREST/CLAMP parameters as the
+// trace grid — carrying the byte n in every channel of texel n. It is an
+// instrument, in the family of claude_view 7 and 8: read only by
+// claude_view 19, so the sampler is genuinely sampled and cannot show up
+// as a false DEAD line in the uniform census.
+//
+// WHY A ROUND-TRIP TEST AT ALL. The band scheme was built to tolerate an
+// 8-bit wobble — its edges sit at half-byte midpoints on purpose. An
+// INDEX tolerates none: one LSB of drift is a different material. So the
+// exactness has to be proven rather than assumed, over all 256 values and
+// not just the handful this world happens to contain (an instrument that
+// only exercises the live values is the blind kind).
+static void claudeMatPalUpload()
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	claudeMatTableBuild();
+	GLint prev_active_unit = GL.TEXTURE0;
+	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
+
+	std::vector<float> pal((size_t)256 * 4, 0.0f);
+	for (int i = 0; i < 256; i++) {
+		pal[i * 4 + 0] = g_claude_matpal[i].emit;
+		pal[i * 4 + 1] = g_claude_matpal[i].fine;
+		pal[i * 4 + 2] = g_claude_matpal[i].transmit;
+		pal[i * 4 + 3] = g_claude_matpal[i].reserved;
+	}
+	bool fresh = !V.matpal_tex;
+	if (fresh)
+		GL.GenTextures(1, &V.matpal_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 20);
+	GL.BindTexture(GL.TEXTURE_2D, V.matpal_tex);
+	if (fresh) {
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA32F, 256, 1, 0,
+				GL.RGBA, GL.FLOAT, nullptr);
+	}
+	GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 1, GL.RGBA, GL.FLOAT,
+			pal.data());
+
+	// ---- the probe, and the round trip it exists to score -------------
+	std::vector<u8> probe((size_t)256 * 4, 0);
+	for (int i = 0; i < 256; i++)
+		for (int k = 0; k < 4; k++)
+			probe[i * 4 + k] = (u8)i;
+	bool fresh_p = !V.matprobe_tex;
+	if (fresh_p)
+		GL.GenTextures(1, &V.matprobe_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 21);
+	GL.BindTexture(GL.TEXTURE_3D, V.matprobe_tex);
+	if (fresh_p) {
+		claudeTraceGridTexParams3D();
+		GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 256, 1, 1, 0, GL.RGBA,
+				GL.UNSIGNED_BYTE, nullptr);
+	}
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 256, 1, 1, GL.RGBA,
+			GL.UNSIGNED_BYTE, probe.data());
+
+	// HALF ONE: does the byte survive the CPU -> GL -> texture-storage
+	// leg? Read the texture back and compare every one of the 256.
+	std::vector<u8> back((size_t)256 * 4, 0);
+	GL.GetTexImage(GL.TEXTURE_3D, 0, GL.RGBA, GL.UNSIGNED_BYTE,
+			back.data());
+	int exact = 0;
+	int first_bad = -1;
+	for (int i = 0; i < 256; i++) {
+		// HALF TWO: the shader's decode, in the same IEEE-754 single
+		// precision GLSL uses. A NEAREST fetch of an RGBA8 texel is
+		// n/255.0 by the GL spec, and matIndex() is floor(v*255 + 0.5);
+		// running that expression here over all 256 values is what makes
+		// the claim total rather than a spot check.
+		float v = (float)back[i * 4 + 3] / 255.0f;
+		int decoded = (int)std::floor(v * 255.0f + 0.5f);
+		if (back[i * 4 + 3] == (u8)i && decoded == i)
+			exact++;
+		else if (first_bad < 0)
+			first_bad = i;
+	}
+	V.matpal_roundtrip = exact;
+	V.matpal_roundtrip_err.clear();
+	if (exact != 256) {
+		std::ostringstream os;
+		os << "index " << first_bad << " came back "
+				<< (int)back[first_bad * 4 + 3];
+		V.matpal_roundtrip_err = os.str();
+		warningstream << "[claude_grid] MATERIAL INDEX ROUND-TRIP FAILED: "
+				<< exact << "/256 exact, first bad " << os.str()
+				<< " -- the per-cell byte is an INDEX now and cannot"
+				   " tolerate a drift of one; do not believe any frame"
+				   " until this reads 256." << std::endl;
+	} else {
+		actionstream << "[claude_grid] material palette: "
+				<< CLAUDE_MAT_COUNT << " of 256 slots used, index"
+				   " round-trip 256/256 exact" << std::endl;
+	}
+	GL.ActiveTexture(prev_active_unit);
 }
 
 // v2 model textures: the voxel-palette atlas + palettes, uploaded once
@@ -3344,6 +3656,10 @@ static void claudeTraceGridUploadFull()
 	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
 	if (!V.tex)
 		GL.GenTextures(1, &V.tex);
+	// The material table is static, so this runs once per client: the
+	// palette texture is the same 4 KB for every snapshot ever taken.
+	if (!V.matpal_tex)
+		claudeMatPalUpload();
 	GL.ActiveTexture(GL.TEXTURE10);
 	GL.BindTexture(GL.TEXTURE_3D, V.tex);
 	claudeTraceGridTexParams3D();
@@ -3889,6 +4205,14 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"grid_hash\": \"" << std::hex << std::setw(16)
 			<< std::setfill('0') << g_claude_grid.content_hash
 			<< std::dec << std::setfill(' ') << "\""
+			// THE MATERIAL INDEX ROUND TRIP, all 256 values, run once at
+			// the first grid upload. 256 = every index survived CPU
+			// encode -> upload -> texture storage -> the shader's decode
+			// expression, exactly. Anything else means the per-cell byte
+			// is not a reliable index and no frame should be believed.
+			// -1 = the grid has not uploaded yet.
+			<< ", \"matpal_roundtrip\": " << g_claude_grid.matpal_roundtrip
+			<< ", \"matpal_slots\": " << CLAUDE_MAT_COUNT
 			<< ", \"emitters\": " << g_claude_grid.emitter_count
 			// the two numbers that explain a noisy room: how many area
 			// emitters NEE can aim at, and how many exist

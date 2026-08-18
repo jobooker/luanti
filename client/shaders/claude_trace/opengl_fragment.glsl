@@ -164,8 +164,9 @@
 //    ClaudeTraceGrid::AREA_CAP). Past that, emitters are lit by being HIT,
 //    which is correct and noisier — see the weights above.
 //  * NEE for the point-light list (claudeEmitter0..7): NOT connected.
-//    Those are class 165/250 cells, which cellEmission() gives no Le, so
-//    there is nothing to sample and nothing to double-count.
+//    Those cells are the nub and the fine materials, whose palette
+//    emission column is 0, so there is nothing to sample and nothing to
+//    double-count.
 //  * irradiance caches, face caches, radiance lattice: deleted.
 //  * spatial denoising: deleted. Noise is resolved by convergence only.
 //  * reprojection: not done. History is read at the SAME uv. Camera
@@ -173,31 +174,32 @@
 //    teleport/grid-rebase), so motion smears over ~2 frames and rest
 //    converges exactly. Photo mode is a parked-camera instrument.
 //  * cell sizes other than 1 m: LANDED 2026-08-16 for the sub-voxel
-//    ring. march() descends into a class-250 cell and continues the
+//    ring. march() descends into a FINE material's cell and continues the
 //    same DDA through its 16^3 mask at 1/16 m (unit 7), so stairs,
 //    slabs, beds and every authored model are real sub-metre geometry
 //    for EVERY ray type — eye, bounce and shadow — because there is
 //    still exactly one traversal. What remains punted:
-//      - outside the ring [48,80)^3 the mask does not exist, so a 250
+//      - outside the ring [48,80)^3 the mask does not exist, so a fine
 //        cell is still a 1 m cube. That is a §2 ladder (a coarser rung
 //        at distance), which §7 permits; it is not a different light
 //        law.
-//      - SUB-VOXEL CELLS EMIT NOTHING. cellEmission() returns zero for
-//        cls >= CLASS_EMIT_HI = 245/255 and 250 is above it, so the
-//        campfire, the lantern and every modelled torch now have their
-//        true SHAPE and no glow. They had no glow before this change
-//        either. The emission data exists (the model palette carries
-//        emit/15 in its alpha) but wiring it in changes the DOMAIN of
-//        the one emission law, and §4 admits exactly one law — that is
-//        a spec decision, not a shader edit. Deliberately not done
-//        here, and deliberately not worked around with a second
-//        emission path.
+//      - SUB-VOXEL CELLS EMIT NOTHING, and since 2026-08-18 that is a
+//        ZERO IN ONE COLUMN OF ONE TABLE rather than a consequence of
+//        where 250 fell between two thresholds. game.cpp's
+//        claudeMatEmission() returns 0 for a fine material, so the
+//        campfire, the lantern and every modelled torch have their true
+//        SHAPE and no glow. Changing that is a change to the emission
+//        law's DOMAIN (§4 admits exactly one law), so it is a decision
+//        and it gets its own commit — not a shader edit, and never a
+//        second emission path.
 //      - per-sub-voxel COLOUR is likewise not read. A sub-voxel hit
 //        takes its cell's stored colour, so a chest is chest-shaped in
 //        one albedo. claudeModelAtlas / claudeModelPal stay unread.
-//  * transmissive materials: water (100), leaves (130), glass (145) are
-//    opaque Lambertian in rung 1. §3 lists them as out of scope.
-//  * the point-light "nub" class (165) is opaque and NON-emissive here:
+//  * transmissive materials: water, leaves and glass are distinct
+//    MATERIALS in the palette but their transmission column is 0, so they
+//    are opaque Lambertian in rung 1. §3 lists them as out of scope, and
+//    the palette is where they stop being so.
+//  * the point-light "nub" material is opaque and NON-emissive here:
 //    its energy used to flow through NEE, which rung 1 does not have.
 //  * specular/gloss: none, at all. §3, observed as a defect 2026-08-15:
 //    "a Cornell box must have no specular response at all."
@@ -249,7 +251,17 @@
 
 uniform sampler2D history;      // previous frame's accumulated radiance
 uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
-                                // a = class byte / 255
+                                // a = MATERIAL INDEX / 255 (see matIndex)
+// THE MATERIAL PALETTE, unit 20: 256x1 RGBA32F, one texel per material
+// index. This is what the per-cell byte points AT — see matPal() for the
+// channel layout and for why the fetch is not in the walk's hot path.
+uniform sampler2D claudeMatPal;
+// THE ROUND-TRIP PROBE, unit 21: 256x1x1 RGBA8, texel n carrying the byte
+// n, in the SAME format and with the same NEAREST/CLAMP parameters as the
+// trace grid. Read ONLY by claude_view 19, which is what keeps it out of
+// every other frame and what keeps this sampler out of the census's dead
+// list — a declared-but-unread sampler is stripped and reports as DEAD.
+uniform sampler3D claudeMatProbe;
 // THE SUB-VOXEL RING, and until 2026-08-16 nothing read it. unit 7,
 // R8 64x512x512, one bit per 1/16 m voxel for the 32^3 cell ring at
 // grid-local [48,80)^3. Layout is game.cpp claudeTraceGridBakeSubvox,
@@ -265,8 +277,8 @@ uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
 // an integer sampler silently kills the Irrlicht material
 // (environment-laws.md, the flat-blue outage).
 uniform sampler3D claudeSubvoxTex;
-// 1 = march() descends into class-250 cells (the default); 0 = the
-// pre-2026-08-16 behaviour, in which a 250 cell is an opaque 1 m cube.
+// 1 = march() descends into a fine material's cell (the default); 0 = the
+// pre-2026-08-16 behaviour, in which such a cell is an opaque 1 m cube.
 // The A/B partner for the energy and cost gates.
 uniform float claudeDescend;
 
@@ -447,29 +459,22 @@ const float RR_Q_MAX = 0.95;
 // furnace referee's rho stays the same number it always was.
 const float ALBEDO_FLOOR = 0.005;
 
-// CLASS BANDS (game.cpp claudeTraceGridSnapshot writes the class byte into
-// the grid's alpha; the shader sees byte/255).
+// THE MATERIAL INDEX (2026-08-18). game.cpp writes ONE byte per cell into
+// the grid's alpha and that byte is an INDEX into claudeMatPal. This file
+// decodes nothing else from it: no bands, no midpoints, no arithmetic.
+//
+// What it replaced, so the old numbers are still readable in a git log:
 //   0 air | 100 water | 130 leaves | 145 glass | 165 point-light nub
 //   170..240 emissive as 170 + light_source*5 | 250 authored model
 //   255 solid
-// Air test: claude_accum's own guard band. There is no class between 0
-// and 100, so this splits air from everything else exactly.
-const float CLASS_AIR_MAX = 0.25;
-// Emissive band, taken at the HALF-BYTE midpoints either side of the
-// 170..240 run so an 8-bit texture round-trip cannot move a cell across
-// the edge. 167.5/255 sits between the nub (165) and the first emissive
-// class (170); 245/255 sits between the last emissive class (240) and
-// the authored-model class (250).
-const float CLASS_EMIT_LO = 167.5 / 255.0;
-const float CLASS_EMIT_HI = 245.0 / 255.0;
-// THE SUB-VOXEL CLASS, 250: "do not stop at my 1 m wall, look at my real
-// shape". Banded at the half-byte midpoints either side of it for the
-// same reason as the emissive band: 245 sits between the last emissive
-// class (240) and 250, 252.5 between 250 and plain solid (255). A cell
-// in this band and inside the ring has a 16^3 mask; one OUTSIDE the ring
-// has none, and is an opaque cube — see march()'s rescale.
-const float CLASS_SUBVOX_LO = 245.0 / 255.0;
-const float CLASS_SUBVOX_HI = 252.5 / 255.0;
+// Those ranges were mutually exclusive, so a cell could be emissive OR
+// fine-shaped and never both — which is why the cabin's campfire, floor
+// lantern and torches had their exact shape and emitted nothing.
+//
+// Index 0 is air and nothing else. The old air test was `a <= 0.25`
+// (byte <= 63), which worked because no class lived between 0 and 100;
+// material indices start at 1, so the test is now "is the byte zero".
+const float MAT_AIR_MAX = 0.5 / 255.0;
 
 // THE SUB-VOXEL RING. game.cpp ClaudeTraceGrid::NBOX_R0/NBOX_R1, and the
 // same two numbers gate the BAKE — a third copy is how a mask ends up
@@ -504,18 +509,17 @@ const float RUNG_FINE = 1.0 / SUBV;
 const int SUBV_ITERS = 51;
 const int WALK_STEPS = MARCH_STEPS * (SUBV_ITERS + 1);
 
-// THE EMISSION LAW (ADR-0009 #1, claude_accum emitStrength()). ONE Le,
-// used by primary rays, bounce rays and every future consumer:
-//     e  = clamp((class/255 - EMIT_E_BIAS) / EMIT_E_SPAN, 0, 1)
-//     Le = albedo * (EMIT_BASE + EMIT_GAIN * e)
-// The band maps light_source 0..14 onto e ~ 0.057..1.0. Cross-checked
-// against util/claude_furnace_check.py, which asserts exactly
-// le = rho * (0.4 + 2.0 * e) with e = 1 for class 240 — so the analytic
-// referee L = Le/(1-rho) stays valid against this shader unchanged.
-const float EMIT_E_BIAS = 0.65;
-const float EMIT_E_SPAN = 0.29;
-const float EMIT_BASE = 0.4;
-const float EMIT_GAIN = 2.0;
+// THE EMISSION LAW (ADR-0009 #1, claude_accum emitStrength()) now lives
+// in the PALETTE, one float per material:
+//     Le = albedo * claudeMatPal[index].r
+// game.cpp's claudeMatEmission() computes that column and still holds
+// EMIT_BASE = 0.4 and EMIT_GAIN = 2.0, so util/claude_furnace_check.py's
+// analytic L = Le/(1-rho) is unchanged and the referee stays valid. What
+// has GONE is the pair of constants that existed only to undo the
+// `170 + light_source*5` packing (0.65 and 0.29) and the two band edges
+// that decided whether a cell was ALLOWED to emit — a decision that now
+// belongs to a column of a table rather than to where a number happened
+// to land between two thresholds.
 
 // Depth packing for claude_present's joint-bilateral upsample and its
 // sky test: alpha carries tHit/DEPTH_SCALE, and a miss sits at the top
@@ -709,15 +713,52 @@ vec3 cellAlbedo(vec3 raw)
 // derived, so lights keep their true Le.
 const vec3 CLAY_RHO = vec3(0.5);
 
+// THE BYTE -> INDEX CONVERSION, and it is the only arithmetic this file
+// performs on the class byte. A NEAREST fetch of an RGBA8 texel is
+// n/255.0 by the GL spec and float32 carries that exactly for every n, so
+// floor(v*255 + 0.5) returns n. The claim is not assumed: game.cpp
+// round-trips ALL 256 values through a texture of the same format and
+// parameters at startup and publishes the score as `matpal_roundtrip` in
+// claude_stats.json, and claude_view 19 draws the same test through this
+// very decode. The band scheme this replaced was deliberately built to
+// tolerate a drift of +/-2 (its edges sit at half-byte midpoints); an
+// index tolerates none, which is why the proof is mechanical.
+float matIndex(float a)
+{
+	return floor(a * 255.0 + 0.5);
+}
+
+// THE PALETTE LOOKUP — what the index points at.
+//   .r = emission scale (multiplies albedo; 0 = not an emitter)
+//   .g = 1 if this material has a 16^3 sub-voxel shape (the old class 250)
+//   .b = transmission, reserved for the transparency step, 0 today
+//   .a = reserved
+// Sampled on ARRIVAL AT A NON-AIR CELL, never per step of the walk: the
+// dead-weight probe priced a per-step dependent read at +2.2 ms (+14 %)
+// and this is deliberately not one.
+vec4 matPal(float a)
+{
+	return texture2D(claudeMatPal, vec2((matIndex(a) + 0.5) / 256.0, 0.5));
+}
+
+// Does this material carry a finer shape? The old "is the class byte in
+// the band around 250", asked of the table instead. Still ring-gated by
+// every caller: outside [48,80)^3 no mask is baked, so a fine material is
+// an opaque 1 m cube there (§7 — geometry may be laddered with distance).
+bool matFine(vec4 pal)
+{
+	return pal.g > 0.5;
+}
+
 // THE EMISSION LAW. An emissive voxel is a surface with BOTH Le and rho
 // (§4) — the caller adds this and then continues the path with rho,
-// which is what makes L = Le/(1-rho) expressible in a sealed room.
+// which is what makes L = Le/(1-rho) expressible in a sealed room. ONE
+// law, one table: game.cpp's area-emitter list asks the same column
+// through claudeMatEmits(), so the set of cells NEE aims at and the set
+// the transport finds emissive cannot drift apart.
 vec3 cellEmission(float cls, vec3 albedo)
 {
-	if (cls <= CLASS_EMIT_LO || cls >= CLASS_EMIT_HI)
-		return vec3(0.0);
-	float e = clamp((cls - EMIT_E_BIAS) / EMIT_E_SPAN, 0.0, 1.0);
-	return albedo * (EMIT_BASE + EMIT_GAIN * e);
+	return albedo * matPal(cls).r;
 }
 
 // ---------------------------------------------------------------------
@@ -812,9 +853,9 @@ vec3 skyRadiance(vec3 d)
 // march() IS that traversal, and it is directly below these two helpers;
 // what it returns and what it guarantees are documented on it.
 
-// Is this cell inside the sub-voxel ring? OUTSIDE IT A CLASS-250 CELL
+// Is this cell inside the sub-voxel ring? OUTSIDE IT A FINE-MATERIAL CELL
 // HAS NO BITS — the bake only fills [48,80)^3, and game.cpp's
-// authored-model branch tags a cell 250 anywhere in the 128^3 grid. A
+// authored-model branch gives a cell a fine material anywhere in the grid. A
 // descent that skipped this test would find an all-zero mask and turn
 // every distant chest, bed and campfire INVISIBLE.
 //
@@ -822,7 +863,7 @@ vec3 skyRadiance(vec3 d)
 // down as one: beyond 16 cells from the grid centre a sub-metre shape
 // renders as the 1 m cell it occupies. It is the same ladder game.cpp
 // already applies to point-light models (game.cpp: "outside the subvox
-// ring a class-250 cell has no bits to express").
+// ring a fine material has no bits to express").
 bool inSubvoxRing(vec3 cell)
 {
 	return all(greaterThanEqual(cell, vec3(SUBV_R0)))
@@ -900,7 +941,7 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // traversal, one lighting law, one emission law, one material law,
 // regardless of cell size." Taken literally, that is this function: one
 // loop, one index, one set of side-distances, one step budget. On
-// entering a class-250 cell inside the ring the walk RESCALES ITSELF by
+// entering a fine material's cell inside the ring the walk RESCALES ITSELF by
 // 16 — the same variables, now measured in 1/16 m — and on leaving the
 // cell it rescales back and carries on. There is no second walk, no
 // second position, no second side-distance triple and no callee holding
@@ -972,6 +1013,8 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	vec3 cellHi = ci;
 	vec3 sideDist = (stepDir * (ci - ro) + stepDir * 0.5 + 0.5) * delta;
 	vec4 s = vec4(0.0);
+	// the material behind s.a, fetched once per non-air arrival
+	vec4 pal = vec4(0.0);
 	float t = 0.0;
 	float lim = GRID_S;
 	int axis = -1;
@@ -1007,7 +1050,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	// upon" — and at 1 m the same reasoning turned out to be wrong.)
 	if (claudeDescend > 0.5 && inSubvoxRing(cellHi)) {
 		s = texture3D(claudeTraceGrid, (cellHi + 0.5) / GRID_S);
-		if (s.a > CLASS_SUBVOX_LO && s.a < CLASS_SUBVOX_HI) {
+		if (matFine(matPal(s.a))) {
 			// entry point in SUB-VOXEL units, clamped INSIDE the
 			// cell: the walk lands exactly on a cell plane and floor()
 			// of an exact boundary can fall either side of it. The
@@ -1063,7 +1106,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 				hp = restartPoint(ro + rd * t, n,
 						cellHi + (ci + n) * RUNG_FINE, RUNG_FINE);
 				alb = cellAlbedo(s.rgb);
-				le = cellEmission(s.a, alb);
+				le = alb * pal.r;   // the palette's emission column (§4: one Le)
 				tHit = t;
 				cellOut = cellHi;   // the COARSE cell, for neeDirect
 				return true;
@@ -1096,15 +1139,20 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		// the mask — and it is only ever written here, on the coarse
 		// rung, where nothing is depending on the old value.
 		s = texture3D(claudeTraceGrid, (ci + 0.5) / GRID_S);
-		if (s.a <= CLASS_AIR_MAX)
+		if (s.a <= MAT_AIR_MAX)
 			continue; // air
+		// The cell is not air, so ask the table what it is. ONE palette
+		// fetch per non-air arrival, kept live across a descent for the
+		// same reason `s` is: a fine hit takes its material from the cell
+		// that owns the mask.
+		pal = matPal(s.a);
 
 		n = vec3(0.0);
 		if (axis == 0) n.x = -stepDir.x;
 		else if (axis == 1) n.y = -stepDir.y;
 		else n.z = -stepDir.z;
 
-		// CLASS 250 SAYS "DO NOT STOP AT MY 1 M WALL". Rescale the walk
+		// A FINE MATERIAL SAYS "DO NOT STOP AT MY 1 M WALL". Rescale the
 		// to 1/16 m and keep going, against this cell's 16^3 mask. The
 		// sub-voxel the ray enters through is tested here, by the
 		// rescale, because the loop only ever tests what it stepped INTO
@@ -1112,15 +1160,14 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		// solid, the surface the ray met is the 1 m face it came
 		// through and n already holds that face's normal. A miss means
 		// the ray passed THROUGH this cell and the walk resumes at 1 m
-		// from the far face. Ring-gated, because outside [48,80)^3 a 250
-		// cell has no mask and must stay the cube it is today.
+		// from the far face. Ring-gated, because outside [48,80)^3 a fine
+		// material has no mask and must stay the cube it is today.
 		//
 		// Shadow and bounce rays get this for free and that is the
 		// point: §2 forbids a voxel that exists for eye rays but not
 		// for shadow rays, and one traversal is the cheapest way never
 		// to commit it. There is no lighter copy of this walk.
-		if (claudeDescend > 0.5 && s.a > CLASS_SUBVOX_LO
-				&& s.a < CLASS_SUBVOX_HI && inSubvoxRing(ci)) {
+		if (claudeDescend > 0.5 && matFine(pal) && inSubvoxRing(ci)) {
 			cellHi = ci;
 			// entry point in SUB-VOXEL units, clamped INSIDE the cell
 			// (see the starting-cell block for why the clamp is on the
@@ -1148,7 +1195,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		// target the right cell rather than merely a nearby one.
 		hp = restartPoint(ro + rd * t, n, ci + n, 1.0);
 		alb = cellAlbedo(s.rgb);
-		le = cellEmission(s.a, alb);
+		le = alb * pal.r;   // the palette's emission column (§4: one Le)
 		tHit = t;
 		cellOut = ci;
 		return true;
@@ -1757,6 +1804,47 @@ void main(void)
 	//
 	// Both present LINEARLY (claude_present lists 7 and 8 beside 1-5):
 	// these are encoded values, and ACES would bend them.
+	// VIEW 19 — THE MATERIAL INDEX ROUND TRIP, drawn.
+	//
+	// The per-cell byte stopped being a set of bands on 2026-08-18 and
+	// became an INDEX. A band tolerated a drift of +/-2 by construction
+	// (its edges were placed at half-byte midpoints for exactly that
+	// reason); an index tolerates none — one LSB is a different material.
+	// So the exactness gets an instrument rather than an assumption.
+	//
+	// claudeMatProbe is 256x1x1 RGBA8 with the SAME internal format and
+	// the same NEAREST/CLAMP parameters as the trace grid, and texel n
+	// carries the byte n. This view screens it: the frame is split into
+	// 256 vertical columns, column i reads probe texel i and runs the
+	// walk's own matIndex() over it.
+	//
+	//   WHITE column = matIndex() returned exactly i
+	//   BLACK column = it did not, and no frame should be believed
+	//
+	// Brightness, not hue: John is colourblind, and a red/green pass-fail
+	// would be unreadable to him. The bottom eighth of the frame draws
+	// the palette's emission column as a brightness ramp, so a palette
+	// that uploaded as zeros is visible in the same picture.
+	//
+	// util/claude_matpal_roundtrip.py scores it threshold-free, and
+	// game.cpp runs the same 256 values through GL at startup and reports
+	// `matpal_roundtrip` in claude_stats.json, which CI asserts. Two
+	// independent readings of one claim, because an instrument that only
+	// exercises the values this world happens to contain is the blind
+	// kind.
+	if (view == 19) {
+		float col = floor(uv.x * 256.0);
+		float a = texture3D(claudeMatProbe,
+				vec3((col + 0.5) / 256.0, 0.5, 0.5)).a;
+		float ok = (abs(matIndex(a) - col) < 0.5) ? 1.0 : 0.0;
+		if (uv.y < 0.125) {
+			// the palette's own emission column, 0..2.4 mapped to 0..1
+			gl_FragColor = vec4(vec3(matPal(a).r / 2.4), 1.0);
+			return;
+		}
+		gl_FragColor = vec4(vec3(ok), 1.0);
+		return;
+	}
 	if (view == 7) {
 		vec3 cellD = floor(ro) + vec3(3.0, -1.0, 1.0);
 		vec2 tile = floor(uv * 4.0);
@@ -1783,10 +1871,10 @@ void main(void)
 					|| any(greaterThanEqual(cw, vec3(GRID_S))))
 				break;
 			vec4 sw = texture3D(claudeTraceGrid, (cw + 0.5) / GRID_S);
-			if (sw.a <= CLASS_AIR_MAX)
+			if (sw.a <= MAT_AIR_MAX)
 				continue;
-			if (claudeDescend > 0.5 && sw.a > CLASS_SUBVOX_LO
-					&& sw.a < CLASS_SUBVOX_HI && inSubvoxRing(cw)) {
+			if (claudeDescend > 0.5 && matFine(matPal(sw.a))
+					&& inSubvoxRing(cw)) {
 				if (!subvoxSolid(cw - vec3(SUBV_R0),
 						floor((pw - cw) * SUBV)))
 					continue;
@@ -1855,7 +1943,7 @@ void main(void)
 	// is one frame's escaped sample buried in a running average, so a
 	// shallow settle hides the defect without changing it.
 	//
-	// WHAT THIS INSTRUMENT IS BLIND TO: a CLASS-250 cell is "solid" to
+	// WHAT THIS INSTRUMENT IS BLIND TO: a FINE-MATERIAL cell is "solid" to
 	// this test and is not a defect. The walk is SUPPOSED to be inside
 	// one -- that is what descending means -- so every sub-voxel hit
 	// reports positive, which is why the cabin, full of authored models,
@@ -1878,7 +1966,7 @@ void main(void)
 			if (all(greaterThanEqual(c0, vec3(0.0)))
 					&& all(lessThan(c0, vec3(GRID_S)))) {
 				vec4 s0 = texture3D(claudeTraceGrid, (c0 + 0.5) / GRID_S);
-				if (s0.a > CLASS_AIR_MAX)
+				if (s0.a > MAT_AIR_MAX)
 					bad = 1.0;
 			}
 			// WHICH WAY c0 DISAGREES with the cell that was hit. The

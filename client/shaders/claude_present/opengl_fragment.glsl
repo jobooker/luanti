@@ -123,8 +123,14 @@ void main(void)
 	// 0.1 linear, nowhere near the ACES shoulder.
 	// 7 and 8 are the DESCENT AUDIT (claude_trace, 2026-08-17): a rung
 	// flag, two counters and a cell index. Encoded values, so linear.
+	// 19 is the MATERIAL INDEX ROUND TRIP (2026-08-18): a pass/fail
+	// screen of 256 columns plus the palette's emission ramp. Encoded
+	// values, so linear — ACES would bend the ramp and squash the top of
+	// it into indistinguishable near-whites, and the ramp is there to be
+	// read as brightness.
 	if ((claudeView > 0.5 && claudeView < 5.5)
-			|| (claudeView > 6.5 && claudeView < 8.5)) {
+			|| (claudeView > 6.5 && claudeView < 8.5)
+			|| (claudeView > 18.5 && claudeView < 19.5)) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}

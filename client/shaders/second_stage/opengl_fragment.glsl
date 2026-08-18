@@ -27,6 +27,23 @@ uniform sampler2D depthmap;
 uniform lowp float ssaoStrength = 0.0;
 
 uniform lowp float gridDebug = 0.0;
+// THE CLASS BYTE BECAME A MATERIAL INDEX on 2026-08-18 (game.cpp,
+// claudeMatIndex). Air is index 0 and everything else is >= 1, so the
+// solid tests below moved from `a > 0.25` to `a > MAT_AIR`.
+//
+// WHAT DID NOT MOVE, stated rather than left to be found: the two
+// WATER-band tests further down (`a > 0.25 && a < 0.75`, and the
+// `a < 0.75` companion) used to mean "class 100, i.e. water". They no
+// longer identify water — under the index encoding they are a range of
+// arbitrary materials. They are left alone on purpose: this whole block
+// is the LEGACY RASTER path, gated to gridDebug < 2.5 and to dials
+// (claude_water_reflections, claude_gi) that both default to 0, so it is
+// unreachable in every configuration this project measures. Wiring the
+// palette into a second shader to revive an off-by-default raster
+// reflection would be scope this change has no gate for. If that path is
+// ever wanted again, the honest fix is to bind claudeMatPal here too and
+// read its transmission column.
+const float MAT_AIR = 0.5 / 255.0;
 uniform sampler3D claudeTraceGrid;
 #if __VERSION__ >= 130
 #define texture3D texture
@@ -64,7 +81,7 @@ float gridShadow(vec3 ro)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
-		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > 0.25)
+		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > MAT_AIR)
 			return 0.45;
 	}
 	return 1.0;
@@ -93,7 +110,7 @@ vec3 gridReflect(vec3 ro, vec3 rd)
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			break;
 		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
-		if (s.a > 0.25) {
+		if (s.a > MAT_AIR) {
 			float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 					: (axis == 0 ? 0.8 : 0.62);
 			vec3 n = vec3(0.0);
@@ -148,7 +165,7 @@ float gridSunVis(vec3 ro)
 		}
 		if (any(lessThan(cell, vec3(0.0))) || any(greaterThanEqual(cell, vec3(S))))
 			return 1.0;
-		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > 0.25)
+		if (texture3D(claudeTraceGrid, (cell + 0.5) / S).a > MAT_AIR)
 			return 0.0;
 	}
 	// unresolved after 144 cells: assume blocked, not lit — a timeout
@@ -181,7 +198,7 @@ vec3 giTrace(vec3 ro, vec3 rd)
 			return giSky(rd);
 		}
 		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
-		if (s.a > 0.25) {
+		if (s.a > MAT_AIR) {
 			// Real forest bounce comes almost entirely from SUNLIT
 			// surfaces — pools of sun on the floor re-radiating onto
 			// trunks. Probe the hit point's sun visibility: lit hits
@@ -224,7 +241,7 @@ vec4 ghostView(vec2 uv)
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			// rgb = node average color; a: 0 air, ~0.5 water, 1 solid
 			vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
-			if (s.a > 0.25) {
+			if (s.a > MAT_AIR) {
 				float face = axis == 1 ? (rd.y < 0.0 ? 1.0 : 0.45)
 						: (axis == 0 ? 0.8 : 0.62);
 				float shade = 1.0;
@@ -330,7 +347,7 @@ vec3 pathRay(vec3 ro, vec3 rd)
 			return pathSkyRadiance(rd);
 		}
 		vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
-		if (s.a > 0.25) {
+		if (s.a > MAT_AIR) {
 			vec3 n = vec3(0.0);
 			if (axis == 0) n.x = -stepDir.x;
 			else if (axis == 1) n.y = -stepDir.y;
@@ -363,7 +380,7 @@ vec4 pathView(vec2 uv)
 	for (int i = 0; i < 384; i++) {
 		if (all(greaterThanEqual(cell, vec3(0.0))) && all(lessThan(cell, vec3(S)))) {
 			vec4 s = texture3D(claudeTraceGrid, (cell + 0.5) / S);
-			if (s.a > 0.25 && axis >= 0) {
+			if (s.a > MAT_AIR && axis >= 0) {
 				vec3 n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
@@ -394,6 +411,10 @@ vec4 pathView(vec2 uv)
 				vec3 c = albedo * (direct + amb);
 				// water surfaces mirror: one traced reflection ray plus
 				// a specular sun glint — still 100% ray-earned light
+				// STALE: this meant "class 100, i.e. water" before the
+				// class byte became a material index. See the note at
+				// the top of this file — legacy raster path, off by
+				// default, deliberately not rewired.
 				if (s.a < 0.75 && n.y > 0.5) {
 					vec3 rr = reflect(rd, vec3(0.0, 1.0, 0.0));
 					vec3 refl = pathRay(hp, rr);
@@ -585,7 +606,7 @@ void main(void)
 				if (all(greaterThanEqual(ccell, vec3(0.0)))
 						&& all(lessThan(ccell, vec3(128.0)))) {
 					vec4 cv = texture3D(claudeTraceGrid, (ccell + 0.5) / 128.0);
-					if (cv.a > 0.25) {
+					if (cv.a > MAT_AIR) {
 						if (clayStrength > 0.95) {
 							// stock-lighting comparison mode: keep the
 							// raster's light, swap texture for flat block
@@ -611,6 +632,7 @@ void main(void)
 			// reflect the view ray about +Y and march it.
 			if (inVol && waterReflStrength > 0.0) {
 				vec4 wv = texture3D(claudeTraceGrid, (wcell + 0.5) / 128.0);
+				// STALE: the old water band. See the note at the top.
 				if (wv.a > 0.25 && wv.a < 0.75) {
 					isWater = true;
 					vec3 vn = normalize(vdir);
@@ -642,7 +664,7 @@ void main(void)
 			vec3 nrm = vec3(0.0, 1.0, 0.0);
 			if (inVol && giStrength > 0.0 && !isWater) {
 				vec4 sv = texture3D(claudeTraceGrid, (scell + 0.5) / 128.0);
-				if (sv.a > 0.25) {
+				if (sv.a > MAT_AIR) {
 					onSurface = true;
 					vec3 q = p - (scell + 0.5);
 					vec3 aq = abs(q);

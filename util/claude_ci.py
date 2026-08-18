@@ -1657,7 +1657,11 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
                                 ("grid_valid", "grid_solid",
                                  "grid_snap_seq", "area_emitters",
                                  "area_total", "emitters", "frame_ms_avg",
-                                 "busy_ms", "pass_ms", "accum_alpha")}
+                                 "busy_ms", "pass_ms", "accum_alpha",
+                                 # the material-index round trip, all 256
+                                 # values, run once at the first grid
+                                 # upload -- see the -matpal assertion
+                                 "matpal_roundtrip", "matpal_slots")}
     with open(lab.PATCH, "w") as f:
         f.write("claude_screenshot = %s\n" % marker)
     png = None
@@ -2542,6 +2546,20 @@ def cmd_run(args):
             else:
                 A.add("%s-camera-vs-golden" % name, True,
                       "golden run records no camera position for this arm")
+            # THE MATERIAL INDEX SURVIVES THE ROUND TRIP, all 256 of
+            # them. The per-cell byte stopped being a band with slack in
+            # it on 2026-08-18 and became an INDEX, which tolerates no
+            # drift at all: one least-significant bit is a different
+            # material. game.cpp runs every value through upload ->
+            # glGetTexImage -> the decode expression at the first grid
+            # upload and reports the score; claude_view 19 and
+            # util/claude_matpal_roundtrip.py read the same claim through
+            # the real shader.
+            mrt = (cap.get("stats_at_shutter") or {}).get("matpal_roundtrip")
+            A.add("%s-matpal" % name, mrt == 256,
+                  "material index round-trip %s/256 (%s slots used)"
+                  % (mrt, (cap.get("stats_at_shutter") or {})
+                     .get("matpal_slots")))
             vol = cap.get("grid") or {}
             A.add("%s-grid" % name, vol.get("ok"),
                   vol.get("error") or "solid=%s (floor %s) area_emitters=%s/%s "
