@@ -150,6 +150,21 @@ def main():
         print("descend=%d samples=%-5d mean=%7.3f max=%3d  (%s shot)"
               % (dsc, n, img.mean(), img.max(), how))
     ref = res["off"]
+    # A BLACK FRAME IS UNIFORM, and the guard below would bless it.
+    # `screencapture` without screen-recording rights returns all zeros;
+    # so does a frame taken before the client has drawn. Either way the
+    # reference passes "uniform", every |on - ref| is 0, and the probe
+    # reports PASS on nothing at all -- the exact failure this file's
+    # own docstring describes, one level further in. Refuse instead.
+    # 2 is well below any real surface here (the flat wall reads 70) and
+    # well above sensor-free zero, so this cannot misfire on live pixels.
+    if ref.max() <= 2 and res["on"].max() <= 2:
+        print("REFUSED: both frames are black (ref max %d, on max %d). "
+              "Nothing was measured -- this is a blind capture, not a "
+              "clean wall. Check screen-recording permission, or that "
+              "the client had drawn a frame before the shot."
+              % (ref.max(), res["on"].max()))
+        return 2
     if ref.max() != ref.min():
         print("WARNING: the descend=0 reference is NOT uniform (%d..%d). "
               "The vantage no longer shows a single flat wall, so this "
