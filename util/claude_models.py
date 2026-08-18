@@ -45,9 +45,20 @@ def model_furnace():
     # subtle banding: top course lighter, base course darker
     v[:, 15, :] = 6
     v[:, 0, :] = 2
-    # mouth: opening 6 wide x 5 tall in the +z face, recessed 4 deep
-    #   x 5..10, y 1..5, z 12..15 carved to air; frame stays
-    for z in range(12, 16):
+    # mouth: opening 6 wide x 5 tall in the +z face, recessed 3 deep
+    #   x 5..10, y 1..5, z 13..15 carved to air; frame stays
+    #
+    # 3 AND NOT 4, corrected 2026-08-18 (0d). This said 4 (z 12..15) and
+    # had said so since it was written -- but the bake floor's carve
+    # shell for this model is 3 sub-voxels deep, so the z = 12 layer was
+    # in NO face shell and was silently plugged on the way out. The
+    # shipped mask has therefore had a 3-deep mouth all along, with the
+    # fire WALLED IN behind the plug (12 of its 18 emissive cells sat at
+    # z = 11, one layer behind solid stone). The new precondition in
+    # enforce_opaque() is what surfaced it. Nothing on screen moves:
+    # MANIFEST maps every furnace node to furnace_baked, so this
+    # hand-authored model is a fallback that is not placed in the world.
+    for z in range(13, 16):
         for y in range(1, 6):
             for x in range(5, 11):
                 v[z, y, x] = 0
@@ -57,7 +68,7 @@ def model_furnace():
             if (y in (0, 6) or x in (4, 11)) and v[15, y, x] != 0:
                 v[15, y, x] = 2
     # recess walls get soot
-    for z in range(12, 16):
+    for z in range(13, 16):
         for y in range(1, 6):
             for x in range(5, 11):
                 for dz, dy, dx in ((0, -1, 0), (0, 1, 0), (0, 0, -1),
@@ -66,14 +77,14 @@ def model_furnace():
                     if 0 <= zz < N and 0 <= yy < N and 0 <= xx < N \
                             and v[zz, yy, xx] == 1:
                         v[zz, yy, xx] = 3
-    # fire: back wall of the recess (z=11 face voxels) glows
+    # fire: back wall of the recess (z=12 face voxels) glows
     for y in range(2, 5):
         for x in range(6, 10):
-            v[11, y, x] = 4
+            v[12, y, x] = 4
     # embers on the recess floor
     for x in range(6, 10):
-        v[12, 1, x] = 5
-        v[13, 1, x] = 5 if x % 2 == 0 else 3
+        v[13, 1, x] = 5
+        v[14, 1, x] = 5 if x % 2 == 0 else 3
     return "furnace_custom", pal, v
 
 
@@ -588,22 +599,47 @@ def model_cobble():
 # FILL POLICY: the offending cells take the model's base material -- the
 # modal solid palette entry, which for a texture bake is the interior
 # fill colour the bake already writes. Equivalently, and this is the way
-# to picture the cost: a face may only carve its central 10x10 texels,
-# and keeps a 3-texel solid rim. MEASURED: 2.7-4.3 % of a cell for the
-# planks, 13.2 % for the furnace.
+# to picture the cost: a face may only carve its central texels and keeps
+# a SOLID RIM whose width is exactly the carve depth.
+#
+# **RIM WIDTH AND CARVE DEPTH ARE ONE NUMBER.** That is why the depth
+# below is PER MODEL and not global (2026-08-18, DECISIONS 0d, John:
+# "shallow grooves"). Until now every solid node was judged at depth 3 --
+# the deepest carve in the set, which is the furnace's mouth -- so a
+# plank, whose grooves are only ONE sub-voxel deep, was made to carry a
+# THREE-texel rim it had no carve to justify. On screen a plank wall
+# stopped reading as continuous plank lines and started reading as inset
+# panels: every groove died three texels short of the block edge, so the
+# joins between blocks became a raised lattice.
+#
+# The proof below needs only that no carve in THIS model goes deeper than
+# THIS model's depth, so each model may use its own -- and every model's
+# own depth is the `maxdepth` its bake was already called with. The
+# planks, log, cobble and bookshelf drop 3 -> 1, so the rim drops to a
+# single texel, which is the narrowest a one-deep carve can possibly
+# leave. The furnace keeps 3: its mouth really is carved that deep.
+# `main()` ASSERTS this rather than trusting the table -- an air cell
+# deeper than the declared depth is a bake error, not a plug.
 #
 # Applied ONLY to SOLID_NODE_MODELS. A bed, a lantern, a campfire, a
 # carpet, a torch and a flowerpot are see-through on purpose and any
 # "fix" to them would be a defect.
 
-SOLID_NODE_MODELS = frozenset((
-    # texture-derived cube bakes
-    "furnace_baked", "crafting_baked", "bookshelf_baked",
-    "planks_oak_baked", "planks_spruce_baked", "log_oak_baked",
-    "cobble_baked",
-    # hand-authored full-cube nodes
-    "furnace_custom", "crafting_custom",
-))
+# name -> carve depth = rim width, in sub-voxels (1/16 m each).
+SOLID_NODE_MODELS = {
+    # texture-derived cube bakes: the `maxdepth=` of each bake_from_tiles
+    # call below, which is the deepest air any face of it can reach.
+    "furnace_baked": 3,      # near-black mouth band, carved 3 deep
+    "crafting_baked": 2,
+    "bookshelf_baked": 1,    # book spines recess a single voxel
+    "planks_oak_baked": 1,
+    "planks_spruce_baked": 1,
+    "log_oak_baked": 1,
+    "cobble_baked": 1,
+    # hand-authored full-cube nodes: the depth their own carve reaches.
+    "furnace_custom": 3,     # mouth: z 12..15 air behind the +z face
+    "crafting_custom": 1,    # 3x3 grid of grooves, recessed one voxel
+}
 # NOT here, and each for a reason: chest_custom (a chest body is inset
 # from its cell -- it is a full node in the map but not a full cube of
 # geometry), bed_red_foot/head, lantern_floor, campfire_lit,
@@ -642,21 +678,41 @@ def base_material_index(pal, v):
     return int(counts.argmax())
 
 
-SHELL = 3            # = the bakes' maxdepth: no carve goes deeper
+# The deepest carve in the whole set, kept only as the upper bound a
+# per-model depth may not exceed. It is NOT the depth any model is judged
+# at: SOLID_NODE_MODELS carries that, per model, and it is the rim width.
+SHELL_MAX = 3
 
 
-def shell_count(n=N, depth=SHELL):
+def shell_count(n=N, depth=SHELL_MAX):
     """For every cell of an n^3 model, how many of the six faces it is
     within `depth` of. 1 = it may be air; 0 or >=2 = it may not."""
     idx = np.indices((n, n, n))
     return (np.minimum(idx, n - 1 - idx) < depth).sum(axis=0)
 
 
-def enforce_opaque(name, pal, v):
+def carve_reach(v):
+    """The deepest air in the model, as a DEPTH: 0 = no air at all,
+    1 = air only in the outermost layer of some face, 3 = air three
+    layers in. Compared against the model's declared depth, this is what
+    turns "no carve goes deeper than the shell" from an assumption into
+    an assertion."""
+    air = np.asarray(v) == 0
+    if not air.any():
+        return 0
+    idx = np.indices(air.shape)
+    depth = np.minimum(idx, N - 1 - idx).min(axis=0)   # distance to nearest face
+    return int(depth[air].max()) + 1
+
+
+def enforce_opaque(name, pal, v, depth):
     """Apply the bake floor: every air cell must sit in EXACTLY ONE
     face's carve shell, which makes the node opaque to any straight ray
     (see the block above). Returns (v, report); v is modified in place.
     report = dict(before=n, after=n, plugs=[(x,y,z)], material=i).
+
+    `depth` is the model's own carve depth, which is also the width of
+    the solid rim this leaves on every face.
 
     `before`/`after` still count all-air AXIS-ALIGNED lines, because
     that is the number this bake has reported since 2026-08-16 and it
@@ -665,14 +721,26 @@ def enforce_opaque(name, pal, v):
     """
     v = np.asarray(v)
     before = through_lines(v)
+    reach = carve_reach(v)
+    # THE PRECONDITION OF THE PROOF, checked before anything is plugged:
+    # the six carve shells are disjoint boxes only while no carve reaches
+    # deeper than `depth`. An air cell deeper than that would be silently
+    # filled below -- geometry destroyed by a table entry that is too
+    # small -- so it stops the bake instead.
+    if reach > depth:
+        raise SystemExit(
+            "BAKE FLOOR: %s carves %d sub-voxels deep but is declared at "
+            "depth %d in SOLID_NODE_MODELS. Plugging would destroy that "
+            "carve; raise the declared depth (and its rim) or carve "
+            "shallower." % (name, reach, depth))
     mat = base_material_index(pal, v)
-    bad = (v == 0) & (shell_count() != 1)
+    bad = (v == 0) & (shell_count(depth=depth) != 1)
     plugs = [(int(x), int(y), int(z))
              for z, y, x in np.argwhere(bad)]
     v[bad] = mat
     after = through_lines(v)
     return v, dict(before=len(before), after=len(after), plugs=plugs,
-                   material=mat)
+                   material=mat, depth=depth, reach=reach)
 
 
 def extrude_cutout(name, path, thick=2, emit_level=12):
@@ -827,16 +895,23 @@ def main():
                model_log_oak, model_cobble):
         name, pal, v = fn()
         if name in SOLID_NODE_MODELS:
-            v, floor = enforce_opaque(name, pal, v)
-            holes = "  holes %d->%d  opacity fill %4d" % (
-                floor["before"], floor["after"], len(floor["plugs"]))
+            depth = SOLID_NODE_MODELS[name]
+            if depth > SHELL_MAX:
+                raise SystemExit("%s: declared depth %d exceeds SHELL_MAX %d"
+                                 % (name, depth, SHELL_MAX))
+            v, floor = enforce_opaque(name, pal, v, depth)
+            holes = "  rim %d  holes %d->%d  opacity fill %4d" % (
+                depth, floor["before"], floor["after"], len(floor["plugs"]))
             # The invariant, checked rather than trusted: no air
-            # cell may be in two shells or in none. That is the whole
-            # proof, it is 4096 cells to look at rather than a ray
-            # budget to argue about, and it is asserted on the RESULT so
-            # a future carve that reaches deeper than SHELL trips it.
+            # cell may be in two shells or in none, at THIS model's own
+            # depth. That is the whole proof, it is 4096 cells to look at
+            # rather than a ray budget to argue about, and it is asserted
+            # on the RESULT so a future carve that reaches deeper than the
+            # declared depth trips it (enforce_opaque checks the same
+            # thing before it plugs anything, so a too-small entry in the
+            # table stops the bake rather than eating the geometry).
             leftover = int(((np.asarray(v) == 0)
-                            & (shell_count() != 1)).sum())
+                            & (shell_count(depth=depth) != 1)).sum())
             if leftover:
                 raise SystemExit(
                     "BAKE FLOOR FAILED on %s: %d air cell(s) are not in "
