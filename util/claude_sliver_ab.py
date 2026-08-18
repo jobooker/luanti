@@ -23,6 +23,15 @@ Why this rather than screenshots of the photo view:
   * the photo view averages the leak into the wall and is UNRELIABLE at
     this depth -- one run read 75 differing px, a second read 0.
 
+VIEW 2 IS THE ARM; VIEW 1 IS NOT, and the numbers above say why if you
+read them twice: the normal ladder's descend = 0 reference is 108.520
+MEAN against a 115 MAX, i.e. it was never uniform, and the probe's own
+guard says so. It cannot be uniform -- claude_descend = 1 legitimately
+turns a groove's floor into a +Y face inside a -X wall, because every
+building block in this world carries baked relief. ALBEDO is the honest
+channel: it is read from the CELL, so it can only change when the hit
+lands in a DIFFERENT cell, which is exactly the leak and nothing else.
+
 Usage:  python3 util/claude_sliver_ab.py [--target N] [--view 2]
 Requires a live look seat (util/claude_look.sh) and window id lookup.
 """
@@ -38,7 +47,11 @@ CROP = (300, 880, 200, 1700)   # y0,y1,x0,x1 -- excludes HUD text and hotbar
 
 
 def window_id():
-    out = subprocess.run([sys.executable, "-c", """
+    # /usr/bin/python3 on purpose: Quartz (pyobjc) ships with macOS's
+    # own python and is absent from a homebrew one, so `python3
+    # claude_sliver_ab.py` printed "no Luanti window found" on a seat
+    # that was up (2026-08-17). numpy and PIL are present in both.
+    out = subprocess.run(["/usr/bin/python3", "-c", """
 import Quartz
 wl=Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll
     |Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)

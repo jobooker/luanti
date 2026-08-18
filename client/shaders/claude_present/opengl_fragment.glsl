@@ -121,7 +121,10 @@ void main(void)
 	// second decode path in the referee, i.e. a second thing to keep
 	// honest, for no gain — the direct term in this room peaks around
 	// 0.1 linear, nowhere near the ACES shoulder.
-	if (claudeView > 0.5 && claudeView < 5.5) {
+	// 7 and 8 are the DESCENT AUDIT (claude_trace, 2026-08-17): a rung
+	// flag, two counters and a cell index. Encoded values, so linear.
+	if ((claudeView > 0.5 && claudeView < 5.5)
+			|| (claudeView > 6.5 && claudeView < 8.5)) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}

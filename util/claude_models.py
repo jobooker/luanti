@@ -543,21 +543,54 @@ def model_cobble():
 # The rule below is written against the RESULT, not against either
 # cause, so it also catches the third way in that nobody has thought of.
 #
-# THE RULE: in a model that represents a FULL SOLID NODE, no line of
-# cells through the model on any axis may be all air -- minimum
-# thickness >= 1 sub-voxel along x, y and z.
+# THE 2026-08-16 RULE, AND WHY IT WAS NOT ENOUGH. It said: no line of
+# cells through the model ON ANY AXIS may be all air, and it plugged one
+# cell (index 7) of each offending line. It closed all 768 axis-aligned
+# lines and John's specks came back anyway -- because A RAY IS NOT AXIS
+# ALIGNED. The reasoning behind the one-cell plug ("a ray can only
+# traverse the tunnel end to end by staying inside it") is false for a
+# tunnel 3 cells DEEP: the face carves reach maxdepth = 3, so the air
+# beside a plugged line is usually air too, and a ray that drifts one
+# sub-voxel sideways over the crossing goes round the plug.
 #
-# FILL POLICY, and why: plug the CENTRE-MOST cell of the offending line
-# (index 7 of 0..15) with the model's base material -- the modal solid
-# palette entry, which for a texture bake is the interior fill colour
-# the bake already uses. One cell, not the whole line, because the line
-# is 1/16 m wide: a ray can only traverse it end to end by staying
-# inside it, so a single plug blocks every ray the tunnel could carry,
-# and refilling the rest would erase the groove that the texture asked
-# for. Centre-most rather than at a face because plugs at index 0/15
-# land on the node seam, where the neighbouring node's plug sits one
-# cell away and the pair reads as a 2-voxel lump; a centre plug is as
-# deep inside the node as the geometry allows.
+# AND THE TUNNEL CROSSES A NODE SEAM, which is why one model in
+# isolation looks innocent. MEASURED 2026-08-17 on the SHIPPED masks
+# with a plain DDA on the CPU: not one ray in 120,000 gets from the -x
+# face of a single plank cell to its +x face. Simulate the actual WALL
+# instead -- one node thick, the same mask tiled in y and z -- and rays
+# DO get through: 5 in 300,000 for spruce, 19 in 300,000 for oak, all of
+# them near-perpendicular. A ray leaves one cell's carved shell through
+# a SIDE face and carries on inside its neighbour's. That is the sliver
+# rate, and none of it is the renderer's doing: the GPU's copy of the
+# spruce mask was dumped to screen the same day and matched the JSON in
+# all 4096 bits, and an independent point sampler found no place where
+# the walk stepped over geometry that was there.
+#
+# THE RULE NOW, and it is a proof rather than a patch: in a model that
+# represents a FULL SOLID NODE, every air cell lies within MAXDEPTH of
+# EXACTLY ONE face. Carving is a surface effect -- no face carves deeper
+# than maxdepth -- so that makes the air six DISJOINT BOXES, one per
+# face, each open only to its own face:
+#
+#     -x box = x in [0,3), y and z in [3,13)      (and five more)
+#
+# A 3D-DDA visits face-adjacent cells, so a ray's path through air is a
+# 6-CONNECTED chain and cannot leave its box without entering a cell the
+# rule has made solid. A ray that came in through the -x face is moving
+# +x, so it cannot leave the way it came either. It therefore STOPS
+# INSIDE THE NODE, whatever its direction. Both leaks this bake has now
+# paid for are corollaries: a straight crossing (-x to +x) has to cross
+# the solid core, and a CORNER CLIP (-z to +x, which is what survived
+# the first attempt at this fix on 2026-08-17 and put the corner post's
+# oak inside the cabin's spruce wall) has to cross a cell that is within
+# maxdepth of both faces.
+#
+# FILL POLICY: the offending cells take the model's base material -- the
+# modal solid palette entry, which for a texture bake is the interior
+# fill colour the bake already writes. Equivalently, and this is the way
+# to picture the cost: a face may only carve its central 10x10 texels,
+# and keeps a 3-texel solid rim. MEASURED: 2.7-4.3 % of a cell for the
+# planks, 13.2 % for the furnace.
 #
 # Applied ONLY to SOLID_NODE_MODELS. A bed, a lantern, a campfire, a
 # carpet, a torch and a flowerpot are see-through on purpose and any
@@ -575,9 +608,6 @@ SOLID_NODE_MODELS = frozenset((
 # from its cell -- it is a full node in the map but not a full cube of
 # geometry), bed_red_foot/head, lantern_floor, campfire_lit,
 # carpet_white, flowerpot_poppy, torch_baked.
-
-PLUG_AT = 7          # centre-most index of 0..15, tie broken low
-
 
 def through_lines(v):
     """Every all-air line through a 16^3 mask, as (axis, a, b) with
@@ -612,23 +642,34 @@ def base_material_index(pal, v):
     return int(counts.argmax())
 
 
-def enforce_min_thickness(name, pal, v):
-    """Apply the bake floor. Returns (v, report); v is modified in
-    place. report = dict(before=n, after=n, plugs=[(axis,a,b,x,y,z)]).
+SHELL = 3            # = the bakes' maxdepth: no carve goes deeper
+
+
+def shell_count(n=N, depth=SHELL):
+    """For every cell of an n^3 model, how many of the six faces it is
+    within `depth` of. 1 = it may be air; 0 or >=2 = it may not."""
+    idx = np.indices((n, n, n))
+    return (np.minimum(idx, n - 1 - idx) < depth).sum(axis=0)
+
+
+def enforce_opaque(name, pal, v):
+    """Apply the bake floor: every air cell must sit in EXACTLY ONE
+    face's carve shell, which makes the node opaque to any straight ray
+    (see the block above). Returns (v, report); v is modified in place.
+    report = dict(before=n, after=n, plugs=[(x,y,z)], material=i).
+
+    `before`/`after` still count all-air AXIS-ALIGNED lines, because
+    that is the number this bake has reported since 2026-08-16 and it
+    stays comparable -- but it is a corollary of the rule now, not the
+    rule, and `after` is 0 by construction.
     """
     v = np.asarray(v)
     before = through_lines(v)
     mat = base_material_index(pal, v)
-    plugs = []
-    for axis, a, b in before:
-        if axis == "x":
-            z, y, x = a, b, PLUG_AT
-        elif axis == "y":
-            z, y, x = a, PLUG_AT, b
-        else:
-            z, y, x = PLUG_AT, a, b
-        v[z, y, x] = mat
-        plugs.append((axis, a, b, x, y, z))
+    bad = (v == 0) & (shell_count() != 1)
+    plugs = [(int(x), int(y), int(z))
+             for z, y, x in np.argwhere(bad)]
+    v[bad] = mat
     after = through_lines(v)
     return v, dict(before=len(before), after=len(after), plugs=plugs,
                    material=mat)
@@ -786,8 +827,20 @@ def main():
                model_log_oak, model_cobble):
         name, pal, v = fn()
         if name in SOLID_NODE_MODELS:
-            v, floor = enforce_min_thickness(name, pal, v)
-            holes = "  holes %d->%d" % (floor["before"], floor["after"])
+            v, floor = enforce_opaque(name, pal, v)
+            holes = "  holes %d->%d  opacity fill %4d" % (
+                floor["before"], floor["after"], len(floor["plugs"]))
+            # The invariant, checked rather than trusted: no air
+            # cell may be in two shells or in none. That is the whole
+            # proof, it is 4096 cells to look at rather than a ray
+            # budget to argue about, and it is asserted on the RESULT so
+            # a future carve that reaches deeper than SHELL trips it.
+            leftover = int(((np.asarray(v) == 0)
+                            & (shell_count() != 1)).sum())
+            if leftover:
+                raise SystemExit(
+                    "BAKE FLOOR FAILED on %s: %d air cell(s) are not in "
+                    "exactly one face shell" % (name, leftover))
             if floor["after"]:
                 raise SystemExit(
                     "BAKE FLOOR FAILED on %s: %d through-line(s) survived "

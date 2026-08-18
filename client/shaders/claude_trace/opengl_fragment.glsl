@@ -1687,7 +1687,7 @@ void main(void)
 	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
 	// and want the free anti-aliasing (and want it identically, so the
 	// three instrument views can be divided pixel by pixel).
-	if (view >= 1 && view <= 5)
+	if ((view >= 1 && view <= 5) || view == 7 || view == 8)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -1719,6 +1719,89 @@ void main(void)
 	vec3 prevX = vec3(0.0);
 	float prevPdfB = 0.0;
 	bool misArmed = false;
+
+	// --- INSTRUMENT: claude_view 7 / 8, THE SUB-VOXEL SLIVER ----------
+	// Bright specks inside the cabin's solid walls, 2026-08-17. There
+	// were three ways that can happen and they need separating BEFORE
+	// anything is fixed: the mask says air where the node is solid (the
+	// BAKE), the walk steps over a solid sub-voxel (the TRAVERSAL), or
+	// the walk reads the right mask at the wrong address (an OFFSET
+	// READ, which shows as geometry drawn at a displaced position -- too
+	// much of it in one place and too little in another). These two
+	// views answer that, they touch nothing in march(), and they cost
+	// nothing when they are not selected.
+	//
+	//   view 7  MASK DUMP. The whole 16^3 mask of ONE cell, as a 4x4
+	//           sheet of 16x16 slices (tile = z, within a tile x is
+	//           right and y is up), read through subvoxSolid() -- the
+	//           same function the walk uses. Diff it against the model
+	//           JSON the bake wrote and an offset read cannot survive:
+	//           it displaces the whole pattern. The cell is the CAMERA's
+	//           own cell + (3,-1,1), which at the leak-sliver vantage is
+	//           the east wall the specks are in. VERDICT 2026-08-17:
+	//           bit-identical to planks_spruce_baked.json, all 4096.
+	//
+	//   view 8  A SECOND OPINION on the traversal, by a DIFFERENT
+	//           algorithm. march() is a DDA; this is a dumb point
+	//           sampler at 1/32 m -- half a sub-voxel, so it cannot step
+	//           over one -- asking the same texture the same question.
+	//           R = it found a surface march() walked PAST
+	//           G = how far past, in metres / 16
+	//           B = march() hit where the sampler found nothing
+	//           VERDICT 2026-08-17: R was 0 on every pixel of the frame,
+	//           before the fix as well as after.
+	//
+	// With both of those negative the answer was the BAKE, and it was:
+	// the masks themselves carried tunnels that cross a node seam. See
+	// util/claude_models.py, "the bake floor".
+	//
+	// Both present LINEARLY (claude_present lists 7 and 8 beside 1-5):
+	// these are encoded values, and ACES would bend them.
+	if (view == 7) {
+		vec3 cellD = floor(ro) + vec3(3.0, -1.0, 1.0);
+		vec2 tile = floor(uv * 4.0);
+		vec2 loc = floor(fract(uv * 4.0) * 16.0);
+		float sz = (3.0 - tile.y) * 4.0 + tile.x;
+		bool bit = inSubvoxRing(cellD)
+				&& subvoxSolid(cellD - vec3(SUBV_R0),
+						vec3(loc.x, loc.y, sz));
+		gl_FragColor = vec4(vec3(bit ? 1.0 : 0.0), 1.0);
+		return;
+	}
+	if (view == 8) {
+		vec3 hp, n, alb, le, cell;
+		float tHit;
+		bool h = march(ro, rd, hp, n, alb, le, tHit, cell);
+		float tEnd = h ? tHit : 8.0;
+		float tSlow = -1.0;
+		for (int k = 2; k < 256; k++) {
+			float ts = float(k) / 32.0;
+			if (ts >= tEnd) break;
+			vec3 pw = ro + rd * ts;
+			vec3 cw = floor(pw);
+			if (any(lessThan(cw, vec3(0.0)))
+					|| any(greaterThanEqual(cw, vec3(GRID_S))))
+				break;
+			vec4 sw = texture3D(claudeTraceGrid, (cw + 0.5) / GRID_S);
+			if (sw.a <= CLASS_AIR_MAX)
+				continue;
+			if (claudeDescend > 0.5 && sw.a > CLASS_SUBVOX_LO
+					&& sw.a < CLASS_SUBVOX_HI && inSubvoxRing(cw)) {
+				if (!subvoxSolid(cw - vec3(SUBV_R0),
+						floor((pw - cw) * SUBV)))
+					continue;
+			}
+			tSlow = ts;
+			break;
+		}
+		float missed = (tSlow >= 0.0 && (!h || tSlow < tHit - 0.05))
+				? 1.0 : 0.0;
+		gl_FragColor = vec4(missed,
+				missed * clamp((tEnd - tSlow) / 16.0, 0.0, 1.0),
+				(h && tSlow < 0.0) ? 1.0 : 0.0,
+				h ? min(tHit, DEPTH_MAX_HIT) / DEPTH_SCALE : 1.0);
+		return;
+	}
 
 	// --- INSTRUMENT: claude_view 18, DOES A BOUNCE RAY START INSIDE A
 	// SOLID CELL? ----------------------------------------------------
