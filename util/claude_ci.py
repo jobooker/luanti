@@ -565,6 +565,14 @@ ROOM_BOXES = {
     "cave-skylight": ((10, 8, 85), (18, 14, 93)),
     "cave-glass": ((30, 8, 85), (38, 14, 93)),
     "sky-furnace-050": ((47, 8, 97), (73, 9, 123)),
+    # TRANSPARENCY REFEREE ROOMS (2026-08-18). Not CI arms -- adding one
+    # changes what CI proves, which is John's call (DECISIONS 0b) -- but
+    # they are hashed like every other room so util/claude_glass_probe.py
+    # can refuse a measurement taken in a room somebody dug through.
+    # z >= 170 puts them outside the 128^3 bubble of every CI vantage, so
+    # their emissive walls cannot join a referee room's area-emitter list.
+    "glasspair": ((0, 8, 170), (12, 14, 176)),
+    "glassfurnace": ((100, 8, 170), (106, 14, 176)),
     # exterior-ci is "no build" (the handoff's own words) — there is no
     # structure to protect, so this is a small box around the stand
     # point rather than a meaningful integrity claim. It still gets a
@@ -583,6 +591,8 @@ VANTAGE_ROOM = {
     "skyfurnace-050": "sky-furnace-050",
     "skyfurnace-050-nee1": "sky-furnace-050",
     "exterior-ci": "exterior-ci",
+    "glass-dark": "glasspair", "glass-lit": "glasspair",
+    "glassfurnace": "glassfurnace",
 }
 
 
@@ -1661,7 +1671,12 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
                                  # the material-index round trip, all 256
                                  # values, run once at the first grid
                                  # upload -- see the -matpal assertion
-                                 "matpal_roundtrip", "matpal_slots")}
+                                 "matpal_roundtrip", "matpal_slots",
+                                 # transmissive cells in the bubble
+                                 # (2026-08-18): a transparency
+                                 # measurement taken where this reads 0
+                                 # is a measurement of nothing
+                                 "grid_transmissive")}
     with open(lab.PATCH, "w") as f:
         f.write("claude_screenshot = %s\n" % marker)
     png = None

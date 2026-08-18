@@ -459,6 +459,13 @@ const float RR_Q_MAX = 0.95;
 // furnace referee's rho stays the same number it always was.
 const float ALBEDO_FLOOR = 0.005;
 
+// The IOR claude_view 20's ladder is drawn at. It is glass's, and it is a
+// CONSTANT here on purpose: the ladder is an instrument for the interface
+// ARITHMETIC, so it must not depend on what game.cpp happened to upload
+// into the palette this run. The palette's own value is what the picture
+// uses, and claude_fresnel_check.py reads both.
+const float IOR_LADDER = 1.52;
+
 // THE MATERIAL INDEX (2026-08-18). game.cpp writes ONE byte per cell into
 // the grid's alpha and that byte is an INDEX into claudeMatPal. This file
 // decodes nothing else from it: no bands, no midpoints, no arithmetic.
@@ -731,14 +738,80 @@ float matIndex(float a)
 // THE PALETTE LOOKUP — what the index points at.
 //   .r = emission scale (multiplies albedo; 0 = not an emitter)
 //   .g = 1 if this material has a 16^3 sub-voxel shape (the old class 250)
-//   .b = transmission, reserved for the transparency step, 0 today
-//   .a = reserved
+//   .b = transmission: > 0.5 means a ray is SUPPOSED to cross this
+//   .a = index of refraction, read only where .b says to
 // Sampled on ARRIVAL AT A NON-AIR CELL, never per step of the walk: the
 // dead-weight probe priced a per-step dependent read at +2.2 ms (+14 %)
 // and this is deliberately not one.
+//
+// TWO ENTRY POINTS FOR ONE FETCH. matPalIdx() takes the index the walk
+// already decoded; matPal() takes the raw byte and decodes it first. The
+// walk has the index in hand at every point that matters, and paying for
+// matIndex() twice on the same texel is the kind of small dishonesty that
+// makes a cost table wrong.
+vec4 matPalIdx(float idx)
+{
+	return texture2D(claudeMatPal, vec2((idx + 0.5) / 256.0, 0.5));
+}
 vec4 matPal(float a)
 {
-	return texture2D(claudeMatPal, vec2((matIndex(a) + 0.5) / 256.0, 0.5));
+	return matPalIdx(matIndex(a));
+}
+
+// TRANSMISSION, READ AS A SWITCH. game.cpp stores a fraction so a mixture
+// BSDF can arrive later without moving the byte; today every material is
+// 0.0 or 1.0 and this file does not implement a partial interface,
+// because a fractional one is two lobes with a stochastic choice between
+// them and §6 prices an estimator change.
+//
+// AIR IS FULLY TRANSMISSIVE AND IT IS NOT IN THE TABLE. Index 0's palette
+// row is all zeros — it has to be, because "emits nothing" is what makes
+// the air test cheap — so the two helpers below answer for index 0
+// explicitly rather than by looking it up. Air's IOR is 1.0 and its
+// transmission is 1.0, and a ray travelling through it is travelling
+// through a medium exactly like any other.
+bool matTransmits(float idx, vec4 pal)
+{
+	return idx < 0.5 || pal.b > 0.5;
+}
+float matIor(float idx, vec4 pal)
+{
+	return idx < 0.5 ? 1.0 : pal.a;
+}
+
+// THE FRESNEL TERM FOR A DIELECTRIC INTERFACE — exact, not Schlick.
+//
+// eta = n_incident / n_transmitted, cosI = |cos| of the incidence angle
+// measured against the facing normal. Returns the unpolarised
+// reflectance, the average of the s and p amplitudes squared. Total
+// internal reflection returns exactly 1.0, which is the same branch the
+// caller needs anyway (refract() returns the zero vector there).
+//
+// SCHLICK WAS NOT USED AND THAT IS A DECISION, not an accident. Its error
+// against this expression peaks around 1-2 % near grazing at n = 1.5 —
+// small, invisible in a picture, and about the size of the Cornell
+// referee's whole tolerance. claude_view 20 scores this function against
+// the closed form computed off-GPU, so an approximation here would be a
+// difference the instrument reports rather than a difference nobody can
+// see; there is no reason to spend the accuracy.
+//
+// R + T = 1 IS NOT ASSERTED ANYWHERE AND MUST NOT BE, because in this
+// implementation it is a TAUTOLOGY: the caller reflects with probability
+// R carrying weight R/R and refracts with probability 1-R carrying weight
+// (1-R)/(1-R), so no code path ever computes T. An instrument that
+// "checked" it would be the fifth blind one. The real energy claims are
+// (a) this function agreeing with the closed form, which view 20 scores,
+// and (b) a lossless slab not moving a sealed furnace's analytic
+// radiance, which is transport rather than arithmetic.
+float fresnelDielectric(float cosI, float eta)
+{
+	float s2 = eta * eta * (1.0 - cosI * cosI);
+	if (s2 >= 1.0)
+		return 1.0;               // total internal reflection
+	float cosT = sqrt(1.0 - s2);
+	float rs = (eta * cosI - cosT) / (eta * cosI + cosT);
+	float rp = (cosI - eta * cosT) / (cosI + eta * cosT);
+	return 0.5 * (rs * rs + rp * rp);
 }
 
 // Does this material carry a finer shape? The old "is the class byte in
@@ -997,9 +1070,31 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // two are equivalent because the fine walk leaves the cell through the
 // same face, at the same t, on the same axis, as the coarse step it
 // replaces.
-bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
-		out vec3 le, out float tHit, out vec3 cellOut)
+//
+// THE MEDIUM THE RAY IS TRAVELLING IN — curMed, added 2026-08-18 with
+// transparency, and it is the whole of the change to this walk.
+//
+// It is the MATERIAL INDEX of the stuff around the ray: 0 for air (and
+// for every caller that has no opinion), the glass's own index for a ray
+// inside a pane, the water's for a ray inside a tank. The arrival test
+// used to be "is this cell air"; it is now "is this cell a DIFFERENT
+// material from the one I am in", which is the same test when curMed is
+// 0 and is what lets a ray inside glass keep going until it reaches the
+// far face. Nothing else in the walk knows about transparency: there is
+// no second traversal, no per-material branch and no transmissive walk
+// beside the opaque one.
+//
+// palOut / idxOut are the material the walk ARRIVED at. The caller needs
+// both to decide what kind of interface it is standing on, and handing
+// them back costs nothing — the walk fetched the palette on arrival
+// anyway, and returning a value it already holds is cheaper than making
+// the caller fetch it again.
+bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
+		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
+		out vec4 palOut, out float idxOut)
 {
+	palOut = vec4(0.0);
+	idxOut = 0.0;
 	hp = ro;
 	n = vec3(0.0, 1.0, 0.0);
 	alb = vec3(0.0);
@@ -1050,7 +1145,25 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	// upon" — and at 1 m the same reasoning turned out to be wrong.)
 	if (claudeDescend > 0.5 && inSubvoxRing(cellHi)) {
 		s = texture3D(claudeTraceGrid, (cellHi + 0.5) / GRID_S);
-		if (matFine(matPal(s.a))) {
+		// THE MATERIAL OF THE CELL THE RAY STARTS IN, reported even
+		// though the walk is about to skip the cell itself. It has to
+		// be: a hit on the fine rung inside this cell IS a hit on this
+		// material, and a caller handed idxOut = 0 would read it as AIR
+		// -- which since 2026-08-18 means "an interface a ray passes
+		// through", so a solid sub-voxel of a stair would be crossed
+		// rather than stopped at. Found by reading the transparency
+		// change back against this block rather than by a frame.
+		//
+		// `pal` is deliberately NOT set from here, and that is a
+		// PRE-EXISTING hole left standing rather than fixed in the same
+		// commit: a fine hit inside the starting cell reports le = 0, so
+		// a bounce ray leaving a torch and landing on the torch's own
+		// far side sees no emission. Fixing it changes what the cabin
+		// arms photograph, which is coverage item 5's variable, not this
+		// step's. Written into spec/roadmap.md instead.
+		idxOut = matIndex(s.a);
+		palOut = matPalIdx(idxOut);
+		if (matFine(palOut)) {
 			// entry point in SUB-VOXEL units, clamped INSIDE the
 			// cell: the walk lands exactly on a cell plane and floor()
 			// of an exact boundary can fall either side of it. The
@@ -1139,13 +1252,24 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		// the mask — and it is only ever written here, on the coarse
 		// rung, where nothing is depending on the old value.
 		s = texture3D(claudeTraceGrid, (ci + 0.5) / GRID_S);
-		if (s.a <= MAT_AIR_MAX)
-			continue; // air
-		// The cell is not air, so ask the table what it is. ONE palette
-		// fetch per non-air arrival, kept live across a descent for the
+		// THE ARRIVAL TEST, and since 2026-08-18 it is a comparison rather
+		// than a threshold: a cell whose material is the one the ray is
+		// already travelling through is not a boundary, so the walk goes
+		// on. With curMed = 0 that is exactly the old `s.a <= MAT_AIR_MAX`
+		// air test — index 0 is air and nothing else — and every caller
+		// that never entered a medium takes precisely the path it took
+		// before. With curMed = a pane's index, it is what carries a
+		// refracted ray across the inside of the pane to its far face.
+		float idx = matIndex(s.a);
+		if (idx == curMed)
+			continue;
+		// A boundary. Ask the table what is on the far side of it. ONE
+		// palette fetch per arrival, kept live across a descent for the
 		// same reason `s` is: a fine hit takes its material from the cell
 		// that owns the mask.
-		pal = matPal(s.a);
+		pal = matPalIdx(idx);
+		palOut = pal;
+		idxOut = idx;
 
 		n = vec3(0.0);
 		if (axis == 0) n.x = -stepDir.x;
@@ -1201,6 +1325,21 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 		return true;
 	}
 	return false;
+}
+
+// THE VACUUM WALK — every caller that has no medium to declare.
+//
+// It exists so that the seven call sites that predate transparency are
+// byte-identical to what they were: an instrument view, a shadow ray, the
+// path loop's first march all start in air, and `curMed = 0` makes the
+// arrival test above the same air test it always was. The two extra
+// results are dropped here rather than at each call site.
+bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
+		out vec3 le, out float tHit, out vec3 cellOut)
+{
+	vec4 pal;
+	float idx;
+	return marchMed(ro, rd, 0.0, hp, n, alb, le, tHit, cellOut, pal, idx);
 }
 
 // Cosine-weighted hemisphere direction about a cardinal normal n.
@@ -1360,7 +1499,17 @@ float neePdfSa(vec3 cellHit, vec3 nHit, vec3 x, float dist, float cosY,
 vec4 g_neeDiag;
 float g_neeDiagK;
 
-vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
+//
+// curMed (2026-08-18) is the medium the RECEIVING vertex sits in, handed
+// to the shadow march so that a surface at the bottom of a tank is not
+// shadowed by the water it is standing in. It changes nothing about the
+// pdf: the light sampler still cannot see through a refractive interface,
+// because a straight shadow ray is not the path a refracted one takes.
+// That is a variance cost and never an energy one — a face reachable only
+// through glass is reached by the BSDF technique at MIS weight 1, since
+// the interface disarms MIS (see the path loop's dielectric block).
+vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
+		float curMed)
 {
 	g_neeDiag = vec4(0.0);
 	g_neeDiagK = 0.0;
@@ -1424,7 +1573,10 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn)
 	// for the emitter to shadow itself.
 	vec3 shp, shn, shalb, shle, shcell;
 	float sht;
-	if (!march(x, wi, shp, shn, shalb, shle, sht, shcell))
+	vec4 shpal;
+	float shidx;
+	if (!marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+			shpal, shidx))
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
 		return vec3(0.0); // occluded
@@ -1530,7 +1682,13 @@ float skyPdfSa(vec3 wi)
 
 // One sky-light sample at vertex (x, nx) with reflectance rho. Returns
 // the MIS-weighted direct contribution WITHOUT the path throughput.
-vec3 neeSky(vec3 x, vec3 nx, vec3 rho)
+//
+// curMed, as in neeDirect(): the medium the receiving vertex is in, so a
+// shadow ray leaving a surface inside a tank of water is not stopped by
+// the water. It still cannot see the sky THROUGH the surface of that
+// tank, and it should not — that path is refracted, and a straight ray is
+// not it.
+vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 {
 	vec3 bdir;
 	float bcos;
@@ -1559,7 +1717,10 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho)
 	// same false the escape branch in main() reads.
 	vec3 shp, shn, shalb, shle, shcell;
 	float sht;
-	if (march(x, wi, shp, shn, shalb, shle, sht, shcell))
+	vec4 shpal;
+	float shidx;
+	if (marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+			shpal, shidx))
 		return vec3(0.0); // occluded
 
 	// THE LAW: one sky. skyBody() here is the same evaluation the camera
@@ -1749,6 +1910,16 @@ void main(void)
 	vec3 tp = vec3(1.0);
 	vec3 p = ro;
 	vec3 dir = rd;
+	// THE MEDIUM THE PATH IS CURRENTLY INSIDE (2026-08-18), as a material
+	// index. 0 is air, which is where every camera in this world starts.
+	//
+	// It is a single number and not a STACK, and that is exact rather than
+	// a simplification: the walk hands back the index of the cell it
+	// arrived at, so "what am I in now" is read off the geometry at every
+	// interface instead of being remembered across them. A pane inside a
+	// tank inside a pane needs no bookkeeping — each crossing names its
+	// own new medium.
+	float curMed = 0.0;
 
 	float primaryT = DEPTH_MISS; // for the depth channel + view 4
 	vec3 primaryN = vec3(0.0);   // view 1
@@ -1843,6 +2014,65 @@ void main(void)
 			return;
 		}
 		gl_FragColor = vec4(vec3(ok), 1.0);
+		return;
+	}
+	// --- INSTRUMENT: claude_view 20, THE INTERFACE LADDER -------------
+	//
+	// WHAT IT IS ABOUT. Transparency in this renderer is one decision
+	// taken at one surface: how much of the ray bounces off and which way
+	// the rest of it bends. Both are closed-form functions of the
+	// incidence angle and the two indices of refraction, and both are
+	// invisible in a picture — a wrong Fresnel term or a wrong IOR still
+	// draws plausible glass. So they get an instrument that does not need
+	// a scene at all.
+	//
+	// This view draws the SHADER'S OWN fresnelDielectric() and the
+	// SHADER'S OWN refract() across every incidence angle, as brightness,
+	// in four horizontal bands. x is cos(theta_i), 0 at the left edge
+	// (grazing) to 1 at the right (normal incidence).
+	//
+	//   band 0 (top)     R, air -> glass    eta = 1 / 1.52
+	//   band 1           R, glass -> air    eta = 1.52  (TIR at the left)
+	//   band 2           sin(theta_t), air -> glass
+	//   band 3 (bottom)  sin(theta_t), glass -> air, 0 inside TIR
+	//
+	// Bands 0 and 1 are the ENERGY claim: R is what decides the split, and
+	// T is 1 - R by construction in the path loop, so scoring R against
+	// the closed form is scoring the split. Bands 2 and 3 are the
+	// GEOMETRY claim, i.e. Snell's law and the IOR that went into it, and
+	// they are the reason "state the IOR you chose" is answerable by
+	// measurement rather than by reading the source.
+	//
+	// util/claude_fresnel_check.py screens it against the same four
+	// functions computed off-GPU in double precision. It is a real
+	// external reference and not a tautology: this file's Fresnel is the
+	// exact unpolarised expression, so a Schlick approximation, a swapped
+	// eta or a wrong IOR all show up as a curve that misses.
+	//
+	// Brightness, not hue (John is colourblind), and it presents LINEARLY
+	// (claude_present) — the values ARE the message and ACES would bend
+	// them.
+	if (view == 20) {
+		float ci = clamp(uv.x, 0.001, 1.0);   // cos(theta_i)
+		float band = min(floor((1.0 - uv.y) * 4.0), 3.0);
+		float eta = (band == 0.0 || band == 2.0)
+				? (1.0 / IOR_LADDER) : IOR_LADDER;
+		float v;
+		if (band < 1.5) {
+			v = fresnelDielectric(ci, eta);
+		} else {
+			// the shader's own refract(), fed a canonical geometry: the
+			// facing normal is +z and the incident ray comes down onto it
+			// at the same cos. sin(theta_t) is read straight off the
+			// returned vector, so a bend the path loop would take is the
+			// bend this band draws.
+			float si = sqrt(max(0.0, 1.0 - ci * ci));
+			vec3 idir = vec3(si, 0.0, -ci);
+			vec3 nrm = vec3(0.0, 0.0, 1.0);
+			vec3 wt = refract(idir, nrm, eta);
+			v = (dot(wt, wt) < 1e-8) ? 0.0 : length(wt.xy);
+		}
+		gl_FragColor = vec4(vec3(clamp(v, 0.0, 1.0)), 1.0);
 		return;
 	}
 	if (view == 7) {
@@ -2042,7 +2272,7 @@ void main(void)
 			if (view == 9 || view == 12 || view == 13) {
 				// the light-sampling half, w_l forced to 1
 				if (nInstr > 0)
-					L = neeDirect(hp, n, alb, nInstr, 0.0);
+					L = neeDirect(hp, n, alb, nInstr, 0.0, 0.0);
 				// FORENSICS (12/13). Scratch views: they answer "what did
 				// the aimed sampler aim at, from this pixel" when the
 				// answer is not readable off the code. Each channel is a
@@ -2132,7 +2362,10 @@ void main(void)
 
 		vec3 hp, n, alb, le, cell;
 		float tHit;
-		if (!march(p, dir, hp, n, alb, le, tHit, cell)) {
+		vec4 hitPal;
+		float hitIdx;
+		if (!marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
+				hitPal, hitIdx)) {
 			// ESCAPED THE GRID — and since 2026-08-17 that is not black.
 			// The ray sees the sky, through the same skyRadiance() the
 			// camera ray and the NEE shadow ray use.
@@ -2193,6 +2426,103 @@ void main(void)
 		if (view >= 1 && view <= 4)
 			break; // first-hit views need nothing past the primary
 
+		// =============================================================
+		// A REFRACTIVE INTERFACE (2026-08-18) — glass and water
+		// =============================================================
+		// This is the whole of transparency in this renderer, and the
+		// shape of it is the reason the handoff said this step should be
+		// EASIER than the rasterizer it replaces: the ray crosses the
+		// surface and carries on. There is no depth sort, no
+		// order-dependent blend, no OIT and no second pass, because
+		// nothing here composites — the transport just continues.
+		//
+		// WHEN IT FIRES. Both sides of the boundary have to be things a
+		// ray can travel in. `curMed` is what the ray is in now and
+		// `hitIdx` is the cell it just arrived at; air counts as
+		// transmissive with IOR 1. Air -> glass and glass -> air both
+		// fire; glass -> stone does not, and neither does air -> stone,
+		// so an opaque scene never reaches this block at all.
+		//
+		// IT IS A SPECULAR VERTEX, and that single fact answers the
+		// landmine this step was warned about. A delta BSDF has no light
+		// sampler to be MIS-partnered with, so:
+		//   - no next-event estimation is taken here (the two calls
+		//     below are past the `continue`),
+		//   - misArmed goes FALSE, so the next emitter this path lands
+		//     on is added at weight 1.
+		// That is what keeps an emissive face behind glass honest. The
+		// area-emitter face mask still drops a face whose neighbour is
+		// non-air, so the light sampler's density for such a face is 0;
+		// the BSDF technique's weight for it is 1. Both halves of the
+		// balance heuristic agree, which is exactly what §6 asks and what
+		// the 1a failure was.
+		//
+		// THE THROUGHPUT IS NOT TOUCHED. Reflect with probability R
+		// carrying weight R/R, refract with probability 1-R carrying
+		// weight (1-R)/(1-R). Energy is conserved by CONSTRUCTION, which
+		// is why the gate for it is transport (a lossless slab must not
+		// move a sealed furnace) and arithmetic (claude_view 20 against
+		// the closed-form Fresnel), never a check that R + T = 1 — that
+		// one cannot fail here and would be a blind instrument.
+		//
+		// ONE PALETTE FETCH FOR THE MEDIUM, and it is skipped entirely
+		// while the path is in air: matPalIdx(0) is never sampled, because
+		// matTransmits()/matIor() answer for index 0 without a lookup. So
+		// a path that never enters anything pays nothing for this block
+		// beyond one compare per hit.
+		vec4 medPal = curMed < 0.5 ? vec4(0.0) : matPalIdx(curMed);
+		if (matTransmits(curMed, medPal) && matTransmits(hitIdx, hitPal)) {
+			float eta = matIor(curMed, medPal) / matIor(hitIdx, hitPal);
+			// march() guarantees n opposes the ray, so it is already the
+			// facing normal and cosI is a plain dot.
+			float cosI = clamp(dot(-dir, n), 0.0, 1.0);
+			float R = fresnelDielectric(cosI, eta);
+			vec3 wt = refract(dir, n, eta);
+			// Total internal reflection: R is exactly 1 above the
+			// critical angle and refract() returns the zero vector. The
+			// length test is belt and braces on the same event, stated
+			// rather than relied upon.
+			if (dot(wt, wt) < 1e-8)
+				R = 1.0;
+			// THE ONE EXTRA RANDOM DRAW IN THIS FILE, and it is taken
+			// only at an interface. An opaque scene contains none, so its
+			// per-pixel random chain is the sequence it always was and
+			// its goldens are comparable — which is gate 1.
+			float ur = rnd1();
+			// The surface point itself, recomputed from the ray that is
+			// still current — the same expression, on the same inputs,
+			// that march() evaluated internally, so it is bit-identical
+			// and not merely nearby. Taken BEFORE dir is reassigned.
+			vec3 phit = p + dir * tHit;
+			if (ur < R) {
+				dir = reflect(dir, n);
+				p = hp;           // the restart march() already clamped
+				                  // into the cell the ray came THROUGH
+			} else {
+				dir = wt;
+				// THE FAR SIDE. march()'s own restart point sits in the
+				// cell the ray came from, which is the wrong side for a
+				// ray that is crossing: starting there would step
+				// straight back into this same face and the path would
+				// hammer the interface forever. Same construction, the
+				// other way — clamped into the cell that was ENTERED, so
+				// the walk's "never test the cell you start in" rule
+				// names the cell the ray is genuinely inside.
+				//
+				// `cell` is the COARSE cell march() arrived at, which is
+				// the right one here because a transmissive material is
+				// never a fine one — game.cpp asserts that pairing can
+				// never exist, for the bake's own opacity proof.
+				p = restartPoint(phit, -n, cell, 1.0);
+				curMed = hitIdx;
+			}
+			misArmed = false;     // a delta lobe has no light-sampling
+			                      // partner: the next Le arrives at
+			                      // weight 1
+			pathBounces += 1.0;
+			continue;
+		}
+
 		// NEXT-EVENT ESTIMATION at this vertex, before the throughput
 		// absorbs alb: neeDirect() carries its own rho/PI, and it must be
 		// the rho this vertex actually reflects with — which in clay
@@ -2200,12 +2530,12 @@ void main(void)
 		// term at the same vertex it cuts the BSDF half, so claudeBounces
 		// means the same thing under either dial.
 		if (nLights > 0)
-			L += tp * neeDirect(hp, n, alb, nLights, 1.0);
+			L += tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
 		// The sky's own light sample, at the same vertex and under the
 		// same depth cap, drawing from the RESERVED counter range so the
 		// path's own random sequence is untouched (see rndSky()).
 		if (skyNee)
-			L += tp * neeSky(hp, n, alb);
+			L += tp * neeSky(hp, n, alb, curMed);
 
 		tp *= alb;
 

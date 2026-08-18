@@ -150,6 +150,16 @@ struct ClaudeTraceGrid
 	// silently worked as an "is there a grid" proxy for months and was
 	// never actually testing that. See solid_count below for the real one.
 	int area_total = 0;         // emissive cells the snapshot actually found
+	// TRANSMISSIVE CELLS the snapshot found (2026-08-18). Not a
+	// performance counter: it is the one thing that says the drawtype
+	// chain actually classified this room's glass AS glass. Every gate on
+	// the transparency step is a comparison between two pictures, and a
+	// classifier that silently produced zero transmissive cells would make
+	// both of them the same picture and read as "no change" -- the blind
+	// instrument this project has now paid for five times. Published as
+	// `grid_transmissive` in claude_stats.json so a probe can refuse to
+	// report a ratio taken in a room with no glass in it.
+	int transmissive_total = 0;
 	// solid_count / snap_seq (roadmap 1b, gate hardening 2026-08-16):
 	// `valid` is set true once and never cleared (see below), so
 	// `grid_valid == 1` alone is a TAUTOLOGY after the first snapshot
@@ -474,15 +484,68 @@ static float claudeMatEmission(const ClaudeMat &m)
 }
 
 // The palette texel, and it holds ONLY what a shader reads. Declaring
-// roughness/metallic/ior here before anything samples them would be the
+// roughness/metallic here before anything samples them would be the
 // dead-uniform trap in its data form: four channels that look like a
 // material model and are provably never consulted.
 //
 //   R = emission scale (multiplies albedo; 0 = not an emitter)
 //   G = 1 if this material has a 16^3 sub-voxel shape (the old class 250)
-//   B = transmission — reserved for the transparency step, 0 today
-//   A = reserved
-struct ClaudeMatTexel { float emit, fine, transmit, reserved; };
+//   B = transmission. > 0 means "a ray is SUPPOSED to cross this": the
+//       walk stops at the interface and the path refracts through it
+//   A = index of refraction, and it is only read where B > 0
+//
+// IOR MOVED INTO THE TABLE ON THE DAY IT WAS FIRST SAMPLED (2026-08-18),
+// which is the rule the paragraph above states: A said "reserved" for as
+// long as nothing read it.
+struct ClaudeMatTexel { float emit, fine, transmit, ior; };
+
+// THE TRANSMISSION COLUMN, and the two numbers in it.
+//
+// 1.52 is soda-lime window glass and 1.333 is water at 20 C. They are the
+// physical constants, chosen for the same reason every other number in
+// this renderer is physical: the referee for an interface is the
+// closed-form Fresnel value at that IOR (claude_view 20), and a made-up
+// index would make that referee a comparison against itself.
+//
+// TRANSMISSION IS STORED AS A FRACTION AND READ AS A SWITCH. The shader
+// treats > 0.5 as "this is a dielectric interface" and does not implement
+// a partial one, because a fractional transmission is a MIXTURE BSDF —
+// two lobes with a stochastic choice between them — and §6 prices an
+// estimator change. The column is a float so the mixture can arrive later
+// without moving the byte; today every material is 0.0 or 1.0.
+//
+// NO ABSORPTION AND NO TINT (v1, documented rather than discovered). A
+// ray crossing one of these interfaces is reflected or refracted with
+// R + T = 1 and its throughput is untouched, so the glass is clear and
+// colourless and a lossless dielectric neither creates nor destroys
+// light. That is what makes the energy gate exact: a glass slab dropped
+// into a sealed furnace cannot move the furnace's analytic radiance.
+// Beer-Lambert attenuation through the medium is the next thing here and
+// it needs a per-material absorption column, not a reinterpretation of
+// this one.
+//
+// AND THE (n_t/n_i)^2 RADIANCE SCALE IS DELIBERATELY ABSENT. Radiance is
+// not invariant across a refractive interface; the compression on entry
+// is exactly undone on exit, and every camera and every emitter in this
+// world sits in air, so the product over any complete path is 1. Written
+// down because it is a real term that is missing, not an oversight — the
+// day a camera goes underwater it stops cancelling.
+static constexpr float CLAUDE_IOR_GLASS = 1.52f;
+static constexpr float CLAUDE_IOR_WATER = 1.333f;
+static constexpr float CLAUDE_IOR_AIR = 1.0f;
+
+static float claudeMatTransmission(const ClaudeMat &m)
+{
+	return (m.kind == MATK_GLASS || m.kind == MATK_LIQUID) ? 1.0f : 0.0f;
+}
+static float claudeMatIor(const ClaudeMat &m)
+{
+	if (m.kind == MATK_GLASS)
+		return CLAUDE_IOR_GLASS;
+	if (m.kind == MATK_LIQUID)
+		return CLAUDE_IOR_WATER;
+	return CLAUDE_IOR_AIR;
+}
 
 static ClaudeMat g_claude_mattab[256];
 static ClaudeMatTexel g_claude_matpal[256];
@@ -505,10 +568,57 @@ static void claudeMatTableBuild()
 	for (int l = 0; l < CLAUDE_MAT_LIGHTS; l++) {
 		ClaudeMat m;
 		m.kind = (u8)k; m.fine = (u8)f; m.light = (u8)l;
+		// A TRANSMISSIVE KIND HAS NO FINE VARIANT, and this line is the
+		// decision the transparency handoff asked to be made explicitly
+		// rather than the shortcut it looks like.
+		//
+		// The bake carries an OPACITY PROOF since 2026-08-18
+		// (`b945042ee`): every air cell of a full-solid node's 16^3 model
+		// lies within the carve depth of exactly one face, which makes
+		// the air six disjoint boxes and proves a ray cannot cross the
+		// node whatever its direction. A transmissive node is one a ray
+		// is SUPPOSED to cross. Those two claims contradict each other on
+		// any material that is both, so no material is both.
+		//
+		// THE PROOF APPLIES TO FULL-SOLID OPAQUE NODES AND NOTHING ELSE.
+		// Glass and water get no 16^3 mask, so it does not speak about
+		// them -- not an exemption carved out of it, a domain it never
+		// covered. NDT_GLASSLIKE_FRAMED, which really does have a solid
+		// frame around a transparent pane, is therefore a uniform pane
+		// here: its frame is geometry this rung does not represent, in
+		// the same way a torch outside the sub-voxel ring is a nub. That
+		// is §7's laddered geometry and it is written down rather than
+		// left to be found.
+		//
+		// Skipping the key leaves those 30 slots at the zero row, which
+		// reads as a plain opaque non-emitting material -- a TOTAL answer
+		// for an index the snapshot cannot produce. claudeMatIndex() is
+		// untouched, so no reachable index moves and the block hash is
+		// bit-identical.
+		if (m.fine && claudeMatTransmission(m) > 0.0f)
+			continue;
 		u8 idx = claudeMatIndex(m);
 		g_claude_mattab[idx] = m;
 		g_claude_matpal[idx] = ClaudeMatTexel{claudeMatEmission(m),
-				m.fine ? 1.0f : 0.0f, 0.0f, 0.0f};
+				m.fine ? 1.0f : 0.0f, claudeMatTransmission(m),
+				claudeMatIor(m)};
+	}
+	// ...and the invariant, asserted over the WHOLE 256 rather than over
+	// the keys anyone expects to be reachable. The first version of this
+	// check asserted the reachable set and passed; this one caught
+	// (liquid, fine) on its first run, which is the difference between a
+	// claim about the table and a claim about what someone believes is in
+	// it.
+	for (int i = 0; i < 256; i++) {
+		if (g_claude_matpal[i].transmit > 0.0f
+				&& g_claude_matpal[i].fine > 0.0f) {
+			errorstream << "[claude_grid] material " << i
+					<< " is BOTH transmissive and fine: the bake's opacity"
+					   " proof and the transmissive walk contradict each"
+					   " other on it. Fix the classifier, not this line."
+					<< std::endl;
+			FATAL_ERROR("transmissive material carries a sub-voxel mask");
+		}
 	}
 }
 
@@ -540,9 +650,22 @@ static inline bool claudeMatEmits(u8 idx)
 // 16-slot cap ("emitters are lit by being HIT, which is correct and
 // noisier"), not a new rule. The fix, when it is wanted, is an emitter
 // sampler that knows the 16^3 mask -- not a wider tolerance here.
+// AND SINCE 2026-08-18 THERE IS A THIRD ANSWER, for the same reason: a
+// TRANSMISSIVE emitter is not area-samplable either. The area sampler's
+// pdf is built from an exposed 1 m face, and a face a ray passes THROUGH
+// is not a surface that face's area describes. Excluded rather than
+// approximated, and the exclusion is safe in exactly the way the fine one
+// is: neePdfSa() returns 0 for a cell that is not in the list, so the
+// BSDF technique carries its full radiance at MIS weight 1. Variance,
+// never energy.
+static inline bool claudeMatTransmissive(u8 idx)
+{
+	return g_claude_matpal[idx].transmit > 0.0f;
+}
 static inline bool claudeMatAreaSamplable(u8 idx)
 {
-	return claudeMatEmits(idx) && !g_claude_mattab[idx].fine;
+	return claudeMatEmits(idx) && !g_claude_mattab[idx].fine
+			&& !claudeMatTransmissive(idx);
 }
 
 // Does this material get sub-voxel bits baked for it? The old `a > 230`,
@@ -1287,7 +1410,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 19.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 20.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3279,6 +3402,30 @@ static void claudeTraceGridFinishEmitters()
 	// samples a different set of emitters than the transport sees while
 	// every picture stays plausible. Both sides now ask
 	// g_claude_matpal, which is the texture the shader samples.
+	//
+	// THE FACE MASK'S JUSTIFICATION CHANGED ON 2026-08-18 AND ITS
+	// BEHAVIOUR DID NOT, which is worth more words than a change would
+	// have been. A face whose neighbour is non-air is dropped from the
+	// mask. Until today the reason was "in rung 1 every non-air class is
+	// opaque, so that is a face no ray can reach". Transparency makes that
+	// sentence FALSE: an emissive face behind glass is reachable.
+	//
+	// The conclusion survives for a different and stronger reason. A ray
+	// can only reach that face by crossing the glass, and a refractive
+	// interface is a SPECULAR vertex — the path loop takes no light sample
+	// there and disarms MIS, so the emitter it lands on afterwards is
+	// added at weight 1. So the light sampler's density for that face is
+	// zero and the BSDF technique's weight for it is one, on BOTH sides of
+	// the balance heuristic, which is precisely the agreement §6 requires.
+	// Keeping the face would have been legal too and strictly worse: NEE
+	// would aim at it, the shadow ray would be stopped by the glass, and
+	// the sample would return zero while inflating k for every face that
+	// works.
+	//
+	// This is the landmine the transparency handoff named, and the answer
+	// to it is "nothing changes here, and here is why" rather than a patch.
+	// The check that it holds is the 1a Cornell ratio referee (--ratio),
+	// which is what a disagreeing pdf shows up in.
 	{
 		const u8 *occ = V.occ.data();
 		std::vector<std::array<float, 4>> areas;
@@ -3292,10 +3439,13 @@ static void claudeTraceGridFinishEmitters()
 			size_t j = (((size_t)az * S + ay) * S + ax) * 4 + 3;
 			return occ[j] == 0;
 		};
+		int ntrans = 0;
 		for (s16 z = 0; z < S; z++)
 		for (s16 y = 0; y < S; y++)
 		for (s16 x = 0; x < S; x++) {
 			u8 cls = occ[((((size_t)z * S + y) * S + x)) * 4 + 3];
+			if (claudeMatTransmissive(cls))
+				ntrans++;
 			if (!claudeMatAreaSamplable(cls))
 				continue;
 			int mask = 0;
@@ -3322,6 +3472,7 @@ static void claudeTraceGridFinishEmitters()
 					};
 					return d2(a) < d2(b);
 				});
+		V.transmissive_total = ntrans;
 		V.area_total = (int)areas.size();
 		V.area_count = (int)std::min<size_t>(areas.size(),
 				ClaudeTraceGrid::AREA_CAP);
@@ -3516,7 +3667,7 @@ static void claudeMatPalUpload()
 		pal[i * 4 + 0] = g_claude_matpal[i].emit;
 		pal[i * 4 + 1] = g_claude_matpal[i].fine;
 		pal[i * 4 + 2] = g_claude_matpal[i].transmit;
-		pal[i * 4 + 3] = g_claude_matpal[i].reserved;
+		pal[i * 4 + 3] = g_claude_matpal[i].ior;
 	}
 	bool fresh = !V.matpal_tex;
 	if (fresh)
@@ -3949,6 +4100,7 @@ static void claudeTraceGridSnapshot(Client *client)
 			<< origin.Y << "," << origin.Z << ") solid=" << solid << "/"
 			<< (S * S * S) << " area_emitters="
 			<< V.area_count << "/" << V.area_total
+			<< " transmissive=" << V.transmissive_total
 			// palette caps at 254 and never evicts: past the cap new
 			// materials render UNTEXTURED and nothing said so until now
 			// (spec/measured.md "Owed to the harness")
@@ -4083,6 +4235,7 @@ static bool claudeTraceGridIncremental(Client *client)
 			<< cz0 << ")+(" << (cx1 - cx0) << "," << (cy1 - cy0) << ","
 			<< (cz1 - cz0) << ") solid=" << solid
 			<< " area_emitters=" << V.area_count << "/" << V.area_total
+				<< " transmissive=" << V.transmissive_total
 			<< " [walk=" << walk_us << "us bake=" << bake_us
 			<< "us gl=" << gl_us << "us emit=" << emit_us
 			<< "us total=" << (porting::getTimeUs() - tu0) << "us]"
@@ -4257,6 +4410,11 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// emitters NEE can aim at, and how many exist
 			<< ", \"area_emitters\": " << g_claude_grid.area_count
 			<< ", \"area_total\": " << g_claude_grid.area_total
+			// Transmissive cells in the bubble (2026-08-18). A
+			// transparency measurement taken in a room this reads 0 for is
+			// a measurement of nothing; the probes assert it.
+			<< ", \"grid_transmissive\": "
+					<< g_claude_grid.transmissive_total
 			<< ", \"accum_alpha\": " << g_claude_grid.accum_alpha
 			<< ", \"light_body\": " << g_claude_grid.light_body
 			<< ", \"light_y\": " << g_claude_grid.prev_light_dir.Y

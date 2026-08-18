@@ -128,9 +128,13 @@ void main(void)
 	// values, so linear — ACES would bend the ramp and squash the top of
 	// it into indistinguishable near-whites, and the ramp is there to be
 	// read as brightness.
+	// 20 is THE INTERFACE LADDER (claude_trace, 2026-08-18): Fresnel
+	// reflectance and sin(theta_t) drawn as brightness against incidence
+	// angle. The values are the message and a referee inverts them
+	// directly, so ACES must not touch them.
 	if ((claudeView > 0.5 && claudeView < 5.5)
 			|| (claudeView > 6.5 && claudeView < 8.5)
-			|| (claudeView > 18.5 && claudeView < 19.5)) {
+			|| (claudeView > 18.5 && claudeView < 20.5)) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}

@@ -161,6 +161,154 @@ function OPS.skypad(p)
     return { ok = true, fence = fence, half = half, fdist = fdist }
 end
 
+-- =====================================================================
+-- TRANSPARENCY REFEREE ROOMS (roadmap coverage 4, 2026-08-18)
+-- =====================================================================
+--
+-- WHAT THEY ARE FOR, before any coordinate. Until today every non-air
+-- cell in this renderer was opaque: glass was a solid block and a lit
+-- room seen through a window was black. These two rooms are the pair of
+-- measurements that say whether that stopped being true and whether it
+-- stopped being true WITHOUT inventing or losing light.
+--
+-- cave-glass IS NOT ONE OF THEM AND MUST NOT BECOME ONE. Despite its
+-- name it is plugged with the WALL node, deliberately -- it is the
+-- sealed control that caught the origin-cell leak, and it is the only
+-- bit-exactly black instrument in this harness. These rooms are built
+-- BESIDE it (in fact 85 nodes north of everything), not out of it.
+--
+-- WHY SO FAR NORTH. The trace grid is 128^3 centred on the camera, so a
+-- room within 64 nodes of a CI vantage is inside that capture's bubble.
+-- These rooms contain emissive walls, and an emissive cell inside the
+-- bubble joins the area-emitter list the estimator samples from -- a
+-- cap-16 list sorted by distance, so a new lit room could silently
+-- displace a referee room's own lights. z >= 170 clears every vantage on
+-- the z axis alone (the northernmost is the sky pad at z = 104).
+
+-- A LIT CHAMBER AND A DARK ONE, SHARING ONE WALL -- the "does light get
+-- through" measurement, and the whole point is that it is a DIFFERENCE.
+--
+-- Chamber A (west) has furnace-050 walls: uniform rho = 0.50, uniformly
+-- emissive, so its interior radiance is the analytic Le/(1-rho). Chamber
+-- B (east) has the same walls UNLIT, so with an opaque partition it is
+-- honestly black -- and every photon it ever sees had to cross the
+-- partition. The partition is the variable and nothing else is: same
+-- geometry, same albedo, same vantage, one node changed.
+--
+--   p.pane = "glass" | "water" | "opaque" | "air"
+--
+-- "opaque" is the before-half of the A/B and "air" opens the two
+-- chambers into one room, which is the control that says the lit side is
+-- lit at all. Walk-in doors on the z = o.z wall for both chambers, in
+-- the gallery's own idiom; plug them with OPS.door before measuring.
+--
+-- in: { pos={x,y,z}, s=5, pane="glass" }
+function OPS.glasspair(p)
+    local o = p.pos
+    local s = p.s or 5              -- interior edge of each chamber
+    local lit = "claude_bridge:gray186_lit"
+    local dark = "claude_bridge:gray186"
+    local panes = {
+        glass = { "mcl_core:glass", "default:glass" },
+        water = { "mcl_core:water_source", "default:water_source" },
+        opaque = { dark },
+        air = { "air" },
+    }
+    local want = panes[p.pane or "glass"]
+    local pane = nil
+    for _, n in ipairs(want) do
+        if n == "air" or core.registered_nodes[n] then pane = n break end
+    end
+    if not pane then return { error = "no node for pane " .. tostring(p.pane),
+                              tried = want } end
+    -- exterior: wall + s + partition + s + wall on x; wall + s + wall on
+    -- y and z
+    local ex = 2 * s + 2
+    local ey, ez = s + 1, s + 1
+    box({ x = o.x, y = o.y, z = o.z },
+        { x = o.x + ex, y = o.y + ey, z = o.z + ez }, dark)
+    -- chamber A is a FURNACE: every face of it emissive, including the
+    -- partition's own A-side is NOT (the partition is the variable)
+    box({ x = o.x, y = o.y, z = o.z },
+        { x = o.x + s + 1, y = o.y + ey, z = o.z + ez }, lit)
+    box({ x = o.x + 1, y = o.y + 1, z = o.z + 1 },
+        { x = o.x + s, y = o.y + s, z = o.z + s }, "air")
+    box({ x = o.x + s + 2, y = o.y + 1, z = o.z + 1 },
+        { x = o.x + ex - 1, y = o.y + s, z = o.z + s }, "air")
+    -- THE PARTITION, one node thick, spanning the full interior cross
+    -- section. Every path from A to B crosses exactly one of these cells.
+    local px = o.x + s + 1
+    box({ x = px, y = o.y + 1, z = o.z + 1 },
+        { x = px, y = o.y + s, z = o.z + s }, pane)
+    -- walk-in doors, one per chamber, on the south wall
+    local dax = o.x + 1 + math.floor((s - 1) / 2)
+    local dbx = o.x + s + 2 + math.floor((s - 1) / 2)
+    box({ x = dax, y = o.y + 1, z = o.z }, { x = dax, y = o.y + 2, z = o.z },
+        "air")
+    box({ x = dbx, y = o.y + 1, z = o.z }, { x = dbx, y = o.y + 2, z = o.z },
+        "air")
+    return { pane = pane, partition_x = px,
+             door_a = { x = dax, y = o.y + 1, z = o.z },
+             door_b = { x = dbx, y = o.y + 1, z = o.z } }
+end
+
+-- A FURNACE WITH A LOSSLESS SLAB THROUGH THE MIDDLE OF IT -- the energy
+-- measurement, and it is the sharpest one available because it needs no
+-- new referee at all.
+--
+-- A sealed uniform-albedo uniformly-emissive box reads L = Le/(1-rho)
+-- everywhere inside, and claude_furnace_check.py already scores that to
+-- 0.3 %. Drop a LOSSLESS dielectric into it -- one that reflects R and
+-- transmits 1-R and absorbs nothing -- and the equilibrium cannot move:
+-- the slab neither adds energy nor removes it. So the pane material is
+-- the only variable and the analytic answer is "no change", which is a
+-- number this harness has been checking since August.
+--
+-- That is the honest form of the handoff's "furnace variant with a
+-- transmissive SHELL". A transmissive shell would let the light out and
+-- the room would stop being a furnace; a transmissive PARTITION leaves
+-- it a furnace and puts the interface on every path.
+--
+-- The three arms:
+--   air     the plain furnace-050, which must reproduce its own pin
+--   opaque  the wall node -- two furnaces back to back, same answer
+--   glass   the same room with a dielectric across it
+--
+-- in: { pos={x,y,z}, size=5, pane="glass" }
+function OPS.glassfurnace(p)
+    local o, s = p.pos, p.size or 5
+    local wall = "claude_bridge:gray186_lit"
+    local panes = {
+        glass = { "mcl_core:glass", "default:glass" },
+        water = { "mcl_core:water_source", "default:water_source" },
+        opaque = { wall },
+        air = { "air" },
+    }
+    local want = panes[p.pane or "glass"]
+    local pane = nil
+    for _, n in ipairs(want) do
+        if n == "air" or core.registered_nodes[n] then pane = n break end
+    end
+    if not pane then return { error = "no node for pane " .. tostring(p.pane),
+                              tried = want } end
+    local e = s + 1
+    box({ x = o.x, y = o.y, z = o.z },
+        { x = o.x + e, y = o.y + e, z = o.z + e }, wall)
+    box({ x = o.x + 1, y = o.y + 1, z = o.z + 1 },
+        { x = o.x + s, y = o.y + s, z = o.z + s }, "air")
+    -- the slab: one node thick, across the whole interior, at the
+    -- half-depth plane so a camera at the south end looks THROUGH it at
+    -- the north wall
+    local pz = o.z + 1 + math.floor((s - 1) / 2)
+    box({ x = o.x + 1, y = o.y + 1, z = pz },
+        { x = o.x + s, y = o.y + s, z = pz }, pane)
+    local dx = o.x + 1 + math.floor((s - 1) / 2)
+    box({ x = dx, y = o.y + 1, z = o.z },
+        { x = dx, y = o.y + 2, z = o.z }, "air")
+    return { door = { x = dx, y = o.y + 1, z = o.z }, wall = wall,
+             pane = pane, slab_z = pz }
+end
+
 -- The connecting hall (phase 1 item 4). Rooms sit in a row along the
 -- z=0 line with their doors facing SOUTH; the hall runs east-west to
 -- the south of them across a 3m daylight gap, and each room connects

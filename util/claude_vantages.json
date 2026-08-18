@@ -206,6 +206,51 @@
 		"time" : 0.5,
 		"yaw" : 270
 	},
+	"glass-dark" : 
+	{
+		"ci" : false,
+		"notes" : "roadmap coverage 4 (transparency), 2026-08-18. The DARK half of OPS.glasspair at (0,8,170): unlit rho=0.50 walls sharing one 1-node partition with a furnace-050-walled chamber to the west. Looking -x at that partition from ~3.5 nodes. With an opaque partition this room is EXACTLY black, so the pane material is the only variable and the before-half of the A/B needs no tolerance. NOT a CI arm -- util/claude_glass_probe.py shoots it. Doors plugged before capture (A 3,9,170 with the lit wall; B 9,9,170 with the dark one).",
+		"pitch" : 0,
+		"pos" : 
+		[
+			10,
+			9,
+			173
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 90
+	},
+	"glass-lit" : 
+	{
+		"ci" : false,
+		"notes" : "roadmap coverage 4, 2026-08-18. The LIT half of OPS.glasspair: furnace-050 walls, so its interior radiance is the analytic Le/(1-rho) and it is the reference the dark half's reading is quoted against. Looking +x at the partition.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			2,
+			9,
+			173
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 270
+	},
+	"glassfurnace" : 
+	{
+		"ci" : false,
+		"notes" : "roadmap coverage 4, 2026-08-18. OPS.glassfurnace at (100,8,170): furnace-050 exactly, plus a one-node slab across the whole interior at z=173. A LOSSLESS dielectric cannot move a sealed furnace's equilibrium, so claude_furnace_check.py must read the same ratio with the slab as air, as the wall node and as glass -- the energy gate for the Fresnel split, and it needs no new referee. Door plugged before capture (103,9,170).",
+		"pitch" : 0,
+		"pos" : 
+		[
+			103,
+			9,
+			171
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
 	"leak-sliver" : 
 	{
 		"ci" : true,

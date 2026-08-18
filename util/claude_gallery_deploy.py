@@ -28,8 +28,13 @@ WALK = FLOOR + 1
 # Widened 2026-08-15 (roadmap 1b) to cover the sky/sun/glass referee
 # cluster (cave pair + sky-furnace pad), which sits >=70 nodes north of
 # the cabin/Cornell line on purpose — see claude_ci.py ROOM_BOXES.
+# Widened again 2026-08-18 (roadmap coverage 4) for the transparency
+# referee pair, which sits at z >= 170 -- far enough north that its
+# emissive walls are outside the 128^3 trace bubble of every CI vantage,
+# so a new lit room cannot displace a referee room's own lights in the
+# cap-16 area-emitter list.
 CLEAR = dict(p1={"x": -56, "y": WALK, "z": -40},
-             p2={"x": 80, "y": 30, "z": 128})
+             p2={"x": 112, "y": 30, "z": 182})
 
 
 def emerge(p1, p2):
@@ -58,6 +63,7 @@ def main():
     # looks exactly like a successful build.
     print("emerging build region...")
     emerge({"x": -60, "y": 0, "z": -44}, {"x": 84, "y": 40, "z": 132})
+    emerge({"x": -4, "y": 0, "z": 164}, {"x": 116, "y": 40, "z": 184})
 
     if args.emerge_only:
         print("\n--emerge-only: chunks loaded, stopping (no clear, no rebuild)")
@@ -110,6 +116,19 @@ def main():
     print("sky-furnace-050 pad @ (60,%d,110)..." % FLOOR)
     print("  ", rpc("skypad", center={"x": 60, "y": FLOOR, "z": 110},
                     half=12, fence=13))
+
+    # Transparency referee pair (roadmap coverage 4, 2026-08-18). Built
+    # with an OPAQUE partition, which is what the world holds between
+    # measurements: util/claude_glass_probe.py swaps the pane per arm and
+    # puts it back. So the standing world is the BEFORE half of the A/B,
+    # and a probe that dies half way leaves a sealed, honest room rather
+    # than a half-glazed one.
+    print("glasspair @ (0,%d,170), partition opaque..." % FLOOR)
+    print("  ", rpc("glasspair", pos={"x": 0, "y": FLOOR, "z": 170},
+                    s=5, pane="opaque"))
+    print("glassfurnace @ (100,%d,170), slab opaque..." % FLOOR)
+    print("  ", rpc("glassfurnace", pos={"x": 100, "y": FLOOR, "z": 170},
+                    size=5, pane="opaque"))
 
     print("\ndone. vantages: util/claude_vantages.json")
 
