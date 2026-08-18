@@ -130,17 +130,6 @@ def main():
     print("  ", rpc("glassfurnace", pos={"x": 100, "y": FLOOR, "z": 170},
                     size=5, pane="opaque"))
 
-    # LET THE WORLD GO QUIET BEFORE ANYONE MEASURES IN IT. A deploy is
-    # tens of thousands of set_node calls plus two emerges, and the server
-    # is still activating and saving mapblocks for a beat afterwards.
-    # MEASURED 2026-08-18: with a deploy, exterior-ci's aim assertion goes
-    # RED because the player has not finished FALLING the half node onto
-    # the terrain by the time the shutter fires -- it rests at exactly the
-    # golden's y afterwards, so the room and the camera are right and only
-    # the timing is not. The same arm shot three times in isolation, and a
-    # whole --all run with --skip-deploy, are green.
-    time.sleep(6.0)
-
     print("\ndone. vantages: util/claude_vantages.json")
 
 

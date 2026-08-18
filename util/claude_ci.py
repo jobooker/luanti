@@ -1422,6 +1422,63 @@ def read_aim():
         return {"error": str(e)}
 
 
+# A TELEPORT IS A FALL, AND THE SHUTTER MUST NOT FIRE DURING ONE.
+#
+# Every vantage but one stores an INTEGER y and relies on the player
+# FALLING the half node onto the floor -- environment-laws records that
+# as the reason `cornell`'s camera is at 8.5 and not 9. The fall is
+# normally over in a tick, and for months nothing had to wait for it.
+#
+# MEASURED 2026-08-18: with a gallery deploy in front of the run, it is
+# NOT over in a tick. `exterior-ci` captured at y = 9.00 against its
+# golden's 8.50, three runs out of four, while the aim read taken
+# afterwards showed 8.50 -- so the room was right, the camera was right,
+# and the shutter had fired mid-fall. The same arm shot three times in
+# isolation is fine, and a whole --all with --skip-deploy is GREEN; only
+# a run with a deploy in front of it fails, and only sometimes. A deploy
+# is tens of thousands of set_node calls and two emerges, and the server
+# is still activating and saving mapblocks for a beat afterwards.
+#
+# THE FIRST FIX WAS A SLEEP AND IT DID NOT HOLD -- six seconds of quiet
+# at the end of the deploy went GREEN once and RED on the next run. A
+# sleep is a guess about how busy the server was; "has the player stopped
+# moving" is a fact the harness can read, and reading it terminates where
+# a guess loops (the two-miss rule, global CLAUDE.md).
+#
+# So: poll until two consecutive reads agree, then go. It ASSERTS
+# NOTHING and WIDENS NOTHING -- every existing aim check still fires on
+# exactly the numbers it fired on before, and on a timeout this returns
+# what it saw rather than raising, so a genuinely unstable seat still
+# reaches those checks and fails there rather than being hidden here.
+REST_EPS = 0.001        # nodes; a resting player reads bit-identical
+REST_TIMEOUT = 12.0     # s
+REST_POLL = 0.25        # s
+
+
+def await_rest():
+    """{"resting": bool, "waited_s": float, "reads": [...]} once the
+    player's position stops changing between two reads."""
+    t0 = time.time()
+    reads = []
+    prev = None
+    while time.time() - t0 < REST_TIMEOUT:
+        a = read_aim()
+        p = (a or {}).get("pos")
+        if not p:
+            time.sleep(REST_POLL)
+            continue
+        cur = (p.get("x"), p.get("y"), p.get("z"))
+        reads.append(cur)
+        if prev is not None and all(abs(c - q) <= REST_EPS
+                                    for c, q in zip(cur, prev)):
+            return {"resting": True, "waited_s": round(time.time() - t0, 2),
+                    "reads": reads[-4:]}
+        prev = cur
+        time.sleep(REST_POLL)
+    return {"resting": False, "waited_s": round(time.time() - t0, 2),
+            "reads": reads[-4:]}
+
+
 def _dang(a, b):
     return abs((a - b + 180.0) % 360.0 - 180.0)
 
@@ -1627,6 +1684,10 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     tl.mark("dials_pre")
     info["reset_error"] = reset_accumulation(vantage, park)
     tl.mark("reset")
+    # THE PLAYER MUST HAVE LANDED before anything is read or settled --
+    # see await_rest() for the four runs that made this necessary.
+    info["rest"] = await_rest()
+    tl.mark("rest")
     info["aim_at_start"] = read_aim()
     tl.mark("aim_start")
     # Take one snapshot here — before the settle, since it clamps
