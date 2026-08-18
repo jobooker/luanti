@@ -309,6 +309,130 @@ function OPS.glassfurnace(p)
              pane = pane, slab_z = pz }
 end
 
+-- =====================================================================
+-- THE SEALED-PLANK REFEREE (2026-08-18)
+-- =====================================================================
+--
+-- WHAT THIS IS FOR, before any coordinate. On 2026-08-17 the cabin walls
+-- were found leaking light through pinholes: the baked 16^3 masks of the
+-- plank models carve grooves into every face, the grooves of one block
+-- line up with the grooves of the next, and a ray that is not axis
+-- aligned walks through a wall that is one node thick. Fixed by
+-- b945042ee. NOTHING IN CI WOULD HAVE CAUGHT IT AND NOTHING WOULD CATCH
+-- IT COMING BACK -- cave-glass is the only sealed arm and it is built
+-- from a PLAIN wall node, so it contains no carved relief at all.
+--
+-- John asked for this room in these words: "a fully enclosed house, with
+-- a wall of emissive blocks surrounding it entirely would be good. the
+-- room should be completely dark, any holes would bleed through."
+--
+--   emissive shell   1 node   the brightest emitter this world has
+--   air gap          1 node   REQUIRED -- see below
+--   PLANK shell      1 node   the material that leaked
+--   interior         5x4x5    air, and NO light source of any kind
+--
+-- Any non-black pixel in the interior is a leak. No tolerance, no
+-- golden, no region boxes: black is the analytic answer.
+--
+-- EVERY NUMBER ABOVE HAS A REASON AND TWO OF THEM ARE SILENTLY FATAL:
+--
+--  * WALL THICKNESS EXACTLY 1. The defect is grooves in one block
+--    meeting grooves in the next ACROSS a single-block wall. A two-node
+--    wall masks it completely -- the second node's core is solid where
+--    the first node's groove is open. So the builder probes the finished
+--    room along all three axes and hands the names back; the deploy
+--    asserts the pattern rather than trusting this code.
+--  * THE MATERIAL MUST BE A BAKED MODEL WITH RELIEF. Measured on the
+--    shipped masks 2026-08-17: oak leaks 19 rays in 300,000, spruce 5.
+--    Oak is the primary for that reason. A plain full-cube node here
+--    would test nothing at all.
+--  * THE 1-NODE AIR GAP, and the reason is not intuition. The area
+--    emitter face mask DROPS ANY FACE WHOSE NEIGHBOUR IS NON-AIR
+--    (game.cpp, struct ClaudeTraceGrid ~100: "in rung 1 every non-air
+--    class is opaque, so that is a face no ray can reach"). Emitters
+--    flush against the plank shell would have their inward faces dropped
+--    from the NEE light list, so claude_nee = 1 would sample nothing
+--    there. One node of air keeps every inward face in the list.
+--  * GAP OF ONE, NOT MORE. Irradiance falls with distance, so the
+--    closest legal gap is the brightest and the most sensitive.
+--  * NO EMITTER INSIDE. That is the whole point -- the correct answer is
+--    zero, so the measurement needs no reference image.
+--
+-- NO DOOR, DELIBERATELY. Every other referee room has a walk-in doorway
+-- that OPS.door plugs before a capture. A doorway here would have to
+-- pierce three shells and would be a standing hole in the one room whose
+-- entire claim is that it has none. The room is reached with /warp
+-- (sealed-plank-east and its five siblings) -- the "second way into
+-- every room" the gallery already provides.
+--
+-- WHY SO FAR NORTH (z >= 250 in the deploy). The trace grid is 128^3
+-- centred on the camera, and this room's shell is 562 emissive cells. A
+-- room within 64 nodes of a CI vantage would put those cells inside that
+-- capture's bubble, where they join the cap-16 area-emitter list sorted
+-- by distance and can displace a referee room's own lights. Same reason
+-- the transparency pair sits at z >= 170, and this sits north of that.
+--
+-- in: { pos={x,y,z}, sx=5, sy=4, sz=5, wood="oak"|"spruce" }
+-- pos is the exterior SW floor corner of the EMISSIVE shell.
+function OPS.sealedbox(p)
+    local o = p.pos
+    local sx, sy, sz = p.sx or 5, p.sy or 4, p.sz or 5
+    local emit = "claude_bridge:white_lit"   -- white255 @ light_source 14
+    local woods = {
+        oak = { "mcl_trees:wood_oak", "mcl_core:wood", "default:wood" },
+        spruce = { "mcl_trees:wood_spruce", "mcl_core:sprucewood",
+                   "default:pine_wood" },
+    }
+    local want = woods[p.wood or "oak"]
+    local plank = nil
+    for _, n in ipairs(want) do
+        if core.registered_nodes[n] then plank = n break end
+    end
+    if not plank then
+        return { error = "no plank node for wood " .. tostring(p.wood),
+                 tried = want }
+    end
+    -- outer extent = interior + 2 planks + 2 air + 2 emitters
+    local ex, ey, ez = sx + 5, sy + 5, sz + 5
+    local function shell(inset, name)
+        box({ x = o.x + inset, y = o.y + inset, z = o.z + inset },
+            { x = o.x + ex - inset, y = o.y + ey - inset,
+              z = o.z + ez - inset }, name)
+    end
+    shell(0, emit)     -- emissive shell, 1 thick
+    shell(1, "air")    -- the gap, 1 thick
+    shell(2, plank)    -- the plank shell, 1 thick
+    shell(3, "air")    -- the interior, lightless
+
+    -- THE ROOM IS PROBED, NOT ASSUMED. Read the finished world back
+    -- along the three centre lines and hand the names to the caller, so
+    -- "the plank wall is exactly one node thick" is a fact about the map
+    -- rather than a claim about this function. The expected pattern on
+    -- every axis is emit, air, plank, air*, plank, air, emit.
+    local mid = { x = o.x + 3 + math.floor((sx - 1) / 2),
+                  y = o.y + 3 + math.floor((sy - 1) / 2),
+                  z = o.z + 3 + math.floor((sz - 1) / 2) }
+    local probe = {}
+    local function line(axis, n)
+        local names = {}
+        for i = 0, n do
+            local q = { x = mid.x, y = mid.y, z = mid.z }
+            q[axis] = o[axis] + i
+            names[#names + 1] = (core.get_node_or_nil(q) or {}).name
+                    or "unloaded"
+        end
+        probe[axis] = names
+    end
+    line("x", ex)
+    line("y", ey)
+    line("z", ez)
+    return { plank = plank, emit = emit, probe = probe,
+             interior = { sx = sx, sy = sy, sz = sz },
+             p1 = { x = o.x, y = o.y, z = o.z },
+             p2 = { x = o.x + ex, y = o.y + ey, z = o.z + ez },
+             stand = { x = mid.x, y = o.y + 3, z = mid.z } }
+end
+
 -- The connecting hall (phase 1 item 4). Rooms sit in a row along the
 -- z=0 line with their doors facing SOUTH; the hall runs east-west to
 -- the south of them across a 3m daylight gap, and each room connects

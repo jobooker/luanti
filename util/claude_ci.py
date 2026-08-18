@@ -434,6 +434,15 @@ CI_TAG = "ci"              # the key that marks a vantage as part of this set
 # one).
 SKY_UNIFORM_L = 1.0
 
+# THE DEPTH A RARE-EVENT GATE RUNS AT, and it is not SETTLE_FRAMES.
+# environment-laws: on the SAME broken build the origin-cell leak read 0
+# leaked pixels at a 500-frame settle and 144 at 2000, because the defect
+# is a per-ray event of rate ~1e-06 and a shallow average had simply not
+# sampled it yet. A shallow run can therefore certify a rare defect
+# ABSENT. Any arm whose whole claim is "this never happens" runs deep and
+# reports the depth it ran at.
+SEALED_SETTLE = 2000
+
 CI_SHOTS = [
     {"name": "furnace-050", "vantage": "furnace-050",
      "referee": ("furnace", "050")},
@@ -481,6 +490,46 @@ CI_SHOTS = [
     # honestly black until 2b lights it through the windows.
     {"name": "cozy-day-dark-ci", "vantage": "cozy-day-ci", "referee": None,
      "lamps_off": True},
+
+    # --- THE SEALED-PLANK REFEREE (2026-08-18, John's request) ---------
+    # "a fully enclosed house, with a wall of emissive blocks surrounding
+    # it entirely would be good. the room should be completely dark, any
+    # holes would bleed through."
+    #
+    # WHAT IT PROVES. An oak-plank box ONE NODE THICK, inside a one-node
+    # air gap, inside a shell of emitters, with nothing lighting the
+    # interior: any non-black pixel is light that came THROUGH a wall.
+    # The defect it was built for lived in the carved relief of the baked
+    # 16^3 models -- grooves in one block meeting grooves in the next, 19
+    # rays in 300,000 for oak -- fixed by b945042ee, and NOTHING IN CI
+    # WOULD HAVE CAUGHT IT OR WOULD CATCH IT COMING BACK. cave-glass is
+    # the only other sealed arm and it is built from a PLAIN wall node,
+    # which carries no relief at all.
+    #
+    # PROVEN BY THE HISTORICAL DEFECT, which is the only reason to
+    # believe it: with util/claude_models.py and the masks it bakes
+    # checked out at 66c673684 (the state immediately before the fix)
+    # these arms go RED, and on HEAD they read 0. Both numbers are in
+    # luanti-docs spec/measured.md, "The sealed-plank referee". A referee
+    # that has never failed is not known to work (physics-contract §8
+    # clause 3, and claude_ci calibrate exists for the same reason).
+    #
+    # SIX AIMS AND NOT ONE. John's own observation of the original defect
+    # was that it "seems to occur only when looking east" -- a leak is a
+    # particular ray through a particular groove pair, so a referee that
+    # looks one way is a referee that can be walked around. Six arms off
+    # one standing position: +Z, -Z, +X, -X, up, down.
+    #
+    # AND AT FULL SETTLE DEPTH, which is not a detail. Measured
+    # 2026-08-17 on the same broken build, the origin-cell leak read 0
+    # pixels at a 500-frame settle and 144 at 2000 (environment-laws,
+    # "SETTLE DEPTH CHANGES WHETHER A RARE DEFECT EXISTS AT ALL"): a
+    # shallow run can certify a rare defect ABSENT. So these arms carry
+    # their own settle instead of taking the run's.
+] + [
+    {"name": "sealed-plank-" + aim, "vantage": "sealed-plank-" + aim,
+     "referee": ("sealed", None), "settle": SEALED_SETTLE}
+    for aim in ("north", "south", "east", "west", "up", "down")
 ]
 # The golden image every Cornell region ratio is measured against: the
 # PHOTO arm of the pinned golden run.
@@ -573,6 +622,13 @@ ROOM_BOXES = {
     # their emissive walls cannot join a referee room's area-emitter list.
     "glasspair": ((0, 8, 170), (12, 14, 176)),
     "glassfurnace": ((100, 8, 170), (106, 14, 176)),
+    # THE SEALED-PLANK REFEREE (2026-08-18). The box is the WHOLE room,
+    # all three shells and the interior: 11 x 10 x 11 = 1,331 cells,
+    # inside OPS.scan's 20,000 cap. It has no door, so nothing about this
+    # hash depends on set_doors -- a change in it is a dug node or a
+    # re-bake and nothing else. z = 250 keeps its 562 emissive cells out
+    # of the 128^3 bubble of every other vantage.
+    "sealed-plank": ((0, 8, 250), (10, 17, 260)),
     # exterior-ci is "no build" (the handoff's own words) — there is no
     # structure to protect, so this is a small box around the stand
     # point rather than a meaningful integrity claim. It still gets a
@@ -593,6 +649,11 @@ VANTAGE_ROOM = {
     "exterior-ci": "exterior-ci",
     "glass-dark": "glasspair", "glass-lit": "glasspair",
     "glassfurnace": "glassfurnace",
+    # six aims, one room, one standing position
+    "sealed-plank-north": "sealed-plank", "sealed-plank-south": "sealed-plank",
+    "sealed-plank-east": "sealed-plank", "sealed-plank-west": "sealed-plank",
+    "sealed-plank-up": "sealed-plank", "sealed-plank-down": "sealed-plank",
+    "sealed-plank-outside": "sealed-plank",
 }
 
 
@@ -980,6 +1041,10 @@ EXPECTED_DEPLOY_HASH = {
     # photographable at all (every other stair in this world is roof).
     "cozy": "9e352f88",
     "exterior-ci": "cc32604a",
+    # sealed-plank (2026-08-18). Measured on the deploy that built it;
+    # it has no door, so unlike the others this value is the same before
+    # and after set_doors and any change in it is real damage.
+    "sealed-plank": "e3820c10",
 }
 
 
@@ -989,7 +1054,13 @@ def check_deploy_hashes():
     bad = {}
     for room, want in EXPECTED_DEPLOY_HASH.items():
         got, err = room_hash(room)
-        if got != want:
+        if want is None:
+            # A pin that has not been derived yet is NOT a pass. Same
+            # shape as skyfurnace_verdict's un-derived pin: say the
+            # measured value out loud so the next edit can paste it in,
+            # and go red until someone does.
+            bad[room] = (got, "no pin derived yet — measured %s" % got, err)
+        elif got != want:
             bad[room] = (got, want, err)
     return bad
 
@@ -1519,7 +1590,7 @@ def aim_ok(start, now, vantage):
 # is comfortably below every measured sealed room and comfortably above
 # what a genuinely broken/near-empty bubble would read.
 SEALED_ROOMS = {"furnace-050", "furnace-073", "cornell", "cozy",
-                 "cave-skylight", "cave-glass"}
+                 "cave-skylight", "cave-glass", "sealed-plank"}
 VOLUME_SOLID_FLOOR_SEALED = 100000
 
 
@@ -1841,6 +1912,8 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
         out.update(parse_furnace(text))
     elif kind == "skyfurnace":
         out.update(parse_skyfurnace(text))
+    elif kind == "sealed":
+        out.update(parse_sealed(text))
     else:
         out.update(parse_cornell(text))
     return out
@@ -1871,6 +1944,22 @@ def parse_skyfurnace(t):
     m = re.search(r"clipped\s+([-\d.]+)%", t)
     if m:
         out["clipped_pct"] = float(m.group(1))
+    return out
+
+
+def parse_sealed(t):
+    """Headline: how many pixels of a room with no light in it are not
+    black. The correct answer is 0 and there is no tolerance to parse."""
+    out = {}
+    m = re.search(r"^verdict input: LEAKED (\d+)", t, re.M)
+    if m:
+        out["leaked_px"] = int(m.group(1))
+    m = re.search(r"max byte (\d+)", t)
+    if m:
+        out["max_byte"] = int(m.group(1))
+    m = re.search(r"nonzero pixels: \d+ of (\d+)", t)
+    if m:
+        out["total_px"] = int(m.group(1))
     return out
 
 
@@ -1964,6 +2053,27 @@ def cornell_verdict(ref):
         worst_name, worst, CORNELL_RATIO_TOL)
 
 
+def sealed_verdict(ref):
+    """PASS iff the sealed room's frame contains ZERO non-black pixels.
+
+    The only referee here with no tolerance in it, because it needs none:
+    nothing lights that room's interior, so black is the analytic answer
+    and one lit pixel is one ray that crossed a solid wall. Deliberately
+    NOT a mean and NOT an RMS -- cave-glass leaked 444 pixels on
+    2026-08-17 while its region means read 0.000000 and its RMS sat
+    inside furnace-050's noise floor, and the accumulator makes a rare
+    event dimmer the longer the camera stands still.
+    """
+    if not ref or ref.get("returncode") != 0:
+        return "-", "referee could not speak"
+    n = ref.get("leaked_px")
+    if n is None:
+        return "-", "unparsed"
+    return ("PASS" if n == 0 else "FAIL"), (
+        "%d non-black pixel(s) of %s, max byte %s (must be 0 — the room "
+        "has no light in it)" % (n, ref.get("total_px"), ref.get("max_byte")))
+
+
 def verdict(shot_def, ref):
     """(mark, key number). '-' whenever the referee could not speak, and
     '-' counts as RED: a referee that cannot speak is not a pass."""
@@ -1976,6 +2086,8 @@ def verdict(shot_def, ref):
         return furnace_verdict(ref, arg)
     if kind == "skyfurnace":
         return skyfurnace_verdict(ref, arg)
+    if kind == "sealed":
+        return sealed_verdict(ref)
     return cornell_verdict(ref)
 
 
@@ -2519,8 +2631,17 @@ def cmd_run(args):
                        p2=dict(zip("xyz", p2)), state="off")
             try:
                 try:
+                    # A PER-ARM SETTLE, and only where the arm's claim
+                    # needs one. environment-laws: the same broken build
+                    # read 0 leaked pixels at 500 frames and 144 at
+                    # 2000, so an arm hunting a rare event must not
+                    # inherit the run's shallow default -- a shallow run
+                    # can certify a rare defect ABSENT. Every other arm
+                    # still takes args.settle exactly as before.
                     png, cap = capture(shot_def, vs[vname], park_for(vname, vs),
-                                       dials, rundir, args.settle, vname)
+                                       dials, rundir,
+                                       shot_def.get("settle", args.settle),
+                                       vname)
                 except Exception as ex:
                     # One dead vantage must not cost the other four.
                     run["shots"][name] = {"error": str(ex)}
@@ -2751,6 +2872,21 @@ def cmd_calibrate(args):
             for shot_def in CI_SHOTS:
                 if not shot_def["referee"] or shot_def["name"] == "cornell-nee1":
                     continue      # referee vantages only, photo arm only
+                if shot_def["referee"][0] == "sealed":
+                    # THE SEALED-PLANK ARMS ARE CALIBRATED ALREADY, AND
+                    # NOT BY A PLANTED DIAL. Their claim is "no light
+                    # crosses a solid wall", which neither planted defect
+                    # touches -- claude_bounces = 1 and claude_view = 6
+                    # both leave a lightless room lightless, so both
+                    # would be reported BLIND and this command would exit
+                    # nonzero for a referee that is working. The defect
+                    # that DOES fail them is the real historical one: the
+                    # pre-fix masks at 66c673684 put 222,876 non-black
+                    # pixels into a room that reads 0 on HEAD
+                    # (luanti-docs measured.md, "The sealed-plank
+                    # referee"). Re-run that with
+                    # util/claude_sealed_probe.py, not with this.
+                    continue
                 name = "%s_%s" % (shot_def["name"], defect["name"])
                 vname = shot_def["vantage"]
                 dials = dict(base, **shot_def.get("dials", {}))

@@ -64,6 +64,11 @@ def main():
     print("emerging build region...")
     emerge({"x": -60, "y": 0, "z": -44}, {"x": 84, "y": 40, "z": 132})
     emerge({"x": -4, "y": 0, "z": 164}, {"x": 116, "y": 40, "z": 184})
+    # the sealed-plank referee (2026-08-18). No CLEAR pass out here on
+    # purpose: the room is a closed box and nothing outside it can reach
+    # the interior, so surface vegetation is not a light-control problem
+    # the way it is around the open sky pad.
+    emerge({"x": -8, "y": 0, "z": 244}, {"x": 20, "y": 30, "z": 268})
 
     if args.emerge_only:
         print("\n--emerge-only: chunks loaded, stopping (no clear, no rebuild)")
@@ -129,6 +134,42 @@ def main():
     print("glassfurnace @ (100,%d,170), slab opaque..." % FLOOR)
     print("  ", rpc("glassfurnace", pos={"x": 100, "y": FLOOR, "z": 170},
                     size=5, pane="opaque"))
+
+    # THE SEALED-PLANK REFEREE (2026-08-18, John's request). A plank box
+    # inside a shell of emitters, one node of air between them, nothing
+    # lighting the interior. Any non-black pixel inside is a leak through
+    # the carved relief of a baked model -- the defect b945042ee fixed
+    # and that nothing in CI could see.
+    #
+    # z = 250 for the same reason the transparency pair is at 170, only
+    # more so: 562 emissive cells inside the 128^3 bubble of another
+    # vantage would join that capture's cap-16 area-emitter list. 250 is
+    # 74 clear of the northernmost thing here (glasspair, z <= 176).
+    print("sealed-plank @ (0,%d,250), oak, no door..." % FLOOR)
+    r = rpc("sealedbox", pos={"x": 0, "y": FLOOR, "z": 250},
+            sx=5, sy=4, sz=5, wood="oak")
+    print("  ", {k: v for k, v in r.items() if k != "probe"})
+    # THE WALL IS EXACTLY ONE NODE THICK, READ BACK OFF THE MAP.
+    # A two-node wall masks the defect completely (the second node's
+    # solid core covers the first node's groove), so this is the one
+    # parameter that silently destroys the test -- assert it here rather
+    # than trust the builder, and fail the deploy loudly if it moves.
+    if r.get("error"):
+        print("  !! SEALED-PLANK BUILD FAILED:", r["error"])
+        raise SystemExit(2)
+    plank, emit = r["plank"], r["emit"]
+    for axis, names in sorted(r["probe"].items()):
+        n = len(names)
+        want = ([emit, "air", plank] + ["air"] * (n - 6)
+                + [plank, "air", emit])
+        ok = names == want
+        print("  probe %s: %s%s" % (axis, "1-node wall OK" if ok else "BAD",
+                                    "" if ok else " got %s want %s"
+                                    % (names, want)))
+        if not ok:
+            raise SystemExit(
+                "SEALED-PLANK WALL IS NOT ONE NODE THICK on the %s axis "
+                "-- the room cannot see the defect it exists for" % axis)
 
     print("\ndone. vantages: util/claude_vantages.json")
 

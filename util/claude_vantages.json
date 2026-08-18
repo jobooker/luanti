@@ -280,5 +280,110 @@
 		"set" : "gallery",
 		"time" : 0.5,
 		"yaw" : 0
+	},
+	"sealed-plank-down" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming -Y (85 deg, clear of the pitch clamp). The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : -85,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"sealed-plank-east" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming +X -- the direction John saw it in. The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 270
+	},
+	"sealed-plank-north" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming +Z. The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"sealed-plank-outside" : 
+	{
+		"ci" : false,
+		"notes" : "SANITY CONTROL for the sealed-plank arms, NOT a CI arm. Stands 5 nodes south of the box on open ground looking at the emissive shell's south face. It must read BRIGHT. A black frame is a uniform frame -- claude_sliver_ab.py refuses when both frames are black and claude_sealed_probe.py refuses when this one is, because a blinded capture and a sealed room are the same picture.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			5,
+			9,
+			245
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"sealed-plank-south" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming -Z. The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 180
+	},
+	"sealed-plank-up" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming +Y (85 deg, clear of the pitch clamp). The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : 85,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"sealed-plank-west" : 
+	{
+		"ci" : true,
+		"notes" : "THE SEALED-PLANK REFEREE (2026-08-18, John's request: \"a fully enclosed house, with a wall of emissive blocks surrounding it entirely... the room should be completely dark, any holes would bleed through\"). ONE interior standing position, aiming -X. The room is an oak-plank box, wall EXACTLY 1 node thick (the carved relief that leaked, fixed by b945042ee), inside a 1-node air gap inside a shell of claude_bridge:white_lit. Nothing lights the interior, so ANY non-black pixel is a leak and the analytic answer is 0. SIX AIMS AND NOT ONE: John's own observation of the original defect was that it \"seems to occur only when looking east\" -- a leak is a particular ray through a particular groove pair, so a single fixed vantage can miss it entirely. No door to plug: the room has none, a doorway would pierce all three shells. y = 11 is the teleport aim; the body rests at 10.5 on the plank floor, the same half-node fall every gallery vantage takes.",
+		"pitch" : 0,
+		"pos" : 
+		[
+			5,
+			11,
+			255
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 90
 	}
 }
