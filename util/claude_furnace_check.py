@@ -12,7 +12,12 @@ Engine-side constants (claude_accum/opengl_fragment.glsl @ a9c07ba52,
 game.cpp claudeTraceGridSnapshot):
   albedo      rho = pow(c/255, 2.2) of the stored cell color
   warm force  emissive cells store r=255, g=max(g,200), b=max(b,120)
-  emissive class a = (170 + 5*light_source)/255; e=(a-0.65)/0.29 clamped
+  emission (2026-08-18): the cell's byte is a MATERIAL INDEX and the
+    palette's R column holds the scale; game.cpp claudeMatEmission still
+    computes it as 0.4 + 2*e with e = clamp(((170+5*light)/255 - 0.65)
+    / 0.29, 0, 1), so the numbers below are unchanged. The 0.65/0.29
+    pair are the old band packing and are kept only to hold every
+    emitter's radiance still; when they go, this referee re-pins.
   Le (as seen by light transport / photoMarch) = rho_vec * (0.4 + 2*e)
   eye-hit glow (primary ray, no transport)     = rho_vec * (0.5 + 5*e)
 The last two DIFFER (2.4x vs 5.5x at e=1) — reported alongside, since

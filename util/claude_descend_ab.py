@@ -3,7 +3,8 @@
 
 WHAT IS BEING MEASURED. Before 2026-08-16 the tracer's walk stopped at
 the 1 m wall of every cell, including the cells that carry a finer 16^3
-shape (class 250: stairs, slabs, beds, chests, the campfire). Those
+shape (a FINE material; "class 250" before 2026-08-18: stairs, slabs,
+beds, chests, the campfire). Those
 shapes were baked and uploaded and never read. `claude_descend = 1`
 makes march() step into such a cell and continue the same walk at 1/16 m
 until it hits a sub-voxel or leaves the cell; `= 0` is the old

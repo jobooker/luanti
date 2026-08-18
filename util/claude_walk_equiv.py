@@ -4,7 +4,8 @@
 
 THE WORK, plainly. Until 2026-08-17 the tracer walked the 128^3 grid at
 1 m in `march()` and, on entering a cell that carries a 16^3 mask
-(class 250, inside the ring), called `descendCell()` -- a SECOND DDA
+(a FINE material -- "class 250" before 2026-08-18 -- inside the ring),
+called `descendCell()` -- a SECOND DDA
 with its own position, its own three side-distances, its own step
 counter and its own axis, all live alongside the first one's. The cost
 instrument (spec/measured.md, "Descend cost instrument") measured what
@@ -95,6 +96,11 @@ class World:
             c = (rng.randrange(44, 84), rng.randrange(44, 84),
                  rng.randrange(44, 84))
             r = rng.random()
+            # NOTE 2026-08-18: these are the OLD class-band values. This
+            # model is self-contained -- it defines what each value means
+            # a few lines below and never reads the real palette -- so it
+            # still tests exactly what it always tested. Read them as
+            # "fine / solid / emissive / glass", not as live encodings.
             if r < 0.60:
                 cls = 250.0 / 255.0
             elif r < 0.80:
