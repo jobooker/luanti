@@ -526,9 +526,25 @@ const float DEPTH_MISS = 4096.0;
 const float DEPTH_MAX_HIT = 4090.0;
 
 // Ray restart offset off a surface, in cell units. The DDA advances
-// before it tests, so the starting cell is never re-hit; this only
-// keeps floor() on the correct side of the face.
+// before it tests, so the starting cell is never re-hit; this pushes the
+// restart clear of the face it left, along that face's own normal.
+//
+// IT IS NOT ON ITS OWN ENOUGH TO KEEP floor() HONEST, and believing it
+// was is what leaked a sealed room for as long as the walk has existed
+// (2026-08-17). An epsilon along n says nothing about the other two
+// axes, and it is the other two that go wrong. See restartPoint().
 const float SURFACE_EPS = 0.01;
+
+// The margin the restart point keeps from the walls of the cell it is
+// clamped into, as a fraction of that cell's own size — so it is the
+// same rule at 1 m and at 1/16 m, which is §2's "size is a parameter,
+// never a branch" applied to this constant too. It is not a tuned
+// tolerance: the only thing it has to beat is a float32 ulp at grid
+// coordinates (1.5e-5 at 128), and 1/512 clears that by 128x while
+// moving a bounce origin by at most 2 mm — a fifth of what SURFACE_EPS
+// already moves it. It is also the constant the sub-voxel entry clamp
+// has always used, in that rung's own units.
+const float CELL_IN = 1.0 / 512.0;
 
 // Guard against a division blowing up on an axis-aligned ray.
 const float DDA_MIN_ABS = 1e-6;
@@ -831,6 +847,53 @@ bool subvoxSolid(vec3 rc, vec3 sc)
 }
 
 // ---------------------------------------------------------------------
+// THE RESTART POINT — where a ray that just hit something starts next
+// ---------------------------------------------------------------------
+// A bounce ray, a shadow ray and the next segment of a path all begin on
+// a surface, and the whole ray-origin exclusion rests on WHERE. The walk
+// never tests the cell a ray starts in — that is what keeps a bounce ray
+// off the face it just left — so the starting cell had better be the
+// cell the ray just came THROUGH, which the walk has already tested and
+// found empty. If it is any other cell, and that cell is solid, the
+// exclusion waves the ray straight through a wall.
+//
+// IT WAS ANY OTHER CELL, AND THAT WAS THE LEAK (2026-08-17). cave-glass
+// — a sealed 7x5x7 room with no opening at all — put 668 pixels of sky
+// on screen under a 50x test sky. The restart was computed as
+// hit + n * SURFACE_EPS and handed to floor(), and floor() and the walk
+// disagreed about which cell that is.
+//
+// MEASURED with claude_view 18, not theorised, and it is none of the
+// three things it looked like. In 100 % of events, in both plain-cube
+// rooms, the cell floor() chose was the cell across the hit face PLUS a
+// step SIDEWAYS — into a neighbour of the cell that was hit — and the
+// restart point sat BIT-EXACTLY on that neighbour's boundary plane (its
+// distance to the nearest face was 0 to the instrument's 1e-12 floor).
+// The epsilon moves along n and along n only, so a tangential
+// disagreement cannot be an epsilon that is too short, a grazing angle,
+// or a normal pointing the wrong way. It is a hit landing on the EDGE of
+// a face: the hit point's tangential coordinate is within half a float32
+// ulp of an integer, floor() rounds it into the next cell, and at a
+// concave corner — where a floor meets a wall — that cell is the wall.
+//
+// So the restart is CONSTRAINED, not merely offset: clamped into the
+// cell the walk came through, whose corner is `lo` and whose size is
+// `h`. floor() of the result IS that cell, by construction, at either
+// rung. The ordinal rule ("skip the cell the ray starts in") and the
+// identity rule ("skip the cell the ray just left") then name the same
+// cell, always — which is what the exclusion's own comment has claimed
+// since it was written.
+//
+// The clamp can only bite tangentially: along n the epsilon has already
+// placed the point 0.01 inside, five times deeper than CELL_IN's margin.
+// It costs two vector min/max per HIT, not per step.
+vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
+{
+	float m = h * CELL_IN;
+	return clamp(phit + n * SURFACE_EPS, lo + m, lo + (h - m));
+}
+
+// ---------------------------------------------------------------------
 // THE WALK — ONE 3D-DDA, and the cell size is a PARAMETER of it
 // ---------------------------------------------------------------------
 // §2 of the physics contract: "size is a parameter, never a branch. One
@@ -915,7 +978,18 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 
 	// THE STARTING CELL, and it is tested for exactly one thing. The
 	// loop below never tests the cell the ray starts in, which is what
-	// keeps a bounce ray off its own surface. Once cells have interiors
+	// keeps a bounce ray off its own surface.
+	//
+	// THAT RULE IS ONLY SAFE BECAUSE OF restartPoint(). "The cell the ray
+	// starts in" is a statement about floor(ro), and until 2026-08-17
+	// nothing made floor(ro) agree with the walk that produced ro — so a
+	// restart landing one ulp over a cell boundary began the walk inside
+	// a WALL and this rule waved it through. It is now clamped into the
+	// cell the previous walk came through, so the cell skipped here is
+	// provably the cell the ray just left, at either rung. See
+	// restartPoint() for the measurement that named it.
+	//
+	// Once cells have interiors
 	// that rule is too coarse: a ray leaving one sub-voxel would escape
 	// the other 4095 for free — a stair would not self-shadow, a chest
 	// lid would not shadow its own body, and sub-metre geometry would
@@ -925,9 +999,12 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	// sub-voxel the ray starts in — the ray-origin exclusion, moved one
 	// rung down — and every other class is left alone. A 255 cell, an
 	// emitter, air: unchanged, not tested, exactly as before. (That
-	// origin sub-voxel is air in any case, since SURFACE_EPS pushes the
-	// restart 0.16 sub-voxels off the face it left; this is belt and
-	// braces, stated rather than relied upon.)
+	// origin sub-voxel is now air by CONSTRUCTION rather than by an
+	// epsilon's good behaviour: a fine hit's restart is clamped into the
+	// sub-voxel the walk came through, and the walk only walks through
+	// empty ones. It was "SURFACE_EPS pushes the restart 0.16 sub-voxels
+	// off the face it left, belt and braces, stated rather than relied
+	// upon" — and at 1 m the same reasoning turned out to be wrong.)
 	if (claudeDescend > 0.5 && inSubvoxRing(cellHi)) {
 		s = texture3D(claudeTraceGrid, (cellHi + 0.5) / GRID_S);
 		if (s.a > CLASS_SUBVOX_LO && s.a < CLASS_SUBVOX_HI) {
@@ -978,7 +1055,13 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
 				else n.z = -stepDir.z;
-				hp = ro + rd * t + n * SURFACE_EPS;
+				// ci + n is the SUB-VOXEL the walk came through, and it
+				// is empty: the loop only continues past sub-voxels it
+				// found empty, and the origin one is excluded. So the
+				// next ray starts inside a known-empty 1/16 m cell of
+				// cellHi — the same guarantee as at 1 m, one rung down.
+				hp = restartPoint(ro + rd * t, n,
+						cellHi + (ci + n) * RUNG_FINE, RUNG_FINE);
 				alb = cellAlbedo(s.rgb);
 				le = cellEmission(s.a, alb);
 				tHit = t;
@@ -1057,7 +1140,13 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 
 		// every other class is one thing: an opaque Lambertian surface
 		// with a cardinal normal, which may also emit
-		hp = ro + rd * t + n * SURFACE_EPS;
+		//
+		// ci + n is the cell the walk came through — tested and found
+		// air on the step before this one, or the cell the ray started
+		// in, which the origin exclusion guarantees was air for the same
+		// reason one rung up. That is what makes restartPoint()'s clamp
+		// target the right cell rather than merely a nearby one.
+		hp = restartPoint(ro + rd * t, n, ci + n, 1.0);
 		alb = cellAlbedo(s.rgb);
 		le = cellEmission(s.a, alb);
 		tHit = t;
@@ -1634,45 +1723,69 @@ void main(void)
 	// --- INSTRUMENT: claude_view 18, DOES A BOUNCE RAY START INSIDE A
 	// SOLID CELL? ----------------------------------------------------
 	// Built 2026-08-17 for a defect the sky REVEALED rather than caused:
-	// cave-glass, a sealed 7x5x7 box whose golden is black, leaks a few
-	// hundred pixels of sky. Measured, one variable at a time, at
-	// claude_sky_uniform = 50:
+	// cave-glass, a sealed 7x5x7 box whose golden is black, put a few
+	// hundred pixels of sky on screen. THIS IS NO LONGER A HYPOTHESIS —
+	// the view found the mechanism, then named the cause, and the fix is
+	// restartPoint(). What follows is what it was.
+	//
+	// The view asks one question and nothing else: take the primary hit,
+	// draw one cosine-hemisphere bounce the way the path loop does, and
+	// report whether the cell that ray STARTS in is solid. That matters
+	// because march() never tests the cell a ray starts in — the
+	// exclusion that keeps a bounce ray off its own face — so a ray
+	// starting inside a wall is waved straight out through it.
+	//
+	// WHAT IT WAS, measured 2026-08-17 (util/claude_leak_probe.py), both
+	// plain-cube rooms, marker excluded:
+	//   rate      cave-glass 3.7e-07 / 784 px ever positive
+	//             cornell    9.9e-07 / 1812 px
+	//   sideways  1.000 in BOTH rooms
+	//   across    1.000 in BOTH rooms
+	// i.e. in 100 % of events the cell floor() chose was the cell across
+	// the hit face PLUS a step sideways, into a neighbour of the cell
+	// that was hit — and the restart point sat BIT-EXACTLY on that
+	// neighbour's boundary plane (depth 0 to the instrument's 1e-12
+	// floor, measured before these two channels replaced it). The
+	// epsilon moves along n and only along n, so a tangential
+	// disagreement is not a short epsilon, not a grazing angle and not a
+	// wrong normal: it is a hit on the EDGE of a face, where the
+	// tangential coordinate is within half a float32 ulp of an integer
+	// and floor() rounds it into the wall next door.
+	//
+	// The verdict was never this rate — a rate can be made rarer by a bad
+	// fix and still leak given enough frames. The verdict is cave-glass
+	// under a 50x uniform test sky being EXACTLY black at every bounce
+	// depth, which is analytic: a room with no opening receives no sky.
+	// The ladder that got here, one variable at a time, at a 2000-frame
+	// settle:
 	//   claudeBounces 0  -> 0 leaking pixels, from twelve directions.
 	//                       No EYE ray escapes; the room is sealed.
-	//   claudeBounces 1  -> it leaks. So it is the FIRST BOUNCE.
+	//   claudeBounces 1  -> 144 px. The FIRST bounce is enough.
+	//                 2  -> 320 px.   4 -> 1072 px. More depth, more
+	//                       chances at the same mechanism.
 	//   claudeDescend 0  -> unchanged. Not the sub-voxel walk.
 	//   leak is LINEAR in sky radiance, so it is rays getting out.
 	//
-	// The remaining suspect is the one thing a bounce ray does that an
-	// eye ray does not: it starts ON A SURFACE. march() restarts it at
-	// hit + n * SURFACE_EPS and then never tests the cell it starts in
-	// (that exclusion is what keeps a bounce ray off its own face). If a
-	// grazing hit ever puts that restart point inside a SOLID cell, the
-	// walk begins inside the wall, the exclusion waves it through, and it
-	// marches out of the room.
+	// AND THE COUNT DEPENDS ON HOW LONG YOU LOOK, which is the sharpest
+	// reason a rate is not a verdict: at a 500-frame settle the SAME
+	// build reads 0 px at claudeBounces 1 and 516 at 4. Each leaked pixel
+	// is one frame's escaped sample buried in a running average, so a
+	// shallow settle hides the defect without changing it.
 	//
-	// This view asks exactly that question and nothing else: take the
-	// primary hit, draw one cosine-hemisphere bounce the way the path
-	// loop does, and report whether the cell that ray STARTS in is solid.
-	// White = yes. A black frame would have killed the hypothesis; it
-	// did not. MEASURED 2026-08-17, per-pixel rate over 40 s:
-	//   cave-glass  3.6e-07 mean, 784 pixels ever positive
-	//   cornell     9.7e-07 mean, 1812 pixels
-	//   cozy-day-ci 3.3e-03 mean, 963124 pixels
-	// The two plain-cube rooms are the evidence, and cave-glass's 784 is
-	// the same order as the 444 pixels of sky it leaks.
-	//
-	// WHAT THIS INSTRUMENT IS BLIND TO, and it matters for the third row:
-	// a CLASS-250 cell is "solid" to this test and is not a defect. The
-	// walk is SUPPOSED to be inside one -- that is what descending means
-	// -- so every sub-voxel hit reports positive, which is why the cabin,
-	// full of authored models, reads 46 % of the frame. Read this view
+	// WHAT THIS INSTRUMENT IS BLIND TO: a CLASS-250 cell is "solid" to
+	// this test and is not a defect. The walk is SUPPOSED to be inside
+	// one -- that is what descending means -- so every sub-voxel hit
+	// reports positive, which is why the cabin, full of authored models,
+	// reads 46 % of the frame (3.3e-03 mean, 963124 px). Read this view
 	// only in rooms built from plain cubes until it learns to ask the
 	// 16^3 mask the same question.
 	if (view == 18) {
 		vec3 hp, n, alb, le, cell;
 		float tHit;
-		float bad = 0.0;
+		float bad = 0.0;      // R: the event happened
+		float sideways = 0.0; // G: c0 also differs TANGENTIALLY to the face
+		float across = 0.0;   // B: c0 differs by exactly +n on the face's
+		                      //    own axis (i.e. it stepped through it)
 		if (march(ro, rd, hp, n, alb, le, tHit, cell)) {
 			float u1 = rnd1();
 			float u2 = rnd1();
@@ -1685,6 +1798,18 @@ void main(void)
 				if (s0.a > CLASS_AIR_MAX)
 					bad = 1.0;
 			}
+			// WHICH WAY c0 DISAGREES with the cell that was hit. The
+			// restart moved along n and along n ONLY, so the walk's own
+			// answer for "which cell is the ray in now" is cell + n --
+			// the cell it came THROUGH, which it tested and found empty.
+			// Splitting the disagreement on n's axis from the two
+			// tangential ones is what separates "the epsilon failed to
+			// clear the face" from "the point slid sideways into a
+			// neighbour of the cell it hit", i.e. a concave corner.
+			vec3 d = c0 - cell;
+			across = bad * ((abs(dot(d, n) - 1.0) < 0.5) ? 1.0 : 0.0);
+			vec3 dt = d - n * dot(d, n);
+			sideways = bad * ((dot(abs(dt), vec3(1.0)) > 0.5) ? 1.0 : 0.0);
 			// wi is drawn but unused except to keep the RNG consumption
 			// identical to the path loop's, so the two see the same
 			// directions at the same pixels.
@@ -1694,8 +1819,10 @@ void main(void)
 		// the RATE -- the number worth having for an event this rare.
 		// x1000 because a rate of 1e-6 would otherwise land below the
 		// first display step; divide the inverted linear value by 1000
-		// to read the rate back.
-		L = vec3(bad * 1000.0);
+		// to read the rate back. All three channels carry the same
+		// scale, so G/R and B/R are read as plain fractions of the
+		// events and need no scale of their own.
+		L = vec3(bad, sideways, across) * 1000.0;
 		maxBounces = -1;
 	}
 
