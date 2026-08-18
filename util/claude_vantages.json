@@ -1,194 +1,239 @@
 {
-  "cave-glass": {
-    "ci": true,
-    "notes": "roadmap 1b: identical box to cave-skylight, but the ceiling opening is PLUGGED with the wall node itself (John 2026-08-15: glass IS opaque today, build what it is). No lamps, no opening -> honestly black, and correct. The plug becomes a real glass node only in 2b, as its own change. Door plugged before capture (claude_ci: 34,9,85).",
-    "pitch": -10,
-    "pos": [
-      34,
-      9,
-      87
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  },
-  "cave-skylight-night": {
-    "ci": true,
-    "notes": "roadmap 1b: same room and camera as cave-skylight-noon, zenith moon. Night variant referees the moon/sky floor (2b). Dark/placeholder until 2b.",
-    "pitch": -15,
-    "pos": [
-      14,
-      9,
-      87
-    ],
-    "set": "gallery",
-    "time": 0,
-    "yaw": 0
-  },
-  "cave-skylight-noon": {
-    "ci": true,
-    "notes": "roadmap 1b: sealed rho=0.50 box, interior 7x5x7, ONE 1x1 ceiling opening at (14,14,89), zenith sun. Door plugged before capture (claude_ci: 14,9,85). Referee (2b): direct sun patch on the floor under the opening is analytic. Dark/placeholder until 2b.",
-    "pitch": -15,
-    "pos": [
-      14,
-      9,
-      87
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  },
-  "cornell": {
-    "ci": true,
-    "notes": "door plugged claude_bridge:gray221 (claude_ci does it: 47,9,0); red left, green right",
-    "pitch": 12,
-    "pos": [
-      47,
-      9,
-      1
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  },
-  "cozy-ci": {
-    "ci": true,
-    "note": "feet at the PHYSICS REST position mid-aisle: teleporting to (5,9,1) landed the player against the door threshold and physics slid them ~1.7 nodes over ~50s, resetting accumulation the whole way (CI run 4, 84-sample capture). Teleport to where the body already rests and nothing moves.",
-    "notes": "CI: feet just inside the south door (x=5,z=0), facing +Z up the room like cornell does; pitch +15 puts the y=13 x4-6 z=4 emissive bar high in frame (eye y~10.6, dz 3, dy 2.4 -> 38 deg up) while the floor to the back wall stays in shot",
-    "pitch": 15,
-    "pos": [
-      5,
-      8.56,
-      2.5
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  },
-  "cozy-day-ci": {
-    "ci": true,
-    "notes": "roadmap 1b: cozy-midday moved to CI, same REST position. Zenith sun; day/night pair with cozy-night-ci for 2b's sky term. cozy-day-dark-ci reuses this vantage with OPS.lamps(off).",
-    "pitch": -8,
-    "pos": [
-      7,
-      9,
-      6
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 149
-  },
-  "cozy-golden": {
-    "notes": "west slot raking the hearth; t=0.73 (sun ~15-20 deg west \u2014 t=0.78 was beam-past-the-room, 2026-08-13)",
-    "pitch": -8,
-    "pos": [
-      8,
-      9,
-      3
-    ],
-    "set": "gallery",
-    "time": 0.73,
-    "yaw": 90
-  },
-  "cozy-holes": {
-    "notes": "JOHN'S OWN VANTAGE, 2026-08-16, standing inside the cosy cabin at the west end of the aisle looking WEST (yaw 268.5) at the far plank wall, with the lit furnace room on the other side of it. This is the frame that found the holes: with claude_descend = 1 the wall showed bright specks in horizontal rows that moved with the camera -- the furnace room seen through 1/16 m tunnels in the plank model (roadmap \"HOLES IN THE WALL\"; the original frame is screenshots/screenshot_20260816_184259.png, HUD on, nee 1). NOT a CI arm: it is a defect vantage, kept so the bake floor can be re-judged by eye at the exact pose that found the defect. Feet at 8.5, the physics REST height, so the seat does not fall or slide.",
-    "pitch": -0.7,
-    "pos": [
-      0.9,
-      8.5,
-      5.0
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 268.5
-  },
-  "cozy-midday": {
-    "notes": "south wall+door; zenith sun (south glass never gets direct sun)",
-    "pitch": -8,
-    "pos": [
-      7,
-      9,
-      6
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 149
-  },
-  "cozy-night": {
-    "notes": "hearth+lantern+dark corner; zenith moon",
-    "pitch": -5,
-    "pos": [
-      7,
-      9,
-      2
-    ],
-    "set": "gallery",
-    "time": 0,
-    "yaw": 55
-  },
-  "cozy-night-ci": {
-    "ci": true,
-    "notes": "roadmap 1b: cozy-night moved to CI, same REST position (plain y=9, no threshold). Zenith moon; torches removed room-wide, so tonight's only light is the vault panel.",
-    "pitch": -5,
-    "pos": [
-      7,
-      9,
-      2
-    ],
-    "set": "gallery",
-    "time": 0,
-    "yaw": 55
-  },
-  "exterior-ci": {
-    "ci": true,
-    "notes": "roadmap 1b: no build -- standing on the open mgflat plain south of the hall looking north at the cabin cluster (roofline in the lower half of frame, sky above). Not an image referee until 2b (roadmap 1c); today it is the perf vantage (steps/pixel, ms/bounce). Unconstrained distance (not a light-referee room).",
-    "pitch": -5,
-    "pos": [
-      5,
-      9,
-      -25
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  },
-  "furnace-050": {
-    "ci": true,
-    "notes": "door plugged with wall node before capture (claude_ci does it: 20,9,0)",
-    "pitch": 0,
-    "pos": [
-      18,
-      9,
-      3
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 270
-  },
-  "furnace-073": {
-    "ci": true,
-    "notes": "door plugged with wall node before capture (claude_ci does it: 33,9,0)",
-    "pitch": 0,
-    "pos": [
-      31,
-      9,
-      3
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 270
-  },
-  "skyfurnace-050": {
-    "ci": true,
-    "notes": "roadmap 1b: open flat rho=0.50 pad (24x24, no walls), fenced yard (fence >=12 nodes from pad centre at (60,8,110), 1 node high). Camera looking down ~45deg so only pad fills frame. Referee (2b): L = rho*L_sky under a uniform test sky. Dark/placeholder until 2b.",
-    "pitch": -45,
-    "pos": [
-      60,
-      9,
-      104
-    ],
-    "set": "gallery",
-    "time": 0.5,
-    "yaw": 0
-  }
+	"cave-glass" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: identical box to cave-skylight, but the ceiling opening is PLUGGED with the wall node itself (John 2026-08-15: glass IS opaque today, build what it is). No lamps, no opening -> honestly black, and correct. The plug becomes a real glass node only in 2b, as its own change. Door plugged before capture (claude_ci: 34,9,85).",
+		"pitch" : -10,
+		"pos" : 
+		[
+			34,
+			9,
+			87
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"cave-skylight-night" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: same room and camera as cave-skylight-noon, zenith moon. Night variant referees the moon/sky floor (2b). Dark/placeholder until 2b.",
+		"pitch" : -15,
+		"pos" : 
+		[
+			14,
+			9,
+			87
+		],
+		"set" : "gallery",
+		"time" : 0,
+		"yaw" : 0
+	},
+	"cave-skylight-noon" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: sealed rho=0.50 box, interior 7x5x7, ONE 1x1 ceiling opening at (14,14,89), zenith sun. Door plugged before capture (claude_ci: 14,9,85). Referee (2b): direct sun patch on the floor under the opening is analytic. Dark/placeholder until 2b.",
+		"pitch" : -15,
+		"pos" : 
+		[
+			14,
+			9,
+			87
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"cornell" : 
+	{
+		"ci" : true,
+		"notes" : "door plugged claude_bridge:gray221 (claude_ci does it: 47,9,0); red left, green right",
+		"pitch" : 12,
+		"pos" : 
+		[
+			47,
+			9,
+			1
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"cozy-ci" : 
+	{
+		"ci" : true,
+		"note" : "feet at the PHYSICS REST position mid-aisle: teleporting to (5,9,1) landed the player against the door threshold and physics slid them ~1.7 nodes over ~50s, resetting accumulation the whole way (CI run 4, 84-sample capture). Teleport to where the body already rests and nothing moves.",
+		"notes" : "CI: feet just inside the south door (x=5,z=0), facing +Z up the room like cornell does; pitch +15 puts the y=13 x4-6 z=4 emissive bar high in frame (eye y~10.6, dz 3, dy 2.4 -> 38 deg up) while the floor to the back wall stays in shot",
+		"pitch" : 15,
+		"pos" : 
+		[
+			5,
+			8.5600000000000005,
+			2.5
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"cozy-day-ci" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: cozy-midday moved to CI, same REST position. Zenith sun; day/night pair with cozy-night-ci for 2b's sky term. cozy-day-dark-ci reuses this vantage with OPS.lamps(off).",
+		"pitch" : -8,
+		"pos" : 
+		[
+			7,
+			9,
+			6
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 149
+	},
+	"cozy-golden" : 
+	{
+		"notes" : "west slot raking the hearth; t=0.73 (sun ~15-20 deg west \u2014 t=0.78 was beam-past-the-room, 2026-08-13)",
+		"pitch" : -8,
+		"pos" : 
+		[
+			8,
+			9,
+			3
+		],
+		"set" : "gallery",
+		"time" : 0.72999999999999998,
+		"yaw" : 90
+	},
+	"cozy-holes" : 
+	{
+		"notes" : "JOHN'S OWN VANTAGE, 2026-08-16, standing inside the cosy cabin at the west end of the aisle looking WEST (yaw 268.5) at the far plank wall, with the lit furnace room on the other side of it. This is the frame that found the holes: with claude_descend = 1 the wall showed bright specks in horizontal rows that moved with the camera -- the furnace room seen through 1/16 m tunnels in the plank model (roadmap \"HOLES IN THE WALL\"; the original frame is screenshots/screenshot_20260816_184259.png, HUD on, nee 1). NOT a CI arm: it is a defect vantage, kept so the bake floor can be re-judged by eye at the exact pose that found the defect. Feet at 8.5, the physics REST height, so the seat does not fall or slide.",
+		"pitch" : -0.69999999999999996,
+		"pos" : 
+		[
+			0.90000000000000002,
+			8.5,
+			5
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 268.5
+	},
+	"cozy-midday" : 
+	{
+		"notes" : "south wall+door; zenith sun (south glass never gets direct sun)",
+		"pitch" : -8,
+		"pos" : 
+		[
+			7,
+			9,
+			6
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 149
+	},
+	"cozy-night" : 
+	{
+		"notes" : "hearth+lantern+dark corner; zenith moon",
+		"pitch" : -5,
+		"pos" : 
+		[
+			7,
+			9,
+			2
+		],
+		"set" : "gallery",
+		"time" : 0,
+		"yaw" : 55
+	},
+	"cozy-night-ci" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: cozy-night moved to CI, same REST position (plain y=9, no threshold). Zenith moon; torches removed room-wide, so tonight's only light is the vault panel.",
+		"pitch" : -5,
+		"pos" : 
+		[
+			7,
+			9,
+			2
+		],
+		"set" : "gallery",
+		"time" : 0,
+		"yaw" : 55
+	},
+	"exterior-ci" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: no build -- standing on the open mgflat plain south of the hall looking north at the cabin cluster (roofline in the lower half of frame, sky above). Not an image referee until 2b (roadmap 1c); today it is the perf vantage (steps/pixel, ms/bounce). Unconstrained distance (not a light-referee room).",
+		"pitch" : -5,
+		"pos" : 
+		[
+			5,
+			9,
+			-25
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
+	"furnace-050" : 
+	{
+		"ci" : true,
+		"notes" : "door plugged with wall node before capture (claude_ci does it: 20,9,0)",
+		"pitch" : 0,
+		"pos" : 
+		[
+			18,
+			9,
+			3
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 270
+	},
+	"furnace-073" : 
+	{
+		"ci" : true,
+		"notes" : "door plugged with wall node before capture (claude_ci does it: 33,9,0)",
+		"pitch" : 0,
+		"pos" : 
+		[
+			31,
+			9,
+			3
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 270
+	},
+	"leak-sliver" : 
+	{
+		"ci" : true,
+		"notes" : "saved by /warp save (claude)",
+		"pitch" : -4.4599999761233748,
+		"pos" : 
+		[
+			7.2440004348754883,
+			9.0599994659423828,
+			6.2009997367858887
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 265.71998558326192
+	},
+	"skyfurnace-050" : 
+	{
+		"ci" : true,
+		"notes" : "roadmap 1b: open flat rho=0.50 pad (24x24, no walls), fenced yard (fence >=12 nodes from pad centre at (60,8,110), 1 node high). Camera looking down ~45deg so only pad fills frame. Referee (2b): L = rho*L_sky under a uniform test sky. Dark/placeholder until 2b.",
+		"pitch" : -45,
+		"pos" : 
+		[
+			60,
+			9,
+			104
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	}
 }
