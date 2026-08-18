@@ -427,28 +427,46 @@ static inline u8 claudeMatIndex(const ClaudeMat &m)
 	return claudeMatIndex(m.kind, m.fine, m.light);
 }
 
-// THE EMISSION COLUMN, and it is the ONLY thing that changes when the
-// torches become lights.
-//
-// Preserved bit-for-bit from the band era so the vocabulary change
-// cannot move the image: cellEmission() answered only for classes
-// strictly inside (167.5, 245)/255, so the nub (165) and the sub-voxel
-// class (250) emitted nothing however bright the node was. The two
-// guards below are that band, stated as what it actually meant.
+// THE EMISSION COLUMN. ONE law, ONE domain, and since 2026-08-18 that
+// domain is "every material carrying a light_source", at either cell
+// size.
 //
 //     Le = albedo * (EMIT_BASE + EMIT_GAIN * e),
-//     e  = clamp((class/255 - 0.65) / 0.29, 0, 1),  class = 170 + 5*light
+//     e  = clamp(((170 + 5*light)/255 - 0.65) / 0.29, 0, 1)
 //
 // EMIT_BASE and EMIT_GAIN are the law (ADR-0009 #1, and
-// util/claude_furnace_check.py asserts exactly le = rho * (0.4 + 2.0*e)).
-// The 0.65 / 0.29 pair are NOT: they exist solely to undo the 170 + 5*n
-// packing, and they die with it the moment the emission law is rewritten
-// in its own commit.
+// util/claude_furnace_check.py asserts exactly le = rho * (0.4 + 2.0*e)),
+// so the analytic furnace referee is unchanged. The 0.65 / 0.29 pair are
+// NOT the law: they exist solely to undo the old `170 + 5*n` packing and
+// are kept ONLY so that every emitter that was already lit keeps exactly
+// the radiance it had. They are the next thing to go, and going will
+// re-pin the furnace.
+//
+// WHAT CHANGED HERE, and it is the whole point of this commit. This
+// function used to return 0 for a FINE material, because in the band era
+// 250 fell outside the emissive band (167.5, 245) and cellEmission() did
+// not answer for it at all. That is physics-contract §2's own listed
+// violation -- "emission available to one cell size and not another" --
+// and it is why the cosy cabin's campfire, floor lantern and torches had
+// their exact shape and were completely dark. A campfire is now solid +
+// fine + light 13 and it emits because it carries a light_source, not
+// because of where a number landed between two thresholds.
+//
+// THE NUB IS DELIBERATELY STILL DARK, and that is one variable held
+// still rather than an oversight. The nub is the placeholder a point
+// light gets OUTSIDE the sub-voxel ring, where no 16^3 mask is baked --
+// so it is a full 1 m cell with no finer shape, and lighting it would
+// draw every distant torch as a bright warm CUBE. That is the exact
+// artifact the nub was invented to avoid, arriving from the other side.
+// physics-contract observation 2 already says what to do instead: fold
+// the nub into the model path and delete it. Until then a distant torch
+// is a coarser rung (§7 permits laddered geometry), and this is written
+// down rather than left to be found.
 static constexpr float CLAUDE_EMIT_BASE = 0.4f;
 static constexpr float CLAUDE_EMIT_GAIN = 2.0f;
 static float claudeMatEmission(const ClaudeMat &m)
 {
-	if (m.light == 0 || m.fine || m.kind == MATK_NUB)
+	if (m.light == 0 || m.kind == MATK_NUB)
 		return 0.0f;
 	float cls = (170.0f + 5.0f * (float)std::min<int>(m.light, 14)) / 255.0f;
 	float e = std::min(std::max((cls - 0.65f) / 0.29f, 0.0f), 1.0f);
@@ -503,6 +521,28 @@ static void claudeMatTableBuild()
 static inline bool claudeMatEmits(u8 idx)
 {
 	return g_claude_matpal[idx].emit > 0.0f;
+}
+
+// CAN NEXT-EVENT ESTIMATION AIM AT IT? A different question from "does it
+// emit", and since 2026-08-18 the two genuinely have different answers.
+//
+// The area sampler picks a uniform point on an exposed 1 m FACE of the
+// cell and builds its pdf from that face's area. For a full glowing cube
+// that is exact. For a FINE material it is not: a torch fills a few per
+// cent of its cell, so aiming at the whole face would put area in the pdf
+// that carries no Le, the BSDF technique would see the true geometry, and
+// the two MIS partners would disagree -- an estimator that converges to
+// the wrong picture while every arm stays green, which is the 1a failure
+// class this project has already paid for once.
+//
+// So a fine emitter is lit by being HIT: unbiased, and noisier. That is
+// the same treatment the shader already documents for emitters past the
+// 16-slot cap ("emitters are lit by being HIT, which is correct and
+// noisier"), not a new rule. The fix, when it is wanted, is an emitter
+// sampler that knows the 16^3 mask -- not a wider tolerance here.
+static inline bool claudeMatAreaSamplable(u8 idx)
+{
+	return claudeMatEmits(idx) && !g_claude_mattab[idx].fine;
 }
 
 // Does this material get sub-voxel bits baked for it? The old `a > 230`,
@@ -3228,17 +3268,16 @@ static void claudeTraceGridFinishEmitters()
 	// fill loop, for two reasons: the face mask needs neighbours the fill
 	// loop has not written yet, and the material index is not final until
 	// the authored-model branch has had its say (an emissive full cube
-	// that gets a model becomes a fine material, which the palette gives
-	// no Le — it must not appear here, or the light sampler would aim at
-	// a cell with no Le and the MIS weights would disagree with the
-	// transport).
+	// that gets a model becomes a FINE material, and a fine emitter is
+	// deliberately not area-sampled — see claudeMatAreaSamplable for the
+	// pdf argument).
 	//
 	// THE FILTER AND THE SHADER NOW READ THE SAME TABLE. It used to be
 	// `170 <= cls <= 240` here against CLASS_EMIT_LO/HI there — two
 	// copies of one band, and the 1a failure class waiting to happen:
 	// change the encoding, miss one copy, and next-event estimation
 	// samples a different set of emitters than the transport sees while
-	// every picture stays plausible. claudeMatEmits() asks
+	// every picture stays plausible. Both sides now ask
 	// g_claude_matpal, which is the texture the shader samples.
 	{
 		const u8 *occ = V.occ.data();
@@ -3257,7 +3296,7 @@ static void claudeTraceGridFinishEmitters()
 		for (s16 y = 0; y < S; y++)
 		for (s16 x = 0; x < S; x++) {
 			u8 cls = occ[((((size_t)z * S + y) * S + x)) * 4 + 3];
-			if (!claudeMatEmits(cls))
+			if (!claudeMatAreaSamplable(cls))
 				continue;
 			int mask = 0;
 			if (is_air(x + 1, y, z)) mask |= 1;
