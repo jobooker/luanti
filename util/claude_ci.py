@@ -1535,7 +1535,12 @@ def await_rest():
     while time.time() - t0 < REST_TIMEOUT:
         a = read_aim()
         p = (a or {}).get("pos")
-        if not p:
+        # isinstance, not truthiness: the bridge answers some queries with
+        # a bare string ("unloaded"), and a string is truthy, so `not p`
+        # would let one through to p.get() and kill the run mid-capture --
+        # 700 s of CI for a typo-shaped failure. Loud rather than silent,
+        # but expensive, and the guard is free.
+        if not isinstance(p, dict):
             time.sleep(REST_POLL)
             continue
         cur = (p.get("x"), p.get("y"), p.get("z"))
