@@ -150,7 +150,9 @@ void GameUI::update(const RunStats &stats, Client *client, MapDrawControl *draw_
 		// claude_trace: only while the traced pipeline is actually driving
 		// the frame (same >= 2.5 threshold Game::toggleClaudeTrace uses to
 		// flip claude_grid_debug between 0/pass-through and 3/traced).
-		if (g_settings->getFloat("claude_grid_debug", 0.0f, 12.0f) >= 2.5f) {
+		if ((g_settings->exists("claude_grid_debug")
+				? g_settings->getFloat("claude_grid_debug", 0.0f, 12.0f)
+				: 0.0f) >= 2.5f) {
 			float still_frames = 0.0f, accum_alpha = 0.0f;
 			claudeGetTraceStats(&still_frames, &accum_alpha);
 			os << std::setprecision(0)
@@ -158,8 +160,17 @@ void GameUI::update(const RunStats &stats, Client *client, MapDrawControl *draw_
 				<< std::setprecision(3)
 				<< " | alpha " << accum_alpha
 				<< std::setprecision(0)
-				<< " | view " << g_settings->getFloat("claude_view", 0.0f, 16.0f)
-				<< " | bounces " << g_settings->getFloat("claude_bounces", 0.0f, 24.0f)
+				// exists() on BOTH: getFloat() THROWS on a missing key, and
+				// this is the DEBUG HUD -- a seat whose conf omits a dial
+				// died the moment the line was drawn (2026-08-22, F4 on the
+				// rig's first look seat). claude_nee below was guarded from
+				// the start; these two were not. Fallbacks are the shipped
+				// defaults, so the line never claims a state the shader is
+				// not in.
+				<< " | view " << (g_settings->exists("claude_view")
+						? g_settings->getFloat("claude_view", 0.0f, 16.0f) : 0.0f)
+				<< " | bounces " << (g_settings->exists("claude_bounces")
+						? g_settings->getFloat("claude_bounces", 0.0f, 24.0f) : 24.0f)
 				// transport mode: 0 = the pure photo path (§6 truth),
 				// 1 = next-event estimation + MIS. An absent key reads as
 				// the shipped default, 1 — the same fallback readNee() uses,

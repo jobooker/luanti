@@ -6194,7 +6194,13 @@ void Game::toggleClaudeTrace()
 // the wall a torch cannot directly see. (B was taken: hotbar_previous.)
 void Game::toggleClaudeBounce()
 {
-	float cur = g_settings->getFloat("claude_bounces", 0.0f, 64.0f);
+	// exists() FIRST: getFloat() THROWS on a missing key, and this is a
+	// KEYPRESS path -- a seat whose conf simply has no claude_bounces line
+	// died on G (2026-08-22, the rig's first look seat). readBounces()
+	// above has guarded this since it was written; this one never did.
+	float cur = g_settings->exists("claude_bounces")
+			? g_settings->getFloat("claude_bounces", 0.0f, 64.0f)
+			: 24.0f;
 	bool to_full = cur < 12.0f;
 	g_settings->set("claude_bounces", to_full ? "24" : "1");
 	claudeResetAccumulation();
@@ -7958,7 +7964,31 @@ void Game::updateFrame(ProfilerGraph *graph, RunStats *stats, f32 dtime,
 	bool noclip_fly = draw_control->allow_noclip &&
 			m_cache_enable_free_move &&
 			client->checkPrivilege("fly");
-	if (!sky->getAutoCaveBrightness() || noclip_fly) {
+	// AND ALWAYS, WHEN THE TRACER IS ON (2026-08-22).
+	//
+	// The else-branch below scales the sky by getBackgroundBrightness() --
+	// a RASTER-era estimate of how much sky this player can see, which
+	// exists because a raster renderer cannot compute that. It flows
+	// through sky->update() into Sky::getBgColor()/getSkyColor(), into
+	// g_claude_grid.sky_horizon, into the skyHorizonCol/skyZenithCol
+	// uniforms, and out of skyDome() as the tracer's SKY RADIANCE.
+	//
+	// THE TRACER COMPUTES THAT EXACT QUANTITY BY TRACING SHADOW RAYS. So
+	// with the scalar applied the occlusion is counted TWICE: once as a
+	// dimming of the light source, once physically. §4's one-Le law says
+	// the sky a camera ray sees and the sky a shadow ray samples are one
+	// evaluation of one function -- skyRadiance() is built that way, and
+	// this restores the law by fixing its INPUT, not the function.
+	//
+	// MEASURED, and it is not a subtlety: at a FROZEN camera aim, walking
+	// ~16 m sideways swung sky_horizon from 0.000000 to 0.493616 and back
+	// (spec/measured.md, "the sky's radiance is a function of where you
+	// stand"). A physical sky does not do that. Standing outdoors near the
+	// ground was enough to zero it; `fly` "fixed" the picture only because
+	// noclip_fly already took this branch.
+	bool traced = g_settings->exists("claude_grid_debug")
+			&& g_settings->getFloat("claude_grid_debug", 0.0f, 12.0f) >= 2.5f;
+	if (!sky->getAutoCaveBrightness() || noclip_fly || traced) {
 		direct_brightness = time_brightness;
 		sunlight_seen = true;
 	} else {
