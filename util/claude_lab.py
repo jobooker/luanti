@@ -200,6 +200,123 @@ FPS_CAP_PINNED = 200.0
 CAP_SLEEP_FRAC = 0.05   # >5% of the frame spent asleep = contaminated
 
 
+# ------------------------------------------------- the framebuffer size
+# EVERY CROP IN THIS HARNESS IS A PIXEL BOX WRITTEN FOR ONE FRAMEBUFFER,
+# and nothing checked that the frame it cropped had that size.
+# claude_regions.REGIONS, claude_cornell_check's wall boxes and
+# claude_sliver_ab's CROP / CROP_CLIENT are all hand-placed at 1920x1080
+# and are PINNED, not derived -- "a box that moves with the window is a
+# box that measures something different after a resize"
+# (claude_regions.py). So a frame of any other size silently re-aims
+# every one of them at a different piece of the scene, and the number
+# still prints.
+#
+# MEASURED 2026-08-23 on the Linux rig: every PNG in screenshots/ from
+# the 2026-08-22 look session is 3840x2049, not 1920x1080. Two causes,
+# and the second one is the reason a conf pin alone cannot close this:
+#
+#  1. minetest.conf carried window_maximized = true and NO
+#     autosave_screensize line. autosave_screensize defaults to TRUE
+#     (src/defaultsettings.cpp:267), so on exit
+#     RenderingEngine::autosaveScreensizeAndCo
+#     (src/client/renderingengine.cpp:446-465, called from
+#     src/client/game.cpp:4981) wrote the live drawable size back into
+#     screen_w / screen_h. The conf's own comment still says "1920x1080
+#     ON PURPOSE" three lines above screen_w = 3840.
+#
+#  2. THE CONF ASKS IN LOGICAL POINTS; THE FRAMEBUFFER COMES BACK IN
+#     PIXELS. screen_w / screen_h go straight to SDL_CreateWindow
+#     (renderingengine.cpp:194 -> irr/src/CIrrDeviceSDL.cpp:726/728) with
+#     SDL_WINDOW_ALLOW_HIGHDPI always set (CIrrDeviceSDL.cpp:619), and
+#     CIrrDeviceSDL::updateSizeAndScale (CIrrDeviceSDL.cpp:1260-1273)
+#     reports Width/Height from SDL_GL_GetDrawableSize. This seat's
+#     output DP-2 is a 3840x2160 panel at KDE scale 1.5, so
+#     screen_w = 1920 yields a 2880x1620 framebuffer, not a 1920x1080
+#     one -- and the box has a SECOND output at scale 1, so the right
+#     number depends on which screen the window opens on. There is no
+#     value of screen_w that is correct a priori.
+#
+# Hence: pin what can be pinned, and then MEASURE the frame you actually
+# got and refuse to crop it if it is the wrong size. The PNG's own
+# dimensions are the framebuffer size -- the client renders and writes
+# the drawable, so no engine change and no new stats key is needed.
+PINNED_FB = (1920, 1080)
+
+# The conf keys that decide the window's shape. All five are in
+# claude_ci.PINNED_CONF; they are listed again here so a refusal can say
+# what the conf asked for beside what the frame came back as.
+FB_CONF_KEYS = ("screen_w", "screen_h", "fullscreen", "window_maximized",
+                "autosave_screensize")
+
+
+def png_size(path):
+    """(width, height) of a PNG, without decoding the pixels."""
+    from PIL import Image
+    with Image.open(path) as im:
+        return (int(im.size[0]), int(im.size[1]))
+
+
+def fb_hint(got, expect=PINNED_FB, path=CONF):
+    """What to do about a wrong framebuffer, derived from the run itself.
+
+    If the conf asked for W x H and the frame came back k*W x k*H, the
+    compositor scaled it and the fix is to ask for expect/k. That ratio
+    is measured here, not read off kscreen: the seat has two outputs at
+    different scales, so which one the window opened on is only knowable
+    from the frame it produced.
+    """
+    conf = conf_keys(FB_CONF_KEYS, path)
+    parts = ["conf asked screen_w=%s screen_h=%s (fullscreen=%s "
+             "window_maximized=%s autosave_screensize=%s)"
+             % tuple(conf.get(k, "ABSENT") for k in FB_CONF_KEYS)]
+    if conf.get("autosave_screensize", "").lower() != "false":
+        parts.append("autosave_screensize is not false, so the client "
+                     "REWRITES screen_w/screen_h on exit and the pin is "
+                     "erased by the seat that used it")
+    if str(conf.get("window_maximized", "")).lower() == "true":
+        parts.append("window_maximized = true, so screen_w/screen_h are "
+                     "ignored at startup")
+    try:
+        # Only meaningful if the window was actually SIZED by the
+        # request. Maximized or fullscreen, screen_w/screen_h were never
+        # used, so the ratio measures the desktop, not the scale.
+        if (str(conf.get("window_maximized", "")).lower() == "true"
+                or str(conf.get("fullscreen", "")).lower() == "true"):
+            raise ValueError("window not sized by the conf")
+        aw, ah = float(conf["screen_w"]), float(conf["screen_h"])
+        kx, ky = got[0] / aw, got[1] / ah
+        if abs(kx - ky) < 0.02 and kx > 0:
+            parts.append("frame is %.3fx the requested window, i.e. a "
+                         "compositor scale of %.3f -- for a %dx%d "
+                         "framebuffer set screen_w = %d, screen_h = %d"
+                         % (kx, kx, expect[0], expect[1],
+                            round(expect[0] / kx), round(expect[1] / kx)))
+    except Exception:
+        pass
+    return "; ".join(parts)
+
+
+def fb_ok(path, expect=PINNED_FB, conf_path=CONF):
+    """(ok, detail) -- is this capture the size every crop assumes?
+
+    A refusal here is not pedantry about a window: the crops are absolute
+    pixel boxes, so a frame of the wrong size makes every referee that
+    uses one report a confident number about a different part of the
+    image. Refuse the number; do not scale the boxes.
+    """
+    try:
+        got = png_size(path)
+    except Exception as e:
+        return False, "cannot read the capture's size (%s): %s" % (path, e)
+    if got == tuple(expect):
+        return True, "framebuffer %dx%d, as every crop assumes" % got
+    return False, ("framebuffer is %dx%d but every crop in this harness is "
+                   "written for %dx%d — REFUSING to report a cropped "
+                   "number. %s"
+                   % (got[0], got[1], expect[0], expect[1],
+                      fb_hint(got, expect, conf_path)))
+
+
 def conf_keys(names, path=CONF):
     """Named keys of a conf file, as a dict (missing keys omitted)."""
     out = {}

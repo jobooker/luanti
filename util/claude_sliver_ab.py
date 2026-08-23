@@ -51,6 +51,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIAL = os.path.join(REPO, "worlds/gallery/claude_dial.conf")
 STATS = os.path.join(REPO, "claude_stats.json")
 VANTS = os.path.join(REPO, "util/claude_vantages.json")
+# BOTH CROPS BELOW ARE ABSOLUTE PIXEL BOXES AT lab.PINNED_FB (1920x1080)
+# and neither is derived from the frame. On the Linux rig the seat came
+# up at 3840x2049 (see claude_lab.fb_ok for the two causes), where
+# (300,880,200,1700) is a box in the upper-left QUARTER of the image --
+# a different wall, or no wall at all, with the descend=0 reference
+# still plausibly uniform and every number still printing. main()
+# refuses on a size mismatch before it crops anything.
 CROP = (300, 880, 200, 1700)   # y0,y1,x0,x1 -- excludes HUD text and hotbar
 # The client's own screenshot is the 1920x1080 render target rather than
 # the window's Retina backing store, and its hotbar starts at row 861 --
@@ -144,6 +151,14 @@ def main():
     for tag, dsc in (("off", 0), ("on", 1)):
         p = "/tmp/sliver_%s.png" % tag
         n, how = arm(a.view, dsc, a.target, wid, p)
+        # THE CROP ASSUMES A FRAMEBUFFER SIZE. Check it before cropping,
+        # not after: a wrong-size frame crops to a real, uniform-looking
+        # patch of some other part of the scene, so the blindness guard
+        # below cannot see this one -- it would bless it.
+        fb_ok, fb_detail = L.fb_ok(p)
+        if not fb_ok:
+            print("REFUSED: %s" % fb_detail)
+            return 2
         y0, y1, x0, x1 = CROP if how == "window" else CROP_CLIENT
         img = np.asarray(Image.open(p).convert("L"), dtype=np.int16)[y0:y1, x0:x1]
         res[tag] = img

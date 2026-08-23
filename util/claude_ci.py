@@ -291,9 +291,35 @@ PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
 #
 # These keys are forced into minetest.conf before every seat start;
 # autosave_screensize=false stops the exit-save from undoing it.
+# THE SCREEN-SIZE PIN IS A REQUEST, NOT A GUARANTEE, AND lab.fb_ok IS
+# WHAT MAKES IT EVIDENCE (2026-08-23, the Linux rig). Three separate
+# things have to hold for a 1920x1080 framebuffer and only two of them
+# are conf keys:
+#   * autosave_screensize = false, or the client REWRITES screen_w /
+#     screen_h from the live window on exit (renderingengine.cpp:446,
+#     called from game.cpp:4981) and the next run inherits the window
+#     the last human dragged. Its engine default is TRUE
+#     (defaultsettings.cpp:267), so a conf with no line here has it on.
+#   * window_maximized = false, or screen_w / screen_h are not used at
+#     all (renderingengine.cpp:177/197).
+#   * AND the compositor must not scale, which no conf key can say.
+#     screen_w/screen_h are LOGICAL points handed to SDL_CreateWindow
+#     with ALLOW_HIGHDPI set; the framebuffer comes back as
+#     SDL_GL_GetDrawableSize (CIrrDeviceSDL.cpp:619, 726, 1260-1273).
+#     On this seat's DP-2 (3840x2160 at KDE scale 1.5) that turns 1920
+#     into 2880, and the box's second output is at scale 1, so the
+#     correct number depends on which screen the window opens on.
+# So: pin the two that can be pinned, then MEASURE the frame and refuse
+# to crop it if it is the wrong size (lab.fb_ok, the <arm>-fb-size
+# assertion, and the refusal at the top of run_referee).
 PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                "fullscreen": "false", "window_maximized": "false",
                "autosave_screensize": "false",
+               # environment-laws "Measurement traps": both keys carry
+               # hidden defaults (60 / 10, defaultsettings.cpp), and an
+               # unfocused window at the default reads ~10 fps / 100 ms,
+               # which has twice been misread as a performance collapse.
+               # A CI window is never focused.
                "fps_max": "200", "fps_max_unfocused": "200",
                # Harness precondition, not a feature (John, 2026-08-15,
                # after a creeper detonated inside the Cornell box and
@@ -1888,6 +1914,18 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
         raise RuntimeError("no complete screenshot appeared for %s" % name)
     tl.mark("shutter")
     lab.write_capture_record(png)
+    # THE SIZE OF THE FRAME IS PART OF THE CAPTURE. Every referee box in
+    # this harness is an absolute pixel rectangle at lab.PINNED_FB, so a
+    # capture of any other size re-aims all of them at a different piece
+    # of the scene and still prints a number. Read it off the PNG the
+    # client just wrote -- that IS the framebuffer -- and carry it into
+    # the run record so the <arm>-fb-size assertion can go red on it.
+    fb_ok_, fb_detail = lab.fb_ok(png)
+    info["fb"] = {"ok": fb_ok_, "detail": fb_detail}
+    try:
+        info["fb_size"] = list(lab.png_size(png))
+    except Exception:
+        info["fb_size"] = None
 
     dst = os.path.join(rundir, name + ".png")
     shutil.copy2(png, dst)
@@ -1952,6 +1990,22 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
     carried through to the parsed result so cornell_verdict() can say
     REFUSED instead of "no golden pinned" (a golden IS pinned; it was
     refused, a different claim)."""
+    # REFUSE BEFORE MEASURING. Every referee below reads a pinned pixel
+    # box (claude_regions.REGIONS, claude_cornell_check's wall boxes,
+    # claude_furnace_check's patch), so on a frame that is not
+    # lab.PINNED_FB it would answer confidently about the wrong pixels.
+    # Not running it is the whole point: returncode is left non-zero so
+    # every *_verdict() reads "referee could not speak", which is RED —
+    # an instrument that cannot fail is not evidence.
+    fb_ok_, fb_detail = lab.fb_ok(png)
+    if not fb_ok_:
+        text = "REFUSED (framebuffer size): %s\n" % fb_detail
+        with open(os.path.join(rundir, name + ".referee.txt"), "w") as f:
+            f.write(text)
+        return {"kind": kind, "arg": arg, "returncode": 64,
+                "txt": name + ".referee.txt", "stdout": text,
+                "golden_png": None, "golden_refused": golden_refused,
+                "fb_refused": fb_detail}
     script = os.path.join(HERE, "claude_%s_check.py" % kind)
     cmd = [sys.executable, script, png] + ([arg] if arg else [])
     if kind == "furnace" and FURNACE_PATCH:
@@ -2789,6 +2843,13 @@ def cmd_run(args):
                       for k in PROVEN_DIALS))
             ok, detail = trace_marker(png)
             A.add("%s-traced" % name, ok, detail)
+            # THE CROPS ASSUME A SIZE; THIS IS WHERE THAT ASSUMPTION IS
+            # CHECKED. Red here means no cropped number from this run is
+            # trustworthy — see lab.fb_ok for why a conf pin alone is not
+            # enough on a fractionally-scaled seat.
+            fb = cap.get("fb") or {}
+            A.add("%s-fb-size" % name, fb.get("ok"),
+                  fb.get("detail") or "capture recorded no framebuffer size")
             aim = cap.get("aim_at_shutter") or {}
             A.add("%s-aim" % name, aim.get("ok"), aim.get("detail"))
             # ...and the half-node question aim_ok cannot ask.
