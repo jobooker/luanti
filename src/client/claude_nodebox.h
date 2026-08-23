@@ -48,14 +48,34 @@ static constexpr int CLAUDE_NBOX_MASK_BYTES = 512;
 //                        on param2 — see claudeTraceGridWalkBlock's hash.
 //   NODEBOX_LEVELED   -> not yet.
 //   NODEBOX_WALLMOUNTED -> not yet.
-//   NODEBOX_CONNECTED -> DEFERRED, DELIBERATELY. The shape depends on
-//                        NEIGHBOURS, and the grid re-snap re-walks single
-//                        dirty blocks: a fence at a block boundary can be
-//                        re-walked without its neighbour and the per-block
-//                        hash will happily call the wrong shape converged.
-//                        Falling back to the whole cell is the honest
-//                        answer; falling back to fixed[] alone would draw
-//                        a fence post with no rails.
+//   NODEBOX_CONNECTED -> YES SINCE 2026-08-23 (PANES). Every glass pane
+//                        with a neighbour is this type, so deferring it
+//                        meant deferring every window.
+//
+// WHAT THE DEFERRAL WAS ABOUT, AND WHAT PAID IT OFF. The shape depends on
+// NEIGHBOURS, and the grid re-snap re-walks single dirty blocks: a fence
+// at a block boundary could be re-walked without its neighbour and the
+// per-block hash would happily call the wrong shape converged. That was a
+// correct reading of the incremental path and it is fixed there, not
+// here, in two places that are both in game.cpp:
+//
+//   - the dirty map-block box is grown by ONE NODE on every axis before
+//     it is turned into grid blocks, so every cell whose 6-neighbourhood
+//     an edit touched is re-walked (claudeTraceGridIncremental);
+//   - the neighbour byte is part of the shape-cache key, so two panes of
+//     the same content and param2 with different neighbours are different
+//     entries, and the mask id — which is what the per-block hash mixes —
+//     moves when the shape moves (claudeNodeBoxMaskId).
+//
+// The resolution itself is not re-derived: MapNode::getNeighbors() is
+// Luanti's own, the same call drawNodeboxNode() makes, so `connects_to`
+// groups, `connect_sides` and facedir rotation are answered once in the
+// engine and read here.
+//
+// fixed[] alone is still NOT an acceptable answer for this type — it is a
+// fence post with no rails, and a pane post with no pane — which is why
+// the union comes from getNodeBoxes(ndef, &boxes, neighbours) rather than
+// from nb.fixed.
 bool claudeNodeBoxConvertible(const NodeBox &nb);
 
 // Rasterize a node's box list (node-local, BS units, i.e. -BS/2..+BS/2 on

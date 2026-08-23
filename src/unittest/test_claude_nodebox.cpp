@@ -48,7 +48,10 @@ public:
 	void testParam2RotatesTheStep();
 	void testEdgesLandOnSubvoxelLines();
 	void testSliverCannotFattenALayer();
-	void testConnectedFallsBackWholeCell();
+	void testConnectedIsConverted();
+	void testPaneAloneIsJustThePost();
+	void testPaneWestAndEastIsAFullSlab();
+	void testPaneNeighboursAreDifferentShapes();
 };
 
 static TestClaudeNodeBox g_test_instance;
@@ -104,7 +107,10 @@ void TestClaudeNodeBox::runTests(IGameDef *gamedef)
 	TEST(testParam2RotatesTheStep);
 	TEST(testEdgesLandOnSubvoxelLines);
 	TEST(testSliverCannotFattenALayer);
-	TEST(testConnectedFallsBackWholeCell);
+	TEST(testConnectedIsConverted);
+	TEST(testPaneAloneIsJustThePost);
+	TEST(testPaneWestAndEastIsAFullSlab);
+	TEST(testPaneNeighboursAreDifferentShapes);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -312,34 +318,172 @@ void TestClaudeNodeBox::testSliverCannotFattenALayer()
 	}
 }
 
-// DEFERRED TYPE, ASSERTED. NODEBOX_CONNECTED depends on neighbours, and
-// the grid re-snap is incremental — a one-block re-walk at a block
-// boundary can compute the wrong shape and the per-block hash will call
-// it converged. So connected types are NOT converted, and this pins the
-// fallback: a connected node must keep its full 1 m cube, never a
-// half-converted shape built from the fixed[] list alone (which for a
-// fence is the post, i.e. a fence whose rails have vanished).
-void TestClaudeNodeBox::testConnectedFallsBackWholeCell()
+// mcl_panes' `pane_nodebox`, verbatim from
+// games/mineclonia/mods/ITEMS/mcl_panes/init.lua. A post through the
+// middle of the cell, and one arm per horizontal face that connects.
+// This is the shape every window in the world is made of.
+static void paneNodeBox(NodeBox *nb)
+{
+	nb->type = NODEBOX_CONNECTED;
+	nb->fixed.push_back(boxOf(-1.f / 16, -0.5f, -1.f / 16,
+			1.f / 16, 0.5f, 1.f / 16));
+	auto &c = nb->getConnected();
+	// front = -z, left = -x, back = +z, right = +x. The names and the
+	// bit order are Luanti's (mapnode.cpp transformNodeBox):
+	//   1 top, 2 bottom, 4 front(-z), 8 left(-x), 16 back(+z), 32 right(+x)
+	c.connect_front.push_back(boxOf(-1.f / 16, -0.5f, -0.5f,
+			1.f / 16, 0.5f, -1.f / 16));
+	c.connect_left.push_back(boxOf(-0.5f, -0.5f, -1.f / 16,
+			-1.f / 16, 0.5f, 1.f / 16));
+	c.connect_back.push_back(boxOf(-1.f / 16, -0.5f, 1.f / 16,
+			1.f / 16, 0.5f, 0.5f));
+	c.connect_right.push_back(boxOf(1.f / 16, -0.5f, -1.f / 16,
+			0.5f, 0.5f, 1.f / 16));
+}
+
+// Rasterize one pane at one neighbour state. `neighbors` is the byte
+// MapNode::getNeighbors() produces in the real walk.
+static int paneMask(u8 neighbors, u8 *mask)
 {
 	NodeBox nb;
-	nb.type = NODEBOX_CONNECTED;
-	// a fence: a thin post in fixed[], rails only in the connect_* lists
-	nb.fixed.push_back(boxOf(-0.125f, -0.5f, -0.125f, 0.125f, 0.5f, 0.125f));
-	auto &c = nb.getConnected();
-	c.connect_front.push_back(boxOf(-0.0625f, 0.1875f, -0.5f,
-			0.0625f, 0.375f, -0.125f));
-
-	// The engine WOULD produce a shape here; the grid must not use it.
+	paneNodeBox(&nb);
 	std::vector<aabb3f> boxes;
-	transformNodeBox(MapNode(CONTENT_AIR), nb, nullptr, &boxes, 0);
-	UASSERT(!boxes.empty()); // proves the fallback is a choice, not an accident
+	// nodemgr is only dereferenced by the FIXED/LEVELED branch
+	transformNodeBox(MapNode(CONTENT_AIR), nb, nullptr, &boxes, neighbors);
+	memset(mask, 0, CLAUDE_NBOX_MASK_BYTES);
+	return claudeRasterizeBoxes(boxes, mask);
+}
 
-	// claudeNodeBoxKind is the single place that decides. CONNECTED must
-	// answer "not mine", so the walk leaves the cell class 255 / 1 m.
-	UASSERT(!claudeNodeBoxConvertible(nb));
-	UASSERT(!claudeNodeBoxConvertible(NodeBox())); // REGULAR too
+// TYPE GATE, THE OTHER WAY ROUND SINCE 2026-08-23 (PANES).
+//
+// This test used to assert the opposite: NODEBOX_CONNECTED was refused,
+// because the shape depends on NEIGHBOURS and a one-block re-walk at a
+// block boundary could compute the wrong shape while the per-block hash
+// called it converged. Every glass pane with a neighbour is this type, so
+// refusing it refused every window.
+//
+// The deferral was paid off in game.cpp, not here, and in two places: the
+// incremental dirty box is grown by ONE NODE on each axis before it is
+// turned into grid blocks (so every cell whose 6-neighbourhood an edit
+// touched is re-walked), and the neighbour byte is part of the shape
+// cache key (so the mask id the block hash mixes moves when the shape
+// moves). What stays true is the other half of the old assertion:
+// fixed[] alone is never the answer — see the two pane tests below, where
+// the arms carry most of the geometry.
+void TestClaudeNodeBox::testConnectedIsConverted()
+{
+	NodeBox nb;
+	paneNodeBox(&nb);
+	UASSERT(claudeNodeBoxConvertible(nb));
+
+	// a fence: a thin post in fixed[], rails only in the connect_* lists
+	NodeBox fence;
+	fence.type = NODEBOX_CONNECTED;
+	fence.fixed.push_back(boxOf(-0.125f, -0.5f, -0.125f,
+			0.125f, 0.5f, 0.125f));
+	fence.getConnected().connect_front.push_back(
+			boxOf(-0.0625f, 0.1875f, -0.5f, 0.0625f, 0.375f, -0.125f));
+	UASSERT(claudeNodeBoxConvertible(fence));
+
+	// A CONNECTED box with an EMPTY fixed[] is still ours: its whole body
+	// can live in the connect_*/disconnected_* lists, and emptiness is
+	// decided where the neighbours are known, not at this gate.
+	NodeBox armsonly;
+	armsonly.type = NODEBOX_CONNECTED;
+	armsonly.getConnected().connect_left.push_back(
+			boxOf(-0.5f, -0.5f, -0.0625f, 0.0f, 0.5f, 0.0625f));
+	UASSERT(armsonly.fixed.empty());
+	UASSERT(claudeNodeBoxConvertible(armsonly));
+
+	// and the two refusals that have not moved
+	UASSERT(!claudeNodeBoxConvertible(NodeBox()));   // REGULAR
+	NodeBox emptyfixed;
+	emptyfixed.type = NODEBOX_FIXED;
+	UASSERT(!claudeNodeBoxConvertible(emptyfixed));  // FIXED with no boxes
 	NodeBox fixed;
 	fixed.type = NODEBOX_FIXED;
 	stairBoxes(&fixed.fixed);
 	UASSERT(claudeNodeBoxConvertible(fixed));
+}
+
+// NO NEIGHBOURS: the post and nothing else. 2x2 sub-voxels in x and z,
+// full height — a glass POST, which is what Mineclonia draws for a pane
+// standing on its own.
+void TestClaudeNodeBox::testPaneAloneIsJustThePost()
+{
+	u8 mask[CLAUDE_NBOX_MASK_BYTES];
+	int bits = paneMask(0, mask);
+	UASSERTEQ(int, bits, 2 * 2 * 16);
+
+	for (int x = 0; x < 16; x++)
+	for (int y = 0; y < 16; y++)
+	for (int z = 0; z < 16; z++) {
+		bool want = (x == 7 || x == 8) && (z == 7 || z == 8);
+		if (claudeMaskBit(mask, x, y, z) != want) {
+			rawstream << "pane, no neighbours:\n" << claudeMaskAscii(mask);
+			UASSERT(false);
+		}
+	}
+}
+
+// THE WORKED EXAMPLE, and it is what makes a window a window. A pane with
+// a WEST (-x, bit 8 "left") and an EAST (+x, bit 32 "right") neighbour
+// unions three boxes:
+//
+//   fixed          x [-1/16, 1/16]  ->  sub-voxels x 7..8
+//   connect_left   x [-1/2, -1/16]  ->  sub-voxels x 0..6
+//   connect_right  x [ 1/16,  1/2]  ->  sub-voxels x 9..15
+//
+// all of them z [-1/16, 1/16] (sub-voxels 7..8) and full height. So the
+// mask is a 16 x 16 pane TWO SUB-VOXELS THICK: 512 bits, a continuous
+// sheet of glass across the whole cell with no seam at the post. Before
+// this step the same node baked as a full opaque 1 m cube — 4096 bits of
+// stone behaviour where the window is.
+void TestClaudeNodeBox::testPaneWestAndEastIsAFullSlab()
+{
+	u8 mask[CLAUDE_NBOX_MASK_BYTES];
+	int bits = paneMask(8 | 32, mask);
+	UASSERTEQ(int, bits, 16 * 16 * 2);
+
+	for (int x = 0; x < 16; x++)
+	for (int y = 0; y < 16; y++)
+	for (int z = 0; z < 16; z++) {
+		bool want = (z == 7 || z == 8);
+		if (claudeMaskBit(mask, x, y, z) != want) {
+			rawstream << "pane, west+east:\n" << claudeMaskAscii(mask);
+			UASSERT(false);
+		}
+	}
+}
+
+// THE LANDMINE THE DEFERRAL WAS ABOUT, ASSERTED AS BITS: the same content
+// and the same param2 are DIFFERENT SHAPES at different neighbour states.
+// That is why the neighbour byte is in claudeNodeBoxMaskId()'s cache key
+// and why the incremental walk grows its dirty box by a node — if either
+// were missing, one of these masks would be served for the other and the
+// per-block hash would call it converged.
+void TestClaudeNodeBox::testPaneNeighboursAreDifferentShapes()
+{
+	// west+east (a sheet), north+south (the same sheet turned 90 deg),
+	// west only (half a sheet), a corner, and all four.
+	const u8 states[5] = {8 | 32, 4 | 16, 8, 8 | 4, 4 | 8 | 16 | 32};
+	const int want_bits[5] = {512, 512, 64 + 224, 64 + 224 + 224,
+			512 + 512 - 64};
+	u8 masks[5][CLAUDE_NBOX_MASK_BYTES];
+	for (int i = 0; i < 5; i++) {
+		int bits = paneMask(states[i], masks[i]);
+		if (bits != want_bits[i]) {
+			rawstream << "neighbours " << (int)states[i] << " -> "
+					<< bits << " bits, expected " << want_bits[i] << "\n"
+					<< claudeMaskAscii(masks[i]);
+			UASSERT(false);
+		}
+	}
+	// west+east and north+south have the same COUNT and must not have the
+	// same bits: a count-only check would pass a mask rotated 90 degrees
+	// out of true, which is a window that looks right end-on and is a
+	// wall from the side.
+	for (int i = 0; i < 5; i++)
+	for (int j = i + 1; j < 5; j++)
+		UASSERT(memcmp(masks[i], masks[j], CLAUDE_NBOX_MASK_BYTES) != 0);
 }

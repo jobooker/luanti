@@ -568,34 +568,49 @@ static void claudeMatTableBuild()
 	for (int l = 0; l < CLAUDE_MAT_LIGHTS; l++) {
 		ClaudeMat m;
 		m.kind = (u8)k; m.fine = (u8)f; m.light = (u8)l;
-		// A TRANSMISSIVE KIND HAS NO FINE VARIANT, and this line is the
-		// decision the transparency handoff asked to be made explicitly
-		// rather than the shortcut it looks like.
+		// GLASS IS FINE-SHAPED SINCE 2026-08-23 (PANES); LIQUID STILL IS
+		// NOT. What this line refuses, and why, is the whole of the
+		// transmissive/sub-voxel question and it is worth stating exactly
+		// rather than by the shape of the `continue`.
 		//
-		// The bake carries an OPACITY PROOF since 2026-08-18
-		// (`b945042ee`): every air cell of a full-solid node's 16^3 model
-		// lies within the carve depth of exactly one face, which makes
-		// the air six disjoint boxes and proves a ray cannot cross the
-		// node whatever its direction. A transmissive node is one a ray
-		// is SUPPOSED to cross. Those two claims contradict each other on
-		// any material that is both, so no material is both.
+		// THE OPACITY PROOF'S DOMAIN IS FULL-SOLID OPAQUE NODES.
+		// The bake has carried it since 2026-08-18 (`b945042ee`): every
+		// air cell of a full-solid node's 16^3 model lies within the
+		// carve depth of exactly one face, which makes the air six
+		// disjoint boxes and proves a ray cannot cross the node whatever
+		// its direction. That proof is about a node whose mask is a
+		// CARVED CUBE. It never spoke about a node that is mostly air.
 		//
-		// THE PROOF APPLIES TO FULL-SOLID OPAQUE NODES AND NOTHING ELSE.
-		// Glass and water get no 16^3 mask, so it does not speak about
-		// them -- not an exemption carved out of it, a domain it never
-		// covered. NDT_GLASSLIKE_FRAMED, which really does have a solid
-		// frame around a transparent pane, is therefore a uniform pane
-		// here: its frame is geometry this rung does not represent, in
-		// the same way a torch outside the sub-voxel ring is a nub. That
-		// is §7's laddered geometry and it is written down rather than
-		// left to be found.
+		// A TRANSMISSIVE FINE CELL'S MASK IS WHERE THE GLASS IS, AND AIR
+		// EVERYWHERE ELSE. A glass pane is a 2/16 m slab inside a 1 m
+		// cell: the other 14/16 of that cell is not "carved-out solid",
+		// it is the room. So the mask is not a claim that a ray cannot
+		// cross the cell — it is the statement of WHERE the two
+		// interfaces are. The walk reads it that way
+		// (`opengl_fragment.glsl`, the fine rung: the material of a
+		// sub-voxel is the cell's own where the bit is set and AIR where
+		// it is not), so the interface a ray refracts at is the mask
+		// boundary, not the 1 m wall. There is no contradiction to
+		// resolve here any more; there are two different questions that
+		// were once answered by one flag.
 		//
-		// Skipping the key leaves those 30 slots at the zero row, which
-		// reads as a plain opaque non-emitting material -- a TOTAL answer
-		// for an index the snapshot cannot produce. claudeMatIndex() is
-		// untouched, so no reachable index moves and the block hash is
-		// bit-identical.
-		if (m.fine && claudeMatTransmission(m) > 0.0f)
+		// LIQUID x FINE STAYS REFUSED, and not out of symmetry: it
+		// caught a real bug on this check's first run, no liquid node in
+		// this world carries a 16^3 mask (`isLiquid()` is decided before
+		// any fine branch in the walk), and a flowing liquid's sub-metre
+		// shape is a LEVEL, which is a different mechanism (NODEBOX_LEVELED,
+		// not yet read) with its own free surface. An index that cannot
+		// be produced is left at the zero row, which reads as a plain
+		// opaque non-emitting material -- a TOTAL answer for an index the
+		// snapshot cannot produce. claudeMatIndex() is untouched, so no
+		// reachable index moves and the block hash is bit-identical.
+		//
+		// NDT_GLASSLIKE_FRAMED is still a uniform pane here: its solid
+		// frame is geometry this rung does not represent, in the same way
+		// a torch outside the sub-voxel ring is a nub. §7's laddered
+		// geometry, written down rather than left to be found.
+		if (m.fine && m.kind != MATK_GLASS
+				&& claudeMatTransmission(m) > 0.0f)
 			continue;
 		u8 idx = claudeMatIndex(m);
 		g_claude_mattab[idx] = m;
@@ -608,10 +623,14 @@ static void claudeMatTableBuild()
 	// check asserted the reachable set and passed; this one caught
 	// (liquid, fine) on its first run, which is the difference between a
 	// claim about the table and a claim about what someone believes is in
-	// it.
+	// it. NARROWED 2026-08-23, not deleted: glass left its domain (see the
+	// comment on the `continue` above), liquid did not, so the check is
+	// now "transmissive AND fine AND not glass" and (liquid, fine) is
+	// still the thing it would catch.
 	for (int i = 0; i < 256; i++) {
 		if (g_claude_matpal[i].transmit > 0.0f
-				&& g_claude_matpal[i].fine > 0.0f) {
+				&& g_claude_matpal[i].fine > 0.0f
+				&& g_claude_mattab[i].kind != MATK_GLASS) {
 			errorstream << "[claude_grid] material " << i
 					<< " is BOTH transmissive and fine: the bake's opacity"
 					   " proof and the transmissive walk contradict each"
@@ -671,9 +690,17 @@ static inline bool claudeMatAreaSamplable(u8 idx)
 // Does this material get sub-voxel bits baked for it? The old `a > 230`,
 // which meant "class 250 or class 255" and nothing else: a fine cell
 // takes its authored/derived mask, a plain 1 m solid takes 4,096 ones,
-// and air, water, glass, leaves, the nub and every emissive full cube
-// take none. Stated as the question rather than as a number, because the
-// number was a band edge and the bands are gone.
+// and air, water, leaves, the nub and every emissive full cube take none.
+// Stated as the question rather than as a number, because the number was
+// a band edge and the bands are gone.
+//
+// A FINE GLASS CELL (a pane, 2026-08-23) ANSWERS YES THROUGH THE SAME
+// `m.fine` CLAUSE, and it had to be that clause and not a new one: the
+// pane's mask is baked, uploaded and read by the same three lines a
+// stair's is. The only reason it did not bake before is that the material
+// table refused to build a (glass, fine) row at all, so this function was
+// handed the zero row and read `fine = 0`. Filling the row is the whole
+// wiring; there is no glass-shaped branch anywhere in the bake.
 static inline bool claudeMatBakesBits(u8 idx)
 {
 	const ClaudeMat &m = g_claude_mattab[idx];
@@ -2982,11 +3009,28 @@ static inline int claudeNBoxRing(int x, int y, int z)
 
 // One node's real box list -> a 16^3 mask id, memoised per shape.
 //
-// The rasterizer runs once per DISTINCT (content, param2), not once per
-// cell: a cabin floor of 200 identical slabs converts one box list. The
-// cache is never invalidated because a node definition does not change
-// inside a session; param2 is in the key, so a rotated stair is a
-// different entry rather than a stale one.
+// The rasterizer runs once per DISTINCT (content, param2, neighbours),
+// not once per cell: a cabin floor of 200 identical slabs converts one
+// box list. The cache is never invalidated because a node definition does
+// not change inside a session; param2 is in the key, so a rotated stair
+// is a different entry rather than a stale one.
+//
+// THE NEIGHBOUR BYTE IS IN THE KEY (PANES, 2026-08-23) and it has to be,
+// because a NODEBOX_CONNECTED node's shape is a function of its six
+// neighbours as well as of its content and param2. Two panes of the same
+// content and param2, one in the middle of a window and one at its edge,
+// are different shapes and must be different cache entries. The byte is
+// 6 bits, so the key is content(16) | param2(8) | neighbours(6) and still
+// fits a u32 with two bits spare.
+//
+// It is Luanti's OWN resolution, not a re-derivation: MapNode::getNeighbors()
+// is the function the mesh generator's drawNodeboxNode() and the
+// server-side collision path both go through, and it calls
+// NodeDefManager::nodeboxConnects() per face — connects_to ids,
+// connect_sides, facedir rotation of those sides, and the "both ends
+// agree" rule for two connected nodeboxes. It returns 0 for every node
+// that is not NODEBOX_CONNECTED, which is why a stair's key and a stair's
+// box list are byte-for-byte what they were before this line existed.
 //
 // Returns 0 for "leave this cell a 1 m cube", which is the answer for
 // every shape the grid must not express: an empty box list (a
@@ -2994,11 +3038,12 @@ static inline int claudeNBoxRing(int x, int y, int z)
 // (a mask that costs 512 bytes to say nothing), and a shape found after
 // the budget is spent. 0 is CACHED too, so a fallback costs one
 // rasterization, not one per cell per walk.
-static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, const MapNode &n,
-		content_t c, const ContentFeatures &f)
+static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, Map &map,
+		v3s16 wp, const MapNode &n, content_t c, const ContentFeatures &f)
 {
 	ClaudeTraceGrid &V = g_claude_grid;
-	u32 key = ((u32)c << 8) | (u32)n.getParam2();
+	u8 nbrs = n.getNeighbors(wp, &map);
+	u32 key = ((u32)c << 16) | ((u32)n.getParam2() << 8) | (u32)nbrs;
 	auto it = V.nbox_of.find(key);
 	if (it != V.nbox_of.end())
 		return it->second;
@@ -3008,10 +3053,11 @@ static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, const MapNode &n,
 		std::vector<aabb3f> boxes;
 		// Luanti's OWN reader, not a re-derivation of it: this is the
 		// function the mesh generator and the raycast use, so the traced
-		// shape cannot drift from the shape the player collides with.
-		// neighbours = 0 is safe because claudeNodeBoxConvertible()
-		// refuses NODEBOX_CONNECTED, the only type that reads them.
-		n.getNodeBoxes(ndef, &boxes, 0);
+		// shape cannot drift from the shape the player collides with. For
+		// NODEBOX_CONNECTED it unions fixed[] with one connect_*/
+		// disconnected_* list per face according to `nbrs`, which is
+		// exactly what drawNodeboxNode() hands it.
+		n.getNodeBoxes(ndef, &boxes, nbrs);
 		std::array<u8, 512> mask{};
 		int bits = claudeRasterizeBoxes(boxes, mask.data());
 		if (bits > 0 && bits < 4096) {
@@ -3235,6 +3281,40 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED
 				|| f.drawtype == NDT_GLASSLIKE_FRAMED_OPTIONAL)
 			mat.kind = MATK_GLASS;
+		// A NODEBOX MADE OF GLASS — glass panes (PANES, 2026-08-23).
+		//
+		// THE RULE IS THE GAME'S OWN MATERIAL DECLARATION, `material_glass`,
+		// and it was picked over the two the roadmap offered because both
+		// of those are wrong on the same node. Mineclonia registers
+		// `mcl_panes:bar` — IRON BARS — through the identical pane
+		// factory: same `mcl_panes:` prefix, same NDT_NODEBOX, same
+		// connected node_box, and `use_texture_alpha = "clip"` exactly
+		// like plain glass panes (mcl_panes/init.lua). So a name-prefix
+		// rule and a `use_texture_alpha != OPAQUE` rule each turn iron
+		// bars into a dielectric with an IOR of 1.52. `material_glass` is
+		// the group Mineclonia itself asks when it wants to know whether
+		// a block is made of glass (mcl_beacons, mcl_noteblock), it is on
+		// the plain pane and on all sixteen stained panes and on neither
+		// bar, and the five other nodes carrying it (mcl_core:glass and
+		// stained, tinted glass, glowstone, sea lantern) are NDT_NORMAL or
+		// NDT_GLASSLIKE and so cannot reach this branch at all.
+		//
+		// A NAME MATCH WAS THE OTHER CANDIDATE AND IS STRICTLY MORE MAGIC:
+		// it would have to list `mcl_panes:pane*` and exclude
+		// `mcl_panes:bar`, i.e. re-derive by string what the node already
+		// declares by group.
+		//
+		// Scoped to NDT_NODEBOX, to an unlit node, and to a cell this walk
+		// would otherwise have called a plain opaque solid, so it can only
+		// move nodes that are today 1 m opaque cubes or fine opaque masks
+		// — no liquid, no leaves, no glasslike, no emitter.
+		bool glass_nodebox = false;
+		if (mat.kind == MATK_SOLID && mat.light == 0
+				&& f.drawtype == NDT_NODEBOX
+				&& f.getGroup("material_glass") > 0) {
+			mat.kind = MATK_GLASS;
+			glass_nodebox = true;
+		}
 		// "a plain opaque 1 m cube": the old class 255, and the only
 		// class the two sub-voxel branches below were ever allowed to
 		// take over.
@@ -3266,15 +3346,25 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// branch on purpose: a hand-made model beats an extracted box
 		// list, so model_of stays the override it has always been.
 		//
-		// Gated to a plain opaque solid (the old class 255): water, glass,
-		// leaves and every emissive class keep the classification they
-		// have today, and NODEBOX_REGULAR cannot reach here at all
-		// because claudeNodeBoxConvertible() refuses it (handoff gate 2).
-		if (V.nodebox_on && nbring >= 0 && plain_solid
+		// Gated to a plain opaque solid (the old class 255) OR to a glass
+		// nodebox (a pane): water, leaves, glasslike and every emissive
+		// class keep the classification they have today, and
+		// NODEBOX_REGULAR cannot reach here at all because
+		// claudeNodeBoxConvertible() refuses it (handoff gate 2).
+		//
+		// A PANE THAT DOES NOT GET A MASK IS A GLASS CUBE, NOT A STONE
+		// ONE, and that is the §7 ladder arriving in its honest form:
+		// outside the sub-voxel ring, or past the shape-cache budget,
+		// `nbid` is 0, `mat.fine` stays 0, and the cell is a full 1 m
+		// transmissive cell. A ray still crosses it; it just crosses a
+		// metre of it. That is a coarser GEOMETRY rung, which §7 permits,
+		// rather than a different light law.
+		if (V.nodebox_on && nbring >= 0 && (plain_solid || glass_nodebox)
 				&& V.modelids[i] == 0
 				&& f.drawtype == NDT_NODEBOX
 				&& claudeNodeBoxConvertible(f.node_box)) {
-			nbid = claudeNodeBoxMaskId(ndef, n, c, f);
+			nbid = claudeNodeBoxMaskId(ndef, map, origin + v3s16(x, y, z),
+					n, c, f);
 			if (nbid) {
 				mat.fine = 1;            // "this cell has sub-voxel bits"
 				V.nbox_ids[nbring] = nbid;
@@ -4156,14 +4246,30 @@ static bool claudeTraceGridIncremental(Client *client)
 	// one map block straddles up to 2 grid blocks per axis; re-walking
 	// whole grid blocks costs at most 8 x 4096 cells and keeps one
 	// alignment story for the hashes, the pyramid and the uploads.
+	//
+	// ONE NODE OF HALO (PANES, 2026-08-23), and it is what makes
+	// NODEBOX_CONNECTED safe to read here. A connected node's shape is a
+	// function of its six NEIGHBOURS, so an edit inside map block B
+	// changes the shape of a node in the map block next to it — and that
+	// node's grid block would never be re-walked, so its per-block hash
+	// would never move, and the incremental path would call a stale shape
+	// converged. That is exactly the failure claude_nodebox.h deferred the
+	// type for. Growing the dirty box by one cell on every axis makes the
+	// re-walked set a superset of "every cell whose 6-neighbourhood the
+	// edit touched", which is the whole dependency.
+	//
+	// IT CANNOT CHANGE AN OUTPUT, only a cost: a re-walk that produces the
+	// same block hash is skipped by the `block_hash[b] == before` test
+	// below, so widening the marked set widens what is CHECKED and never
+	// what is written.
 	static std::vector<u8> mark;
 	mark.assign(ClaudeTraceGrid::NBLOCKS, 0);
 	int marked = 0;
 	for (const v3s16 &bp : dirty) {
 		v3s16 lo = bp * MAP_BLOCKSIZE - V.origin;
-		int x0 = std::max(0, (int)lo.X), x1 = std::min(S, (int)lo.X + MAP_BLOCKSIZE);
-		int y0 = std::max(0, (int)lo.Y), y1 = std::min(S, (int)lo.Y + MAP_BLOCKSIZE);
-		int z0 = std::max(0, (int)lo.Z), z1 = std::min(S, (int)lo.Z + MAP_BLOCKSIZE);
+		int x0 = std::max(0, (int)lo.X - 1), x1 = std::min(S, (int)lo.X + MAP_BLOCKSIZE + 1);
+		int y0 = std::max(0, (int)lo.Y - 1), y1 = std::min(S, (int)lo.Y + MAP_BLOCKSIZE + 1);
+		int z0 = std::max(0, (int)lo.Z - 1), z1 = std::min(S, (int)lo.Z + MAP_BLOCKSIZE + 1);
 		if (x0 >= x1 || y0 >= y1 || z0 >= z1)
 			continue; // outside the bubble entirely
 		for (int bz = z0 / B; bz <= (z1 - 1) / B; bz++)

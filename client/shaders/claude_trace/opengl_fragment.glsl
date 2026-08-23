@@ -1089,13 +1089,32 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // them back costs nothing — the walk fetched the palette on arrival
 // anyway, and returning a value it already holds is cheaper than making
 // the caller fetch it again.
+//
+// AND THE INTERFACE IS NOT ALWAYS THE 1 M WALL (PANES, 2026-08-23).
+// Inside a fine transmissive cell — a glass pane is a 2/16 m slab in a
+// 1 m cell — the boundary a ray refracts at is where the 16^3 MASK goes
+// 0 -> 1 or 1 -> 0 along the ray, and the sub-voxels the mask does not
+// claim are AIR, the surrounding medium. So the walk answers about a
+// sub-voxel-sized region, and a caller that has to restart on the FAR
+// side of the interface cannot rebuild that region from `cellOut` any
+// more: `restartPoint(phit, -n, cellOut, 1.0)` would drop the ray up to
+// a metre past a 1/16 m pane. hpFar is that restart point, computed at
+// whichever rung the interface was actually found on, by the only code
+// that knows which rung that was. `hp` is unchanged: the near side, in
+// the region the ray came THROUGH.
+//
+// At the coarse rung hpFar is `restartPoint(phit, -n, ci, 1.0)`, which is
+// the expression the path loop used to evaluate itself — same inputs,
+// same order, so an opaque scene and a full-cube glass block are
+// bit-identical to what they were.
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
-		out vec4 palOut, out float idxOut)
+		out vec4 palOut, out float idxOut, out vec3 hpFar)
 {
 	palOut = vec4(0.0);
 	idxOut = 0.0;
 	hp = ro;
+	hpFar = ro;
 	n = vec3(0.0, 1.0, 0.0);
 	alb = vec3(0.0);
 	le = vec3(0.0);
@@ -1205,21 +1224,69 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		if (lim < GRID_S) {
 			// ---- the walk is on the 1/16 m rung, inside cellHi ----
 			if (!escaped) {
-				if (!subvoxSolid(cellHi - vec3(SUBV_R0), ci))
-					continue; // this sub-voxel is empty: step again
+				// THE MATERIAL OF THE SUB-VOXEL JUST ENTERED, and this
+				// one line is the whole of PANES in the walk. A fine
+				// cell's mask says WHERE its material is; where the mask
+				// is 0 the sub-voxel is AIR — the surrounding medium —
+				// not "nothing". So the fine rung asks the same question
+				// the coarse rung asks, against the same `curMed`:
+				// is what I just entered a different material from the
+				// one I am travelling in?
+				//
+				// IT IS THE OLD TEST WHEREVER THE OLD TEST APPLIED. With
+				// curMed = 0 (every opaque walk, every shadow ray, every
+				// eye ray in air) an empty sub-voxel gives subIdx = 0 ==
+				// curMed and steps again, and a solid one gives
+				// subIdx = the cell's index != 0 and stops — which is
+				// `if (!subvoxSolid(...)) continue;` exactly. No stair,
+				// slab, bed or authored model changes by one bit.
+				//
+				// AND IT IS WHERE THE STALE-curMed X-RAY DIES (measured.md
+				// "Defect 2 — glass X-rays the opaque block behind it").
+				// A ray that refracted into glass and then descended into
+				// an opaque FINE cell — a carved plank — used to walk the
+				// air sub-voxels of that plank's relief without noticing
+				// that it had left the glass, and every ray leaving that
+				// vertex inherited curMed = glass. Here that first air
+				// sub-voxel IS an interface: glass -> air, curMed goes
+				// back to 0 at the crossing, and no later ray carries a
+				// medium it is not in.
+				float subIdx = subvoxSolid(cellHi - vec3(SUBV_R0), ci)
+						? idxOut : 0.0;
+				if (subIdx == curMed)
+					continue; // same medium: step again
 				n = vec3(0.0);
 				if (axis == 0) n.x = -stepDir.x;
 				else if (axis == 1) n.y = -stepDir.y;
 				else n.z = -stepDir.z;
 				// ci + n is the SUB-VOXEL the walk came through, and it
-				// is empty: the loop only continues past sub-voxels it
-				// found empty, and the origin one is excluded. So the
-				// next ray starts inside a known-empty 1/16 m cell of
-				// cellHi — the same guarantee as at 1 m, one rung down.
+				// holds the medium the ray is in: the loop only continues
+				// past sub-voxels whose material matched curMed, and the
+				// origin one is excluded. So the next ray starts inside a
+				// known-curMed 1/16 m cell of cellHi — the same guarantee
+				// as at 1 m, one rung down.
 				hp = restartPoint(ro + rd * t, n,
 						cellHi + (ci + n) * RUNG_FINE, RUNG_FINE);
-				alb = cellAlbedo(s.rgb);
-				le = alb * pal.r;   // the palette's emission column (§4: one Le)
+				// the FAR side, in the sub-voxel that was entered
+				hpFar = restartPoint(ro + rd * t, -n,
+						cellHi + ci * RUNG_FINE, RUNG_FINE);
+				if (subIdx < 0.5) {
+					// LEFT the cell's material into one of its air
+					// sub-voxels. Report AIR, because that is what the
+					// ray arrived at — reporting the cell here would
+					// hand the caller glass on both sides of a pane and
+					// it would never refract out. alb/le are what an
+					// ARRIVAL AT AIR reports one rung up, verbatim:
+					// cellAlbedo of a zero texel (the floor) and no
+					// emission, since air's palette row is all zeros.
+					palOut = vec4(0.0);
+					idxOut = 0.0;
+					alb = cellAlbedo(vec3(0.0));
+					le = vec3(0.0);
+				} else {
+					alb = cellAlbedo(s.rgb);
+					le = alb * pal.r;   // the palette's emission column (§4: one Le)
+				}
 				tHit = t;
 				cellOut = cellHi;   // the COARSE cell, for neeDirect
 				return true;
@@ -1261,13 +1328,33 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// before. With curMed = a pane's index, it is what carries a
 		// refracted ray across the inside of the pane to its far face.
 		float idx = matIndex(s.a);
-		if (idx == curMed)
+		// AIR INSIDE AIR — the hot path, and it must stay one compare and
+		// NO palette fetch. Empty space is most of every walk and the
+		// dead-weight probe priced a per-step dependent read at +2.2 ms;
+		// this early-out is why the fetch below is per ARRIVAL and not
+		// per step. With curMed = 0, idx == curMed means idx == 0 means
+		// air, so this is the old test verbatim for every caller that
+		// never entered a medium.
+		if (idx == curMed && curMed < 0.5)
 			continue;
-		// A boundary. Ask the table what is on the far side of it. ONE
-		// palette fetch per arrival, kept live across a descent for the
-		// same reason `s` is: a fine hit takes its material from the cell
-		// that owns the mask.
+		// A boundary, or a cell of the ray's own medium that may still
+		// have an INTERIOR. Ask the table which. ONE palette fetch per
+		// arrival, kept live across a descent for the same reason `s` is:
+		// a fine hit takes its material from the cell that owns the mask.
 		pal = matPalIdx(idx);
+		bool fineHere = claudeDescend > 0.5 && matFine(pal)
+				&& inSubvoxRing(ci);
+		// SAME MATERIAL IS NOT THE SAME AS NO INTERFACE, once a material
+		// can be fine (PANES, 2026-08-23). A ray inside a pane crossing
+		// into the NEXT pane cell of the same window meets the same
+		// material index — but that cell's connected nodebox may have no
+		// arm along this ray, so the glass ends inside it. Skipping the
+		// cell because the index matched would carry the ray through
+		// geometry that is not there. A fine cell is therefore always
+		// descended into and the mask decides; only a homogeneous 1 m
+		// cell of the ray's own medium is stepped over.
+		if (idx == curMed && !fineHere)
+			continue;
 		palOut = pal;
 		idxOut = idx;
 
@@ -1275,6 +1362,16 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		if (axis == 0) n.x = -stepDir.x;
 		else if (axis == 1) n.y = -stepDir.y;
 		else n.z = -stepDir.z;
+
+		// The region a crossing ray would restart INSIDE, defaulted to
+		// the 1 m cell and narrowed to a sub-voxel by the fine gate
+		// below. See hpFar on the signature.
+		vec3 farLo = ci;
+		float farH = 1.0;
+		// "the far side of this face is one of a fine cell's AIR
+		// sub-voxels" — the one arrival at the coarse rung whose material
+		// is not the cell's own. Set only inside the fine gate.
+		bool hitAir = false;
 
 		// A FINE MATERIAL SAYS "DO NOT STOP AT MY 1 M WALL". Rescale the
 		// to 1/16 m and keep going, against this cell's 16^3 mask. The
@@ -1291,15 +1388,24 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// point: §2 forbids a voxel that exists for eye rays but not
 		// for shadow rays, and one traversal is the cheapest way never
 		// to commit it. There is no lighter copy of this walk.
-		if (claudeDescend > 0.5 && matFine(pal) && inSubvoxRing(ci)) {
-			cellHi = ci;
+		if (fineHere) {
+			vec3 hi = ci;
 			// entry point in SUB-VOXEL units, clamped INSIDE the cell
 			// (see the starting-cell block for why the clamp is on the
 			// position rather than on the index)
-			vec3 pu = clamp((ro + rd * t - cellHi) * SUBV, vec3(0.0),
+			vec3 pu = clamp((ro + rd * t - hi) * SUBV, vec3(0.0),
 					vec3(SUBV - 1.0 / 512.0));
 			vec3 su = floor(pu);
-			if (!subvoxSolid(cellHi - vec3(SUBV_R0), su)) {
+			// the entry sub-voxel's material, by the same rule the fine
+			// rung uses: the cell's own where the mask is set, AIR where
+			// it is not
+			float subIdx = subvoxSolid(hi - vec3(SUBV_R0), su) ? idx : 0.0;
+			if (subIdx == curMed) {
+				// no interface at the 1 m face — the ray is still in its
+				// own medium. Descend; the mask boundary inside the cell
+				// is where the interface is. (With curMed = 0 this is the
+				// old `if (!subvoxSolid(...))`, unchanged.)
+				cellHi = hi;
 				delta *= RUNG_FINE;
 				sideDist = t + (stepDir * (su - pu)
 						+ stepDir * 0.5 + 0.5) * delta;
@@ -1307,19 +1413,39 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 				lim = SUBV;
 				continue;
 			}
+			// AN INTERFACE AT THE 1 M FACE. The surface the ray met is
+			// the face it came through and n already holds that face's
+			// normal — but the region on the FAR side of it is the entry
+			// SUB-VOXEL, not the metre cell, so a crossing ray restarts
+			// 1/16 m in and not up to a metre in.
+			farLo = hi + su * RUNG_FINE;
+			farH = RUNG_FINE;
+			if (subIdx < 0.5) {
+				// entering one of this cell's air sub-voxels while
+				// inside a medium: the medium ends here, at the wall
+				palOut = vec4(0.0);
+				idxOut = 0.0;
+				hitAir = true;
+			}
 		}
 
 		// every other class is one thing: an opaque Lambertian surface
 		// with a cardinal normal, which may also emit
 		//
-		// ci + n is the cell the walk came through — tested and found
-		// air on the step before this one, or the cell the ray started
-		// in, which the origin exclusion guarantees was air for the same
-		// reason one rung up. That is what makes restartPoint()'s clamp
-		// target the right cell rather than merely a nearby one.
+		// ci + n is the cell the walk came through — tested and found to
+		// hold the ray's own medium on the step before this one, or the
+		// cell the ray started in, which the origin exclusion guarantees
+		// was that medium for the same reason one rung up. That is what
+		// makes restartPoint()'s clamp target the right cell rather than
+		// merely a nearby one.
 		hp = restartPoint(ro + rd * t, n, ci + n, 1.0);
-		alb = cellAlbedo(s.rgb);
-		le = alb * pal.r;   // the palette's emission column (§4: one Le)
+		hpFar = restartPoint(ro + rd * t, -n, farLo, farH);
+		// hitAir is false everywhere the walk could already reach, and
+		// there `cellAlbedo(s.rgb)` on an air texel is `cellAlbedo(0)`
+		// anyway — so this reports exactly what an arrival at air has
+		// always reported, at either rung.
+		alb = hitAir ? cellAlbedo(vec3(0.0)) : cellAlbedo(s.rgb);
+		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)
 		tHit = t;
 		cellOut = ci;
 		return true;
@@ -1339,7 +1465,9 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 {
 	vec4 pal;
 	float idx;
-	return marchMed(ro, rd, 0.0, hp, n, alb, le, tHit, cellOut, pal, idx);
+	vec3 far;
+	return marchMed(ro, rd, 0.0, hp, n, alb, le, tHit, cellOut, pal, idx,
+			far);
 }
 
 // Cosine-weighted hemisphere direction about a cardinal normal n.
@@ -1575,8 +1703,9 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	float sht;
 	vec4 shpal;
 	float shidx;
+	vec3 shfar;
 	if (!marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
-			shpal, shidx))
+			shpal, shidx, shfar))
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
 		return vec3(0.0); // occluded
@@ -1719,8 +1848,9 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float sht;
 	vec4 shpal;
 	float shidx;
+	vec3 shfar;
 	if (marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
-			shpal, shidx))
+			shpal, shidx, shfar))
 		return vec3(0.0); // occluded
 
 	// THE LAW: one sky. skyBody() here is the same evaluation the camera
@@ -2385,8 +2515,9 @@ void main(void)
 		float tHit;
 		vec4 hitPal;
 		float hitIdx;
+		vec3 hpFar;
 		if (!marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
-				hitPal, hitIdx)) {
+				hitPal, hitIdx, hpFar)) {
 			// ESCAPED THE GRID — and since 2026-08-17 that is not black.
 			// The ray sees the sky, through the same skyRadiance() the
 			// camera ray and the NEE shadow ray use.
@@ -2459,10 +2590,39 @@ void main(void)
 		//
 		// WHEN IT FIRES. Both sides of the boundary have to be things a
 		// ray can travel in. `curMed` is what the ray is in now and
-		// `hitIdx` is the cell it just arrived at; air counts as
+		// `hitIdx` is the material it just arrived at; air counts as
 		// transmissive with IOR 1. Air -> glass and glass -> air both
 		// fire; glass -> stone does not, and neither does air -> stone,
 		// so an opaque scene never reaches this block at all.
+		//
+		// `curMed` IS UPDATED AT EVERY INTERFACE, and since PANES
+		// (2026-08-23) "every interface" includes the ones that are not
+		// here. The walk reports an interface wherever the material
+		// CHANGES along the ray — at a 1 m cell wall, and now also at a
+		// fine cell's mask boundary — and a ray leaving a medium always
+		// crosses one of those before it can reach anything opaque. That
+		// is what makes the `curMed = hitIdx` below sufficient: a
+		// glass -> opaque hit reaches this vertex with the ray genuinely
+		// still in glass (its restart `hp` is in the glass it came
+		// through), and a ray that has already left the glass reaches it
+		// with curMed = 0, because the glass -> air crossing was itself
+		// an interface and fired this block.
+		//
+		// THAT IS THE FIX FOR measured.md "Defect 2 — glass X-rays the
+		// opaque block behind it", and the line it lives on is in
+		// marchMed()'s FINE RUNG, not here. Before PANES a ray refracted
+		// into glass and then descending into an opaque fine cell — a
+		// carved plank — walked that cell's air sub-voxels with
+		// `if (!subvoxSolid(...)) continue;`, which does not compare
+		// anything to curMed, so it crossed out of the glass without an
+		// interface. curMed stayed at the glass index for the rest of the
+		// path: the plank's shadow rays then read the first AIR cell as a
+		// boundary and returned "occluded", and its bounce rays refracted
+		// at that phantom interface, disarmed MIS, and added the sun disc
+		// at weight 1 on top of the sky sample already taken — a bright
+		// hole where a wall should be. The fine rung now compares the
+		// sub-voxel's material to curMed like every other arrival, so the
+		// medium ends where the glass ends.
 		//
 		// IT IS A SPECULAR VERTEX, and that single fact answers the
 		// landmine this step was warned about. A delta BSDF has no light
@@ -2510,31 +2670,36 @@ void main(void)
 			// per-pixel random chain is the sequence it always was and
 			// its goldens are comparable — which is gate 1.
 			float ur = rnd1();
-			// The surface point itself, recomputed from the ray that is
-			// still current — the same expression, on the same inputs,
-			// that march() evaluated internally, so it is bit-identical
-			// and not merely nearby. Taken BEFORE dir is reassigned.
-			vec3 phit = p + dir * tHit;
 			if (ur < R) {
 				dir = reflect(dir, n);
 				p = hp;           // the restart march() already clamped
 				                  // into the cell the ray came THROUGH
 			} else {
 				dir = wt;
-				// THE FAR SIDE. march()'s own restart point sits in the
-				// cell the ray came from, which is the wrong side for a
-				// ray that is crossing: starting there would step
+				// THE FAR SIDE. march()'s own restart point `hp` sits in
+				// the region the ray came from, which is the wrong side
+				// for a ray that is crossing: starting there would step
 				// straight back into this same face and the path would
-				// hammer the interface forever. Same construction, the
-				// other way — clamped into the cell that was ENTERED, so
-				// the walk's "never test the cell you start in" rule
-				// names the cell the ray is genuinely inside.
+				// hammer the interface forever. `hpFar` is the same
+				// construction the other way — clamped into the region
+				// that was ENTERED, so the walk's "never test the cell
+				// you start in" rule names the region the ray is
+				// genuinely inside.
 				//
-				// `cell` is the COARSE cell march() arrived at, which is
-				// the right one here because a transmissive material is
-				// never a fine one — game.cpp asserts that pairing can
-				// never exist, for the bake's own opacity proof.
-				p = restartPoint(phit, -n, cell, 1.0);
+				// IT IS COMPUTED BY THE WALK, NOT HERE (PANES,
+				// 2026-08-23). This line used to read
+				// `restartPoint(phit, -n, cell, 1.0)` and take `cell`,
+				// the COARSE cell, on the grounds that a transmissive
+				// material was never a fine one — game.cpp asserted that
+				// pairing could not exist. A glass pane is exactly that
+				// pairing, and its interfaces are 1/16 m apart, so a
+				// restart clamped into the metre cell would drop a ray
+				// entering the near face of a pane out the far side of
+				// the whole cell. Only marchMed() knows which rung the
+				// interface was found on, so marchMed() hands the point
+				// back. At the coarse rung it is the identical
+				// expression on identical inputs.
+				p = hpFar;
 				curMed = hitIdx;
 			}
 			misArmed = false;     // a delta lobe has no light-sampling
