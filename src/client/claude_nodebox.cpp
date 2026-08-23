@@ -9,7 +9,21 @@
 
 bool claudeNodeBoxConvertible(const NodeBox &nb)
 {
-	return nb.type == NODEBOX_FIXED && !nb.fixed.empty();
+	if (nb.type == NODEBOX_FIXED)
+		return !nb.fixed.empty();
+	// NODEBOX_CONNECTED: fixed[] may legitimately be EMPTY here — a shape
+	// whose whole body lives in the connect_*/disconnected_* lists is a
+	// real thing (a pane with no post, a rail junction) — so the
+	// non-empty test that guards FIXED would refuse it for the wrong
+	// reason. The box list this type produces is a function of the
+	// neighbour byte and is built by the caller through
+	// MapNode::getNodeBoxes(); an empty result there still rasterizes to
+	// 0 bits, which claudeNodeBoxMaskId reads as "leave this cell a 1 m
+	// cube". So the honest answer at THIS gate is "yes, this type is
+	// mine", and emptiness is decided where the neighbours are known.
+	if (nb.type == NODEBOX_CONNECTED)
+		return true;
+	return false;
 }
 
 bool claudeMaskBit(const u8 *mask, int x, int y, int z)
