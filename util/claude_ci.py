@@ -799,6 +799,63 @@ CORNELL_RATIO_TOL = 0.010
 # still_frames at the shutter below which a capture is not a measurement.
 CONVERGED_MIN = 100
 
+# THE SKY IS LIT, AND IT DOES NOT DEPEND ON WHERE THE CAMERA STANDS
+# (the 2026-08-22 fix in game.cpp updateFrame: the tracer bypasses
+# getBackgroundBrightness, the raster-era guess at how much sky this
+# player can see, because the tracer computes that quantity with shadow
+# rays and applying both counts the occlusion twice). Before it, at a
+# FROZEN aim, walking ~16 m sideways swung sky_horizon 0.000000 ->
+# 0.493616: standing outdoors near the ground was enough to ZERO the
+# daylight sky, and the whole suite stayed green through it. This is the
+# referee for that fix, and 0.000000 is exactly what it must turn RED on.
+#
+# THE FLOOR is derived from the value the look seat prints on HEAD --
+# [0.529523,0.687031,0.991393], Rec.709 luminance 0.6756 -- and set an
+# order of magnitude under it. It is a "the sky is on" gate, not a pinned
+# golden: time of day, weather and sky mods may all move the number, and
+# none of them may take it to zero at noon outdoors.
+SKY_HORIZON_MIN_LUM = 0.05
+# WHICH ARMS STAND UNDER AN OPEN SKY. Nothing in claude_vantages.json
+# tags a vantage outdoor, so it is said here, next to the only assertion
+# that asks. exterior-ci is the open mgflat plain; skyfurnace-050 is the
+# unwalled 24x24 pad. Every other CI vantage is a sealed room, and an
+# indoor or night arm is NOT asserted -- a sealed room's sky_horizon is
+# not what lights it, and the night arms' dome is legitimately near zero.
+SKY_LIT_VANTAGES = ("exterior-ci", "skyfurnace-050")
+# Sun up, read off the vantage's own time-of-day (0 and 1 are midnight,
+# 0.5 is noon). Every arm in SKY_LIT_VANTAGES is a noon arm today; the
+# range is here so that adding a dusk vantage does not silently assert a
+# daylight floor against a sunset.
+SUN_UP_RANGE = (0.25, 0.75)
+
+
+def sky_horizon_ok(vantage_name, vantage, stats):
+    """Is the daylight sky non-zero, on an arm that can see the sky?
+
+    Returns (applies, ok, detail). `applies` is False for every indoor or
+    night arm, which is the point: the claim is about an OUTDOOR camera
+    with the SUN UP, and asserting it anywhere else would be asserting a
+    number that nothing in the frame depends on.
+    """
+    t = (vantage or {}).get("time")
+    if vantage_name not in SKY_LIT_VANTAGES or t is None or not (
+            SUN_UP_RANGE[0] <= float(t) <= SUN_UP_RANGE[1]):
+        return False, True, ""
+    h = (stats or {}).get("sky_horizon")
+    if not (isinstance(h, (list, tuple)) and len(h) == 3):
+        return True, False, ("no sky_horizon in the stats at the shutter "
+                             "(read %r)" % (h,))
+    r, g, b = (float(c) for c in h)
+    lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    ok = min(r, g, b) > 0.0 and lum >= SKY_HORIZON_MIN_LUM
+    return True, ok, ("sky_horizon [%.6f,%.6f,%.6f] lum %.6f "
+                      "(floor %.2f, t=%s)%s"
+                      % (r, g, b, lum, SKY_HORIZON_MIN_LUM, t,
+                         "" if ok else " — THE DAYLIGHT SKY IS DARK at an "
+                         "outdoor vantage: the raster occlusion bypass in "
+                         "game.cpp updateFrame is gone or the tracer is off"))
+
+
 THUMB_MAX_PX = 460         # css width cap on gallery thumbnails (no resizing)
 
 # --- planted defects, for `calibrate` ------------------------------------
@@ -1813,7 +1870,10 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
                                  # (2026-08-18): a transparency
                                  # measurement taken where this reads 0
                                  # is a measurement of nothing
-                                 "grid_transmissive")}
+                                 "grid_transmissive",
+                                 # the dome's horizon radiance, for the
+                                 # -sky-lit assertion (2026-08-23)
+                                 "sky_horizon")}
     with open(lab.PATCH, "w") as f:
         f.write("claude_screenshot = %s\n" % marker)
     png = None
@@ -2770,6 +2830,13 @@ def cmd_run(args):
                      vol.get("area_emitters"), vol.get("area_total"),
                      vol.get("attempts")))
             st = (cap.get("stats_at_shutter") or {})
+            # THE SKY IS ON, on the arms that can see it. Same family as
+            # the -grid assertion above: a stat read at the shutter,
+            # judged against a floor rather than a golden. See
+            # SKY_HORIZON_MIN_LUM for the defect this exists for.
+            applies, sky_ok, sky_detail = sky_horizon_ok(vname, vs[vname], st)
+            if applies:
+                A.add("%s-sky-lit" % name, sky_ok, sky_detail)
             sf = cap.get("still_frames_at_shutter")
             se = cap.get("settle") or {}
             # The settle is now reported, not assumed: how deep it got,
