@@ -190,7 +190,20 @@ CLIENT_CMD = ["./bin/luanti", "--address", "127.0.0.1", "--port",
 # pkill -f patterns for the two known seat invocations (RUNTIME only — the
 # script owns the seat while it runs, and leaves it up afterwards).
 SEAT_PATTERNS = ["bin/luantiserver --world " + SEAT_WORLD,
-                 "bin/luanti --address 127.0.0.1"]
+                 "bin/luanti --address 127.0.0.1",
+                 "gamescope --backend headless"]
+# --headless: the client runs inside gamescope's headless backend, an
+# off-screen 1920x1080 output on the same GPU. Added 2026-10-04 on the
+# Linux rig: the only real seat that frames 1920x1080 is DP-2 (the MSI),
+# and when that monitor is off or on another input DRM reports it
+# DISCONNECTED and the client opens on the portrait DP-3, where no conf
+# value gives 1920x1080 (measured.md 2026-08-23). A headless seat also
+# stops a CI run from taking over the screen John is using. Verified the
+# same day: framebuffer 1920x1080, client fd on renderD128 with
+# drm-pdev 0000:03:00.0 = the RX 9070 XT, not the iGPU at 0d:00.0.
+HEADLESS_WRAP = ["gamescope", "--backend", "headless",
+                 "-W", "1920", "-H", "1080", "-w", "1920", "-h", "1080",
+                 "-r", "1000", "--"]
 
 # Canonical photo state. Every capture is taken with exactly these dials,
 # pushed explicitly and PROVEN from the client's own log at each shutter
@@ -967,48 +980,66 @@ def git_state():
 
 
 BINARY = os.path.join(REPO, "bin", "luanti")
-BINARY_SRC_DIRS = ("src", "client/shaders")
-BINARY_SRC_EXT = (".cpp", ".h", ".hpp", ".glsl", ".txt", ".cmake")
+
+
+# Steps `ninja -n` lists on EVERY invocation, even straight after a build:
+# the version header generator (always runs, rewrites only on change) and
+# the bin/minetest* compatibility symlinks. Neither says the binary is old.
+NINJA_ALWAYS_RUN = ("GenerateVersion.cmake", "create_symlink")
 
 
 def binary_staleness():
-    """(newest_source, age_seconds) when ./bin/luanti is OLDER than a
-    source file, else None.
+    """None when the build system would not rebuild ./bin/luanti from
+    this tree, else a sentence saying why it would.
 
     --skip-build exists so a measurement does not pay for a no-op build,
     and it is a loaded gun. MEASURED 2026-08-16, the hard way: a bisect
     left the tree at an old commit, `git checkout HEAD -- src/` put the
     new sources back, and three full CI runs were then taken with the
-    OLD BINARY and reported as evidence for the new one. Every assertion
-    passed, because every assertion was about the harness. The only tell
-    was a log line missing a field the new code adds.
+    OLD BINARY and reported as evidence for the new one.
 
-    The check is a file mtime, which is exactly as strong a claim as
-    "the build system would have rebuilt this", and no stronger -- it
-    cannot see a source edited and reverted, and it does not know what
-    was compiled INTO the binary. It is here because it costs a stat()
-    and would have caught the real failure immediately.
+    REPLACED 2026-10-04: this was a file-mtime walk over src/ and
+    client/shaders, which (a) passed a pre-existing 205 MB binary of
+    unknown provenance AND a fresh 271 MB build of the same tree on the
+    rig (measured.md 2026-08-23 "binary-current is mtime-only"), and (b)
+    went RED on every shader-only edit -- shaders are read at runtime
+    from client/shaders, they are not compiled into the binary, and no
+    build cleared it. Now the build system answers: `ninja -n` on the
+    binary's own target knows every source, header, flag and the build
+    type, because a changed compile command is a rebuild too. It cannot
+    see a binary copied over bin/luanti by hand; run.json records the
+    binary's sha256 so two runs can at least be shown to share one.
     """
+    if not os.path.exists(BINARY):
+        return "(no ./bin/luanti at all)"
     try:
-        bt = os.path.getmtime(BINARY)
-    except OSError:
-        return ("(no ./bin/luanti at all)", 0.0)
-    newest, newest_t = None, 0.0
-    for d in BINARY_SRC_DIRS:
-        for root, _dirs, files in os.walk(os.path.join(REPO, d)):
-            for f in files:
-                if not f.endswith(BINARY_SRC_EXT):
-                    continue
-                fp = os.path.join(root, f)
-                try:
-                    t = os.path.getmtime(fp)
-                except OSError:
-                    continue
-                if t > newest_t:
-                    newest, newest_t = os.path.relpath(fp, REPO), t
-    if newest_t > bt:
-        return (newest, round(newest_t - bt, 1))
+        r = subprocess.run(["ninja", "-C", os.path.join(REPO, "build"), "-n",
+                            os.path.realpath(BINARY)],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return "could not ask ninja whether ./bin/luanti is current: %s" % e
+    if r.returncode != 0:
+        return ("ninja -n failed (%d): %s"
+                % (r.returncode, (r.stderr or r.stdout).strip()[-300:]))
+    steps = [ln for ln in r.stdout.splitlines()
+             if ln.startswith("[") and
+             not any(m in ln for m in NINJA_ALWAYS_RUN)]
+    if steps:
+        return ("ninja would run %d build step(s) first, e.g. %s"
+                % (len(steps), steps[0][:200]))
     return None
+
+
+def binary_sha256():
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(BINARY, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
 
 
 MODEL_HOLE_CHECK = os.path.join(HERE, "claude_model_holes.py")
@@ -1059,10 +1090,11 @@ def stop_seat():
     return False
 
 
-def start_seat(rundir):
+def start_seat(rundir, headless=False):
     logs = {}
+    client = (HEADLESS_WRAP + CLIENT_CMD) if headless else CLIENT_CMD
     for tag, cmd, wait in (("server", SERVER_CMD, SEAT_BOOT_WAIT),
-                           ("client", CLIENT_CMD, 0.0)):
+                           ("client", client, 0.0)):
         logs[tag] = open(os.path.join(rundir, tag + ".log"), "wb")
         subprocess.Popen(cmd, cwd=REPO, stdout=logs[tag],
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -2566,8 +2598,11 @@ def bring_up_seat(rundir, run, args):
         return "bridge mod assembly failed: %s" % asm.get("stderr")
     pin_conf()
     run["pinned_conf"] = PINNED_CONF
-    print("seat: starting server + client on port %d" % SEAT_PORT)
-    start_seat(rundir)
+    headless = bool(getattr(args, "headless", False))
+    run["seat_headless"] = headless
+    print("seat: starting server + client on port %d%s"
+          % (SEAT_PORT, " (headless gamescope)" if headless else ""))
+    start_seat(rundir, headless=headless)
     if not wait_for_client():
         return "client never became ready after %.0fs" % CLIENT_READY_TIMEOUT
     print("seat: client ready")
@@ -2647,10 +2682,11 @@ def cmd_run(args):
           "CMAKE_BUILD_TYPE=%s" % run.get("build_type"))
     stale = binary_staleness()
     run["binary_stale"] = stale
+    run["binary_sha256"] = binary_sha256()
     A.add("binary-current", stale is None,
-          "./bin/luanti is up to date with src/" if not stale else
-          "./bin/luanti is OLDER than %s by %.0f s — this run would "
-          "measure a binary that is not this source tree" % stale)
+          "ninja: ./bin/luanti is current with this tree" if not stale else
+          "%s — this run would measure a binary that is not this source "
+          "tree" % stale)
     holes = model_holes()
     run["model_holes"] = holes
     A.add("models-no-holes", holes is None,
@@ -3194,6 +3230,10 @@ def main():
                             "a clock was the wrong gate.")
         p.add_argument("--skip-build", action="store_true",
                        help="capture with the binaries already in ./bin")
+        p.add_argument("--headless", action="store_true",
+                       help="run the client inside gamescope's headless "
+                            "backend (off-screen 1920x1080, same GPU): "
+                            "no monitor needed, the desktop is untouched")
         p.add_argument("--skip-deploy", action="store_true",
                        help="capture the world AS IT SITS, no gallery "
                             "rebuild first (scratch/diagnostic only — this "
