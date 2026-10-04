@@ -143,6 +143,27 @@ function OPS.skypad(p)
                     { name = "claude_bridge:gray186" })
         end
     end
+    -- THE RING BETWEEN THE PAD AND THE FENCE IS LAID HERE TOO (2026-10-04).
+    -- It was left to mapgen, and the room-hash box (47,8,97)-(73,9,123)
+    -- covers it: on the Mac's world the 153 ring cells at the pad's level
+    -- were all grass, but the Linux rig's world has a cave mouth at
+    -- 70..73, 8, 97..101 (141 grass + 11 air + 1 stone), so the deploy
+    -- hash was a property of the world, not of this builder (measured.md
+    -- 2026-08-23). Same node the flat mapgen lays, so a world that
+    -- already had grass there is unchanged.
+    local ground = (core.registered_nodes["mcl_core:dirt_with_grass"] and
+                   "mcl_core:dirt_with_grass")
+            or (core.registered_nodes["default:dirt_with_grass"] and
+               "default:dirt_with_grass")
+            or "claude_bridge:gray186"
+    for x = o.x - fdist, o.x + fdist do
+        for z = o.z - fdist, o.z + fdist do
+            if x < o.x - half or x > o.x + half - 1
+                    or z < o.z - half or z > o.z + half - 1 then
+                core.set_node({ x = x, y = o.y, z = z }, { name = ground })
+            end
+        end
+    end
     local fence = (core.registered_nodes["mcl_fences:oak_fence"] and
                   "mcl_fences:oak_fence")
             or (core.registered_nodes["mcl_fences:spruce_fence"] and
