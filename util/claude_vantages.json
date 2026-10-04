@@ -176,6 +176,21 @@
 		"time" : 0.5,
 		"yaw" : 0
 	},
+	"exterior-wall" : 
+	{
+		"ci" : true,
+		"notes" : "sky-lit referee (2026-10-04, owed since measured.md 2026-08-23). On the 2026-08-22 frozen-aim sweep line (y 8.5, z -6.41, same aim) at x 4.18, where the pre-fix build 5dc573bd5 reads sky_horizon 0 steadily on the rig, 2026-10-04 (the 08-22 x of -4.82 now reads 0.529523: the cabin area changed since). Beside the cabin, aim pitched at the ground. exterior-ci's open plain satisfies the raster occlusion heuristic, so it cannot see that defect; this one can. The image itself is not judged.",
+		"pitch" : -79.8,
+		"pos" : 
+		[
+			4.18,
+			8.5,
+			-6.41
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 220.4
+	},
 	"furnace-050" : 
 	{
 		"ci" : true,

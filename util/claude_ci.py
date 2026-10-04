@@ -501,6 +501,12 @@ CI_SHOTS = [
     # black) until 2b lands the sky/sun terms; see spec/measured.md "1b —
     # Gallery phase 2" for which is which.
     {"name": "exterior-ci", "vantage": "exterior-ci", "referee": None},
+    # THE SKY-LIT REFEREE'S OWN VANTAGE (2026-10-04). exterior-ci stands
+    # on open ground, where the raster occlusion heuristic happens to agree
+    # with the sky, so -sky-lit read the same there on the pre-fix build
+    # (measured.md 2026-08-23, "-sky-lit is live-BLIND"). This stands where
+    # the 2026-08-22 sweep read 0.000000. See SKY_LIT_VANTAGES.
+    {"name": "exterior-wall", "vantage": "exterior-wall", "referee": None},
     # THE ANALYTIC SKY REFEREE (roadmap coverage 3, 2026-08-17). A flat
     # rho = 0.50 pad, unoccluded, under a CONSTANT-radiance test sky:
     # L = rho * L_sky, a number computed rather than a golden pinned, in
@@ -860,7 +866,15 @@ SKY_HORIZON_MIN_LUM = 0.05
 # unwalled 24x24 pad. Every other CI vantage is a sealed room, and an
 # indoor or night arm is NOT asserted -- a sealed room's sky_horizon is
 # not what lights it, and the night arms' dome is legitimately near zero.
-SKY_LIT_VANTAGES = ("exterior-ci", "skyfurnace-050")
+SKY_LIT_VANTAGES = ("exterior-ci", "exterior-wall", "skyfurnace-050")
+# AND THE SKY IS THE SAME SKY EVERYWHERE (2026-10-04). A floor alone let
+# the defect hide on open ground; the defect's real signature was that
+# sky_horizon CHANGED with position (0.000000 to 0.493616 over 16 m at a
+# frozen aim). So every outdoor sun-up arm with the same time of day and
+# the same sky dial must read the same sky_horizon, to this relative
+# tolerance. Post-fix the 2026-08-22 sweep read 0.529523 at all 11
+# positions, identical to six digits.
+SKY_INVARIANT_RTOL = 1e-4
 # Sun up, read off the vantage's own time-of-day (0 and 1 are midnight,
 # 0.5 is noon). Every arm in SKY_LIT_VANTAGES is a noon arm today; the
 # range is here so that adding a dusk vantage does not silently assert a
@@ -2768,6 +2782,7 @@ def cmd_run(args):
         prev, gold = previous_run(run_id), read_golden()
         run["prev_run"], run["golden_run"] = prev, gold
         run["golden_png"] = gold_png
+        sky_seen = {}   # (time, claude_sky_uniform) -> (first arm, horizon)
         for shot_def in shots_for(args):
             name, vname = shot_def["name"], shot_def["vantage"]
             if vname not in vs:
@@ -2934,6 +2949,25 @@ def cmd_run(args):
             applies, sky_ok, sky_detail = sky_horizon_ok(vname, vs[vname], st)
             if applies:
                 A.add("%s-sky-lit" % name, sky_ok, sky_detail)
+                h = st.get("sky_horizon")
+                if isinstance(h, (list, tuple)) and len(h) == 3:
+                    key = (vs[vname].get("time"),
+                           dials.get("claude_sky_uniform"))
+                    if key not in sky_seen:
+                        sky_seen[key] = (name, [float(c) for c in h])
+                    else:
+                        first, h0 = sky_seen[key]
+                        same = all(abs(float(a) - b) <= SKY_INVARIANT_RTOL
+                                   * max(abs(b), 1e-6)
+                                   for a, b in zip(h, h0))
+                        A.add("%s-sky-invariant" % name, same,
+                              "sky_horizon [%s] vs %s [%s] (t=%s, "
+                              "sky_uniform=%s, rtol %g)%s"
+                              % (",".join("%.6f" % float(c) for c in h),
+                                 first, ",".join("%.6f" % c for c in h0),
+                                 key[0], key[1], SKY_INVARIANT_RTOL,
+                                 "" if same else " — THE SKY DEPENDS ON "
+                                 "WHERE THE CAMERA STANDS"))
             sf = cap.get("still_frames_at_shutter")
             se = cap.get("settle") or {}
             # The settle is now reported, not assumed: how deep it got,
