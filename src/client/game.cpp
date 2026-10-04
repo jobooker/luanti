@@ -380,6 +380,35 @@ struct ClaudeTraceGrid
 };
 static ClaudeTraceGrid g_claude_grid;
 
+// THE SCREENSHOT MUST BE TAKEN INSIDE THE FRAME, NOT BETWEEN FRAMES.
+// MEASURED 2026-08-23/24 on the Linux rig (RX 9070 XT / Mesa / RADV,
+// KDE Wayland): two `claude_ci run --all --skip-build --skip-deploy`
+// runs on `one-tracer` @ 6de13554a each came back with exactly ONE
+// arm's PNG fully black — mean 0.0, max byte 0, and not even the
+// traced present path's 12x12 green marker in the corner —
+// `exterior-ci` in screenshots/ci/20260823-234952_6de13554a and
+// `cozy-day-ci` in screenshots/ci/20260824-014255_6de13554a-dirty.
+// A DIFFERENT random arm each run, every other arm fine, and each
+// black arm's own .capture.json was perfectly healthy (grid_valid 1,
+// converged, sky lit). So the render was fine and the READ was not.
+//
+// The cause is WHERE the read happened. `claude_screenshot` arrives on
+// the 1 Hz patch poll, which runs at the top of Game::run()'s loop —
+// after the previous frame's endScene()/swapBuffers() and before the
+// next beginScene(). `takeScreenshot()` -> `createScreenShot()`
+// (irr/src/OpenGL/Driver.cpp) is a bare `GL.ReadPixels` with no
+// glReadBuffer call, so it reads GL_BACK of the default framebuffer.
+// After a swap the back buffer's contents are UNDEFINED: usually the
+// stale previous frame, which is why this mostly looked like it worked,
+// and sometimes a freshly-acquired/cleared buffer, which is black.
+//
+// So the pseudo-key now only SETS this flag; Game::drawScene() serves
+// it after draw_scene() and before endScene(), where the back buffer is
+// the frame that was just drawn, by definition. The F12 keybind goes
+// through the same flag because it sat in exactly the same place in the
+// loop and had exactly the same race.
+static bool g_claude_screenshot_pending = false;
+
 // ---------------------------------------------------------------------
 // THE MATERIAL PALETTE — what the per-cell byte means
 // ---------------------------------------------------------------------
@@ -4755,9 +4784,15 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
 		if (name == "claude_screenshot") {
-			client->makeScreenshot();
-			actionstream << "[claude_settings_patch] screenshot taken"
-					<< std::endl;
+			// DEFERRED to inside the frame on purpose — see
+			// g_claude_screenshot_pending. Taking it here reads a
+			// back buffer that has already been swapped away, and
+			// that is a black PNG on one random arm per CI run.
+			// The log line moves with the shot, so the harness's
+			// "screenshot taken" still marks the moment the pixels
+			// were read; claude_ci does not wait on it (it polls
+			// for a new PNG file), so nothing downstream reorders.
+			g_claude_screenshot_pending = true;
 			continue;
 		}
 		// Pseudo-key: any value change re-snapshots the grid around the
@@ -5967,7 +6002,11 @@ void Game::processKeyInput()
 	} else if (wasKeyDown(KeyType::CINEMATIC)) {
 		toggleCinematic();
 	} else if (wasKeyPressed(KeyType::SCREENSHOT)) {
-		client->makeScreenshot();
+		// Same deferral, same reason: processUserInput() also runs
+		// between endScene() and the next beginScene(), so F12 read
+		// an undefined back buffer too. See
+		// g_claude_screenshot_pending.
+		g_claude_screenshot_pending = true;
 	} else if (wasKeyPressed(KeyType::TOGGLE_BLOCK_BOUNDS)) {
 		toggleBlockBounds();
 	} else if (wasKeyPressed(KeyType::TOGGLE_HUD)) {
@@ -8352,6 +8391,20 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 
 	this->m_rendering_engine->draw_scene(sky_color, this->m_game_ui->m_flags.show_hud,
 			draw_wield_tool, draw_crosshair);
+
+	// THE ONLY DEFINED PLACE TO READ THE BACK BUFFER. Everything the
+	// frame contains has been drawn and endScene()/swapBuffers() has not
+	// run yet, so `GL.ReadPixels(GL_BACK)` inside makeScreenshot() reads
+	// THIS frame. Served here rather than at the 1 Hz poll that requests
+	// it: see g_claude_screenshot_pending for the two runs that measured
+	// the difference. Deliberately BEFORE the profiler graph and the
+	// damage flash below, so neither can land in a referee frame.
+	if (g_claude_screenshot_pending) {
+		g_claude_screenshot_pending = false;
+		this->client->makeScreenshot();
+		actionstream << "[claude_settings_patch] screenshot taken"
+				<< std::endl;
+	}
 
 	/*
 		Profiler graph
