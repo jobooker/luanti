@@ -39,3 +39,7 @@ Every brief carries: the branch, the files it may touch, the seat rule
 a seat you started), and "report what you ran and what it printed, not
 what you concluded". Agents do not commit; the lead reviews the diff and
 commits with the measurement in the message.
+
+## Building — READ THIS
+- Build with `cmake --build build -j$(nproc)`. **Never** use bare `--parallel` / `-j` (unbounded) — this OOM-crashed the machine on 2026-08-23 (~400 cc1plus processes, hard reboot required).
+- Only one build at a time. Subagents must not each run their own build concurrently.
