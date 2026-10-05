@@ -1019,6 +1019,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// by: John's eye, moving and stopping in the cabin and the forest.
 	float m_split = 48.0f;
 	float m_still = 0.0f;
+	float m_exposure = 1.0f;   // claude_exposure: see claude_present
+	CachedPixelShaderSetting<float, 1, false> m_exposure_pixel{"claudeExposure"};
 	CachedPixelShaderSetting<float, 1, false> m_split_pixel{"claudeSplitFrames"};
 	CachedPixelShaderSetting<float, 1, false> m_still_pixel{"claudeStillFrames"};
 	CachedPixelShaderSetting<float, 1, false> m_flame_pixel{"claudeFlame"};
@@ -1215,6 +1217,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_air_scatter",
 		"claude_flame",
 		"claude_split",
+		"claude_exposure",
 		"claude_air_absorb",
 		"claude_air_g",
 		"claude_refine",
@@ -1962,6 +1965,8 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_exposure")
+			m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
 		if (name == "claude_split")
 			m_split = readAir("claude_split", 48.0f, 100000.0f);
 		if (name == "claude_flame")
@@ -2049,6 +2054,7 @@ public:
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		m_split = readAir("claude_split", 48.0f, 100000.0f);
+		m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2319,6 +2325,7 @@ public:
 				m_split_pixel.set(&m_split, services);
 				m_still = g_claude_grid.still_frames;
 				m_still_pixel.set(&m_still, services);
+				m_exposure_pixel.set(&m_exposure, services);
 				m_air_absorb_pixel.set(&m_air_absorb, services);
 				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);

@@ -16,6 +16,12 @@ uniform sampler2D depthmap;
 uniform sampler2D accumDirect;
 uniform float claudeSplitFrames;  // 0 = off: show the total, as before
 uniform float claudeStillFrames;
+// MEASUREMENT EXPOSURE (claude_exposure, 2026-10-05). Linear radiance is
+// scaled by this before the ACES curve. 1 = the look. The furnace referees
+// shoot at 0.25 so a rho = 0.73 room (L = 6.49) lands mid-curve instead of
+// at byte 255 — 98.7 % of furnace-073's patch WAS byte 255, which reads
+// back as 7.22 whatever the truth. The referee divides it back out.
+uniform float claudeExposure;
 uniform lowp float gridDebug;
 // claude_view: 0 = photo, 1-5 = claude_trace's diagnostic views. Only
 // used to choose the display transform below; the photo path is
@@ -155,7 +161,7 @@ void main(void)
 
 	// accum is LINEAR radiance now; the display transform is the ONE
 	// art knob (energy audit): ACES filmic fit (Narkowicz), then gamma
-	vec3 lin = max(c, vec3(0.0));
+	vec3 lin = max(c, vec3(0.0)) * (claudeExposure > 0.0 ? claudeExposure : 1.0);
 	vec3 aces = clamp(lin * (2.51 * lin + 0.03)
 			/ (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
 	gl_FragColor = vec4(pow(aces, vec3(1.0 / 2.2)), 1.0);

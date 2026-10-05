@@ -55,8 +55,12 @@ def main():
         x1, y1 = w // 4 + 100, h // 2 + 100
     patch = im[y0:y1, x0:x1] / 255.0
 
-    # measured: screenshot -> linear radiance
-    meas = aces_inverse(patch ** 2.2)
+    # measured: screenshot -> linear radiance, then undo the capture's
+    # measurement exposure (claude_exposure; 1 = none)
+    exposure = 1.0
+    if "--exposure" in sys.argv:
+        exposure = float(sys.argv[sys.argv.index("--exposure") + 1])
+    meas = aces_inverse(patch ** 2.2) / exposure
     mean = meas.mean(axis=(0, 1))
     std = meas.std(axis=(0, 1))
     clipped = float((patch >= 254.0 / 255.0).mean())

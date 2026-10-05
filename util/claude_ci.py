@@ -235,6 +235,7 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_exposure": 1,  # the look; furnace arms override (FURNACE_EXPOSURE)
     "claude_split": 0,   # captures show the TOTAL, never the faded display (2026-10-05)
     "claude_flame": 1,   # flame-only emission, flux preserved (2026-10-05)
     "claude_air_scatter": 0,   # every existing arm is measured WITHOUT air (2026-10-04)
@@ -495,9 +496,12 @@ SKY_UNIFORM_L = 1.0
 # reports the depth it ran at.
 SEALED_SETTLE = 2000
 
+# measurement exposure for the furnace arms -- see FURNACE_PINNED
+FURNACE_EXPOSURE = 0.1
 CI_SHOTS = [
     {"name": "furnace-050", "vantage": "furnace-050",
-     "referee": ("furnace", "050")},
+     "referee": ("furnace", "050"),
+     "dials": {"claude_exposure": FURNACE_EXPOSURE}},
     # THE AIR ENERGY REFEREE (2026-10-04): the same sealed furnace FULL of
     # non-absorbing haze (mean free path 5 m in a 5 m room). Scattering
     # in a field that is already uniform changes nothing, so the analytic
@@ -505,12 +509,14 @@ CI_SHOTS = [
     # the medium estimator invents or loses moves this ratio.
     {"name": "furnace-050-air", "vantage": "furnace-050",
      "referee": ("furnace", "050"),
-     "dials": {"claude_air_scatter": 0.2, "claude_air_absorb": 0},
+     "dials": {"claude_air_scatter": 0.2, "claude_air_absorb": 0,
+               "claude_exposure": FURNACE_EXPOSURE},
      # 500 frames read 0.988 +/- 0.052 (noise); 4000 read 0.982 +/- 0.003.
      # Captures repeat exactly now, so a noisy depth would fail forever.
      "settle": 4000},
     {"name": "furnace-073", "vantage": "furnace-073",
-     "referee": ("furnace", "073")},
+     "referee": ("furnace", "073"),
+     "dials": {"claude_exposure": FURNACE_EXPOSURE}},
     {"name": "cornell", "vantage": "cornell", "referee": ("cornell", None)},
     {"name": "cornell-nee1", "vantage": "cornell", "referee": ("cornell", None),
      "dials": {"claude_nee": 1}},
@@ -853,8 +859,29 @@ FURNACE_PATCH = None
 SKYFURNACE_PINNED = {"050": 0.9881}
 SKYFURNACE_TOL = {"050": 0.0006}
 
-FURNACE_PINNED = {"050": 0.982, "073": 1.061}
-FURNACE_TOL = {"050": 0.003, "073": 0.048}
+# MEASUREMENT EXPOSURE for every furnace arm (2026-10-05). At exposure 1
+# furnace-073's patch was 98.7 % byte 255 (the clip, read back as 7.22)
+# and 1.3 % byte 254 (5.74) around a true 6.49 at byte 254.56: its ratio
+# was the clip, which is why it "grew" with depth once rng 2 un-stalled
+# convergence. At 0.25 it sits mid-curve. claude_present scales before
+# ACES; claude_furnace_check --exposure divides it back out. The pins
+# below are RE-DERIVED under it (see the note on them). FURNACE_EXPOSURE
+# itself is defined just above CI_SHOTS, which uses it.
+# RE-DERIVED 2026-10-05 under FURNACE_EXPOSURE = 0.1 (patches mid-curve:
+# furnace-050 bytes 159-161, furnace-073 bytes 215-217), from two
+# consecutive clean runs at the same build (20261005-050347 and -050631):
+#   furnace-050      0.998 / 0.998  (2.391 vs analytic 2.395)
+#   furnace-050-air  0.998 / 0.998
+#   furnace-073      0.999 / 0.999  (6.478 vs analytic 6.486)
+# Spread 0 (captures repeat since rng 2), so the floor of 3 x the printed
+# resolution applies to both. THE OLD PINS WERE THE INSTRUMENT: 0.982 was
+# 8-bit quantisation near the ACES shoulder (byte ~241 at exposure 1), and
+# furnace-073's 1.061 +/- 0.048 was a reading of the CLIP (98.7 % of its
+# patch at byte 255). The renderer has been energy-exact to ~0.2 % in both
+# rooms; the instrument could not see it. At exposure 0.25 the same build
+# read 1.001 / 1.000 / 0.998 -- the residual is read-back resolution.
+FURNACE_PINNED = {"050": 0.998, "073": 0.999}
+FURNACE_TOL = {"050": 0.003, "073": 0.003}
 # Legacy name kept so old run.json rows still parse.
 FURNACE_RATIO_TOL = 0.15
 
@@ -2172,6 +2199,8 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
     cmd = [sys.executable, script, png] + ([arg] if arg else [])
     if kind == "furnace" and FURNACE_PATCH:
         cmd += ["--patch"] + [str(v) for v in FURNACE_PATCH]
+    if kind == "furnace":
+        cmd += ["--exposure", str(FURNACE_EXPOSURE)]
     if kind == "skyfurnace":
         # the test sky's radiance comes from THE SAME constant the arm's
         # dial is pushed from, so the referee cannot be judging a
