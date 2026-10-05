@@ -155,6 +155,14 @@ function OPS.cozy(p)
             "default:junglewood") or planks
     local log = R("mcl_trees:tree_oak", "mcl_core:tree", "default:tree")
     local glass = R("mcl_core:glass", "default:glass")
+    -- WINDOWS ARE PANES, not glass blocks (2026-10-04, John: "yes,
+    -- panes"). A glass block is a solid metre of glass: the view through
+    -- it bends as you move, and against carved wood it lit every groove
+    -- (luanti-docs measured.md, "glass beside carved wood"). The flat
+    -- pane is placed with its facedir: 0 = thin in z (the front wall),
+    -- 1 = thin in x (the two side walls).
+    local pane = core.registered_nodes["mcl_panes:pane_natural_flat"]
+            and "mcl_panes:pane_natural_flat" or nil
     local cobble = R("mcl_core:cobble", "default:cobble")
     local stair = R("mcl_stairs:stair_oak", "mcl_stairs:stair_wood_oak",
             "stairs:stair_wood") or planks
@@ -189,6 +197,8 @@ function OPS.cozy(p)
                         or (x == 0 and z >= 3 and z <= 5 and y == 2)
                         or (x == W - 1 and z == 2 and y == 2)
                 if door then set(x, y, z, "air")
+                elseif win and pane then
+                    set(x, y, z, pane, (x == 0 or x == W - 1) and 1 or 0)
                 elseif win then set(x, y, z, glass)
                 elseif corner then set(x, y, z, log)
                 else set(x, y, z, wallwd) end

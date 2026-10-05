@@ -1170,7 +1170,10 @@ EXPECTED_DEPLOY_HASH = {
     # 9e352f88 since 2026-08-17: one stair node added on the cabin floor
     # at (4,9,2), in front of the lantern, so the sub-voxel step line is
     # photographable at all (every other stair in this world is roof).
-    "cozy": "9e352f88",
+    # 06d6d038 since 2026-10-04: the cabin's seven window cells are flat
+    # panes (mcl_panes:pane_natural_flat), not glass blocks — John's call,
+    # luanti-docs measured.md "glass beside carved wood". Was 9e352f88.
+    "cozy": "06d6d038",
     "exterior-ci": "cc32604a",
     # sealed-plank (2026-08-18). Measured on the deploy that built it;
     # it has no door, so unlike the others this value is the same before
