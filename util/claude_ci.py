@@ -242,6 +242,7 @@ CANONICAL_DIALS = {
     "claude_air_absorb": 0,
     "claude_body_colour": 1,  # sun/moon colour = tint; brightness from the dome (2026-10-04)
     "claude_texel_colour": 1,  # face-tile colour on plain cubes (2026-10-04)
+    "claude_water_absorb": 1,  # water absorbs, Pope & Fry 1997 (2026-10-05)
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which

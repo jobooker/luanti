@@ -358,6 +358,7 @@ struct ClaudeTraceGrid
 	float dial_nee = 0.0f;
 	float dial_descend = 0.0f;
 	float dial_glass_flush = 0.0f;
+	float dial_water_absorb = 0.0f;
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
@@ -553,7 +554,12 @@ static float claudeMatEmission(const ClaudeMat &m)
 // IOR MOVED INTO THE TABLE ON THE DAY IT WAS FIRST SAMPLED (2026-08-18),
 // which is the rule the paragraph above states: A said "reserved" for as
 // long as nothing read it.
-struct ClaudeMatTexel { float emit, fine, transmit, ior; };
+struct ClaudeMatTexel {
+	float emit, fine, transmit, ior;
+	// ABSORPTION, per metre of travel inside the medium, R/G/B (palette
+	// row 1, 2026-10-05). 0 for everything that is not a medium.
+	float absorb_r = 0.0f, absorb_g = 0.0f, absorb_b = 0.0f;
+};
 
 // THE TRANSMISSION COLUMN, and the two numbers in it.
 //
@@ -602,6 +608,30 @@ static float claudeMatIor(const ClaudeMat &m)
 		return CLAUDE_IOR_WATER;
 	return CLAUDE_IOR_AIR;
 }
+
+// WATER ABSORBS (claude_water_absorb, 2026-10-05; DECISIONS 0j). Pure
+// water's absorption coefficient, MEASURED: Pope & Fry 1997, "Absorption
+// spectrum (380-700 nm) of pure water. II. Integrating cavity
+// measurements", Appl. Opt. 36, 8710 (table at omlc.org/spectra/water),
+// read at the same three wavelengths the sun's Rayleigh colour uses
+// (612 / 549 / 465 nm for R / G / B), linear between table rows:
+//   612 nm  0.002661 /cm -> 0.2661 /m
+//   549 nm  0.000554 /cm -> 0.0554 /m
+//   465 nm  0.000101 /cm -> 0.0101 /m
+// So a metre of water keeps 77 % of red, 95 % of green, 99 % of blue,
+// and ten metres 7 % / 57 % / 90 %: the blue-green of deep water is this
+// and nothing else. Beer-Lambert over the distance a ray travels inside
+// the medium; the shader multiplies, never adds, so it can only remove
+// light (util/claude_water_depth.py scores it against exp(-a d)).
+// ONE WAVELENGTH PER CHANNEL is the renderer's approximation, as it is for
+// the sun: real red light spans 600-700 nm where water absorbs up to
+// 0.6 /m, so this red is if anything too clear. No scattering in the
+// water (pure water's is ~0.002 /m) and no dissolved matter.
+// Glass stays clear: a stained pane's tint needs a per-NODE colour rule,
+// which is John's (0j's remaining half).
+static constexpr float CLAUDE_WATER_ABSORB_R = 0.2661f;
+static constexpr float CLAUDE_WATER_ABSORB_G = 0.0554f;
+static constexpr float CLAUDE_WATER_ABSORB_B = 0.0101f;
 
 static ClaudeMat g_claude_mattab[256];
 static ClaudeMatTexel g_claude_matpal[256];
@@ -673,6 +703,11 @@ static void claudeMatTableBuild()
 		g_claude_matpal[idx] = ClaudeMatTexel{claudeMatEmission(m),
 				m.fine ? 1.0f : 0.0f, claudeMatTransmission(m),
 				claudeMatIor(m)};
+		if (m.kind == MATK_LIQUID) {
+			g_claude_matpal[idx].absorb_r = CLAUDE_WATER_ABSORB_R;
+			g_claude_matpal[idx].absorb_g = CLAUDE_WATER_ABSORB_G;
+			g_claude_matpal[idx].absorb_b = CLAUDE_WATER_ABSORB_B;
+		}
 	}
 	// ...and the invariant, asserted over the WHOLE 256 rather than over
 	// the keys anyone expects to be reachable. The first version of this
@@ -999,6 +1034,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// 1/16 m air pockets between them. 0 = the walk descends as before.
 	// A dial so the probe can A/B it on one build (util/claude_glass_bars.py).
 	float m_glass_flush = 1.0f;
+	// claude_water_absorb (2026-10-05): 1 (default) = water absorbs at
+	// its measured rate (Pope & Fry 1997, see CLAUDE_WATER_ABSORB_*).
+	// 0 = the lossless water of 2026-08-18. A dial so the depth probe
+	// can A/B it on one build (util/claude_water_depth.py).
+	float m_water_absorb = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_water_absorb_pixel{"claudeWaterAbsorb"};
 	// claude_texel_colour (2026-10-04): 1 (default) = a plain cube's hit
 	// takes its colour from the face tile under the hit point (the cell
 	// colour times the tile's ratio); 0 = one colour per cell, as before.
@@ -1228,6 +1269,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_subvox",
 		"claude_descend",
 		"claude_glass_flush",
+		"claude_water_absorb",
 		"claude_texel_colour",
 		"claude_body_colour",
 		"claude_air_scatter",
@@ -1903,6 +1945,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_nee = m_nee;
 		g_claude_grid.dial_descend = m_descend;
 		g_claude_grid.dial_glass_flush = m_glass_flush;
+		g_claude_grid.dial_water_absorb = m_water_absorb;
 		g_claude_grid.dial_texel = m_texel;
 		g_claude_grid.dial_body_colour = m_body_colour;
 		g_claude_grid.dial_air_scatter = m_air_scatter;
@@ -2006,6 +2049,8 @@ public:
 			m_descend = readDescend();
 		if (name == "claude_glass_flush")
 			m_glass_flush = readGlassFlush();
+		if (name == "claude_water_absorb")
+			m_water_absorb = readAir("claude_water_absorb", 1.0f, 1.0f);
 		if (name == "claude_texel_colour")
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
@@ -2098,6 +2143,7 @@ public:
 		m_subvox = readSubvox();
 		m_descend = readDescend();
 		m_glass_flush = readGlassFlush();
+		m_water_absorb = readAir("claude_water_absorb", 1.0f, 1.0f);
 		m_texel = readTexel();
 		m_body_colour = readBodyColour();
 		m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
@@ -2373,6 +2419,7 @@ public:
 				m_subvox_pixel.set(&m_subvox, services);
 				m_descend_pixel.set(&m_descend, services);
 				m_glass_flush_pixel.set(&m_glass_flush, services);
+				m_water_absorb_pixel.set(&m_water_absorb, services);
 				m_texel_pixel.set(&m_texel, services);
 				m_air_scatter_pixel.set(&m_air_scatter, services);
 				m_flame_pixel.set(&m_flame, services);
@@ -4164,12 +4211,17 @@ static void claudeMatPalUpload()
 	GLint prev_active_unit = GL.TEXTURE0;
 	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
 
-	std::vector<float> pal((size_t)256 * 4, 0.0f);
+	// ROW 0: emit, fine, transmit, ior. ROW 1 (2026-10-05): absorption
+	// R, G, B per metre, and 0.
+	std::vector<float> pal((size_t)256 * 2 * 4, 0.0f);
 	for (int i = 0; i < 256; i++) {
 		pal[i * 4 + 0] = g_claude_matpal[i].emit;
 		pal[i * 4 + 1] = g_claude_matpal[i].fine;
 		pal[i * 4 + 2] = g_claude_matpal[i].transmit;
 		pal[i * 4 + 3] = g_claude_matpal[i].ior;
+		pal[(256 + i) * 4 + 0] = g_claude_matpal[i].absorb_r;
+		pal[(256 + i) * 4 + 1] = g_claude_matpal[i].absorb_g;
+		pal[(256 + i) * 4 + 2] = g_claude_matpal[i].absorb_b;
 	}
 	bool fresh = !V.matpal_tex;
 	if (fresh)
@@ -4181,10 +4233,10 @@ static void claudeMatPalUpload()
 		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
 		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 		GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA32F, 256, 1, 0,
+		GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA32F, 256, 2, 0,
 				GL.RGBA, GL.FLOAT, nullptr);
 	}
-	GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 1, GL.RGBA, GL.FLOAT,
+	GL.TexSubImage2D(GL.TEXTURE_2D, 0, 0, 0, 256, 2, GL.RGBA, GL.FLOAT,
 			pal.data());
 
 	// ---- the probe, and the round trip it exists to score -------------
@@ -4962,6 +5014,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_nee\": " << g_claude_grid.dial_nee
 			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
+			<< ", \"claude_water_absorb\": " << g_claude_grid.dial_water_absorb
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass

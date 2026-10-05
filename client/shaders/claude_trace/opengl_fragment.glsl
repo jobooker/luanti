@@ -300,6 +300,11 @@ uniform float claudeDescend;
 // that cell's 1 m face instead of descending into its relief. See the
 // fineHere gate in marchMed().
 uniform float claudeGlassFlush;
+// WATER ABSORBS (claude_water_absorb, 2026-10-05). 1 = a ray inside a
+// medium loses exp(-a d) of its throughput over the d metres it travels
+// there, a = the palette's row 1 (game.cpp CLAUDE_WATER_ABSORB_*: pure
+// water, measured). 0 = lossless media, as before.
+uniform float claudeWaterAbsorb;
 // FACE-TILE COLOUR (claude_texel_colour, 2026-10-04). claudeMaterials is
 // the per-cell material id (unit 12, R8 128^3, 0 = none); claudeAtlas
 // (unit 13, 256x768) holds three 16x16 tiles per id — top, bottom, side —
@@ -819,7 +824,7 @@ float matIndex(float a)
 // makes a cost table wrong.
 vec4 matPalIdx(float idx)
 {
-	return texture2D(claudeMatPal, vec2((idx + 0.5) / 256.0, 0.5));
+	return texture2D(claudeMatPal, vec2((idx + 0.5) / 256.0, 0.25));
 }
 vec4 matPal(float a)
 {
@@ -1221,6 +1226,18 @@ bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
 		return false;
 	rgb = texture2D(claudeModelPal, (vec2(pidx, m) + 0.5) / vec2(256.0, 64.0)).rgb;
 	return true;
+}
+
+// THE MEDIUM'S ABSORPTION over `dist` metres: the palette's row 1 (per
+// metre, R/G/B; 0 for every material that is not a medium). Air is not
+// in the table and has its own helpers below. Multiplies, never adds:
+// a medium can only remove light.
+vec3 medTr(float idx, float dist)
+{
+	if (idx < 0.5 || claudeWaterAbsorb < 0.5)
+		return vec3(1.0);
+	vec3 a = texture2D(claudeMatPal, vec2((idx + 0.5) / 256.0, 0.75)).rgb;
+	return exp(-a * dist);
 }
 
 // ---- AIR helpers -----------------------------------------------------------
@@ -1944,7 +1961,8 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	g_neeDiagK = float(k);
 	// f_r = rho/PI for a Lambertian; estimator = w * f_r * Le * cos_x/p_l
 	// AIR: the light crosses `dist` metres of it (1 with no medium)
-	float tr = curMed < 0.5 ? airTr(dist) : 1.0;
+	// ...or the medium the vertex is in (water absorbs, 2026-10-05)
+	vec3 tr = curMed < 0.5 ? vec3(airTr(dist)) : medTr(curMed, dist);
 	return w * (rho / PI) * shle * (cosX / pdfL) * tr;
 }
 
@@ -2140,7 +2158,8 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float pdfB = cosX / PI;                  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
-	float tr = curMed < 0.5 ? airTr(airExitT(x, wi)) : 1.0;
+	vec3 tr = curMed < 0.5 ? vec3(airTr(airExitT(x, wi)))
+			: medTr(curMed, airExitT(x, wi));
 	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL) * tr;
 }
 
@@ -2904,6 +2923,12 @@ void main(void)
 				continue;
 			}
 		}
+		// INSIDE A MEDIUM (water, 2026-10-05): Beer-Lambert over the
+		// segment, applied before anything at its far end is added.
+		// Deterministic, not sampled: with no scattering in the medium
+		// the transmittance is the whole answer.
+		if (curMed > 0.5 && !(view >= 1 && view <= 5))
+			tp *= medTr(curMed, hitS ? tHit : airExitT(p, dir));
 		if (!hitS) {
 			// ESCAPED THE GRID — and since 2026-08-17 that is not black.
 			// The ray sees the sky, through the same skyRadiance() the
