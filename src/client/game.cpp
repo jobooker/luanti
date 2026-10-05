@@ -360,6 +360,7 @@ struct ClaudeTraceGrid
 	float dial_glass_flush = 0.0f;
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
+	float dial_reproject = 0.0f;
 	float dial_air_scatter = 0.0f;
 	float dial_flame = 0.0f;
 	float dial_air_absorb = 0.0f;
@@ -1020,6 +1021,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_split = 48.0f;
 	float m_still = 0.0f;
 	float m_exposure = 1.0f;   // claude_exposure: see claude_present
+	// claude_reproject (2026-10-05): keep history through camera motion.
+	// claude_motion_alpha: the floor on the blend weight while moving.
+	// TUNED: 1/16 (history ~16 frames deep in motion) | learn by: John's
+	// eye walking the forest and the cabin, noise vs smear.
+	float m_reproject = 1.0f;
+	float m_motion_alpha = 1.0f / 16.0f;
+	CachedPixelShaderSetting<float, 1, false> m_reproject_pixel{"claudeReproject"};
+	CachedPixelShaderSetting<float, 1, false> m_motion_alpha_pixel{"claudeMotionAlphaMin"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_cam_pos_pixel{"claudePrevCamPos"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_cam_fwd_pixel{"claudePrevCamFwd"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_cam_right_pixel{"claudePrevCamRight"};
+	CachedPixelShaderSetting<float, 3, false> m_prev_cam_up_pixel{"claudePrevCamUp"};
 	CachedPixelShaderSetting<float, 1, false> m_exposure_pixel{"claudeExposure"};
 	CachedPixelShaderSetting<float, 1, false> m_split_pixel{"claudeSplitFrames"};
 	CachedPixelShaderSetting<float, 1, false> m_still_pixel{"claudeStillFrames"};
@@ -1218,6 +1231,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_flame",
 		"claude_split",
 		"claude_exposure",
+		"claude_reproject",
+		"claude_motion_alpha",
 		"claude_air_absorb",
 		"claude_air_g",
 		"claude_refine",
@@ -1965,6 +1980,10 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_reproject")
+			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
+		if (name == "claude_motion_alpha")
+			m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
 		if (name == "claude_exposure")
 			m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
 		if (name == "claude_split")
@@ -2055,6 +2074,8 @@ public:
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		m_split = readAir("claude_split", 48.0f, 100000.0f);
 		m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
+		m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
+		m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2326,6 +2347,9 @@ public:
 				m_still = g_claude_grid.still_frames;
 				m_still_pixel.set(&m_still, services);
 				m_exposure_pixel.set(&m_exposure, services);
+				m_reproject_pixel.set(&m_reproject, services);
+				m_motion_alpha_pixel.set(&m_motion_alpha, services);
+				g_claude_grid.dial_reproject = m_reproject;
 				m_air_absorb_pixel.set(&m_air_absorb, services);
 				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);
@@ -2404,6 +2428,31 @@ public:
 				m_grid_cam_fwd_pixel.set(fwd, services);
 				m_grid_cam_right_pixel.set(right, services);
 				m_grid_cam_up_pixel.set(up, services);
+				// THE PREVIOUS FRAME'S CAMERA, for reprojection. Kept in
+				// WORLD node units and converted with the CURRENT origin, so
+				// a grid rebase between the frames changes nothing. Rolled
+				// once per traced frame (this setter runs per program).
+				{
+					static u32 cam_frame = 0xFFFFFFFFu;
+					static v3f cur_w, cur_f, cur_r, cur_u;
+					static v3f prv_w, prv_f, prv_r, prv_u;
+					v3f world = camera->getPosition() / BS;
+					if (cam_frame != g_claude_frame_no) {
+						if (cam_frame == 0xFFFFFFFFu) {
+							cur_w = world; cur_f = fwd; cur_r = right; cur_u = up;
+						}
+						prv_w = cur_w; prv_f = cur_f; prv_r = cur_r; prv_u = cur_u;
+						cur_w = world; cur_f = fwd; cur_r = right; cur_u = up;
+						cam_frame = g_claude_frame_no;
+					}
+					v3f org((float)g_claude_grid.origin.X,
+							(float)g_claude_grid.origin.Y,
+							(float)g_claude_grid.origin.Z);
+					m_prev_cam_pos_pixel.set(prv_w - org, services);
+					m_prev_cam_fwd_pixel.set(prv_f, services);
+					m_prev_cam_right_pixel.set(prv_r, services);
+					m_prev_cam_up_pixel.set(prv_u, services);
+				}
 				// Traced light source: the sun when it's up (warm, ramped
 				// by day-night ratio), else the moon (cool, dim, a real
 				// light source so traced nights aren't pitch black), else
@@ -4709,6 +4758,12 @@ static void claudeUpdateAccum(Client *client)
 	// the smoothing); when still, a TRUE running average (weight 1/N)
 	// so the image converges to actual stillness instead of the EMA's
 	// perpetual 5%-new-sample pulse.
+	// A grid rebase stays a FULL reset even with reprojection on: the grid
+	// CONTENT changes with it (a fresh snapshot), so history from the old
+	// grid is history of a different world. Measured 2026-10-05: letting a
+	// rebase count as motion put a byte-1 floor across sealed-plank-east
+	// (2,073,456 non-black pixels) -- frames traced before the room was in
+	// the grid, carried into its average.
 	if (origin_changed || moved > 20.0f) {
 		g_claude_grid.accum_alpha = 1.0f;
 		g_claude_grid.still_frames = 0.0f;

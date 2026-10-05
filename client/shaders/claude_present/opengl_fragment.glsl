@@ -95,6 +95,7 @@ void main(void)
 	vec2 f = clamp((uv - base) / ht, 0.0, 1.0);
 	vec3 sum = vec3(0.0);
 	vec3 sumD = vec3(0.0);
+	float sumN = 0.0;
 	float wsum = 0.0;
 	for (int i = 0; i < 4; i++) {
 		vec2 o = vec2(i == 1 || i == 3 ? 1.0 : 0.0,
@@ -110,7 +111,9 @@ void main(void)
 				/ max(1.7, 0.008 * guide));
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
-		sumD += texture2D(accumDirect, base + o * ht).rgb * w;
+		vec4 dd = texture2D(accumDirect, base + o * ht);
+		sumD += dd.rgb * w;
+		sumN += dd.a * w;
 		wsum += w;
 	}
 	vec3 c = sum / wsum;
@@ -118,7 +121,11 @@ void main(void)
 	// of stillness; exactly the total once the ramp is done (or when off)
 	if (claudeSplitFrames > 0.5 && claudeView < 0.5) {
 		vec3 cd = min(sumD / wsum, c);
-		float wb = clamp(claudeStillFrames / claudeSplitFrames, 0.0, 1.0);
+		// per pixel: the samples behind THIS pixel (reprojected history
+		// counts), so a pixel that kept its history while moving keeps its
+		// bounced light too
+		float wb = clamp(max(claudeStillFrames, sumN / wsum - 1.0)
+				/ claudeSplitFrames, 0.0, 1.0);
 		c = cd + (c - cd) * wb;
 	}
 

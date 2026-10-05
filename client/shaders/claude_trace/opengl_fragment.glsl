@@ -386,6 +386,22 @@ uniform vec3 gridCamPos;   // camera in grid-local node units
 uniform vec3 gridCamFwd;   // unit look direction
 uniform vec3 gridCamRight; // camera right, pre-scaled by tan(fovX/2)
 uniform vec3 gridCamUp;    // camera up, pre-scaled by tan(fovY/2)
+// REPROJECTION (claude_reproject, 2026-10-05). The previous frame's camera
+// in the CURRENT grid's coordinates (game.cpp keeps it in world units, so a
+// grid rebase cannot confuse it), same pre-scaling as above. While the
+// camera MOVES, each pixel finds where its primary hit was on the previous
+// frame's screen, checks the stored primary distance agrees, and carries
+// that history forward with weight max(1/(N+1), claudeMotionAlphaMin) — a
+// bounded memory (~1/alpha frames) so moving light still updates. N, the
+// pixel's own sample count, rides in the direct buffer's alpha. A PARKED
+// camera takes the old path exactly, so photo mode and every capture are
+// what they were.
+uniform vec3 claudePrevCamPos;
+uniform vec3 claudePrevCamFwd;
+uniform vec3 claudePrevCamRight;
+uniform vec3 claudePrevCamUp;
+uniform float claudeReproject;
+uniform float claudeMotionAlphaMin;
 
 uniform float animationTimer; // seconds; per-frame RNG decorrelation
 uniform lowp float accumAlpha; // CPU: 1.0 hard reset, 0.5 moving,
@@ -3180,14 +3196,61 @@ void main(void)
 	vec3 fresh = max(L, vec3(0.0));
 	vec3 prev = fresh;
 	float a = 1.0;
+	vec2 huv = uv;          // where this pixel's history lives
+	float nPix = 0.0;       // samples behind it (direct buffer alpha)
 	if (accumAlpha < 0.999) {
-		vec4 h = texture2D(history, uv);
-		// An uninitialised (or once-NaN) history texel must not poison
-		// the average forever — mix() propagates NaN, and abs(NaN)<x is
-		// false, so this rejects both NaN and Inf.
-		if (all(lessThan(abs(h.rgb), vec3(1e6)))) {
-			prev = max(h.rgb, vec3(0.0));
-			a = accumAlpha;
+		// MOVING (accumAlpha 0.5 is the C++'s "camera moved" value; a parked
+		// camera runs 1/(2+N) <= 1/3, a teleport 1.0): reproject.
+		bool moving = accumAlpha > 0.4;
+		bool reproj = claudeReproject > 0.5 && moving;
+		bool hValid = true;
+		vec3 prevEye = claudePrevCamPos + 0.5;
+		float tExp = -1.0;
+		if (reproj) {
+			// the point this pixel sees: its primary hit, or (sky) the
+			// same direction infinitely far away
+			vec3 dvec = primaryHit ? (ro + rd * primaryT) - prevEye : rd;
+			float z = dot(dvec, claudePrevCamFwd);
+			if (z > 1e-3) {
+				vec2 ndcP = vec2(
+						dot(dvec, claudePrevCamRight)
+							/ (z * dot(claudePrevCamRight, claudePrevCamRight)),
+						dot(dvec, claudePrevCamUp)
+							/ (z * dot(claudePrevCamUp, claudePrevCamUp)));
+				huv = ndcP * 0.5 + 0.5;
+				hValid = all(greaterThanEqual(huv, vec2(0.0)))
+						&& all(lessThanEqual(huv, vec2(1.0)));
+				if (primaryHit)
+					tExp = length(dvec);
+			} else {
+				hValid = false;
+			}
+		}
+		vec4 h = texture2D(history, huv);
+		if (hValid && all(lessThan(abs(h.rgb), vec3(1e6)))) {
+			if (reproj) {
+				// the history pixel must have seen the SAME surface: its
+				// stored primary distance from the previous eye must match
+				float tPrev = h.a * DEPTH_SCALE;
+				bool same = primaryHit
+						? abs(tPrev - tExp) < 0.04 * tExp + 0.08
+						: tPrev > DEPTH_MAX_HIT - 1.0;   // sky saw sky
+				if (same) {
+#ifdef CLAUDE_SPLIT_OUT
+					nPix = texture2D(historyDirect, huv).a;
+#else
+					nPix = 8.0;
+#endif
+					prev = max(h.rgb, vec3(0.0));
+					a = max(1.0 / (nPix + 1.0), claudeMotionAlphaMin);
+				}
+			} else {
+				prev = max(h.rgb, vec3(0.0));
+				a = accumAlpha;
+#ifdef CLAUDE_SPLIT_OUT
+				nPix = texture2D(historyDirect, huv).a;
+#endif
+			}
 		}
 	}
 
@@ -3196,10 +3259,12 @@ void main(void)
 	vec3 freshD = max(Ld, vec3(0.0));
 	vec3 prevD = freshD;
 	if (a < 1.0) {
-		vec4 hd = texture2D(historyDirect, uv);
+		vec4 hd = texture2D(historyDirect, huv);
 		if (all(lessThan(abs(hd.rgb), vec3(1e6))))
 			prevD = max(hd.rgb, vec3(0.0));
 	}
-	outDirect = vec4(mix(prevD, freshD, a), tPack);
+	// alpha carries this pixel's sample count (reprojection; the present
+	// pass's split ramp reads it too). Capped: it only ever feeds a weight.
+	outDirect = vec4(mix(prevD, freshD, a), a < 1.0 ? min(nPix + 1.0, 4096.0) : 1.0);
 #endif
 }
