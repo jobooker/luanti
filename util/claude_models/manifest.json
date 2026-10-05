@@ -72,6 +72,30 @@
   ],
   "flower_tulip_red": [
    "mcl_flowers:tulip_red"
+  ],
+  "leaves_oak": [
+   "mcl_trees:leaves_oak",
+   "mcl_trees:leaves_oak_orphan"
+  ],
+  "leaves_dark_oak": [
+   "mcl_trees:leaves_dark_oak",
+   "mcl_trees:leaves_dark_oak_orphan"
+  ],
+  "leaves_jungle": [
+   "mcl_trees:leaves_jungle",
+   "mcl_trees:leaves_jungle_orphan"
+  ],
+  "leaves_spruce": [
+   "mcl_trees:leaves_spruce",
+   "mcl_trees:leaves_spruce_orphan"
+  ],
+  "leaves_acacia": [
+   "mcl_trees:leaves_acacia",
+   "mcl_trees:leaves_acacia_orphan"
+  ],
+  "leaves_birch": [
+   "mcl_trees:leaves_birch",
+   "mcl_trees:leaves_birch_orphan"
   ]
  }
 }

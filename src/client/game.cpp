@@ -3779,6 +3779,11 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// class the two sub-voxel branches below were ever allowed to
 		// take over.
 		bool plain_solid = (mat.kind == MATK_SOLID && mat.light == 0);
+		// LEAVES WITH A MODEL (2026-10-05): an unlit leaf block takes its
+		// authored model like a plain solid does, so a canopy is the
+		// perforated sheets the game draws (claude_models.py
+		// leaf_sheets) and not a 1 m green cube. Its kind stays LEAVES.
+		bool leaves_model = (mat.kind == MATK_LEAVES && mat.light == 0);
 		// authored model: tag the cell and join the micro class so
 		// every path carves it. v2: emissive full-cube nodes (the lit
 		// furnace) join too — their fire voxels render via the palette
@@ -3787,7 +3792,7 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// Sub-cube point lights (torch/lantern/campfire, class 165)
 		// keep their existing nub+NEE treatment.
 		if (!g_claude_grid.model_of.empty()
-				&& (plain_solid || (f.light_source > 0
+				&& (plain_solid || leaves_model || (f.light_source > 0
 					&& f.drawtype == NDT_NORMAL))) {
 			auto mit = g_claude_grid.model_of.find(c);
 			if (mit != g_claude_grid.model_of.end()) {

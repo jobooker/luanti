@@ -738,6 +738,46 @@ def crossed_cutout(name, path):
     return name, pal, v
 
 
+def leaf_sheets(name, path):
+    """Leaves (2026-10-05, John: "tree leaves... there's still too much
+    flatness"). A leaf block is NDT_ALLFACES: Luanti draws the leaf texture
+    on all SIX faces of the cube, holes and all, and draws them even
+    between two leaf blocks, so a canopy is layers of perforated sheets.
+    This bakes exactly that and nothing more: each face a 1/16 m sheet,
+    with a voxel wherever the texel is opaque (alpha >= 128) and a real gap
+    wherever it is not. Until now every leaf block was a solid 1 m cube,
+    so a canopy let no light through at all. Colour: the cell's own (the
+    biome tint), as for tall grass; the texture is grayscale."""
+    img = np.asarray(Image.open(path).convert("RGBA").resize(
+        (N, N), Image.NEAREST), dtype=np.float32)
+    m = img[..., 3] >= 128                      # [v, u], v down the tile
+    opaque = img[..., :3][m]
+    pal = [None, dict(rgb=[int(c) for c in opaque.mean(axis=0)], emit=0)]
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    up = m[::-1, :]                             # [y, u]: row 0 at the bottom
+    for a in range(N):
+        for b in range(N):
+            # x faces: u along z, v up y
+            if up[b, a]:
+                v[0, b, a] = 1
+            if up[b, N - 1 - a]:
+                v[N - 1, b, a] = 1
+            # z faces: u along x
+            if up[b, N - 1 - a]:
+                v[a, b, 0] = 1
+            if up[b, a]:
+                v[a, b, N - 1] = 1
+            # y faces: the tile laid flat, u along x, v along z
+            if m[b, a]:
+                v[a, 0, b] = 1
+                v[a, N - 1, b] = 1
+    return name, pal, v
+
+
+def _leaves(name, mod, tex):
+    return leaf_sheets(name, _mcl("ITEMS", mod, "textures", tex))
+
+
 def _flower(name, tex):
     return crossed_cutout(name, _mcl("ITEMS", "mcl_flowers", "textures", tex))
 
@@ -860,6 +900,21 @@ MANIFEST = {
     "flower_cornflower": ["mcl_flowers:cornflower"],
     "flower_allium": ["mcl_flowers:allium"],
     "flower_tulip_red": ["mcl_flowers:tulip_red"],
+    # leaves (2026-10-05): six perforated sheets, see leaf_sheets(). With
+    # these the table holds 32 models, which is the atlas cap (game.cpp:
+    # 32 models x 4 rotations x 16 layers = 2048, GL's guaranteed 3-D
+    # texture depth). The next model needs that cap raised first.
+    "leaves_oak": ["mcl_trees:leaves_oak", "mcl_trees:leaves_oak_orphan"],
+    "leaves_dark_oak": ["mcl_trees:leaves_dark_oak",
+                        "mcl_trees:leaves_dark_oak_orphan"],
+    "leaves_jungle": ["mcl_trees:leaves_jungle",
+                      "mcl_trees:leaves_jungle_orphan"],
+    "leaves_spruce": ["mcl_trees:leaves_spruce",
+                      "mcl_trees:leaves_spruce_orphan"],
+    "leaves_acacia": ["mcl_trees:leaves_acacia",
+                      "mcl_trees:leaves_acacia_orphan"],
+    "leaves_birch": ["mcl_trees:leaves_birch",
+                     "mcl_trees:leaves_birch_orphan"],
 }
 
 
@@ -886,7 +941,13 @@ def main():
                lambda: _flower("flower_oxeye_daisy", "mcl_flowers_oxeye_daisy.png"),
                lambda: _flower("flower_cornflower", "mcl_flowers_cornflower.png"),
                lambda: _flower("flower_allium", "mcl_flowers_allium.png"),
-               lambda: _flower("flower_tulip_red", "mcl_flowers_tulip_red.png")):
+               lambda: _flower("flower_tulip_red", "mcl_flowers_tulip_red.png"),
+               lambda: _leaves("leaves_oak", "mcl_core", "default_leaves.png"),
+               lambda: _leaves("leaves_dark_oak", "mcl_core", "mcl_core_leaves_big_oak.png"),
+               lambda: _leaves("leaves_jungle", "mcl_core", "default_jungleleaves.png"),
+               lambda: _leaves("leaves_spruce", "mcl_core", "mcl_core_leaves_spruce.png"),
+               lambda: _leaves("leaves_acacia", "mcl_core", "default_acacia_leaves.png"),
+               lambda: _leaves("leaves_birch", "mcl_core", "mcl_core_leaves_birch.png")):
         name, pal, v = fn()
         if name in SOLID_NODE_MODELS:
             v, floor = enforce_opaque(name, pal, v)
