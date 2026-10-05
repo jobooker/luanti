@@ -1288,10 +1288,23 @@ def do_freeze():
     time.sleep(1.5)
     b = lab.read_stats() or {}
     sa, sb = a.get("still_frames", 0), b.get("still_frames", 0)
+    ra, rb = a.get("accum_resets"), b.get("accum_resets")
+    # THE CLAIM IS "NOT ZEROED EVERY FRAME", and accum_resets is the
+    # counter that says it (bumped on zeroing, NOT on the clamp-to-10 a
+    # world change does). A moving sun zeroes every frame: resets climb by
+    # thousands and still_frames never deepens. A block arriving after the
+    # deploy clamps once: still_frames drops, resets do not move. Seen on
+    # the rig 2026-10-04 at fps_max 5000: [4059, 289] with time frozen —
+    # a false RED on still_frames alone (1 of 6 runs).
+    clamped = (sb <= sa and ra is not None and rb is not None and rb == ra
+               and sb > 0)
     return {"time_speed": lab.get_time_speed(),
-            "still_frames": [sa, sb],
+            "still_frames": [sa, sb], "accum_resets": [ra, rb],
             "accum_alpha": [a.get("accum_alpha"), b.get("accum_alpha")],
-            "deepening": bool(sb > sa)}
+            "deepening": bool(sb > sa or clamped),
+            "how": ("climbed" if sb > sa else
+                    "dropped by a clamp (no zeroing in the window)" if clamped
+                    else "not deepening")}
 
 
 def set_doors(shut):
@@ -2801,8 +2814,9 @@ def cmd_run(args):
           "%d 'Failed to compile' lines in debug.txt"
           % len(run["shader_failures"]))
     A.add("freeze-deepening", run["freeze"].get("deepening"),
-          "still_frames %s, time_speed %s" % (run["freeze"].get("still_frames"),
-                                              run["freeze"].get("time_speed")))
+          "still_frames %s, accum_resets %s, %s; time_speed %s"
+          % (run["freeze"].get("still_frames"), run["freeze"].get("accum_resets"),
+             run["freeze"].get("how"), run["freeze"].get("time_speed")))
 
     vs = lab.load_vantages()
     # STILL THE WORLD. Mineclonia's grass ABM changes a node inside the
