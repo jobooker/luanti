@@ -235,6 +235,8 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
+                              # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which
     # is what every arm but one is judged under. > 0 replaces the whole
     # sky with a constant radiance in every direction, and skyfurnace-050

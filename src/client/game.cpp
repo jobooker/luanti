@@ -357,6 +357,7 @@ struct ClaudeTraceGrid
 	float dial_grid_debug = 0.0f;
 	float dial_nee = 0.0f;
 	float dial_descend = 0.0f;
+	float dial_glass_flush = 0.0f;
 	float dial_view = 0.0f;
 	float dial_bounces = 0.0f;
 	float dial_sky_uniform = 0.0f;
@@ -945,6 +946,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// that measures it — the hidden-default class, self-inflicted.
 	float m_descend = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_descend_pixel{"claudeDescend"};
+	// claude_glass_flush (2026-10-04): 1 (default) = a ray travelling in
+	// glass that reaches a carved opaque cell stops at that cell's flat
+	// 1 m face, i.e. glazing sits flush against wood and there are no
+	// 1/16 m air pockets between them. 0 = the walk descends as before.
+	// A dial so the probe can A/B it on one build (util/claude_glass_bars.py).
+	float m_glass_flush = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_glass_flush_pixel{"claudeGlassFlush"};
 	float m_refine = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_refine_pixel{"claudeRefine"};
 	float m_denoise = 1.0f;
@@ -1120,6 +1128,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_sky_azimuth",
 		"claude_subvox",
 		"claude_descend",
+		"claude_glass_flush",
 		"claude_refine",
 		"claude_denoise",
 		"claude_view",
@@ -1435,6 +1444,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
 	}
 
+	// 1 (default) = glass sits flush against carved wood (see m_glass_flush)
+	static float readGlassFlush()
+	{
+		if (!g_settings->exists("claude_glass_flush"))
+			return 1.0f;
+		return g_settings->getFloat("claude_glass_flush", 0.0f, 1.0f);
+	}
+
 	// 1 (default) = extra rays per pixel while the camera is at rest
 	static float readRefine()
 	{
@@ -1721,6 +1738,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_grid_debug = m_grid_debug;
 		g_claude_grid.dial_nee = m_nee;
 		g_claude_grid.dial_descend = m_descend;
+		g_claude_grid.dial_glass_flush = m_glass_flush;
 		g_claude_grid.dial_view = m_view;
 		g_claude_grid.dial_bounces = m_bounces;
 		g_claude_grid.dial_sky_uniform = m_sky_uniform;
@@ -1817,6 +1835,8 @@ public:
 			m_subvox = readSubvox();
 		if (name == "claude_descend")
 			m_descend = readDescend();
+		if (name == "claude_glass_flush")
+			m_glass_flush = readGlassFlush();
 		if (name == "claude_refine")
 			m_refine = readRefine();
 		if (name == "claude_denoise")
@@ -1886,6 +1906,7 @@ public:
 		m_sky_az = readSkyAz();
 		m_subvox = readSubvox();
 		m_descend = readDescend();
+		m_glass_flush = readGlassFlush();
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2149,6 +2170,7 @@ public:
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
 				m_subvox_pixel.set(&m_subvox, services);
 				m_descend_pixel.set(&m_descend, services);
+				m_glass_flush_pixel.set(&m_glass_flush, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				// claude_trace's three dials. Delivered here, next to the
@@ -4569,6 +4591,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_grid_debug\": " << g_claude_grid.dial_grid_debug
 			<< ", \"claude_nee\": " << g_claude_grid.dial_nee
 			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
+			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_view\": " << g_claude_grid.dial_view
 			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces
 			<< ", \"claude_sky_uniform\": "

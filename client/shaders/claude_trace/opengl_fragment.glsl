@@ -281,6 +281,11 @@ uniform sampler3D claudeSubvoxTex;
 // pre-2026-08-16 behaviour, in which such a cell is an opaque 1 m cube.
 // The A/B partner for the energy and cost gates.
 uniform float claudeDescend;
+// GLASS SITS FLUSH (claude_glass_flush, 2026-10-04, John's call). 1 = a
+// ray travelling in glass that arrives at a carved OPAQUE cell stops at
+// that cell's 1 m face instead of descending into its relief. See the
+// fineHere gate in marchMed().
+uniform float claudeGlassFlush;
 
 // --- THE SKY, as Luanti's own Sky class computes it this frame ---------
 // All colours are LINEAR radiance. game.cpp linearises the engine's
@@ -1344,6 +1349,23 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		pal = matPalIdx(idx);
 		bool fineHere = claudeDescend > 0.5 && matFine(pal)
 				&& inSubvoxRing(ci);
+		// GLASS SITS FLUSH AGAINST CARVED WOOD (2026-10-04, John: "glass
+		// sits flush"). A ray still IN a medium (curMed != 0, and only a
+		// transmissive material is ever a medium) that arrives at an
+		// opaque fine cell meets that cell's flat 1 m face: no descent, so
+		// it never meets the 1/16 m air pockets of the relief. Measured
+		// before this (spec/measured.md 2026-10-04, "glass beside carved
+		// wood"): a ray inside glass met a groove's air sub-voxel at a
+		// grazing angle, totally internally reflected, and carried the
+		// window's outside view into every groove of the reveal — bars on
+		// 7.7 % of the frame at a glass-block window, 1.2 % at a pane.
+		// Correct optics for a metre of glass pressed against grooved
+		// wood; the wrong picture, because glazing is sealed to its frame.
+		// curMed = 0 (every opaque scene, every ray in air) can never take
+		// this branch, so nothing without glass changes by one bit.
+		if (fineHere && claudeGlassFlush > 0.5 && curMed > 0.5
+				&& !matTransmits(idx, pal))
+			fineHere = false;
 		// SAME MATERIAL IS NOT THE SAME AS NO INTERFACE, once a material
 		// can be fine (PANES, 2026-08-23). A ray inside a pane crossing
 		// into the NEXT pane cell of the same window meets the same
