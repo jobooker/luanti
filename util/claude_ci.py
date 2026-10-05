@@ -235,6 +235,7 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_texel_colour": 1,  # face-tile colour on plain cubes (2026-10-04)
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which
@@ -1261,13 +1262,23 @@ def wait_for_client(timeout=CLIENT_READY_TIMEOUT):
     return False
 
 
+# debug.txt is APPENDED across every session on this seat, so a failure
+# from an earlier client (a broken shader since fixed) stayed in it and
+# turned every later run red (2026-10-04). Only lines written after this
+# seat's client started count: bring_up_seat() records the size first.
+DEBUG_OFFSET = [0]
+
+
 def shader_compile_failures():
     """environment-laws: shader compile failure is SILENT — the engine
     falls back to raster and keeps reporting stale stats. debug.txt is
     the only honest signal, so read it before believing any frame."""
     try:
-        with open(lab.DEBUG, errors="replace") as f:
-            return [l.strip() for l in f if "Failed to compile" in l][-5:]
+        with open(lab.DEBUG, "rb") as f:
+            f.seek(DEBUG_OFFSET[0])
+            text = f.read().decode("utf-8", errors="replace")
+        return [l.strip() for l in text.splitlines()
+                if "Failed to compile" in l][-5:]
     except Exception:
         return []
 
@@ -2703,6 +2714,10 @@ def bring_up_seat(rundir, run, args):
     run["pinned_conf"] = PINNED_CONF
     headless = bool(getattr(args, "headless", False))
     run["seat_headless"] = headless
+    try:
+        DEBUG_OFFSET[0] = os.path.getsize(lab.DEBUG)
+    except OSError:
+        DEBUG_OFFSET[0] = 0
     print("seat: starting server + client on port %d%s"
           % (SEAT_PORT, " (headless gamescope)" if headless else ""))
     start_seat(rundir, headless=headless)

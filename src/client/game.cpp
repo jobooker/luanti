@@ -358,6 +358,7 @@ struct ClaudeTraceGrid
 	float dial_nee = 0.0f;
 	float dial_descend = 0.0f;
 	float dial_glass_flush = 0.0f;
+	float dial_texel = 0.0f;
 	float dial_view = 0.0f;
 	float dial_bounces = 0.0f;
 	float dial_sky_uniform = 0.0f;
@@ -970,6 +971,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// 1/16 m air pockets between them. 0 = the walk descends as before.
 	// A dial so the probe can A/B it on one build (util/claude_glass_bars.py).
 	float m_glass_flush = 1.0f;
+	// claude_texel_colour (2026-10-04): 1 (default) = a plain cube's hit
+	// takes its colour from the face tile under the hit point (the cell
+	// colour times the tile's ratio); 0 = one colour per cell, as before.
+	float m_texel = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_texel_pixel{"claudeTexel"};
 	CachedPixelShaderSetting<float, 1, false> m_glass_flush_pixel{"claudeGlassFlush"};
 	float m_refine = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_refine_pixel{"claudeRefine"};
@@ -1152,6 +1158,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_subvox",
 		"claude_descend",
 		"claude_glass_flush",
+		"claude_texel_colour",
 		"claude_refine",
 		"claude_denoise",
 		"claude_view",
@@ -1467,6 +1474,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
 	}
 
+	static float readTexel()
+	{
+		if (!g_settings->exists("claude_texel_colour"))
+			return 1.0f;
+		return g_settings->getFloat("claude_texel_colour", 0.0f, 1.0f);
+	}
+
 	// 1 (default) = glass sits flush against carved wood (see m_glass_flush)
 	static float readGlassFlush()
 	{
@@ -1765,6 +1779,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_nee = m_nee;
 		g_claude_grid.dial_descend = m_descend;
 		g_claude_grid.dial_glass_flush = m_glass_flush;
+		g_claude_grid.dial_texel = m_texel;
 		g_claude_grid.dial_view = m_view;
 		g_claude_grid.dial_bounces = m_bounces;
 		g_claude_grid.dial_sky_uniform = m_sky_uniform;
@@ -1863,6 +1878,8 @@ public:
 			m_descend = readDescend();
 		if (name == "claude_glass_flush")
 			m_glass_flush = readGlassFlush();
+		if (name == "claude_texel_colour")
+			m_texel = readTexel();
 		if (name == "claude_refine")
 			m_refine = readRefine();
 		if (name == "claude_denoise")
@@ -1933,6 +1950,7 @@ public:
 		m_subvox = readSubvox();
 		m_descend = readDescend();
 		m_glass_flush = readGlassFlush();
+		m_texel = readTexel();
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2197,6 +2215,7 @@ public:
 				m_subvox_pixel.set(&m_subvox, services);
 				m_descend_pixel.set(&m_descend, services);
 				m_glass_flush_pixel.set(&m_glass_flush, services);
+				m_texel_pixel.set(&m_texel, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				// claude_trace's three dials. Delivered here, next to the
@@ -2671,11 +2690,75 @@ int claudeWarnRenamedSettings(const Settings *src, const char *source)
 // bloom, undersampling, ...) take effect without a client restart. External
 // tooling overwrites the file; identical content is not re-applied.
 // Blit one node type's top tile (16px, scaled) into the material atlas.
+// THE FACE TILES (2026-10-04, roadmap "SUB-VOXEL COLOUR", plain cubes
+// first). Three 16x16 tiles per material id — face 0 = top (+Y), 1 =
+// bottom (-Y), 2 = side (+X, standing in for all four) — at atlas rows
+// face*256 + (mid/16)*16. Each texel is the face AS LUANTI DRAWS IT: the
+// base tile multiplied by its own colour if it has one (Mineclonia's
+// grass sides say color="white") or else by the node's tint, with the
+// overlay composited over it the same way (the grass-side strip takes the
+// tint, the dirt under it does not). Stored as a RATIO to the cell colour
+// this material was first seen with, x64 in a byte (0..~4): the shader
+// multiplies the cell's own colour by it, so a cell's mean stays what the
+// grid says, its biome tint still comes from the grid, and only the
+// pattern is added. Emission does not read it.
+static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
+		video::SColor ref, video::SColor tint)
+{
+	u32 *dst = (u32 *)g_claude_grid.atlas.data();
+	auto load = [&](const TileDef &td, u32 *out) -> bool {
+		if (td.name.empty())
+			return false;
+		video::IImage *img = client->tsrc()->claudeGetImage(td.name);
+		if (!img)
+			return false;
+		img->copyToScaling(out, 16, 16, video::ECF_A8R8G8B8);
+		img->drop();
+		return true;
+	};
+	const int src_face[3] = {0, 1, 2};
+	for (int face = 0; face < 3; face++) {
+		const TileDef &bt = f.tiledef[src_face[face]];
+		const TileDef &ot = f.tiledef_overlay[src_face[face]];
+		u32 base[256], over[256];
+		bool hb = load(bt, base), ho = load(ot, over);
+		video::SColor bm = bt.has_color ? bt.color : tint;
+		video::SColor om = ot.has_color ? ot.color : tint;
+		int ax = (mid % 16) * 16, ay = face * 256 + (mid / 16) * 16;
+		for (int k = 0; k < 256; k++) {
+			double c[3] = {(double)ref.getRed(), (double)ref.getGreen(),
+					(double)ref.getBlue()};   // no tile: ratio 1
+			if (hb) {
+				c[0] = ((base[k] >> 16) & 0xFF) * bm.getRed() / 255.0;
+				c[1] = ((base[k] >> 8) & 0xFF) * bm.getGreen() / 255.0;
+				c[2] = (base[k] & 0xFF) * bm.getBlue() / 255.0;
+			}
+			if (ho) {
+				double a = ((over[k] >> 24) & 0xFF) / 255.0;
+				double o[3] = {((over[k] >> 16) & 0xFF) * om.getRed() / 255.0,
+						((over[k] >> 8) & 0xFF) * om.getGreen() / 255.0,
+						(over[k] & 0xFF) * om.getBlue() / 255.0};
+				for (int ch = 0; ch < 3; ch++)
+					c[ch] = c[ch] * (1.0 - a) + o[ch] * a;
+			}
+			double r[3] = {(double)ref.getRed(), (double)ref.getGreen(),
+					(double)ref.getBlue()};
+			u32 px = 0xFF000000u;
+			for (int ch = 0; ch < 3; ch++) {
+				double ratio = c[ch] / std::max(r[ch], 1.0);
+				u32 v = (u32)std::clamp(ratio * 64.0 + 0.5, 0.0, 255.0);
+				px |= v << (16 - ch * 8);
+			}
+			dst[(ay + k / 16) * 256 + ax + (k % 16)] = px;
+		}
+	}
+}
+
 static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
-		video::SColor fallback)
+		video::SColor fallback, video::SColor tint)
 {
 	if (g_claude_grid.atlas.empty())
-		g_claude_grid.atlas.assign(256 * 256 * 4, 0);
+		g_claude_grid.atlas.assign(256 * 768 * 4, 0);
 	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
 	bool ok = false;
@@ -2821,7 +2904,10 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 	// (The per-material 16^3 stamp bake that lived here is gone with the
 	// runtime carve, ADR-0011 — sub-voxel shape comes from the model
 	// shop's authored 16^3 models, nowhere else.)
-	(void)fallback;
+	// The single top-tile DETAIL written above is superseded by the three
+	// face tiles (it was read by nothing since ADR-0011); they overwrite
+	// the same rows 0..255 for face 0.
+	claudeAtlasFaceTiles(client, mid, f, fallback, tint);
 	g_claude_grid.atlas_dirty = true;
 }
 
@@ -3485,7 +3571,10 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		} else if (g_claude_grid.palette.size() < 254) {
 			u8 mid = (u8)(g_claude_grid.palette.size() + 1);
 			g_claude_grid.palette[c] = mid;
-			claudeAtlasAdd(client, mid, f, col);
+			video::SColor tint0(255, 255, 255, 255);
+			if (f.visuals)
+				f.visuals->getColor(n.getParam2(), &tint0);
+			claudeAtlasAdd(client, mid, f, col, tint0);
 			mids[i] = mid;
 		}
 		solid++;
@@ -3989,7 +4078,7 @@ static void claudeTraceGridUploadAtlas()
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 256, 0, GL.BGRA,
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 768, 0, GL.BGRA,
 			GL.UNSIGNED_BYTE, V.atlas.data());
 	// per-material response params (256x1 RGBA), unit 15
 	if (!V.matparams_tex)
@@ -4626,6 +4715,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_nee\": " << g_claude_grid.dial_nee
 			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
+			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_view\": " << g_claude_grid.dial_view
 			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces
 			<< ", \"claude_sky_uniform\": "

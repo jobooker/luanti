@@ -286,6 +286,18 @@ uniform float claudeDescend;
 // that cell's 1 m face instead of descending into its relief. See the
 // fineHere gate in marchMed().
 uniform float claudeGlassFlush;
+// FACE-TILE COLOUR (claude_texel_colour, 2026-10-04). claudeMaterials is
+// the per-cell material id (unit 12, R8 128^3, 0 = none); claudeAtlas
+// (unit 13, 256x768) holds three 16x16 tiles per id — top, bottom, side —
+// each texel a RATIO x64 to the cell colour (game.cpp
+// claudeAtlasFaceTiles). Read only at a plain cube's hit: carved models
+// keep one colour per cell until their own delit palettes are wired
+// (roadmap SUB-VOXEL COLOUR; a raw tile on a carved groove darkens it
+// twice — bf83f1108).
+uniform sampler3D claudeMaterials;
+uniform sampler2D claudeAtlas;
+uniform float claudeTexel;
+
 
 // --- THE SKY, as Luanti's own Sky class computes it this frame ---------
 // All colours are LINEAR radiance. game.cpp linearises the engine's
@@ -1114,6 +1126,33 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // the expression the path loop used to evaluate itself — same inputs,
 // same order, so an opaque scene and a full-cube glass block are
 // bit-identical to what they were.
+// The face-tile ratio under a plain cube's hit point (claudeTexel).
+vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
+{
+	float mid = floor(texture3D(claudeMaterials,
+			(cell + 0.5) / GRID_S).r * 255.0 + 0.5);
+	if (mid < 0.5)
+		return vec3(1.0);
+	vec3 l = clamp(phit - cell, vec3(0.0), vec3(0.99999));
+	float face;
+	vec2 uv;
+	if (abs(n.y) > 0.5) {
+		face = n.y > 0.0 ? 0.0 : 1.0;
+		uv = vec2(l.x, l.z);
+	} else if (abs(n.x) > 0.5) {
+		face = 2.0;
+		uv = vec2(n.x > 0.0 ? 1.0 - l.z : l.z, 1.0 - l.y);
+	} else {
+		face = 2.0;
+		uv = vec2(n.z > 0.0 ? l.x : 1.0 - l.x, 1.0 - l.y);
+	}
+	vec2 tx = floor(uv * 16.0);
+	vec2 at = vec2(mod(mid, 16.0) * 16.0 + tx.x,
+			face * 256.0 + floor(mid / 16.0) * 16.0 + tx.y);
+	return texture2D(claudeAtlas, (at + 0.5) / vec2(256.0, 768.0)).rgb
+			* (255.0 / 64.0);
+}
+
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
@@ -1470,6 +1509,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// always reported, at either rung.
 		alb = hitAir ? cellAlbedo(vec3(0.0)) : cellAlbedo(s.rgb);
 		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)
+
 		tHit = t;
 		cellOut = ci;
 		return true;
@@ -2575,6 +2615,21 @@ void main(void)
 			L += tp * (skyDome(dir) + misW * skyBody(dir));
 			break;
 		}
+
+		// THE FACE TILE (claudeTexel, 2026-10-04): a plain cube's albedo
+		// takes the pattern of the face tile under the hit point. HERE and
+		// not in marchMed(), which also serves every shadow ray — measured:
+		// inside the walk it cost +0.2-0.3 ms of trace pass on rooms whose
+		// picture it could not change. Le was taken from the cell colour
+		// inside the walk and is not touched: texture is reflectance, never
+		// emission (§4's domain is not this step's to move). Not a fine
+		// cell (carved models keep one colour until their delit palettes
+		// are wired — bf83f1108), not air, not glass. cellAlbedo is
+		// pow(c, 2.2), so the sRGB ratio enters as ratio^2.2.
+		if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
+				&& !matTransmits(hitIdx, hitPal))
+			alb = max(min(alb * pow(faceTileRatio(cell, hp, n), vec3(2.2)),
+					vec3(1.0)), vec3(ALBEDO_FLOOR));
 
 		// clay: march computed le from the TRUE albedo above; clamping
 		// rho afterward changes reflectance only, never the lights
