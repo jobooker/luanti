@@ -235,6 +235,8 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_air_scatter": 0,   # every existing arm is measured WITHOUT air (2026-10-04)
+    "claude_air_absorb": 0,
     "claude_body_colour": 1,  # sun/moon colour = tint; brightness from the dome (2026-10-04)
     "claude_texel_colour": 1,  # face-tile colour on plain cubes (2026-10-04)
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
@@ -494,6 +496,17 @@ SEALED_SETTLE = 2000
 CI_SHOTS = [
     {"name": "furnace-050", "vantage": "furnace-050",
      "referee": ("furnace", "050")},
+    # THE AIR ENERGY REFEREE (2026-10-04): the same sealed furnace FULL of
+    # non-absorbing haze (mean free path 5 m in a 5 m room). Scattering
+    # in a field that is already uniform changes nothing, so the analytic
+    # Le/(1-rho) must hold exactly as it does with clear air. Any energy
+    # the medium estimator invents or loses moves this ratio.
+    {"name": "furnace-050-air", "vantage": "furnace-050",
+     "referee": ("furnace", "050"),
+     "dials": {"claude_air_scatter": 0.2, "claude_air_absorb": 0},
+     # 500 frames read 0.988 +/- 0.052 (noise); 4000 read 0.982 +/- 0.003.
+     # Captures repeat exactly now, so a noisy depth would fail forever.
+     "settle": 4000},
     {"name": "furnace-073", "vantage": "furnace-073",
      "referee": ("furnace", "073")},
     {"name": "cornell", "vantage": "cornell", "referee": ("cornell", None)},

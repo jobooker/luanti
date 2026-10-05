@@ -297,6 +297,16 @@ uniform float claudeGlassFlush;
 uniform sampler3D claudeMaterials;
 uniform sampler2D claudeAtlas;
 uniform float claudeTexel;
+// AIR (2026-10-04, John: "add air/haze as step one"). A homogeneous medium
+// filling every AIR cell of the grid: scattering and absorption
+// coefficients in 1/m, and the Henyey-Greenstein asymmetry g (0 = even,
+// toward 1 = forward, like haze). 0 + 0 = no medium, and then nothing in
+// this file draws a random number for it, so an air-free frame is the
+// frame it always was. Beyond the grid there is no medium (the far field
+// is one flat number; aerial perspective past 64 m is not modelled).
+uniform float claudeAirScatter;
+uniform float claudeAirAbsorb;
+uniform float claudeAirG;
 
 
 // --- THE SKY, as Luanti's own Sky class computes it this frame ---------
@@ -1126,6 +1136,50 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // the expression the path loop used to evaluate itself — same inputs,
 // same order, so an opaque scene and a full-cube glass block are
 // bit-identical to what they were.
+// ---- AIR helpers -----------------------------------------------------------
+float airSigT() { return claudeAirScatter + claudeAirAbsorb; }
+
+// distance from p along unit d to the edge of the trace grid, where the
+// medium ends
+float airExitT(vec3 p, vec3 d)
+{
+	vec3 a = abs(d);
+	vec3 room = mix(p, vec3(GRID_S) - p, step(0.0, d));
+	vec3 tt = room / max(a, vec3(1e-6));
+	return max(min(tt.x, min(tt.y, tt.z)), 0.0);
+}
+
+// transmittance of `dist` metres of air (1 when there is no medium)
+float airTr(float dist) { return exp(-airSigT() * dist); }
+
+// Henyey-Greenstein phase function, per steradian. c = cosine between the
+// path's travel direction and the new one (same sign convention for the
+// light sample: c = dot(dir, wi), wi toward the light).
+float hgPhase(float c, float g)
+{
+	float g2 = g * g;
+	return (1.0 - g2) / (4.0 * 3.14159265
+			* pow(max(1.0 + g2 - 2.0 * g * c, 1e-6), 1.5));
+}
+
+vec3 hgSample(vec3 w, float g, float u1, float u2)
+{
+	float c;
+	if (abs(g) < 1e-3) {
+		c = 1.0 - 2.0 * u1;
+	} else {
+		float q = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+		c = (1.0 + g * g - q * q) / (2.0 * g);
+	}
+	c = clamp(c, -1.0, 1.0);
+	float sn = sqrt(max(0.0, 1.0 - c * c));
+	float ph = 6.28318531 * u2;
+	vec3 ta = abs(w.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = normalize(cross(ta, w));
+	vec3 ty = cross(w, tx);
+	return normalize(tx * (sn * cos(ph)) + ty * (sn * sin(ph)) + w * c);
+}
+
 // The face-tile ratio under a plain cube's hit point (claudeTexel).
 vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 {
@@ -1792,7 +1846,73 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	g_neeDiag = vec4(1.0, c.y + gridOrigin.y, cosX, float(li));
 	g_neeDiagK = float(k);
 	// f_r = rho/PI for a Lambertian; estimator = w * f_r * Le * cos_x/p_l
-	return w * (rho / PI) * shle * (cosX / pdfL);
+	// AIR: the light crosses `dist` metres of it (1 with no medium)
+	float tr = curMed < 0.5 ? airTr(dist) : 1.0;
+	return w * (rho / PI) * shle * (cosX / pdfL) * tr;
+}
+
+// neeDirect() for a point IN THE AIR (2026-10-04): the same emitter-list
+// sample, with the phase function where a surface has rho/PI * cos and no
+// facing test. `dir` is the path's travel direction into the point. This
+// is what gives a torch or a glowing block its halo in haze.
+vec3 neeDirectAir(vec3 x, vec3 dir, int nLights)
+{
+	float us = rnd1();
+	int li = min(int(float(nLights) * us), nLights - 1);
+	vec4 e = areaEmitter(li);
+	vec3 c = e.xyz;
+	int mask = int(e.w + 0.5);
+	int k = 0;
+	for (int f = 0; f < 6; f++) {
+		if (faceCandidate(c, mask, f, x))
+			k++;
+	}
+	if (k == 0)
+		return vec3(0.0);
+	float uf = rnd1();
+	int pick = min(int(float(k) * uf), k - 1);
+	int face = 5;
+	int seen = 0;
+	for (int f = 0; f < 6; f++) {
+		if (!faceCandidate(c, mask, f, x))
+			continue;
+		if (seen == pick) {
+			face = f;
+			break;
+		}
+		seen++;
+	}
+	vec3 nL = faceNormal(face);
+	float u1 = rnd1();
+	float u2 = rnd1();
+	vec3 ta = abs(nL.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = cross(ta, nL);
+	vec3 ty = cross(nL, tx);
+	vec3 y = c + vec3(0.5) + nL * 0.5
+			+ tx * (u1 - 0.5) + ty * (u2 - 0.5);
+	vec3 d = y - x;
+	float dist2 = dot(d, d);
+	if (dist2 < 1e-8)
+		return vec3(0.0);
+	float dist = sqrt(dist2);
+	vec3 wi = d / dist;
+	float cosY = dot(nL, -wi);
+	if (cosY <= NEE_COS_MIN)
+		return vec3(0.0);
+	vec3 shp, shn, shalb, shle, shcell;
+	float sht;
+	vec4 shpal;
+	float shidx;
+	vec3 shfar;
+	if (!marchMed(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
+			shpal, shidx, shfar))
+		return vec3(0.0);
+	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
+		return vec3(0.0);
+	float pdfL = dist2 / (float(nLights) * float(k) * cosY);
+	float ph = hgPhase(dot(dir, wi), claudeAirG);
+	float w = pdfL / (pdfL + ph);
+	return w * ph * shle * airTr(dist) / pdfL;
 }
 
 // =====================================================================
@@ -1922,7 +2042,42 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos)); // p_sky, sa
 	float pdfB = cosX / PI;                  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
-	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL);
+	// AIR between here and the edge of the grid (1 with no medium)
+	float tr = curMed < 0.5 ? airTr(airExitT(x, wi)) : 1.0;
+	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL) * tr;
+}
+
+// neeSky() for a point IN THE AIR: the body sample with the phase function
+// and no facing test. These are the light shafts — a scattering point that
+// can see the sun lights up, one in a building's shadow does not.
+vec3 neeSkyAir(vec3 x, vec3 dir)
+{
+	vec3 bdir;
+	float bcos;
+	if (!skyNeeBody(bdir, bcos))
+		return vec3(0.0);
+	float u1 = rndSky();
+	float u2 = rndSky();
+	float cosT = 1.0 - u1 * (1.0 - bcos);
+	float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+	float phi = PI2 * u2;
+	vec3 ta = abs(bdir.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = normalize(cross(ta, bdir));
+	vec3 ty = cross(bdir, tx);
+	vec3 wi = normalize(tx * (sinT * cos(phi)) + ty * (sinT * sin(phi))
+			+ bdir * cosT);
+	vec3 shp, shn, shalb, shle, shcell;
+	float sht;
+	vec4 shpal;
+	float shidx;
+	vec3 shfar;
+	if (marchMed(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
+			shpal, shidx, shfar))
+		return vec3(0.0);
+	float pdfL = 1.0 / (PI2 * (1.0 - bcos));
+	float ph = hgPhase(dot(dir, wi), claudeAirG);
+	float w = pdfL / (pdfL + ph);
+	return w * ph * skyBody(wi) * airTr(airExitT(x, wi)) / pdfL;
 }
 
 // =====================================================================
@@ -2593,8 +2748,50 @@ void main(void)
 		vec4 hitPal;
 		float hitIdx;
 		vec3 hpFar;
-		if (!marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
-				hitPal, hitIdx, hpFar)) {
+		bool hitS = marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
+				hitPal, hitIdx, hpFar);
+		// AIR (2026-10-04). On a segment travelled in air, sample where the
+		// ray would next interact with the air: s ~ sigma_t exp(-sigma_t s).
+		// Before the surface (or the grid's edge) it scatters or is
+		// absorbed there, with weight sigma_s / sigma_t; otherwise the
+		// segment is untouched (transmittance over its own probability is
+		// exactly 1). That is the whole estimator, and it is why no energy
+		// can be invented: a non-absorbing medium cannot move a sealed
+		// furnace (the furnace-050-air arm). Debug views see geometry only.
+		if (airSigT() > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)) {
+			float tSeg = hitS ? tHit : airExitT(p, dir);
+			float ua = rnd1();
+			float sAir = -log(max(1.0 - ua, 1e-12)) / airSigT();
+			if (sAir < tSeg) {
+				vec3 xa = p + dir * sAir;
+				tp *= claudeAirScatter / airSigT();
+				if (seg == maxBounces)
+					break;
+				// the lights, aimed at from the air point
+				if (nLights > 0)
+					L += tp * neeDirectAir(xa, dir, nLights);
+				if (skyNee)
+					L += tp * neeSkyAir(xa, dir);
+				if (seg + 1 >= RR_START) {
+					float q = clamp(max(tp.r, max(tp.g, tp.b)),
+							RR_Q_MIN, RR_Q_MAX);
+					if (rnd1() > q)
+						break;
+					tp /= q;
+				}
+				float v1 = rnd1();
+				float v2 = rnd1();
+				vec3 nd = hgSample(dir, claudeAirG, v1, v2);
+				prevPdfB = hgPhase(dot(dir, nd), claudeAirG);
+				prevX = xa;
+				misArmed = nLights > 0 || skyNee;
+				dir = nd;
+				p = xa;
+				pathBounces += 1.0;
+				continue;
+			}
+		}
+		if (!hitS) {
 			// ESCAPED THE GRID — and since 2026-08-17 that is not black.
 			// The ray sees the sky, through the same skyRadiance() the
 			// camera ray and the NEE shadow ray use.

@@ -360,6 +360,8 @@ struct ClaudeTraceGrid
 	float dial_glass_flush = 0.0f;
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
+	float dial_air_scatter = 0.0f;
+	float dial_air_absorb = 0.0f;
 	float dial_view = 0.0f;
 	float dial_bounces = 0.0f;
 	float dial_sky_uniform = 0.0f;
@@ -1000,6 +1002,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_body_colour (2026-10-04): 1 (default) = sun/moon colour is
 	// their tint, brightness from the dome; 0 = dome colour per channel.
 	float m_body_colour = 1.0f;
+	// AIR (2026-10-04): claude_air_scatter / claude_air_absorb in 1/m and
+	// claude_air_g (Henyey-Greenstein asymmetry). 0 / 0 = no medium.
+	// TUNED: the defaults are a look, not a measurement — scatter 0.004
+	// (a 250 m mean free path: haze you notice past ~30 m), g 0.6 (haze
+	// scatters forward) | learn by: John's eye on the shafts/haze frames.
+	float m_air_scatter = 0.004f;
+	float m_air_absorb = 0.0f;
+	float m_air_g = 0.6f;
+	CachedPixelShaderSetting<float, 1, false> m_air_scatter_pixel{"claudeAirScatter"};
+	CachedPixelShaderSetting<float, 1, false> m_air_absorb_pixel{"claudeAirAbsorb"};
+	CachedPixelShaderSetting<float, 1, false> m_air_g_pixel{"claudeAirG"};
 	CachedPixelShaderSetting<float, 1, false> m_texel_pixel{"claudeTexel"};
 	CachedPixelShaderSetting<float, 1, false> m_glass_flush_pixel{"claudeGlassFlush"};
 	float m_refine = 1.0f;
@@ -1185,6 +1198,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_glass_flush",
 		"claude_texel_colour",
 		"claude_body_colour",
+		"claude_air_scatter",
+		"claude_air_absorb",
+		"claude_air_g",
 		"claude_refine",
 		"claude_denoise",
 		"claude_view",
@@ -1498,6 +1514,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_descend"))
 			return 1.0f;
 		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
+	}
+
+	static float readAir(const char *key, float dflt, float hi)
+	{
+		if (!g_settings->exists(key))
+			return dflt;
+		return g_settings->getFloat(key, 0.0f, hi);
 	}
 
 	static float readBodyColour()
@@ -1814,6 +1837,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_glass_flush = m_glass_flush;
 		g_claude_grid.dial_texel = m_texel;
 		g_claude_grid.dial_body_colour = m_body_colour;
+		g_claude_grid.dial_air_scatter = m_air_scatter;
+		g_claude_grid.dial_air_absorb = m_air_absorb;
 		g_claude_grid.dial_view = m_view;
 		g_claude_grid.dial_bounces = m_bounces;
 		g_claude_grid.dial_sky_uniform = m_sky_uniform;
@@ -1916,6 +1941,12 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_air_scatter")
+			m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
+		if (name == "claude_air_absorb")
+			m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
+		if (name == "claude_air_g")
+			m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		if (name == "claude_refine")
 			m_refine = readRefine();
 		if (name == "claude_denoise")
@@ -1988,6 +2019,9 @@ public:
 		m_glass_flush = readGlassFlush();
 		m_texel = readTexel();
 		m_body_colour = readBodyColour();
+		m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
+		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
+		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2253,6 +2287,9 @@ public:
 				m_descend_pixel.set(&m_descend, services);
 				m_glass_flush_pixel.set(&m_glass_flush, services);
 				m_texel_pixel.set(&m_texel, services);
+				m_air_scatter_pixel.set(&m_air_scatter, services);
+				m_air_absorb_pixel.set(&m_air_absorb, services);
+				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				// claude_trace's three dials. Delivered here, next to the
@@ -4754,6 +4791,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
+			<< ", \"claude_air_scatter\": " << g_claude_grid.dial_air_scatter
+			<< ", \"claude_air_absorb\": " << g_claude_grid.dial_air_absorb
 			<< ", \"claude_view\": " << g_claude_grid.dial_view
 			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces
 			<< ", \"claude_sky_uniform\": "
