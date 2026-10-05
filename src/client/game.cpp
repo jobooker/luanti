@@ -361,6 +361,8 @@ struct ClaudeTraceGrid
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
+	float sun_airmass = 0.0f;   // for claude_stats.json: the sun's air mass
+	v3f sun_chroma = v3f(1.0f, 1.0f, 1.0f);
 	float dial_air_scatter = 0.0f;
 	float dial_flame = 0.0f;
 	float dial_air_absorb = 0.0f;
@@ -1026,6 +1028,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// TUNED: 1/16 (history ~16 frames deep in motion) | learn by: John's
 	// eye walking the forest and the cabin, noise vs smear.
 	float m_reproject = 1.0f;
+	float m_sun_redden = 1.0f;   // claude_sun_redden: see the sun colour
 	float m_motion_alpha = 1.0f / 16.0f;
 	CachedPixelShaderSetting<float, 1, false> m_reproject_pixel{"claudeReproject"};
 	CachedPixelShaderSetting<float, 1, false> m_motion_alpha_pixel{"claudeMotionAlphaMin"};
@@ -1232,6 +1235,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_split",
 		"claude_exposure",
 		"claude_reproject",
+		"claude_sun_redden",
 		"claude_motion_alpha",
 		"claude_air_absorb",
 		"claude_air_g",
@@ -1784,6 +1788,32 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 				float omega = 2.0f * (float)M_PI * (1.0f - sun_cos);
 				v3f t = SUN_TINT * (3.0f / (SUN_TINT.X + SUN_TINT.Y
 						+ SUN_TINT.Z));
+				// THE SUN'S COLOUR FROM THE AIR IT CROSSES (claude_sun_redden,
+				// 2026-10-05). Physics, not taste: Rayleigh optical depth of
+				// one vertical air mass at sea level (Hansen & Travis 1974,
+				// tau = 0.008569 L^-4 (1 + 0.0113 L^-2 + 0.00013 L^-4), L in
+				// um) at 612 / 549 / 465 nm for R / G / B, times the air mass
+				// along the sun's line (Kasten & Young 1989). A white sun
+				// through that: warm white at noon, orange near 5 deg, deep red
+				// at 1 deg. It REPLACES the hand-picked SUN_TINT. Only the
+				// CHROMA is taken (unit mean): brightness keeps the dome
+				// coupling of claudeBodyCol, so nothing is dimmed twice.
+				// Aerosols (Mie) are not modelled; real sunsets redden more.
+				if (m_sun_redden > 0.5f && m_body_colour > 0.5f) {
+					const float tauR = 0.0629f, tauG = 0.0979f, tauB = 0.1808f;
+					float zdeg = std::acos(std::clamp(sun_dir.Y, -1.0f, 1.0f))
+							* 57.2957795f;
+					float am = 1.0f / (std::cos(zdeg * 0.0174532925f)
+							+ 0.50572f * std::pow(std::max(96.07995f - zdeg, 0.01f),
+									-1.6364f));
+					v3f tr(std::exp(-tauR * am), std::exp(-tauG * am),
+							std::exp(-tauB * am));
+					float msum = tr.X + tr.Y + tr.Z;
+					if (msum > 1e-6f)
+						t = tr * (3.0f / msum);
+					g_claude_grid.sun_airmass = am;
+				}
+				g_claude_grid.sun_chroma = t;
 				sun_col = claudeBodyCol(dome_e, t, BODY_TO_DOME_E / omega,
 						m_body_colour > 0.5f);
 			}
@@ -1980,6 +2010,8 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_sun_redden")
+			m_sun_redden = readAir("claude_sun_redden", 1.0f, 1.0f);
 		if (name == "claude_reproject")
 			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		if (name == "claude_motion_alpha")
@@ -2075,6 +2107,7 @@ public:
 		m_split = readAir("claude_split", 48.0f, 100000.0f);
 		m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
 		m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
+		m_sun_redden = readAir("claude_sun_redden", 1.0f, 1.0f);
 		m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
@@ -4923,6 +4956,9 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
+			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
+			<< ", \"sun_chroma\": [" << g_claude_grid.sun_chroma.X << ","
+			<< g_claude_grid.sun_chroma.Y << "," << g_claude_grid.sun_chroma.Z << "]"
 			<< ", \"claude_air_scatter\": " << g_claude_grid.dial_air_scatter
 			<< ", \"claude_flame\": " << g_claude_grid.dial_flame
 			<< ", \"claude_air_absorb\": " << g_claude_grid.dial_air_absorb
