@@ -359,6 +359,7 @@ struct ClaudeTraceGrid
 	float dial_descend = 0.0f;
 	float dial_glass_flush = 0.0f;
 	float dial_texel = 0.0f;
+	float dial_body_colour = 0.0f;
 	float dial_view = 0.0f;
 	float dial_bounces = 0.0f;
 	float dial_sky_uniform = 0.0f;
@@ -835,6 +836,27 @@ static void claudeUploadMoonSprite(video::ITexture *tex)
 // once per second, so any check that samples still_frames can miss a
 // reset entirely, while two reads of a counter bracket every reset
 // between them.
+// A BODY'S RADIANCE (claude_body_colour, 2026-10-04). Its BRIGHTNESS is
+// tied to the dome (BODY_TO_DOME_E, the sky model's one free number); its
+// COLOUR is its own tint and nothing else. Until today the dome's colour
+// was multiplied in per channel, so the sun was as blue as the sky:
+// dome_e = pi(0.2 H + 0.8 Z) is 4.3x bluer than red at noon, and sunlit
+// dirt (albedo (106,82,69)) rendered (129,136,145) on the rig, a light
+// 3.3x bluer than red measured off it. The sky is blue because it scatters
+// blue OUT of sunlight; direct sunlight is not. So the dome lends a body
+// its LUMINANCE only (Rec.709). Trade-off, stated: the old coupling also
+// lent the sun the sky's sunset orange; a deliberate low-sun reddening is a
+// separate step. 0 = the old per-channel coupling.
+static v3f claudeBodyCol(const v3f &dome_e, const v3f &tint, float scale,
+		bool tint_only)
+{
+	if (!tint_only)
+		return v3f(dome_e.X * tint.X, dome_e.Y * tint.Y,
+				dome_e.Z * tint.Z) * scale;
+	float lum = 0.2126f * dome_e.X + 0.7152f * dome_e.Y + 0.0722f * dome_e.Z;
+	return tint * (lum * scale);
+}
+
 static void claudeResetAccumulation()
 {
 	g_claude_grid.accum_alpha = 1.0f;
@@ -975,6 +997,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// takes its colour from the face tile under the hit point (the cell
 	// colour times the tile's ratio); 0 = one colour per cell, as before.
 	float m_texel = 1.0f;
+	// claude_body_colour (2026-10-04): 1 (default) = sun/moon colour is
+	// their tint, brightness from the dome; 0 = dome colour per channel.
+	float m_body_colour = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_texel_pixel{"claudeTexel"};
 	CachedPixelShaderSetting<float, 1, false> m_glass_flush_pixel{"claudeGlassFlush"};
 	float m_refine = 1.0f;
@@ -1159,6 +1184,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_descend",
 		"claude_glass_flush",
 		"claude_texel_colour",
+		"claude_body_colour",
 		"claude_refine",
 		"claude_denoise",
 		"claude_view",
@@ -1474,6 +1500,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
 	}
 
+	static float readBodyColour()
+	{
+		if (!g_settings->exists("claude_body_colour"))
+			return 1.0f;
+		return g_settings->getFloat("claude_body_colour", 0.0f, 1.0f);
+	}
+
 	static float readTexel()
 	{
 		if (!g_settings->exists("claude_texel_colour"))
@@ -1690,16 +1723,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 				float omega = 2.0f * (float)M_PI * (1.0f - sun_cos);
 				v3f t = SUN_TINT * (3.0f / (SUN_TINT.X + SUN_TINT.Y
 						+ SUN_TINT.Z));
-				sun_col = v3f(dome_e.X * t.X, dome_e.Y * t.Y,
-						dome_e.Z * t.Z) * (BODY_TO_DOME_E / omega);
+				sun_col = claudeBodyCol(dome_e, t, BODY_TO_DOME_E / omega,
+						m_body_colour > 0.5f);
 			}
 			if (m_sky->getMoonVisible() && moon_dir.Y > 0.0f) {
 				moon_cos = 1.0f / std::sqrt(1.0f + moon_half * moon_half);
 				float omega = 2.0f * (float)M_PI * (1.0f - moon_cos);
 				v3f t = MOON_TINT * (3.0f / (MOON_TINT.X + MOON_TINT.Y
 						+ MOON_TINT.Z));
-				moon_col = v3f(dome_e.X * t.X, dome_e.Y * t.Y,
-						dome_e.Z * t.Z) * (BODY_TO_DOME_E / omega);
+				moon_col = claudeBodyCol(dome_e, t, BODY_TO_DOME_E / omega,
+						m_body_colour > 0.5f);
 				// The moon quad's TEXTURE-SPACE axes. sky.cpp winds the
 				// quad so texture u grows toward -x_local and v toward
 				// -y_local (draw_sky_body: the (p1,p1) vertex carries uv
@@ -1780,6 +1813,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_descend = m_descend;
 		g_claude_grid.dial_glass_flush = m_glass_flush;
 		g_claude_grid.dial_texel = m_texel;
+		g_claude_grid.dial_body_colour = m_body_colour;
 		g_claude_grid.dial_view = m_view;
 		g_claude_grid.dial_bounces = m_bounces;
 		g_claude_grid.dial_sky_uniform = m_sky_uniform;
@@ -1880,6 +1914,8 @@ public:
 			m_glass_flush = readGlassFlush();
 		if (name == "claude_texel_colour")
 			m_texel = readTexel();
+		if (name == "claude_body_colour")
+			m_body_colour = readBodyColour();
 		if (name == "claude_refine")
 			m_refine = readRefine();
 		if (name == "claude_denoise")
@@ -1951,6 +1987,7 @@ public:
 		m_descend = readDescend();
 		m_glass_flush = readGlassFlush();
 		m_texel = readTexel();
+		m_body_colour = readBodyColour();
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -4716,6 +4753,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
+			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"claude_view\": " << g_claude_grid.dial_view
 			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces
 			<< ", \"claude_sky_uniform\": "

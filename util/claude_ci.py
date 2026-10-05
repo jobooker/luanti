@@ -235,6 +235,7 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_body_colour": 1,  # sun/moon colour = tint; brightness from the dome (2026-10-04)
     "claude_texel_colour": 1,  # face-tile colour on plain cubes (2026-10-04)
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
