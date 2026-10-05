@@ -361,6 +361,7 @@ struct ClaudeTraceGrid
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
 	float dial_air_scatter = 0.0f;
+	float dial_flame = 0.0f;
 	float dial_air_absorb = 0.0f;
 	float dial_view = 0.0f;
 	float dial_bounces = 0.0f;
@@ -1008,6 +1009,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// (a 250 m mean free path: haze you notice past ~30 m), g 0.6 (haze
 	// scatters forward) | learn by: John's eye on the shafts/haze frames.
 	float m_air_scatter = 0.004f;
+	// claude_flame (2026-10-05, DECISIONS 0e): 1 (default) = a modelled
+	// emitter glows only from its emitting voxels, flux preserved; 0 =
+	// the whole object glows, as before.
+	float m_flame = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_flame_pixel{"claudeFlame"};
 	float m_air_absorb = 0.0f;
 	float m_air_g = 0.6f;
 	CachedPixelShaderSetting<float, 1, false> m_air_scatter_pixel{"claudeAirScatter"};
@@ -1199,6 +1205,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_texel_colour",
 		"claude_body_colour",
 		"claude_air_scatter",
+		"claude_flame",
 		"claude_air_absorb",
 		"claude_air_g",
 		"claude_refine",
@@ -1842,6 +1849,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_texel = m_texel;
 		g_claude_grid.dial_body_colour = m_body_colour;
 		g_claude_grid.dial_air_scatter = m_air_scatter;
+		g_claude_grid.dial_flame = m_flame;
 		g_claude_grid.dial_air_absorb = m_air_absorb;
 		g_claude_grid.dial_view = m_view;
 		g_claude_grid.dial_bounces = m_bounces;
@@ -1945,6 +1953,8 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_flame")
+			m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		if (name == "claude_air_scatter")
 			m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
 		if (name == "claude_air_absorb")
@@ -2026,6 +2036,7 @@ public:
 		m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
 		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
+		m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2292,6 +2303,7 @@ public:
 				m_glass_flush_pixel.set(&m_glass_flush, services);
 				m_texel_pixel.set(&m_texel, services);
 				m_air_scatter_pixel.set(&m_air_scatter, services);
+				m_flame_pixel.set(&m_flame, services);
 				m_air_absorb_pixel.set(&m_air_absorb, services);
 				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);
@@ -3161,6 +3173,45 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 				}
 				glow[r][3] = glowmax / 14.0f;     // NEE intensity
 			}
+		}
+		// FLAME-ONLY EMISSION (2026-10-05, DECISIONS 0e). K = exposed
+		// faces of the whole model / exposed faces of its emitting voxels.
+		// The shader multiplies an emitting voxel's Le by K and gives every
+		// other voxel of an emissive model Le = 0, so the model's total flux
+		// is what it was when the whole object glowed (the §4 law: emission
+		// folds by radiant flux) and it now leaves through the flame only.
+		// Torch 152/10 = 15.2, lantern 4.1, campfire 6.4, lit furnace 185.
+		// Stored as 16-bit K*256 in palette slot 0 (slot 0 is "empty" and
+		// never sampled as a voxel colour).
+		{
+			auto solid = [&](int x, int y, int z) -> int {
+				if (x < 0 || y < 0 || z < 0 || x > 15 || y > 15 || z > 15)
+					return 0;
+				return vox[z][y][x].asInt();
+			};
+			long all_f = 0, emit_f = 0;
+			const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},
+					{0,0,1},{0,0,-1}};
+			for (int z = 0; z < 16; z++)
+			for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++) {
+				int pi = solid(x, y, z);
+				if (pi == 0)
+					continue;
+				int ex = 0;
+				for (const auto &d : dirs)
+					ex += solid(x + d[0], y + d[1], z + d[2]) == 0;
+				all_f += ex;
+				if (pi < npal && !pal[pi].isNull()
+						&& pal[pi]["emit"].asInt() > 0)
+					emit_f += ex;
+			}
+			float K = emit_f > 0 ? (float)all_f / (float)emit_f : 1.0f;
+			u32 k16 = (u32)std::clamp(K * 256.0f + 0.5f, 0.0f, 65535.0f);
+			palrgba[0] = (u8)(k16 >> 8);
+			palrgba[1] = (u8)(k16 & 0xFF);
+			palrgba[2] = 0;
+			palrgba[3] = 0;
 		}
 		V.models.push_back(rots);
 		V.model_vox.push_back(vrots);
@@ -4796,6 +4847,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"claude_air_scatter\": " << g_claude_grid.dial_air_scatter
+			<< ", \"claude_flame\": " << g_claude_grid.dial_flame
 			<< ", \"claude_air_absorb\": " << g_claude_grid.dial_air_absorb
 			<< ", \"claude_view\": " << g_claude_grid.dial_view
 			<< ", \"claude_bounces\": " << g_claude_grid.dial_bounces

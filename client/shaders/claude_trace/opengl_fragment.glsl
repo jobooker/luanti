@@ -307,6 +307,15 @@ uniform float claudeTexel;
 uniform float claudeAirScatter;
 uniform float claudeAirAbsorb;
 uniform float claudeAirG;
+// FLAME-ONLY EMISSION (claude_flame, 2026-10-05, DECISIONS 0e). The model
+// tables uploaded since August and read by nothing until now: per-cell
+// model id ((model << 2) | rot, unit 16), the 16x16x1024 palette-index
+// atlas (layer = (model*4 + rot)*16 + sz, unit 17) and the 256x64 palette
+// (alpha = emit/15; slot 0 carries K*256 in R,G — game.cpp, unit 18).
+uniform sampler3D claudeModelIds;
+uniform sampler3D claudeModelAtlas;
+uniform sampler2D claudeModelPal;
+uniform float claudeFlame;
 
 
 // --- THE SKY, as Luanti's own Sky class computes it this frame ---------
@@ -1136,6 +1145,30 @@ vec3 restartPoint(vec3 phit, vec3 n, vec3 lo, float h)
 // the expression the path loop used to evaluate itself — same inputs,
 // same order, so an opaque scene and a full-cube glass block are
 // bit-identical to what they were.
+// Emission scale for sub-voxel `sv` (0..15 each) of grid cell `cell`: K on
+// an emitting voxel of a modelled cell, 0 on its other voxels, 1 for any
+// cell without a model.
+float modelVoxelEmitScale(vec3 cell, vec3 sv)
+{
+	float mid = floor(texture3D(claudeModelIds,
+			(cell + 0.5) / GRID_S).r * 255.0 + 0.5);
+	if (mid < 3.5)
+		return 1.0;
+	float m = floor(mid / 4.0) - 1.0;
+	float rot = mod(mid, 4.0);
+	float layer = (m * 4.0 + rot) * 16.0 + sv.z;
+	float pidx = floor(texture3D(claudeModelAtlas,
+			(vec3(sv.x, sv.y, layer) + 0.5) / vec3(16.0, 16.0, 1024.0)).r
+			* 255.0 + 0.5);
+	vec4 pe = texture2D(claudeModelPal,
+			(vec2(pidx, m) + 0.5) / vec2(256.0, 64.0));
+	if (pe.a < 0.5 / 255.0)
+		return 0.0;
+	vec4 p0 = texture2D(claudeModelPal, (vec2(0.0, m) + 0.5) / vec2(256.0, 64.0));
+	return (floor(p0.r * 255.0 + 0.5) * 256.0 + floor(p0.g * 255.0 + 0.5))
+			/ 256.0;
+}
+
 // ---- AIR helpers -----------------------------------------------------------
 float airSigT() { return claudeAirScatter + claudeAirAbsorb; }
 
@@ -1386,6 +1419,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 				} else {
 					alb = cellAlbedo(s.rgb);
 					le = alb * pal.r;   // the palette's emission column (§4: one Le)
+					if (claudeFlame > 0.5 && pal.r > 0.0)
+						le *= modelVoxelEmitScale(cellHi, ci);
 				}
 				tHit = t;
 				cellOut = cellHi;   // the COARSE cell, for neeDirect
@@ -1489,6 +1524,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// sub-voxels" — the one arrival at the coarse rung whose material
 		// is not the cell's own. Set only inside the fine gate.
 		bool hitAir = false;
+		// the entry sub-voxel, when this arrival is a fine cell's solid one
+		vec3 suHit = vec3(-1.0);
 
 		// A FINE MATERIAL SAYS "DO NOT STOP AT MY 1 M WALL". Rescale the
 		// to 1/16 m and keep going, against this cell's 16^3 mask. The
@@ -1537,6 +1574,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			// 1/16 m in and not up to a metre in.
 			farLo = hi + su * RUNG_FINE;
 			farH = RUNG_FINE;
+			suHit = su;
 			if (subIdx < 0.5) {
 				// entering one of this cell's air sub-voxels while
 				// inside a medium: the medium ends here, at the wall
@@ -1563,6 +1601,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// always reported, at either rung.
 		alb = hitAir ? cellAlbedo(vec3(0.0)) : cellAlbedo(s.rgb);
 		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)
+		if (claudeFlame > 0.5 && !hitAir && suHit.x >= 0.0 && pal.r > 0.0)
+			le *= modelVoxelEmitScale(ci, suHit);
 
 		tHit = t;
 		cellOut = ci;
