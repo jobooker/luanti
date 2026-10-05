@@ -260,8 +260,29 @@ uniform sampler2D history;
 // the display is exactly the total, as before. The total is untouched.
 #define historyDirect texture1
 uniform sampler2D historyDirect;
+// THE DENOISER'S INPUTS (claude_denoise, 2026-10-05), two more running
+// averages on the same blend weight as the radiance, written to colour
+// attachments 2 and 3:
+//   historyGbuf  rgb = the primary hit's albedo (accumulated, so a pixel
+//                      straddling two texels divides by the same mix it
+//                      averaged); a = WHICH VOXEL FACE the pixel sees,
+//                      this frame: 1 + (axis*2 + sign)*4096 + plane in
+//                      1/16 m, or 0 = never filter (sky, glass, water)
+//   historyMom   r = mean of the squared luminance of this frame's
+//                    texture-free (demodulated) sample; g = how much of
+//                    one sample's variance is still in the average, for
+//                    ANY blend schedule: v' = (1-a)^2 v + a^2 (1/N for a
+//                    true average, a/(2-a) for a moving EMA floor)
+// Every surface in this world is an axis-aligned voxel face at a 1/16 m
+// plane, so "same surface" is an exact test here, not a depth heuristic.
+#define historyGbuf texture2
+uniform sampler2D historyGbuf;
+#define historyMom texture3
+uniform sampler2D historyMom;
 #ifdef CLAUDE_MRT_OK
 layout(location = 1) out vec4 outDirect;
+layout(location = 2) out vec4 outGbuf;
+layout(location = 3) out vec4 outMom;
 #define CLAUDE_SPLIT_OUT 1
 #endif      // previous frame's accumulated radiance
 uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
@@ -2320,6 +2341,8 @@ void main(void)
 	// any early return (debug views, the no-grid passthrough) keeps the
 	// direct history as it was rather than leaving attachment 1 undefined
 	outDirect = texture2D(historyDirect, varTexCoord.st);
+	outGbuf = texture2D(historyGbuf, varTexCoord.st);
+	outMom = texture2D(historyMom, varTexCoord.st);
 #endif
 	vec2 uv = varTexCoord.st;
 	if (gridDebug < 2.5) {
@@ -2409,6 +2432,7 @@ void main(void)
 	float primaryT = DEPTH_MISS; // for the depth channel + view 4
 	vec3 primaryN = vec3(0.0);   // view 1
 	vec3 primaryAlb = vec3(0.0); // view 2
+	bool primaryClear = false;   // the denoiser leaves glass/water alone
 	vec3 primaryLe = vec3(0.0);  // view 3
 	bool primaryHit = false;
 	float pathBounces = 0.0;     // view 5: scatters actually taken
@@ -2980,6 +3004,7 @@ void main(void)
 			primaryN = n;
 			primaryAlb = alb;
 			primaryLe = le;
+			primaryClear = hitIdx > 0.5 && matTransmits(hitIdx, hitPal);
 		}
 
 		// §4: the surface EMITS and REFLECTS. Collect Le, keep going.
@@ -3318,5 +3343,49 @@ void main(void)
 	// alpha carries this pixel's sample count (reprojection; the present
 	// pass's split ramp reads it too). Capped: it only ever feeds a weight.
 	outDirect = vec4(mix(prevD, freshD, a), a < 1.0 ? min(nPix + 1.0, 4096.0) : 1.0);
+
+	// the denoiser's guide and moments (see historyGbuf / historyMom)
+	vec3 albNow = primaryHit ? max(primaryAlb, vec3(ALBEDO_FLOOR)) : vec3(1.0);
+	float faceCode = 0.0;
+	if (primaryHit && !primaryClear && view == 0) {
+		vec3 an = abs(primaryN);
+		float ax = an.x > 0.5 ? 0.0 : (an.y > 0.5 ? 1.0 : 2.0);
+		float sgn = (primaryN.x + primaryN.y + primaryN.z) > 0.0 ? 1.0 : 0.0;
+		vec3 hpP = ro + rd * primaryT;
+		float coord = ax < 0.5 ? hpP.x : (ax < 1.5 ? hpP.y : hpP.z);
+		float q = clamp(floor(coord * 16.0 + 0.5), 0.0, 4095.0);
+		faceCode = 1.0 + (ax * 2.0 + sgn) * 4096.0 + q;
+	}
+	vec3 albAcc = albNow;
+	float m2 = 0.0;
+	float vfac = 1.0;
+	float lD = dot(fresh / albNow, vec3(0.2126, 0.7152, 0.0722));
+	m2 = lD * lD;
+	float m1 = lD;
+	if (a < 1.0) {
+		vec4 hg = texture2D(historyGbuf, huv);
+		vec4 hm = texture2D(historyMom, huv);
+		if (all(lessThan(abs(hg.rgb), vec3(1e6))) && hm.g > 0.0
+				&& hm.g <= 1.0 && hm.r >= 0.0 && hm.r < 1e12) {
+			albAcc = mix(hg.rgb, albNow, a);
+			m2 = mix(hm.r, m2, a);
+			m1 = mix(hm.b, m1, a);
+			vfac = (1.0 - a) * (1.0 - a) * hm.g + a * a;
+			// A PIXEL THAT HAS SEEN TWO FACES IS NOT ON ONE SURFACE. The
+			// sub-pixel jitter puts an edge pixel's samples on both sides
+			// of the edge, so its average is a MIX of two surfaces. It is
+			// marked MIXED (negative code, sticky until the history
+			// resets): claude_denoise may still smooth it, by its own
+			// noise, but it is never a neighbour and never feeds a
+			// neighbour's noise estimate. Measured 2026-10-05 (measured.md,
+			// "the denoiser"): letting its face-to-face contrast into the
+			// clean pixels' estimate blurred their real light gradients,
+			// and a 4000-frame image moved by up to 21/255 along edges.
+			if (faceCode > 0.5 && (hg.a < -0.5 || abs(hg.a - faceCode) > 0.5))
+				faceCode = -faceCode;
+		}
+	}
+	outGbuf = vec4(albAcc, faceCode);
+	outMom = vec4(m2, vfac, m1, 0.0);
 #endif
 }

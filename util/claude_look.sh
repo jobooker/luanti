@@ -66,7 +66,8 @@ defer = ["claude_grid_debug", "claude_descend", "claude_rng",
          "claude_sky_uniform", "claude_view", "claude_nee",
          "claude_texel_colour", "claude_body_colour", "claude_glass_flush",
          "claude_air_scatter", "claude_air_absorb", "claude_air_g",
-         "claude_bounces"]
+         "claude_bounces", "claude_denoise", "claude_water_absorb",
+         "claude_split", "claude_reproject"]
 look = {
     "claude_stats":      "1",
     # A human seat is not a measurement seat:
@@ -81,8 +82,10 @@ look = {
     "time_speed":        "0",
 }
 if nee == "0":
-    look["claude_nee"] = "0"      # --photo: the one dial this seat sets
-    defer.remove("claude_nee")
+    look["claude_nee"] = "0"      # --photo: photo mode is the definition
+    defer.remove("claude_nee")      # of correct, so no estimator and no
+    look["claude_denoise"] = "0"  # display filter (2026-10-05)
+    defer.remove("claude_denoise")
 s = open("minetest.conf").read()
 for k in defer:
     s = re.sub(r"(?m)^%s\s*=.*\n?" % re.escape(k), "", s)

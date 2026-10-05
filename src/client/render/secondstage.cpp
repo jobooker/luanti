@@ -316,6 +316,16 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// the direct/bounced split's own ping-pong (claude_split, 2026-10-05)
 	static const u8 TEXTURE_DIRECT_1 = 33;
 	static const u8 TEXTURE_DIRECT_2 = 34;
+	// THE DENOISER (claude_denoise, 2026-10-05). The tracer writes a guide
+	// (accumulated albedo + which voxel face the pixel sees) and the
+	// luminance moments the noise estimate needs, both ping-ponged like the
+	// history; six filter passes then read them and write DEN_A/DEN_B.
+	static const u8 TEXTURE_GBUF_1 = 35;
+	static const u8 TEXTURE_GBUF_2 = 36;
+	static const u8 TEXTURE_MOM_1 = 37;
+	static const u8 TEXTURE_MOM_2 = 38;
+	static const u8 TEXTURE_DEN_A = 39;
+	static const u8 TEXTURE_DEN_B = 40;
 	// Trace resolution, relative to the render target. 0.5 was chosen on a
 	// retina laptop, where a 2x backing store downsampled the result and gave
 	// free supersampling; on a plain 1080p external monitor the same 0.5 is
@@ -354,6 +364,12 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	buffer->setTexture(TEXTURE_MERGED, scale, "claude_merged", color_format);
 	buffer->setTexture(TEXTURE_DIRECT_1, scale * trace_scale, "claude_direct_1", accum_format);
 	buffer->setTexture(TEXTURE_DIRECT_2, scale * trace_scale, "claude_direct_2", accum_format);
+	buffer->setTexture(TEXTURE_GBUF_1, scale * trace_scale, "claude_gbuf_1", accum_format);
+	buffer->setTexture(TEXTURE_GBUF_2, scale * trace_scale, "claude_gbuf_2", accum_format);
+	buffer->setTexture(TEXTURE_MOM_1, scale * trace_scale, "claude_mom_1", accum_format);
+	buffer->setTexture(TEXTURE_MOM_2, scale * trace_scale, "claude_mom_2", accum_format);
+	buffer->setTexture(TEXTURE_DEN_A, scale * trace_scale, "claude_den_a", accum_format);
+	buffer->setTexture(TEXTURE_DEN_B, scale * trace_scale, "claude_den_b", accum_format);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
@@ -364,17 +380,46 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// ACCUM_1 for next frame, exactly as before.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_trace");
 	PostProcessingStep *trace = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1 });
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1,
+					TEXTURE_GBUF_1, TEXTURE_MOM_1 });
 	trace->setRenderSource(buffer);
 	trace->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
-			std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2 }));
+			std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2,
+					TEXTURE_GBUF_2, TEXTURE_MOM_2 }));
+
+	// claude_denoise: DISPLAY ONLY. It reads the running average and never
+	// writes it, so the history the tracer accumulates — and every referee
+	// — is exactly what it was; only what is SHOWN is filtered. Pass 0
+	// estimates each pixel's remaining noise, passes 1-5 are the a-trous
+	// steps 1, 2, 4, 8, 16, and pass 5 also puts the albedo back and the
+	// primary distance in alpha, which is what claude_present's upsample
+	// reads from its texture 1. One shader, compiled six times with the
+	// pass number as a constant. Ping-pong: 0->A 1->B 2->A 3->B 4->A 5->B.
+	for (int it = 0; it <= 5; it++) {
+		ShaderConstants dn_consts;
+		dn_consts["CLAUDE_DN_ITER"] = it;
+		u32 dn_id = client->getShaderSource()->getShader("claude_denoise",
+				dn_consts, video::EMT_TRANSPARENT_ALPHA_CHANNEL_REF);
+		u8 out = (it % 2 == 0) ? TEXTURE_DEN_A : TEXTURE_DEN_B;
+		u8 in = (it % 2 == 0) ? TEXTURE_DEN_B : TEXTURE_DEN_A;
+		std::vector<u8> inputs = (it == 0)
+				? std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_GBUF_2,
+						TEXTURE_MOM_2, TEXTURE_DIRECT_2 }
+				: std::vector<u8> { in, TEXTURE_GBUF_2, TEXTURE_ACCUM_2,
+						TEXTURE_DIRECT_2 };
+		PostProcessingStep *dn = pipeline->addStep<PostProcessingStep>(dn_id,
+				inputs);
+		dn->setRenderSource(buffer);
+		dn->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
+				out));
+	}
 
 	// claude_present is UNCHANGED in its slots: texture 1 is the traced
 	// lighting it upsamples and tonemaps. It used to be the denoiser's
 	// output; it is now the tracer's own, straight out of ACCUM_2.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2, TEXTURE_DEPTH,
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DEN_B, TEXTURE_DEPTH,
 					TEXTURE_DIRECT_2 });
 	pipeline->addStep(present);
 	// joint-bilateral upsample does its own tap weighting: keep NEAREST
@@ -382,6 +427,8 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_DIRECT_1, TEXTURE_DIRECT_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_GBUF_1, TEXTURE_GBUF_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_MOM_1, TEXTURE_MOM_2);
 
 	return present;
 }

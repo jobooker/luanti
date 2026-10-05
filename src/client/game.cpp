@@ -359,6 +359,7 @@ struct ClaudeTraceGrid
 	float dial_descend = 0.0f;
 	float dial_glass_flush = 0.0f;
 	float dial_water_absorb = 0.0f;
+	float dial_denoise = 0.0f;
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
@@ -1637,12 +1638,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_refine", 0.0f, 1.0f);
 	}
 
-	// 1 (default) = edge-aware spatial denoise; 0 = raw samples
+	// 1 (default) = edge-aware spatial denoise; 0 = raw samples.
+	// REVIVED 2026-10-05 for client/shaders/claude_denoise (display only;
+	// claude_ci pins 0 so no referee ever judges a filtered frame).
 	static float readDenoise()
 	{
 		if (!g_settings->exists("claude_denoise"))
 			return 1.0f;
-		return g_settings->getFloat("claude_denoise", 0.0f, 1.0f);
+		return g_settings->getFloat("claude_denoise", 0.0f, 2.0f);
 	}
 
 	// claude_trace diagnostic view selector, 0..17. 17 is the SKY chart:
@@ -2434,6 +2437,7 @@ public:
 				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
+				g_claude_grid.dial_denoise = m_denoise;
 				// claude_trace's three dials. Delivered here, next to the
 				// samplers, because claude_present consumes claudeView
 				// too and both programs run every frame regardless of
@@ -5015,6 +5019,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_descend\": " << g_claude_grid.dial_descend
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_water_absorb\": " << g_claude_grid.dial_water_absorb
+			<< ", \"claude_denoise\": " << g_claude_grid.dial_denoise
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
