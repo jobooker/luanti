@@ -1013,6 +1013,14 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// emitter glows only from its emitting voxels, flux preserved; 0 =
 	// the whole object glows, as before.
 	float m_flame = 1.0f;
+	// claude_split (2026-10-05): frames of stillness over which the
+	// bounced light fades in on top of the direct light; 0 = off.
+	// TUNED: 48 (about half a second at the look seat's frame rate) | learn
+	// by: John's eye, moving and stopping in the cabin and the forest.
+	float m_split = 48.0f;
+	float m_still = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_split_pixel{"claudeSplitFrames"};
+	CachedPixelShaderSetting<float, 1, false> m_still_pixel{"claudeStillFrames"};
 	CachedPixelShaderSetting<float, 1, false> m_flame_pixel{"claudeFlame"};
 	float m_air_absorb = 0.0f;
 	float m_air_g = 0.6f;
@@ -1206,6 +1214,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_body_colour",
 		"claude_air_scatter",
 		"claude_flame",
+		"claude_split",
 		"claude_air_absorb",
 		"claude_air_g",
 		"claude_refine",
@@ -1953,6 +1962,8 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_split")
+			m_split = readAir("claude_split", 48.0f, 100000.0f);
 		if (name == "claude_flame")
 			m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		if (name == "claude_air_scatter")
@@ -2037,6 +2048,7 @@ public:
 		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);
+		m_split = readAir("claude_split", 48.0f, 100000.0f);
 		m_refine = readRefine();
 		m_denoise = readDenoise();
 		m_view = readView();
@@ -2304,6 +2316,9 @@ public:
 				m_texel_pixel.set(&m_texel, services);
 				m_air_scatter_pixel.set(&m_air_scatter, services);
 				m_flame_pixel.set(&m_flame, services);
+				m_split_pixel.set(&m_split, services);
+				m_still = g_claude_grid.still_frames;
+				m_still_pixel.set(&m_still, services);
 				m_air_absorb_pixel.set(&m_air_absorb, services);
 				m_air_g_pixel.set(&m_air_g, services);
 				m_refine_pixel.set(&m_refine, services);

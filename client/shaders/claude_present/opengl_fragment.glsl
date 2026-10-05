@@ -7,10 +7,15 @@
 #define merged texture0
 #define accum texture1
 #define depthmap texture2
+#define accumDirect texture3
 
 uniform sampler2D merged;
 uniform sampler2D accum;
 uniform sampler2D depthmap;
+// the direct part of accum (claude_trace historyDirect) and the ramp
+uniform sampler2D accumDirect;
+uniform float claudeSplitFrames;  // 0 = off: show the total, as before
+uniform float claudeStillFrames;
 uniform lowp float gridDebug;
 // claude_view: 0 = photo, 1-5 = claude_trace's diagnostic views. Only
 // used to choose the display transform below; the photo path is
@@ -83,6 +88,7 @@ void main(void)
 	vec2 base = (floor(uv / ht - 0.5) + 0.5) * ht;
 	vec2 f = clamp((uv - base) / ht, 0.0, 1.0);
 	vec3 sum = vec3(0.0);
+	vec3 sumD = vec3(0.0);
 	float wsum = 0.0;
 	for (int i = 0; i < 4; i++) {
 		vec2 o = vec2(i == 1 || i == 3 ? 1.0 : 0.0,
@@ -98,9 +104,17 @@ void main(void)
 				/ max(1.7, 0.008 * guide));
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
+		sumD += texture2D(accumDirect, base + o * ht).rgb * w;
 		wsum += w;
 	}
 	vec3 c = sum / wsum;
+	// THE SPLIT: direct now, bounced light faded in over claudeSplitFrames
+	// of stillness; exactly the total once the ramp is done (or when off)
+	if (claudeSplitFrames > 0.5 && claudeView < 0.5) {
+		vec3 cd = min(sumD / wsum, c);
+		float wb = clamp(claudeStillFrames / claudeSplitFrames, 0.0, 1.0);
+		c = cd + (c - cd) * wb;
+	}
 
 	// DIAGNOSTIC VIEWS (claude_view 1-5) present LINEARLY. Their values
 	// are the message: a 6-step gray normal ladder, a linear Le, a

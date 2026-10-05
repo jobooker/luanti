@@ -836,14 +836,28 @@ void ShaderSource::generateShader(ShaderInfo &shaderinfo)
 		if (use_glsl3) {
 			fragment_header += "#define VARYING_ in\n"
 				"#define gl_FragColor outFragColor\n"
-				"layout(location = 0) out vec4 outFragColor;\n";
+				"layout(location = 0) out vec4 outFragColor;\n"
+				"#define CLAUDE_MRT_OK 1\n";
 		} else if (use_glsl15) {
 			// gl_FragColor is removed in 1.50 too; declare our own output.
 			// No layout(location=...) on outputs before 3.30, so it is a
 			// bare declaration.
+			// claude_trace writes a SECOND colour attachment (the direct/
+			// bounced split, 2026-10-05), and two outputs need explicit
+			// locations, which 1.50 only has through this extension. It is
+			// enabled here, right after #version, because Mesa refuses an
+			// #extension after the first declaration. Without it the single
+			// output keeps its implicit location 0 and claude_trace drops
+			// the second one (CLAUDE_MRT_OK unset).
 			fragment_header += "#define VARYING_ in\n"
 				"#define gl_FragColor outFragColor\n"
-				"out vec4 outFragColor;\n";
+				"#ifdef GL_ARB_explicit_attrib_location\n"
+				"#extension GL_ARB_explicit_attrib_location : enable\n"
+				"layout(location = 0) out vec4 outFragColor;\n"
+				"#define CLAUDE_MRT_OK 1\n"
+				"#else\n"
+				"out vec4 outFragColor;\n"
+				"#endif\n";
 		} else {
 			fragment_header += "#define VARYING_ varying\n";
 		}

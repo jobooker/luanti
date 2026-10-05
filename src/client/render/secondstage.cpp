@@ -313,6 +313,9 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	static const u8 TEXTURE_ACCUM_1 = 30;
 	static const u8 TEXTURE_ACCUM_2 = 31;
 	static const u8 TEXTURE_MERGED = 32;
+	// the direct/bounced split's own ping-pong (claude_split, 2026-10-05)
+	static const u8 TEXTURE_DIRECT_1 = 33;
+	static const u8 TEXTURE_DIRECT_2 = 34;
 	// Trace resolution, relative to the render target. 0.5 was chosen on a
 	// retina laptop, where a 2x backing store downsampled the result and gave
 	// free supersampling; on a plain 1080p external monitor the same 0.5 is
@@ -349,6 +352,8 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	buffer->setTexture(TEXTURE_ACCUM_1, scale * trace_scale, "claude_accum_1", accum_format);
 	buffer->setTexture(TEXTURE_ACCUM_2, scale * trace_scale, "claude_accum_2", accum_format);
 	buffer->setTexture(TEXTURE_MERGED, scale, "claude_merged", color_format);
+	buffer->setTexture(TEXTURE_DIRECT_1, scale * trace_scale, "claude_direct_1", accum_format);
+	buffer->setTexture(TEXTURE_DIRECT_2, scale * trace_scale, "claude_direct_2", accum_format);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
@@ -359,21 +364,24 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// ACCUM_1 for next frame, exactly as before.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_trace");
 	PostProcessingStep *trace = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_ACCUM_1 });
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1 });
 	trace->setRenderSource(buffer);
-	trace->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_ACCUM_2));
+	trace->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
+			std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2 }));
 
 	// claude_present is UNCHANGED in its slots: texture 1 is the traced
 	// lighting it upsamples and tonemaps. It used to be the denoiser's
 	// output; it is now the tracer's own, straight out of ACCUM_2.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2, TEXTURE_DEPTH });
+			std::vector<u8> { TEXTURE_MERGED, TEXTURE_ACCUM_2, TEXTURE_DEPTH,
+					TEXTURE_DIRECT_2 });
 	pipeline->addStep(present);
 	// joint-bilateral upsample does its own tap weighting: keep NEAREST
 	present->setRenderSource(buffer);
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_DIRECT_1, TEXTURE_DIRECT_2);
 
 	return present;
 }

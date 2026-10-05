@@ -249,7 +249,21 @@
 
 #define history texture0
 
-uniform sampler2D history;      // previous frame's accumulated radiance
+uniform sampler2D history;
+// THE DIRECT/BOUNCED SPLIT (claude_split, 2026-10-05, John: "not sure if
+// the first frame could be rendered with one bounce, then more?"). A
+// second running average holding only the light that reached the camera
+// after at most ONE diffuse or air scatter, written to colour attachment 1
+// and read back here as texture1. claude_present shows direct + bounced x
+// a weight that ramps 0 -> 1 over claude_split frames of stillness, so the
+// clean part is there at once and the slow part fades in; past the ramp
+// the display is exactly the total, as before. The total is untouched.
+#define historyDirect texture1
+uniform sampler2D historyDirect;
+#ifdef CLAUDE_MRT_OK
+layout(location = 1) out vec4 outDirect;
+#define CLAUDE_SPLIT_OUT 1
+#endif      // previous frame's accumulated radiance
 uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
                                 // a = MATERIAL INDEX / 255 (see matIndex)
 // THE MATERIAL PALETTE, unit 20: 256x1 RGBA32F, one texel per material
@@ -2240,6 +2254,11 @@ vec3 panelDirect(vec3 x, vec3 nx, vec3 rho)
 
 void main(void)
 {
+#ifdef CLAUDE_SPLIT_OUT
+	// any early return (debug views, the no-grid passthrough) keeps the
+	// direct history as it was rather than leaving attachment 1 undefined
+	outDirect = texture2D(historyDirect, varTexCoord.st);
+#endif
 	vec2 uv = varTexCoord.st;
 	if (gridDebug < 2.5) {
 		// traced mode off: carry history through untouched
@@ -2309,6 +2328,8 @@ void main(void)
 
 	// --- the path ----------------------------------------------------
 	vec3 L = vec3(0.0);
+	vec3 Ld = vec3(0.0);   // the direct part of L (see historyDirect)
+	float nScat = 0.0;     // diffuse + air scatters so far (not interfaces)
 	vec3 tp = vec3(1.0);
 	vec3 p = ro;
 	vec3 dir = rd;
@@ -2808,10 +2829,18 @@ void main(void)
 				if (seg == maxBounces)
 					break;
 				// the lights, aimed at from the air point
-				if (nLights > 0)
-					L += tp * neeDirectAir(xa, dir, nLights);
-				if (skyNee)
-					L += tp * neeSkyAir(xa, dir);
+				if (nLights > 0) {
+					vec3 cA = tp * neeDirectAir(xa, dir, nLights);
+					L += cA;
+					if (nScat < 0.5)
+						Ld += cA;
+				}
+				if (skyNee) {
+					vec3 cB = tp * neeSkyAir(xa, dir);
+					L += cB;
+					if (nScat < 0.5)
+						Ld += cB;
+				}
 				if (seg + 1 >= RR_START) {
 					float q = clamp(max(tp.r, max(tp.g, tp.b)),
 							RR_Q_MIN, RR_Q_MAX);
@@ -2828,6 +2857,7 @@ void main(void)
 				dir = nd;
 				p = xa;
 				pathBounces += 1.0;
+				nScat += 1.0;
 				continue;
 			}
 		}
@@ -2849,7 +2879,10 @@ void main(void)
 				float denom = prevPdfB + pdfL;
 				misW = denom > 0.0 ? prevPdfB / denom : 1.0;
 			}
-			L += tp * (skyDome(dir) + misW * skyBody(dir));
+			vec3 cSky = tp * (skyDome(dir) + misW * skyBody(dir));
+			L += cSky;
+			if (nScat <= 1.0)
+				Ld += cSky;
 			break;
 		}
 
@@ -2901,6 +2934,8 @@ void main(void)
 			misW = denom > 0.0 ? prevPdfB / denom : 1.0;
 		}
 		L += tp * misW * le;
+		if (nScat <= 1.0)
+			Ld += tp * misW * le;
 
 		if (seg == maxBounces)
 			break; // depth cap: no scatter from this vertex
@@ -3044,13 +3079,21 @@ void main(void)
 		// (view 6) is CLAY_RHO, clamped above. The depth cap cuts this
 		// term at the same vertex it cuts the BSDF half, so claudeBounces
 		// means the same thing under either dial.
-		if (nLights > 0)
-			L += tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
+		if (nLights > 0) {
+			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
+			L += cN;
+			if (nScat < 0.5)
+				Ld += cN;
+		}
 		// The sky's own light sample, at the same vertex and under the
 		// same depth cap, drawing from the RESERVED counter range so the
 		// path's own random sequence is untouched (see rndSky()).
-		if (skyNee)
-			L += tp * neeSky(hp, n, alb, curMed);
+		if (skyNee) {
+			vec3 cS = tp * neeSky(hp, n, alb, curMed);
+			L += cS;
+			if (nScat < 0.5)
+				Ld += cS;
+		}
 
 		tp *= alb;
 
@@ -3081,6 +3124,7 @@ void main(void)
 		misArmed = nLights > 0 || skyNee;
 		p = hp;
 		pathBounces += 1.0;
+		nScat += 1.0;
 	}
 
 	float tPack = primaryHit
@@ -3148,4 +3192,14 @@ void main(void)
 	}
 
 	gl_FragColor = vec4(mix(prev, fresh, a), tPack);
+#ifdef CLAUDE_SPLIT_OUT
+	vec3 freshD = max(Ld, vec3(0.0));
+	vec3 prevD = freshD;
+	if (a < 1.0) {
+		vec4 hd = texture2D(historyDirect, uv);
+		if (all(lessThan(abs(hd.rgb), vec3(1e6))))
+			prevD = max(hd.rgb, vec3(0.0));
+	}
+	outDirect = vec4(mix(prevD, freshD, a), tPack);
+#endif
 }

@@ -235,6 +235,7 @@ CANONICAL_DIALS = {
     # (claude_subvox) is pinned to 0 in the seat conf and nothing reads
     # it, which is exactly the silence this line exists to avoid.
     "claude_descend": 1,
+    "claude_split": 0,   # captures show the TOTAL, never the faded display (2026-10-05)
     "claude_flame": 1,   # flame-only emission, flux preserved (2026-10-05)
     "claude_air_scatter": 0,   # every existing arm is measured WITHOUT air (2026-10-04)
     "claude_air_absorb": 0,
