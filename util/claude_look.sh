@@ -57,13 +57,17 @@ sh "$HERE/claude_seat_assemble.sh" >/dev/null
 python3 - "$NEE" <<'PY'
 import re, sys
 nee = sys.argv[1]
+# THE LOOK IS THE GAME'S OWN DEFAULTS (2026-10-04). This dict used to
+# restate renderer dials (grid_debug, descend, rng, sky_uniform, view,
+# nee) and the restatement went stale: it still forced claude_rng = 1 after
+# the code default moved to 2. Those keys are now DELETED from the conf so
+# game.cpp's defaults apply; only what makes this a human seat is written.
+defer = ["claude_grid_debug", "claude_descend", "claude_rng",
+         "claude_sky_uniform", "claude_view", "claude_nee",
+         "claude_texel_colour", "claude_body_colour", "claude_glass_flush",
+         "claude_air_scatter", "claude_air_absorb", "claude_air_g",
+         "claude_bounces"]
 look = {
-    "claude_grid_debug": "3",     # 3 = traced (0 = plain raster)
-    "claude_descend":    "1",     # stairs/beds are real sub-metre shapes
-    "claude_rng":        "2",     # 2 = frame-index key (2026-10-04); 1 stalls past ~1k frames
-    "claude_sky_uniform":"0",     # 0 = the REAL sky; >0 is the flat test sky
-    "claude_view":       "0",     # 0 = photo; U cycles the debug views
-    "claude_nee":        nee,
     "claude_stats":      "1",
     # A human seat is not a measurement seat:
     "claude_input_lock": "0",     # CI locks input; you need it unlocked
@@ -76,7 +80,12 @@ look = {
     # time deliberately with /time.
     "time_speed":        "0",
 }
+if nee == "0":
+    look["claude_nee"] = "0"      # --photo: the one dial this seat sets
+    defer.remove("claude_nee")
 s = open("minetest.conf").read()
+for k in defer:
+    s = re.sub(r"(?m)^%s\s*=.*\n?" % re.escape(k), "", s)
 for k, v in look.items():
     if re.search(r"(?m)^%s\s*=" % re.escape(k), s):
         s = re.sub(r"(?m)^%s\s*=.*$" % re.escape(k), "%s = %s" % (k, v), s)

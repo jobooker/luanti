@@ -1233,8 +1233,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 
 	static float readGridDebug()
 	{
+		// 3 BY DEFAULT since 2026-10-04: this fork's client traces unless
+		// told not to (John: "this game is basically for me"). It was 0, so
+		// a client launched without the look seat's conf lines rendered
+		// plain raster Luanti. 0 is still one keypress away.
 		if (!g_settings->exists("claude_grid_debug"))
-			return 0.0f;
+			return 3.0f;
 		// 1 = ghost view with shadow rays, 2 = ghost without (A/B),
 		// 3 = pure path-traced view (zero ambient, all light via rays),
 		// 4 = mode 3 with neutral albedo (lighting-only diagnostic),
