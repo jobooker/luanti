@@ -3314,7 +3314,10 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 			u32 k16 = (u32)std::clamp(K * 256.0f + 0.5f, 0.0f, 65535.0f);
 			palrgba[0] = (u8)(k16 >> 8);
 			palrgba[1] = (u8)(k16 & 0xFF);
-			palrgba[2] = 0;
+			// B: 255 = this model's fine hits take the VOXEL's palette
+			// colour (the model file says "colour": "palette" -- flowers)
+			palrgba[2] = (md.isMember("colour")
+					&& md["colour"].asString() == "palette") ? 255 : 0;
 			palrgba[3] = 0;
 		}
 		V.models.push_back(rots);
@@ -3555,13 +3558,17 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// quads inside a cell, not cubes — leaving them solid makes a
 		// flower cast a full block shadow. Emissive ones (torches) stay,
 		// since they are light sources.
+		// ...unless the model shop baked it real 1/16 geometry (plantlike
+		// crossed sheets, 2026-10-05): then it falls through to the
+		// authored-model branch like any other modelled node.
 		if (f.light_source == 0
 				&& (f.drawtype == NDT_PLANTLIKE
 					|| f.drawtype == NDT_PLANTLIKE_ROOTED
 					|| f.drawtype == NDT_FIRELIKE
 					|| f.drawtype == NDT_SIGNLIKE
 					|| f.drawtype == NDT_RAILLIKE
-					|| f.drawtype == NDT_TORCHLIKE))
+					|| f.drawtype == NDT_TORCHLIKE)
+				&& g_claude_grid.model_of.find(c) == g_claude_grid.model_of.end())
 			continue;
 
 		// alpha = the MATERIAL INDEX (2026-08-18). It used to be a set of
@@ -4246,10 +4253,11 @@ static void claudeTraceGridUploadModelTex()
 	if (!V.model_tex_dirty)
 		return;
 	V.model_tex_dirty = false;
-	// atlas 16x16x1024: layer = (idx0*4+rot)*16+sz, 16 models max
-	std::vector<u8> atlas((size_t)16 * 16 * 1024, 0);
+	// atlas 16x16x2048: layer = (idx0*4+rot)*16+sz, 32 models max (was
+	// 1024 / 16; the plantlike models of 2026-10-05 took it past 16)
+	std::vector<u8> atlas((size_t)16 * 16 * 2048, 0);
 	std::vector<u8> pals((size_t)256 * 64 * 4, 0);
-	size_t nm = std::min<size_t>(V.model_vox.size(), 16);
+	size_t nm = std::min<size_t>(V.model_vox.size(), 32);
 	for (size_t m = 0; m < nm; m++) {
 		for (int r = 0; r < 4; r++) {
 			const auto &vr = V.model_vox[m][r];
@@ -4271,11 +4279,11 @@ static void claudeTraceGridUploadModelTex()
 	if (fresh_ma) {
 		claudeTraceGridTexParams3D();
 		GL.TexImage3D(GL.TEXTURE_3D, 0,
-				claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 16, 16, 1024, 0,
+				claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 16, 16, 2048, 0,
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
 				GL.UNSIGNED_BYTE, nullptr);
 	}
-	GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 16, 16, 1024,
+	GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, 16, 16, 2048,
 			claudeUseR8() ? GL.RED : GL_LUMINANCE,
 			GL.UNSIGNED_BYTE, atlas.data());
 	bool fresh_mp = !V.model_pal_tex;

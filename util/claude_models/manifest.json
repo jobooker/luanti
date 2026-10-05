@@ -48,6 +48,30 @@
   ],
   "cobble_baked": [
    "mcl_core:cobble"
+  ],
+  "plant_tallgrass": [
+   "mcl_flowers:tallgrass"
+  ],
+  "plant_fern": [
+   "mcl_flowers:fern"
+  ],
+  "flower_poppy": [
+   "mcl_flowers:poppy"
+  ],
+  "flower_dandelion": [
+   "mcl_flowers:dandelion"
+  ],
+  "flower_oxeye_daisy": [
+   "mcl_flowers:oxeye_daisy"
+  ],
+  "flower_cornflower": [
+   "mcl_flowers:cornflower"
+  ],
+  "flower_allium": [
+   "mcl_flowers:allium"
+  ],
+  "flower_tulip_red": [
+   "mcl_flowers:tulip_red"
   ]
  }
 }

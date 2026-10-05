@@ -1188,7 +1188,7 @@ float modelVoxelEmitScale(vec3 cell, vec3 sv)
 	float rot = mod(mid, 4.0);
 	float layer = (m * 4.0 + rot) * 16.0 + sv.z;
 	float pidx = floor(texture3D(claudeModelAtlas,
-			(vec3(sv.x, sv.y, layer) + 0.5) / vec3(16.0, 16.0, 1024.0)).r
+			(vec3(sv.x, sv.y, layer) + 0.5) / vec3(16.0, 16.0, 2048.0)).r
 			* 255.0 + 0.5);
 	vec4 pe = texture2D(claudeModelPal,
 			(vec2(pidx, m) + 0.5) / vec2(256.0, 64.0));
@@ -1197,6 +1197,30 @@ float modelVoxelEmitScale(vec3 cell, vec3 sv)
 	vec4 p0 = texture2D(claudeModelPal, (vec2(0.0, m) + 0.5) / vec2(256.0, 64.0));
 	return (floor(p0.r * 255.0 + 0.5) * 256.0 + floor(p0.g * 255.0 + 0.5))
 			/ 256.0;
+}
+
+// The VOXEL's own palette colour, for models flagged "colour": "palette"
+// (flowers, 2026-10-05). False (and `rgb` untouched) for every other cell.
+bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
+{
+	rgb = vec3(0.0);
+	float mid = floor(texture3D(claudeModelIds,
+			(cell + 0.5) / GRID_S).r * 255.0 + 0.5);
+	if (mid < 3.5)
+		return false;
+	float m = floor(mid / 4.0) - 1.0;
+	vec4 p0 = texture2D(claudeModelPal, (vec2(0.0, m) + 0.5) / vec2(256.0, 64.0));
+	if (p0.b < 0.5)
+		return false;
+	float rot = mod(mid, 4.0);
+	float layer = (m * 4.0 + rot) * 16.0 + sv.z;
+	float pidx = floor(texture3D(claudeModelAtlas,
+			(vec3(sv.x, sv.y, layer) + 0.5) / vec3(16.0, 16.0, 2048.0)).r
+			* 255.0 + 0.5);
+	if (pidx < 0.5)
+		return false;
+	rgb = texture2D(claudeModelPal, (vec2(pidx, m) + 0.5) / vec2(256.0, 64.0)).rgb;
+	return true;
 }
 
 // ---- AIR helpers -----------------------------------------------------------
@@ -1448,6 +1472,9 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 					le = vec3(0.0);
 				} else {
 					alb = cellAlbedo(s.rgb);
+					vec3 vrgb;
+					if (modelVoxelColour(cellHi, ci, vrgb))
+						alb = cellAlbedo(vrgb);
 					le = alb * pal.r;   // the palette's emission column (§4: one Le)
 					if (claudeFlame > 0.5 && pal.r > 0.0)
 						le *= modelVoxelEmitScale(cellHi, ci);

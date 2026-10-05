@@ -707,6 +707,51 @@ def extrude_cutout(name, path, thick=2, emit_level=12):
     return name, pal, v
 
 
+def crossed_cutout(name, path):
+    """Plantlike bake (2026-10-05, roadmap "2-D OBJECTS -> thin 1/16
+    geometry"). Luanti draws a plantlike node as two quads crossing on the
+    cell's diagonals with the tile spanning each; this places every opaque
+    texel (alpha >= 128) on BOTH diagonals, one sub-voxel thick, so a tuft
+    or a flower is real geometry that casts a real shadow. Colour per
+    voxel is the texel's own (see PALETTE_COLOUR_MODELS)."""
+    img = np.asarray(Image.open(path).convert("RGBA").resize(
+        (N, N), Image.NEAREST), dtype=np.float32)
+    pal = [None]
+    pindex = {}
+
+    def pi(rgb):
+        if rgb not in pindex:
+            pal.append(dict(rgb=list(rgb), emit=0))
+            pindex[rgb] = len(pal) - 1
+        return pindex[rgb]
+
+    v = np.zeros((N, N, N), dtype=np.uint16)
+    for vv in range(N):
+        for u in range(N):
+            r, g, b, a = img[vv, u]
+            if a < 128:
+                continue
+            idx = pi((int(r), int(g), int(b)))
+            y = N - 1 - vv
+            v[u, y, u] = idx               # one diagonal  (z = x)
+            v[u, y, N - 1 - u] = idx       # the other     (z = 15 - x)
+    return name, pal, v
+
+
+def _flower(name, tex):
+    return crossed_cutout(name, _mcl("ITEMS", "mcl_flowers", "textures", tex))
+
+
+# Models whose fine hits take the VOXEL's palette colour instead of the
+# cell's one colour (game.cpp reads "colour": "palette"). Flowers: their
+# texels are the colour. Tall grass and fern are NOT here: their tiles are
+# grayscale and take the biome tint through the cell colour, as the
+# rasteriser does.
+PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
+                         "flower_oxeye_daisy", "flower_cornflower",
+                         "flower_allium", "flower_tulip_red"}
+
+
 def model_torch_baked():
     tdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "..", "games", "mineclonia", "mods", "ITEMS",
@@ -806,6 +851,15 @@ MANIFEST = {
     "planks_spruce_baked": ["mcl_trees:wood_spruce"],
     "log_oak_baked": ["mcl_trees:tree_oak"],
     "cobble_baked": ["mcl_core:cobble"],
+    # plantlike (2026-10-05): crossed 1/16 sheets, see crossed_cutout()
+    "plant_tallgrass": ["mcl_flowers:tallgrass"],
+    "plant_fern": ["mcl_flowers:fern"],
+    "flower_poppy": ["mcl_flowers:poppy"],
+    "flower_dandelion": ["mcl_flowers:dandelion"],
+    "flower_oxeye_daisy": ["mcl_flowers:oxeye_daisy"],
+    "flower_cornflower": ["mcl_flowers:cornflower"],
+    "flower_allium": ["mcl_flowers:allium"],
+    "flower_tulip_red": ["mcl_flowers:tulip_red"],
 }
 
 
@@ -824,7 +878,15 @@ def main():
                lambda: model_bed("foot"), lambda: model_bed("head"),
                model_lantern, model_campfire, model_carpet,
                model_flowerpot, model_planks_oak, model_planks_spruce,
-               model_log_oak, model_cobble):
+               model_log_oak, model_cobble,
+               lambda: _flower("plant_tallgrass", "mcl_flowers_tallgrass.png"),
+               lambda: _flower("plant_fern", "mcl_flowers_fern.png"),
+               lambda: _flower("flower_poppy", "mcl_flowers_poppy.png"),
+               lambda: _flower("flower_dandelion", "flowers_dandelion_yellow.png"),
+               lambda: _flower("flower_oxeye_daisy", "mcl_flowers_oxeye_daisy.png"),
+               lambda: _flower("flower_cornflower", "mcl_flowers_cornflower.png"),
+               lambda: _flower("flower_allium", "mcl_flowers_allium.png"),
+               lambda: _flower("flower_tulip_red", "mcl_flowers_tulip_red.png")):
         name, pal, v = fn()
         if name in SOLID_NODE_MODELS:
             v, floor = enforce_opaque(name, pal, v)
@@ -852,6 +914,8 @@ def main():
                                            emit=p["emit"])
                                       for p in pal[1:]],
                     voxels=v.tolist())
+        if name in PALETTE_COLOUR_MODELS:
+            data["colour"] = "palette"
         jp = os.path.join(outdir, name + ".json")
         with open(jp, "w") as f:
             json.dump(data, f, separators=(",", ":"))
