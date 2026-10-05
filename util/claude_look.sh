@@ -60,7 +60,7 @@ nee = sys.argv[1]
 look = {
     "claude_grid_debug": "3",     # 3 = traced (0 = plain raster)
     "claude_descend":    "1",     # stairs/beds are real sub-metre shapes
-    "claude_rng":        "1",     # counter-based RNG (roadmap 1a)
+    "claude_rng":        "2",     # 2 = frame-index key (2026-10-04); 1 stalls past ~1k frames
     "claude_sky_uniform":"0",     # 0 = the REAL sky; >0 is the flat test sky
     "claude_view":       "0",     # 0 = photo; U cycles the debug views
     "claude_nee":        nee,
