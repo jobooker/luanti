@@ -226,7 +226,7 @@ CANONICAL_DIALS = {
     # EXPLICITLY and proven, like the rest: an unset claude_* dial is a
     # silent default (environment-laws, the hidden-default class), and
     # this one decides what the Monte Carlo integrator integrates.
-    "claude_rng": 1,
+    "claude_rng": 2,  # 2026-10-04: frame-index key (1 = 10-bit timer key, stalls ~1k frames)
     # SUB-VOXEL DESCENT (2026-08-16). 1 = march() steps into a class-250
     # cell's 16^3 mask; 0 = the pre-descend behaviour, where a stair is a
     # 1 m cube. Pushed EXPLICITLY and recorded in every .capture.json
@@ -301,7 +301,12 @@ PROVEN_DIALS = ("claude_view", "claude_nee", "claude_bounces",
 # hidden defaults (60 / 10). A CI seat's window is never focused, so
 # every headless run before today slept to 100 ms frames and reported
 # them as frame_ms_avg — a sleeping client reading as a slow renderer.
-# 200 is above anything this renderer reaches, so no sleep is taken.
+# The cap must sit above anything this renderer reaches, so no sleep is
+# taken. 200 did on the M4; on the Linux rig it does NOT (2026-10-04:
+# busy_ms 0.4-2.0 per frame on every arm, i.e. 500-2,300 fps, so every
+# arm slept ~60-90 % of each frame and a 500-frame settle cost 2.5 s of
+# wall time instead of ~0.5). 5000 clears the fastest arm measured
+# (sealed-plank-up, busy 0.44 ms) with room to spare.
 # Keep this list identical to the fps block in claude_seat_conf.ref.
 #
 # These keys are forced into minetest.conf before every seat start;
@@ -335,7 +340,7 @@ PINNED_CONF = {"screen_w": "1920", "screen_h": "1080",
                # unfocused window at the default reads ~10 fps / 100 ms,
                # which has twice been misread as a performance collapse.
                # A CI window is never focused.
-               "fps_max": "200", "fps_max_unfocused": "200",
+               "fps_max": "5000", "fps_max_unfocused": "5000",
                # Harness precondition, not a feature (John, 2026-08-15,
                # after a creeper detonated inside the Cornell box and
                # damaged a referee room): a hostile mob wandering into a
@@ -1864,6 +1869,63 @@ def await_frames(target, max_s=SETTLE_MAX_S, min_frames=SETTLE_MIN_FRAMES,
         time.sleep(SETTLE_POLL)
 
 
+def await_shutter(target, token, before, max_s=SETTLE_MAX_S,
+                  min_frames=SETTLE_MIN_FRAMES, hard_max_s=SETTLE_HARD_MAX_S):
+    """THE FRAME-EXACT SETTLE (2026-10-04). `claude_shutter = target:token`
+    has just been written: the client resets its accumulator when it
+    applies it and takes the screenshot ITSELF in the frame where
+    still_frames reaches `target`. This waits for that PNG, then reads
+    the depth the client reports for this token (shutter_frames in
+    claude_stats.json). await_frames() could only say "at least N, read
+    up to a second late"; this says N.
+
+    Same ceilings as await_frames: an arm whose world never stops
+    changing cannot wedge a run. Past them the shutter is DISARMED and
+    the caller shoots immediately, as before, and the record says so.
+    Returns the await_frames-shaped record plus "png" (None on ceiling).
+    """
+    t0 = time.time()
+    st0 = lab.read_stats() or {}
+    resets0 = st0.get("accum_resets")
+    png = None
+    while png is None:
+        el = time.time() - t0
+        cur = lab.newest_shot()
+        if cur and cur != before:
+            png = await_complete(cur)
+            break
+        st = lab.read_stats() or {}
+        sf = st.get("still_frames") or 0
+        if (el >= max_s and sf >= min_frames) or el >= hard_max_s:
+            return {"reached": False, "still_frames": sf, "wall_s": round(el, 1),
+                    "target": target, "resets": [], "mode": "client-shutter",
+                    "png": None,
+                    "why": ("hard ceiling %.0fs" % hard_max_s
+                            if el >= hard_max_s else
+                            "ceiling %.0fs with >= %d frames" % (max_s, min_frames))}
+        time.sleep(SHOT_POLL_INTERVAL)
+    wall = round(time.time() - t0, 1)
+    # the stats file is rewritten once per second: wait for THIS token
+    fired, st = None, {}
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        st = lab.read_stats() or {}
+        if st.get("shutter_token") == token:
+            fired = st.get("shutter_frames")
+            break
+        time.sleep(0.2)
+    r1 = st.get("accum_resets")
+    extra = (r1 - resets0 - 1) if (r1 is not None and resets0 is not None) else None
+    return {"reached": fired is not None and fired >= target,
+            "still_frames": fired, "wall_s": wall, "target": target,
+            # resets after the shutter's own (a world change mid-settle);
+            # the count, not the list — the client fired at N regardless
+            "resets": [{"count": extra}] if extra else [],
+            "mode": "client-shutter", "png": png,
+            **({} if fired is not None else
+               {"why": "shot taken but no shutter_token %s in the stats" % token})}
+
+
 def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     """dials -> park -> vantage (proven reset) -> snapshot -> re-assert
     dials -> settle (N frames) -> shutter -> N read BEFORE the PNG write
@@ -1920,7 +1982,12 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     info["grid"] = await_grid(marker, block, room=room,
                                   seq_before=seq_before)
     tl.mark("await_grid")
-    info["settle"] = await_frames(settle)
+    before = lab.newest_shot()
+    shutter_tok = "%d:%s" % (settle, marker)
+    with open(lab.PATCH, "w") as f:
+        f.write("claude_shutter = %s\n" % shutter_tok)
+    info["settle"] = await_shutter(settle, shutter_tok, before)
+    png = info["settle"].pop("png")
     tl.mark("settle")
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
@@ -1931,9 +1998,10 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     ok, detail = aim_ok(info.get("aim_at_start"), read_aim(), vantage)
     info["aim_at_shutter"] = {"ok": ok, "detail": detail}
     tl.mark("aim_shutter")
-    before = lab.newest_shot()
     st = lab.read_stats() or {}
-    info["still_frames_at_shutter"] = st.get("still_frames")
+    # exact when the client fired the shutter; the 1 Hz reading otherwise
+    info["still_frames_at_shutter"] = (info["settle"].get("still_frames")
+                                       if png else st.get("still_frames"))
     info["stats_at_shutter"] = {k: st.get(k) for k in
                                 ("grid_valid", "grid_solid",
                                  "grid_snap_seq", "area_emitters",
@@ -1951,16 +2019,19 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
                                  # the dome's horizon radiance, for the
                                  # -sky-lit assertion (2026-08-23)
                                  "sky_horizon")}
-    with open(lab.PATCH, "w") as f:
-        f.write("claude_screenshot = %s\n" % marker)
-    png = None
-    deadline = time.time() + SHOT_TIMEOUT
-    while time.time() < deadline:
-        cur = lab.newest_shot()
-        if cur and cur != before:
-            png = await_complete(cur)
-            break
-        time.sleep(SHOT_POLL_INTERVAL)
+    if png is None:
+        # CEILING: disarm the shutter and shoot now, the pre-2026-10-04 way
+        before = lab.newest_shot()
+        with open(lab.PATCH, "w") as f:
+            f.write("claude_shutter = 0:disarm_%s\n" % marker)
+            f.write("claude_screenshot = %s\n" % marker)
+        deadline = time.time() + SHOT_TIMEOUT
+        while time.time() < deadline:
+            cur = lab.newest_shot()
+            if cur and cur != before:
+                png = await_complete(cur)
+                break
+            time.sleep(SHOT_POLL_INTERVAL)
     if not png:
         raise RuntimeError("no complete screenshot appeared for %s" % name)
     tl.mark("shutter")

@@ -410,6 +410,24 @@ static ClaudeTraceGrid g_claude_grid;
 // loop and had exactly the same race.
 static bool g_claude_screenshot_pending = false;
 
+// THE FRAME-EXACT SHUTTER (2026-10-04). `claude_shutter = N:token` resets
+// the accumulator where the request is applied and arms a target; the
+// frame in which still_frames reaches N takes the screenshot, inside
+// drawScene() like every other shot. Before this the harness polled the
+// 1 Hz stats file for still_frames >= N and then asked for a screenshot
+// on the 1 Hz patch poll, so the shot landed up to a second of frames
+// late — 545-930 frames for a 500-frame settle at fps_max 5000 — and
+// unconverged arms brighten with depth (luanti-docs measured.md
+// 2026-10-04, "fps_max 5000 — measured, NOT shipped"). N <= 0 disarms
+// without a reset. The fired depth and token are exported in
+// claude_stats.json so the harness reads the depth instead of guessing.
+static float g_claude_shutter_at = 0.0f;
+// every traced frame, for claudeRngFrame while the camera moves
+static u32 g_claude_frame_no = 0;
+static std::string g_claude_shutter_token;
+static float g_claude_shutter_fired = -1.0f;
+static std::string g_claude_shutter_fired_token;
+
 // ---------------------------------------------------------------------
 // THE MATERIAL PALETTE — what the per-cell byte means
 // ---------------------------------------------------------------------
@@ -990,6 +1008,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// before that line was measured against a dark truth renderer.
 	float m_rng = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_rng_pixel{"claudeRng"};
+	// claudeRngFrame (2026-10-04): the frame index claude_rng = 2 keys its
+	// stream on. Parked: still_frames, so the Nth frame after a reset draws
+	// the same numbers every run. Moving (still_frames = 0 every frame): a
+	// running frame counter offset by 2^23, so motion still decorrelates.
+	CachedPixelShaderSetting<float, 1, false> m_rng_frame_pixel{"claudeRngFrame"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
@@ -1505,14 +1528,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_nee", 0.0f, 1.0f);
 	}
 
-	// claude_trace RNG source, 0/1. 1 (default) = the counter-based PCG.
+	// claude_trace RNG source, 0/1/2. 2 (default since 2026-10-04) and 1 = the counter-based PCG.
+	// 2 = the same PCG keyed on a full 32-bit hash of the FRAME INDEX
+	// (claudeRngFrame) instead of 10 bits of animationTimer — see the
+	// shader's key block for the stall it fixes.
 	// 0 = the old, biased hash chain, which is what every Cornell number
 	// in measured.md before the "1a" section was taken with. See m_rng.
 	static float readRng()
 	{
 		if (!g_settings->exists("claude_rng"))
-			return 1.0f;
-		return g_settings->getFloat("claude_rng", 0.0f, 1.0f);
+			return 2.0f;   // 2 since 2026-10-04: the frame-index key
+		return g_settings->getFloat("claude_rng", 0.0f, 2.0f);
 	}
 
 	// claude_trace TEST SKY. 0 (default) = the real sky. > 0 replaces the
@@ -2182,6 +2208,12 @@ public:
 				m_bounces_pixel.set(&m_bounces, services);
 				m_nee_pixel.set(&m_nee, services);
 				m_rng_pixel.set(&m_rng, services);
+				{
+					float rf = g_claude_grid.still_frames > 0.0f
+							? g_claude_grid.still_frames
+							: 8388608.0f + (float)(g_claude_frame_no % 8388608u);
+					m_rng_frame_pixel.set(&rf, services);
+				}
 				SamplerLayer_t cascl = 8;
 				m_cascades_sampler_pixel.set(&cascl, services);
 				SamplerLayer_t casccl = 9;
@@ -4456,6 +4488,8 @@ static void claudeUpdateAccum(Client *client)
 				1.0f / (2.0f + g_claude_grid.still_frames);
 	}
 
+	g_claude_frame_no++;
+
 	// Held light: if the wielded item is a light-emitting node, place an
 	// emitter at the camera every frame. Real-time by construction — no
 	// server round trip, no snapshot lag, no light node in the world.
@@ -4614,6 +4648,10 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"still_frames\": " << g_claude_grid.still_frames
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
+			// the frame-exact shutter: depth and token of the last shot it
+			// fired (-1 / "" until one has)
+			<< ", \"shutter_frames\": " << g_claude_shutter_fired
+			<< ", \"shutter_token\": \"" << g_claude_shutter_fired_token << "\""
 			<< ", \"casc_valid\": [" << (g_claude_grid.casc[0].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[1].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[2].valid ? 1 : 0)
@@ -4806,6 +4844,22 @@ static bool claudeApplyPatchFile(const std::string &path,
 	for (const std::string &name : patch.getNames()) {
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
+		if (name == "claude_shutter") {
+			const std::string v = patch.get(name);
+			const float n = (float)atoi(v.c_str());
+			if (n > 0.0f) {
+				claudeResetAccumulation();
+				g_claude_shutter_at = n;
+				g_claude_shutter_token = v;
+				actionstream << "[claude_settings_patch] shutter armed at "
+						<< n << " (" << v << ")" << std::endl;
+			} else {
+				g_claude_shutter_at = 0.0f;
+				actionstream << "[claude_settings_patch] shutter disarmed ("
+						<< v << ")" << std::endl;
+			}
+			continue;
+		}
 		if (name == "claude_screenshot") {
 			// DEFERRED to inside the frame on purpose — see
 			// g_claude_screenshot_pending. Taking it here reads a
@@ -8422,6 +8476,16 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 	// it: see g_claude_screenshot_pending for the two runs that measured
 	// the difference. Deliberately BEFORE the profiler graph and the
 	// damage flash below, so neither can land in a referee frame.
+	if (g_claude_shutter_at > 0.0f
+			&& g_claude_grid.still_frames >= g_claude_shutter_at) {
+		g_claude_shutter_fired = g_claude_grid.still_frames;
+		g_claude_shutter_fired_token = g_claude_shutter_token;
+		g_claude_shutter_at = 0.0f;
+		g_claude_screenshot_pending = true;   // served just below, this frame
+		actionstream << "[claude_settings_patch] shutter fired at still_frames="
+				<< g_claude_shutter_fired << " ("
+				<< g_claude_shutter_fired_token << ")" << std::endl;
+	}
 	if (g_claude_screenshot_pending) {
 		g_claude_screenshot_pending = false;
 		this->client->makeScreenshot();

@@ -392,6 +392,8 @@ uniform float claudeNee;
 // itself ran 1-8% dark in Cornell and the "NEE is hot" finding was the
 // estimator being RIGHT. spec/measured.md "1a".
 uniform float claudeRng;
+// The frame index claudeRng = 2 keys on (game.cpp m_rng_frame_pixel).
+uniform float claudeRngFrame;
 
 // AREA-EMITTER LIST for next-event estimation (game.cpp
 // claudeTraceGridSnapshot, ClaudeTraceGrid::area). One emissive CELL per slot:
@@ -2034,6 +2036,19 @@ void main(void)
 	g_rngKey = pcgHash(uint(gl_FragCoord.x)
 			^ (uint(gl_FragCoord.y) << 11u)
 			^ (uint(fract(animationTimer * 91.7) * 65536.0) << 22u));
+	// claudeRng = 2 (2026-10-04): THE FRAME GETS 32 BITS, NOT 10. The key
+	// above shifts the frame term left by 22, so only its low 10 bits
+	// survive: 1,024 distinct streams per pixel, and frames past ~1,000
+	// repeat earlier ones. MEASURED on cornell, two captures per depth:
+	// per-image noise 7.00 / 3.41 / 1.89 / 2.13 at N = 256 / 1024 / 4096 /
+	// 16384 — it should halve per 4x and instead STOPPED (luanti-docs
+	// measured.md 2026-10-04). Mode 2 hashes an exact frame index, which
+	// is still_frames while parked, so a parked capture is also the same
+	// numbers every run.
+	if (claudeRng > 1.5)
+		g_rngKey = pcgHash((uint(gl_FragCoord.x)
+				^ (uint(gl_FragCoord.y) << 11u))
+				^ pcgHash(uint(claudeRngFrame) + 2654435769u));
 	g_rngCtr = 0u;
 	g_skyCtr = 0u;
 
