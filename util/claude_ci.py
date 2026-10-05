@@ -3191,6 +3191,17 @@ def finish(run, rundir, A):
 
 # ------------------------------------------------------------- calibrate
 
+# Referee x defect pairs that CANNOT catch the defect by construction,
+# with the reason. Printed as EXPECTED, never counted as blind; anything
+# not listed here that passes a planted defect is still a failure.
+CALIBRATE_EXPECTED_BLIND = {
+    ("furnace-analytic/050", "clay"):
+        "the 050 room's own rho is (186/255)^2.2 = 0.4995 and clay sets "
+        "0.5: its analytic answer moves 0.1 %, under the 0.003 band; "
+        "furnace-073 (rho 0.73) is the clay detector (0.540)",
+}
+
+
 def cmd_calibrate(args):
     """Plant a defect; every referee must FAIL. Physics-contract §8
     clause 3: naming a referee is not enough — one that cannot fail the
@@ -3225,6 +3236,16 @@ def cmd_calibrate(args):
             for shot_def in CI_SHOTS:
                 if not shot_def["referee"] or shot_def["name"] == "cornell-nee1":
                     continue      # referee vantages only, photo arm only
+                if shot_def["referee"][0] == "skyfurnace":
+                    # NEITHER PLANTED DEFECT IS VISIBLE ON AN OPEN PAD, by
+                    # construction (2026-10-05): bounces1 leaves rho * L_sky
+                    # intact (an open plane has almost no interreflection),
+                    # and clay sets rho 0.5 against the pad's own
+                    # (186/255)^2.2 = 0.4995. Until today these arms were
+                    # judged by the CORNELL referee here and printed "no
+                    # golden pinned" as BLIND, every run. Their own
+                    # calibration is the uniform-sky analytic answer.
+                    continue
                 if shot_def["referee"][0] == "sealed":
                     # THE SEALED-PLANK ARMS ARE CALIBRATED ALREADY, AND
                     # NOT BY A PLANTED DIAL. Their claim is "no light
@@ -3283,15 +3304,18 @@ def cmd_calibrate(args):
                                   bl or "unparsed")))
                 for rname, (mark, detail) in seen:
                     caught = mark == "FAIL"
+                    why_ok = CALIBRATE_EXPECTED_BLIND.get(
+                            (rname, defect["name"]))
                     print("  %-28s %-9s %s"
-                          % (rname, "CAUGHT" if caught else "BLIND", detail))
+                          % (rname, "CAUGHT" if caught else
+                             ("EXPECTED" if why_ok else "BLIND"), detail))
                     run["results"].append(
                         {"defect": defect["name"], "arm": shot_def["name"],
                          "referee": rname, "mark": mark, "detail": detail,
                          "caught": caught, "png": os.path.basename(png),
                          "dials_ok": ds.get("ok"),
                          "dials_error": ds.get("error")})
-                    if not caught:
+                    if not caught and not why_ok:
                         blind.append("%s vs %s (%s)"
                                      % (rname, defect["name"], detail))
     finally:
