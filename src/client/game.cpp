@@ -1344,7 +1344,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// leaf sheets (light passes with the leaves' own geometric odds), 0 = a
 	// solid lump (far view v1). Judged, not assumed (spec/measured.md).
 	CachedPixelShaderSetting<float, 1, false> m_far_leaf_medium_pixel{"claudeFarLeafMedium"};
-	// claude_far_plants: 1 = far grass and flowers as a layer of blades
+	// claude_far_plants: 1 (default) = far grass and flowers as a layer of blades
 	CachedPixelShaderSetting<float, 1, false> m_far_plants_pixel{"claudeFarPlants"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
@@ -3090,9 +3090,12 @@ public:
 							? g_settings->getFloat("claude_far_leaf_medium", 0.0f, 1.0f)
 							: 0.0f;
 					m_far_leaf_medium_pixel.set(&flm, services);
+					// ON by default (2026-10-06): +1.7 JOD against the 1 m
+					// truth at a treeline, no measurable cost in play
+					// (spec/measured.md)
 					float fpl = g_settings->exists("claude_far_plants")
 							? g_settings->getFloat("claude_far_plants", 0.0f, 1.0f)
-							: 0.0f;
+							: 1.0f;
 					m_far_plants_pixel.set(&fpl, services);
 					g_claude_grid.far_levels_live = nf;
 				}
