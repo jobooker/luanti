@@ -2352,9 +2352,37 @@ float ptConeCos(vec4 e, vec3 x)
 	return sqrt(1.0 - r2 / d2);
 }
 
+// WHICH FLAME, AND WHETHER TO AIM AT ALL (2026-10-06). A flame is chosen
+// in proportion to the solid angle its sphere covers from x, Omega_i =
+// 2 pi (1 - cos theta_max), and the whole sampler runs only with
+// probability q = min(1, sum Omega / PT_OMEGA_REF). Both are importance
+// sampling, so both keep it unbiased: the density of a direction is
+// q * (number of cones holding it) / sum Omega, and the BSDF side of the
+// MIS pair reads that same number through ptPdfSa(). Why: uniform choice
+// spent a shadow ray on every vertex even when every flame was tens of
+// blocks away (forest: 1.80 ms of 13.25, measured.md 2026-10-06 ledger).
+// TUNED: PT_OMEGA_REF = 0.01 sr, about a torch flame seen from 2-3 m |
+// learn by: the speed ledger and the torch-room noise A/B.
+const float PT_OMEGA_REF = 0.01;
+float ptOmegaSum(vec3 x, int nPts)
+{
+	float sum = 0.0;
+	for (int i = 0; i < 8; i++) {
+		if (i >= nPts)
+			break;
+		float cm = ptConeCos(ptEmitter(i), x);
+		if (cm < 1.5)
+			sum += PI2 * (1.0 - cm);
+	}
+	return sum;
+}
+
 float ptPdfSa(vec3 x, vec3 wi, int nPts)
 {
-	float p = 0.0;
+	float sum = ptOmegaSum(x, nPts);
+	if (sum <= 0.0)
+		return 0.0;
+	float hits = 0.0;
 	for (int i = 0; i < 8; i++) {
 		if (i >= nPts)
 			break;
@@ -2363,20 +2391,39 @@ float ptPdfSa(vec3 x, vec3 wi, int nPts)
 		if (cm > 1.5)
 			continue;
 		if (dot(wi, normalize(e.xyz - x)) >= cm)
-			p += 1.0 / (float(nPts) * PI2 * (1.0 - cm));
+			hits += 1.0;
 	}
-	return p;
+	return min(1.0, sum / PT_OMEGA_REF) * hits / sum;
 }
 
 vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
 {
+	float uq = rndPt();
 	float us = rndPt();
 	float u1 = rndPt();
 	float u2 = rndPt();
-	int li = min(int(float(nPts) * us), nPts - 1);
-	vec4 e = ptEmitter(li);
-	float cm = ptConeCos(e, x);
-	if (cm > 1.5)
+	float sum = ptOmegaSum(x, nPts);
+	if (sum <= 0.0 || uq >= min(1.0, sum / PT_OMEGA_REF))
+		return vec3(0.0);
+	// pick i with probability Omega_i / sum
+	int li = -1;
+	float acc = 0.0, cm = 2.0;
+	vec4 e = vec4(0.0);
+	for (int i = 0; i < 8; i++) {
+		if (i >= nPts)
+			break;
+		vec4 ei = ptEmitter(i);
+		float ci = ptConeCos(ei, x);
+		if (ci > 1.5)
+			continue;
+		acc += PI2 * (1.0 - ci);
+		if (li < 0 && us * sum < acc) {
+			li = i;
+			e = ei;
+			cm = ci;
+		}
+	}
+	if (li < 0)
 		return vec3(0.0);
 	vec3 w = normalize(e.xyz - x);
 	float ct = 1.0 - u1 * (1.0 - cm);
