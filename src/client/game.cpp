@@ -3146,6 +3146,7 @@ Game::Game() :
 
 Game::~Game()
 {
+	claude_lod::stopFarDb();
 	delete client;
 	soundmaker.reset();
 	sound_manager.reset();
@@ -5477,7 +5478,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< "," << g_claude_grid.casc[2].ms
 			<< "," << g_claude_grid.casc[3].ms
 			<< "," << g_claude_grid.casc[4].ms
-			<< "], \"summary_blocks\": " << claude_lod::summaryCount();
+			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
+			<< ", \"far_db_blocks\": " << claude_lod::farDbLoaded();
 	os << ", \"draw_ms\": " << (draw_total / frames / 1000.0f)
 			<< ", \"busy_ms\": " << (busy_total / frames / 1000.0f);
 	os << ", \"pass_ms\": [";
@@ -5542,6 +5544,17 @@ static void claudeCascadeUpdate(Client *client)
 		if (n)
 			infostream << "claude_far: ingested " << n << " blocks"
 					<< std::endl;
+	}
+	// far terrain from the world file: the window is the coarsest level
+	if (g_settings->exists("claude_far_world")) {
+		static bool fd_started = false;
+		if (!fd_started) {
+			fd_started = true;
+			claude_lod::startFarDb(client,
+					g_settings->get("claude_far_world"));
+		}
+		claude_lod::setFarWindow(center,
+				nlev > 0 ? 128 * CELL[nlev - 1] / 2 : 0);
 	}
 	u64 ver = claude_lod::contentVersion();
 
@@ -6082,6 +6095,7 @@ void Game::shutdown()
 		}
 	}
 
+	claude_lod::stopFarDb();
 	delete client;
 	client = nullptr;
 	soundmaker.reset();

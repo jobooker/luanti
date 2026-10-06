@@ -15,6 +15,15 @@
 #include "porting.h"
 
 #include <json/json.h>
+#include "gamedef.h"
+#include "content/mods.h"
+#include "database/database-sqlite3.h"
+#include "util/serialize.h"
+#include "log.h"
+#include <atomic>
+#include <algorithm>
+#include <sstream>
+#include <thread>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -82,7 +91,7 @@ static std::mutex g_mutex;
 static std::unordered_map<v3s16, BlockSummary> g_summaries;
 static u64 g_version = 0;
 
-void summarizeBlock(Client *client, MapBlock *block)
+void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 {
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	BlockSummary s = {};
@@ -259,9 +268,152 @@ void summarizeBlock(Client *client, MapBlock *block)
 	}
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
+		if (fill_only && g_summaries.count(block->getPos()))
+			return;
 		g_summaries[block->getPos()] = s;
 		g_version++;
 	}
+}
+
+// ---- far terrain from the world file (see claude_lod.h) ----
+
+// MapBlock::deSerialize maps node names through a gamedef, and the
+// client's FATAL-ERRORs on a name it does not know. This one forwards to
+// the client and maps an unknown name to CONTENT_UNKNOWN instead.
+class FarGameDef : public IGameDef
+{
+public:
+	FarGameDef(Client *c) : m_c(c) {}
+	IItemDefManager *getItemDefManager() override { return m_c->getItemDefManager(); }
+	const NodeDefManager *getNodeDefManager() override { return m_c->getNodeDefManager(); }
+	ICraftDefManager *getCraftDefManager() override { return nullptr; }
+	u16 allocateUnknownNodeId(const std::string &name) override { return CONTENT_UNKNOWN; }
+	const std::vector<ModSpec> &getMods() const override { return m_mods; }
+	const ModSpec *getModSpec(const std::string &modname) const override { return nullptr; }
+	ModStorageDatabase *getModStorageDatabase() override { return nullptr; }
+	bool joinModChannel(const std::string &channel) override { return false; }
+	bool leaveModChannel(const std::string &channel) override { return false; }
+	bool sendModChannelMessage(const std::string &channel,
+			const std::string &message) override { return false; }
+	ModChannel *getModChannel(const std::string &channel) override { return nullptr; }
+	bool isClient() override { return true; }
+private:
+	Client *m_c;
+	std::vector<ModSpec> m_mods;
+};
+
+static std::thread g_fd_thread;
+static std::atomic<bool> g_fd_run{false};
+static std::atomic<int> g_fd_cx{0}, g_fd_cy{0}, g_fd_cz{0}, g_fd_r{0};
+static std::atomic<size_t> g_fd_loaded{0};
+
+static void farDbLoop(Client *client, std::string dir)
+{
+	FarGameDef gd(client);
+	std::unique_ptr<MapDatabaseSQLite3> db;
+	try {
+		db = std::make_unique<MapDatabaseSQLite3>(dir);
+	} catch (std::exception &e) {
+		errorstream << "claude_far_world: cannot open " << dir << ": "
+				<< e.what() << std::endl;
+		return;
+	}
+	std::vector<v3s16> all;
+	std::unordered_set<v3s16> tried;
+	u64 last_list = 0;
+	std::vector<std::pair<int, v3s16>> todo;
+	while (g_fd_run) {
+		u64 now = porting::getTimeMs();
+		// re-list now and then: the server keeps generating and saving
+		if (all.empty() || now - last_list > 30000) {
+			all.clear();
+			try {
+				db->listAllLoadableBlocks(all);
+			} catch (std::exception &e) {
+				errorstream << "claude_far_world: list: " << e.what() << std::endl;
+			}
+			last_list = now;
+		}
+		v3s16 c(g_fd_cx / MAP_BLOCKSIZE, g_fd_cy / MAP_BLOCKSIZE,
+				g_fd_cz / MAP_BLOCKSIZE);
+		int rb = g_fd_r / MAP_BLOCKSIZE;
+		todo.clear();
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			for (const v3s16 &p : all) {
+				v3s16 d = p - c;
+				int m = std::max({std::abs(d.X), std::abs(d.Y), std::abs(d.Z)});
+				if (m > rb || tried.count(p) || g_summaries.count(p))
+					continue;
+				todo.emplace_back(d.X * d.X + d.Y * d.Y + d.Z * d.Z, p);
+			}
+		}
+		if (todo.empty()) {
+			for (int i = 0; i < 10 && g_fd_run; i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			continue;
+		}
+		// nearest first, a batch at a time so a moving camera re-sorts
+		std::sort(todo.begin(), todo.end(),
+				[](const auto &a, const auto &b) { return a.first < b.first; });
+		size_t batch = std::min<size_t>(todo.size(), 512);
+		std::string blob;
+		for (size_t i = 0; i < batch && g_fd_run; i++) {
+			v3s16 p = todo[i].second;
+			tried.insert(p);
+			blob.clear();
+			try {
+				db->loadBlock(p, &blob);
+				if (blob.empty())
+					continue;
+				std::istringstream is(blob, std::ios_base::binary);
+				u8 version = readU8(is);
+				MapBlock block(p, &gd);
+				block.deSerialize(is, version, true);
+				if (!block.isGenerated())
+					continue;
+				summarizeBlock(client, &block, true);
+				g_fd_loaded++;
+			} catch (std::exception &e) {
+				// a block mid-write or of a newer format: skip it
+			}
+		}
+	}
+}
+
+void startFarDb(Client *client, const std::string &world_dir)
+{
+	if (g_fd_run || world_dir.empty())
+		return;
+	// never CREATE a database: the sqlite backend opens read-write/create
+	if (!fs::PathExists(world_dir + DIR_DELIM + "map.sqlite")) {
+		errorstream << "claude_far_world: no map.sqlite in " << world_dir
+				<< std::endl;
+		return;
+	}
+	g_fd_run = true;
+	g_fd_thread = std::thread(farDbLoop, client, world_dir);
+	actionstream << "claude_far_world: reading " << world_dir << std::endl;
+}
+
+void setFarWindow(v3s16 center_nodes, int radius_nodes)
+{
+	g_fd_cx = center_nodes.X;
+	g_fd_cy = center_nodes.Y;
+	g_fd_cz = center_nodes.Z;
+	g_fd_r = radius_nodes;
+}
+
+void stopFarDb()
+{
+	g_fd_run = false;
+	if (g_fd_thread.joinable())
+		g_fd_thread.join();
+}
+
+size_t farDbLoaded()
+{
+	return g_fd_loaded;
 }
 
 // ---- far-data feed: JSON dropped by tooling (server bridge sample ->

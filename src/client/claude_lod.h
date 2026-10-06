@@ -5,6 +5,7 @@
 #pragma once
 
 #include "irrlichttypes_bloated.h"
+#include <string>
 #include <vector>
 
 class Client;
@@ -19,7 +20,9 @@ namespace claude_lod
 // direct array reads, no map lookups). Called from the main thread
 // (packet handling); the cache is mutex-guarded anyway so a future
 // warm-scan thread can feed it too.
-void summarizeBlock(Client *client, MapBlock *block);
+// fill_only: keep an existing summary (a block the server sent is fresher
+// than the copy in the world file)
+void summarizeBlock(Client *client, MapBlock *block, bool fill_only = false);
 
 // Build a summary-fed cascade level: 128^3 cells of cell_nodes (4 or 8)
 // covering origin_nodes + 128*cell_nodes. rgba: 128^3 * 4 (rgb =
@@ -42,5 +45,21 @@ u64 contentVersion();
 
 // Blocks currently summarized (stats).
 size_t summaryCount();
+
+// FAR TERRAIN FROM THE WORLD FILE (2026-10-06). The server sends only the
+// blocks inside the camera's view cone and not occluded (clientiface.cpp
+// GetNextBlocks), out to max_block_send_distance; the light law needs the
+// world around the camera whatever it faces (a hill behind you shadows the
+// ground in front). When the world's map.sqlite is on this machine, a
+// worker thread reads it directly and folds each block through
+// summarizeBlock -- the SAME fold as a received block, fill-only. Off
+// unless claude_far_world names a world directory.
+void startFarDb(Client *client, const std::string &world_dir);
+// the window to fill: blocks within radius_nodes of center, nearest first
+void setFarWindow(v3s16 center_nodes, int radius_nodes);
+// joins the worker; must run before the Client is destroyed
+void stopFarDb();
+// blocks the worker has folded so far (stats)
+size_t farDbLoaded();
 
 }
