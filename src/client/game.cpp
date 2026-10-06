@@ -366,6 +366,7 @@ struct ClaudeTraceGrid
 	float dial_units = 0.0f;
 	float dial_white_balance = 0.0f, dial_night_vision = 0.0f;
 	float dial_leaf_transmit = 0.0f;
+	float dial_model_far = 0.0f;
 	// what the units law delivered this frame (lux), for claude_stats
 	float units_sky_lux = 0.0f, units_sun_lux = 0.0f, units_moon_lux = 0.0f;
 	float units_moon_phase = -1.0f;
@@ -1198,6 +1199,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_leaf_transmit (2026-10-05): 1 = a leaf sheet transmits as much
 	// as it reflects (see claude_trace); 0 = opaque leaves, as before.
 	float m_leaf_transmit = 1.0f;
+	// claude_model_far (2026-10-06): 1 = model cells (leaves, planks,
+	// plants, torches...) keep their 1/16 m shape across the whole grid,
+	// from the shared atlas; 0 = only inside the 32^3 ring, as before.
+	float m_model_far = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_model_far_pixel{"claudeModelFar"};
 	CachedPixelShaderSetting<float, 1, false> m_leaf_transmit_pixel{"claudeLeafTransmit"};
 	float m_night_vision = 1.0f;
 	float m_adapt_colour = 3.0f;
@@ -1434,6 +1440,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_torch_nee",
 		"claude_white_balance",
 		"claude_leaf_transmit",
+		"claude_model_far",
 		"claude_night_vision",
 		"claude_adapt_colour",
 		"claude_adapt_brighter",
@@ -2321,6 +2328,8 @@ public:
 			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		if (name == "claude_motion_alpha")
 			m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
+		if (name == "claude_model_far")
+			m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
 		if (name == "claude_leaf_transmit")
 			m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		if (name == "claude_white_balance")
@@ -2433,6 +2442,7 @@ public:
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
+		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
 		m_night_vision = readAir("claude_night_vision", 1.0f, 1.0f);
 		m_adapt_colour = readAir("claude_adapt_colour", 3.0f, 600.0f);
 		m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
@@ -2720,6 +2730,8 @@ public:
 				m_auto_exposure_pixel.set(&m_auto_exposure, services);
 				m_white_balance_pixel.set(&m_white_balance, services);
 				m_leaf_transmit_pixel.set(&m_leaf_transmit, services);
+				m_model_far_pixel.set(&m_model_far, services);
+				g_claude_grid.dial_model_far = m_model_far;
 				g_claude_grid.dial_leaf_transmit = m_leaf_transmit;
 				m_night_vision_pixel.set(&m_night_vision, services);
 				m_adapt_colour_pixel.set(&m_adapt_colour, services);
@@ -5379,6 +5391,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_white_balance\": " << g_claude_grid.dial_white_balance
 			<< ", \"claude_night_vision\": " << g_claude_grid.dial_night_vision
 			<< ", \"claude_leaf_transmit\": " << g_claude_grid.dial_leaf_transmit
+			<< ", \"claude_model_far\": " << g_claude_grid.dial_model_far
 			<< ", \"eye_white\": [" << g_claude_white[0] << ","
 			<< g_claude_white[1] << "," << g_claude_white[2] << ","
 			<< g_claude_white[3] << "]"

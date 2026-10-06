@@ -262,6 +262,8 @@ CANONICAL_DIALS = {
     # leaves transmit (2026-10-05): physics, so ON in CI too; no scored
     # arm contains a leaf
     "claude_leaf_transmit": 1,
+    # model shapes past the ring (2026-10-06): geometry, on
+    "claude_model_far": 1,
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which

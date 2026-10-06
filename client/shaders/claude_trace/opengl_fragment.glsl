@@ -1326,6 +1326,29 @@ bool modelFlame(vec3 cell)
 			(vec2(0.0, m) + 0.5) / vec2(256.0, 64.0)).a > 0.5;
 }
 
+// MODELS PAST THE RING (claude_model_far, 2026-10-06). The ring's bits
+// cost memory per CELL, but an authored model's shape is shared: its 16^3
+// voxels sit in claudeModelAtlas once per model and rotation. So a model
+// cell anywhere in the grid can be walked at 1/16 m from the atlas, the
+// same voxels the ring bake copies (claude_models JSON -> both). Node-box
+// shapes (stairs, slabs, panes) are per-cell and stay ring-only.
+bool modelCell(vec3 cell)
+{
+	return floor(texture3D(claudeModelIds, (cell + 0.5) / GRID_S).r
+			* 255.0 + 0.5) > 3.5;
+}
+bool modelVoxelSolid(vec3 cell, vec3 sv)
+{
+	float mid = floor(texture3D(claudeModelIds,
+			(cell + 0.5) / GRID_S).r * 255.0 + 0.5);
+	float m = floor(mid / 4.0) - 1.0;
+	float rot = mod(mid, 4.0);
+	float layer = (m * 4.0 + rot) * 16.0 + sv.z;
+	return texture3D(claudeModelAtlas,
+			(vec3(sv.x, sv.y, layer) + 0.5) / vec3(16.0, 16.0, 2048.0)).r
+			> 0.5 / 255.0;
+}
+
 // The hot law, if it applies: rewrites le (and lava's albedo). `fine`
 // = the hit is a sub-voxel of `cell` at `sv`.
 void hotLaw(float idx, vec3 cell, bool fine, vec3 sv, inout vec3 alb,
@@ -1452,6 +1475,20 @@ vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 			* (255.0 / 64.0);
 }
 
+// Does this cell have 1/16 m bits to walk, and is this sub-voxel solid?
+// Ring cells: the ring's bits (as always). Elsewhere: a model cell's
+// atlas voxels, when claude_model_far is on.
+uniform float claudeModelFar;
+bool fineAt(vec3 cell)
+{
+	return inSubvoxRing(cell) || (claudeModelFar > 0.5 && modelCell(cell));
+}
+bool fineSolid(vec3 cell, vec3 sv)
+{
+	return inSubvoxRing(cell) ? subvoxSolid(cell - vec3(SUBV_R0), sv)
+			: modelVoxelSolid(cell, sv);
+}
+
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
@@ -1507,7 +1544,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 	// empty ones. It was "SURFACE_EPS pushes the restart 0.16 sub-voxels
 	// off the face it left, belt and braces, stated rather than relied
 	// upon" — and at 1 m the same reasoning turned out to be wrong.)
-	if (claudeDescend > 0.5 && inSubvoxRing(cellHi)) {
+	if (claudeDescend > 0.5 && fineAt(cellHi)) {
 		s = texture3D(claudeTraceGrid, (cellHi + 0.5) / GRID_S);
 		// THE MATERIAL OF THE CELL THE RAY STARTS IN, reported even
 		// though the walk is about to skip the cell itself. It has to
@@ -1596,7 +1633,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 				// sub-voxel IS an interface: glass -> air, curMed goes
 				// back to 0 at the crossing, and no later ray carries a
 				// medium it is not in.
-				float subIdx = subvoxSolid(cellHi - vec3(SUBV_R0), ci)
+				float subIdx = fineSolid(cellHi, ci)
 						? idxOut : 0.0;
 				if (subIdx == curMed)
 					continue; // same medium: step again
@@ -1695,7 +1732,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// a fine hit takes its material from the cell that owns the mask.
 		pal = matPalIdx(idx);
 		bool fineHere = claudeDescend > 0.5 && matFine(pal)
-				&& inSubvoxRing(ci);
+				&& fineAt(ci);
 		// GLASS SITS FLUSH AGAINST CARVED WOOD (2026-10-04, John: "glass
 		// sits flush"). A ray still IN a medium (curMed != 0, and only a
 		// transmissive material is ever a medium) that arrives at an
@@ -1770,7 +1807,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			// the entry sub-voxel's material, by the same rule the fine
 			// rung uses: the cell's own where the mask is set, AIR where
 			// it is not
-			float subIdx = subvoxSolid(hi - vec3(SUBV_R0), su) ? idx : 0.0;
+			float subIdx = fineSolid(hi, su) ? idx : 0.0;
 			if (subIdx == curMed) {
 				// no interface at the 1 m face — the ray is still in its
 				// own medium. Descend; the mask boundary inside the cell
@@ -2380,9 +2417,9 @@ bool pointSolid(vec3 x)
 	if (s.a <= MAT_AIR_MAX)
 		return false;
 	vec4 pal = matPal(s.a);
-	if (!(matFine(pal) && inSubvoxRing(c)))
+	if (!(matFine(pal) && fineAt(c)))
 		return true;
-	return subvoxSolid(c - vec3(SUBV_R0), floor((x - c) * SUBV));
+	return fineSolid(c, floor((x - c) * SUBV));
 }
 
 vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
@@ -3443,7 +3480,7 @@ void main(void)
 		vec3 leafBack = vec3(1.0);
 		if (claudeLeafTransmit > 0.5 && hitIdx > 0.5 && view == 0
 				&& abs(matHot(hitIdx) - 3.0) < 0.5 && matFine(hitPal)
-				&& inSubvoxRing(cell)) {
+				&& fineAt(cell)) {
 			alb = min(alb, vec3(0.5));
 			vec3 x1 = hp - n * (1.5 * RUNG_FINE);
 			vec3 x2 = hp - n * (2.5 * RUNG_FINE);
