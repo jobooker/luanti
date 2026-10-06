@@ -2502,6 +2502,17 @@ uniform vec3 cascade3Origin;
 uniform vec3 cascade4Origin;
 uniform float claudeFarLevels;      // valid levels from 0 out (0 = none)
 uniform float claudeFarOnly;        // INSTRUMENT: 1 = skip the 1 m grid
+uniform float claudeFarLeafMedium;  // 1 = far leaf cells are a cloud of sheets
+// A LEAF BLOCK'S OPTICAL DEPTH PER METRE, PER AXIS (2026-10-06). Geometry,
+// not tuning: the leaf model is six perforated 1/16 sheets
+// (claude_models.leaf_sheets), and the share of axis-parallel rays that
+// miss every voxel of a block is T_x = T_z = 0.043, T_y = 0.184 (mean of
+// the six leaf models; -ln T = 3.147 / 1.695 / 3.147). A ray of direction
+// d meets x-sheets at a rate |d.x| per metre of x travelled, so a far cell
+// of leaf density rho attenuates as rho * dot(|d|, LEAF_SIGMA) per metre.
+// APPROXIMATION: sheet families treated as independently placed; the
+// oblique transmission of one real block is not measured yet.
+const vec3 LEAF_SIGMA = vec3(3.147, 1.695, 3.147);
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
 bool g_lastFar = false;
@@ -2593,9 +2604,12 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 			vec4 pal0 = matPalIdx(idx);
 			if (!matTransmits(idx, pal0)) {
 				// the box test, inside this cell's stretch of the ray
-				vec3 bb = floor(texture3D(claudeCascadeBox,
+				vec4 bx4 = texture3D(claudeCascadeBox,
 						(vec3(c.x, c.y, c.z + 128.0 * float(k)) + 0.5)
-						/ vec3(128.0, 128.0, 640.0)).rgb * 255.0 + 0.5);
+						/ vec3(128.0, 128.0, 640.0));
+				vec3 bb = floor(bx4.rgb * 255.0 + 0.5);
+				float rho = (claudeFarLeafMedium > 0.5 && bx4.a < 0.999)
+						? bx4.a * 255.0 / 254.0 : -1.0;
 				float unit = max(1.0, h / 16.0);
 				vec3 blo = org + c * h + mod(bb, 16.0) * unit;
 				vec3 bhi = org + c * h + (floor(bb / 16.0) + 1.0) * unit;
@@ -2608,7 +2622,22 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 				float tx = min(min(tf.x, tf.y), tf.z);
 				float c0 = t * h;
 				float c1 = min(sideDist.x, min(sideDist.y, sideDist.z)) * h;
-				if (te <= tx && tx >= c0 && te <= c1) {
+				if (te <= tx && tx >= c0 && te <= c1 && rho > 0.0) {
+					// a cloud of leaf sheets: free flight inside the box's
+					// stretch of this cell; the sheet family met is the
+					// one whose exponential came first
+					vec3 w3 = abs(rd) * LEAF_SIGMA * rho;
+					float sig = w3.x + w3.y + w3.z;
+					float a0 = max(te, c0), a1 = min(tx, c1);
+					float s = -log(max(1e-7, 1.0 - rnd1())) / max(sig, 1e-6);
+					if (a0 + s < a1) {
+						tIn = (a0 + s) / h;
+						float u = rnd1() * sig;
+						ax = u < w3.x ? 0 : (u < w3.x + w3.y ? 1 : 2);
+					} else {
+						hitHere = false;
+					}
+				} else if (te <= tx && tx >= c0 && te <= c1) {
 					if (te > c0) {
 						tIn = te / h;
 						ax = (tn.x >= tn.y && tn.x >= tn.z) ? 0

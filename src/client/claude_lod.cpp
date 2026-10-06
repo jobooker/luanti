@@ -200,7 +200,11 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 			bmx[sub][oct][0] = std::max(bmx[sub][oct][0], lx);
 			bmx[sub][oct][1] = std::max(bmx[sub][oct][1], ly);
 			bmx[sub][oct][2] = std::max(bmx[sub][oct][2], lz);
-			if (f.drawtype == NDT_ALLFACES_OPTIONAL)
+			// leaves: ALLFACES_OPTIONAL as registered, ALLFACES once
+			// leaves_style = fancy has resolved it at load (until
+			// 2026-10-06 only the first was counted, so no far cell was
+			// ever a leaf cell)
+			if (f.drawtype == NDT_ALLFACES_OPTIONAL || f.drawtype == NDT_ALLFACES)
 				s.leaf[sub]++;
 		}
 		// COLOUR IS WHAT YOU SEE: a node's colour counts toward its cell
@@ -647,7 +651,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// MAJORITY, at least half the cell (ADR-0010; was >= 62 %, see the
 	// octant rule in summarizeBlock for why)
 	const u32 half = (u32)((u32)CELL * CELL * CELL / 2);
-	u32 solid_cells = 0;
+	u32 solid_cells = 0, leaf_cells = 0;
 	size_t i = 0;
 	for (int cz = 0; cz < N; cz++)
 	for (int cy = 0; cy < N; cy++)
@@ -691,8 +695,24 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			for (int a = 0; a < 3; a++)
 				boxes[i * 4 + a] = (u8)(0 | ((CELL / unit - 1) << 4));
 		}
+		// alpha: 255 = a solid box. A LEAF cell carries instead its leaf
+		// density inside the box (leaf nodes / box volume, 1..254), which the
+		// shader walks as a statistical cloud of leaf sheets
+		// (claude_far_leaf_medium) rather than a solid lump.
 		boxes[i * 4 + 3] = 255;
+		if (cls == matidx[1]) {
+			u32 vol = 1;
+			for (int a = 0; a < 3; a++)
+				vol *= (u32)((bxmax[i * 3 + a] / unit) - (bxmin[i * 3 + a] / unit) + 1)
+						* unit;
+			float rho = std::min(1.0f, (float)leaf_acc[i] / (float)std::max(vol, 1u));
+			boxes[i * 4 + 3] = (u8)std::clamp((int)std::lround(rho * 254.0f), 1, 254);
+			leaf_cells++;
+		}
 	}
+	// INSTRUMENT: how many cells the leaf medium can act on
+	infostream << "[claude_lod] level cell " << CELL << " m: " << solid_cells
+			<< " cells, " << leaf_cells << " leaf" << std::endl;
 	return solid_cells;
 }
 

@@ -1,0 +1,7 @@
+{"name": "far-leaves", "frames": 2048,
+ "views": {"overlook": {"pos": [60, 44.5, 60], "yaw": 45, "pitch": -35, "time": 0.45},
+           "overlook-low": {"pos": [60, 44.5, 60], "yaw": 45, "pitch": -15, "time": 0.45}},
+ "reference": "near",
+ "arms": {"near": {"claude_cascades": 1, "claude_exposure": 0.06},
+          "solid": {"claude_cascades": 1, "claude_far_only": 1, "claude_exposure": 0.06},
+          "medium": {"claude_cascades": 1, "claude_far_only": 1, "claude_far_leaf_medium": 1, "claude_exposure": 0.06}}}

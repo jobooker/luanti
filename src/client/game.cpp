@@ -1340,6 +1340,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// ray starts in the far ladder, so one scene can be photographed at
 	// 1 m and folded to 2 m from the same camera (the LOD energy referee).
 	CachedPixelShaderSetting<float, 1, false> m_far_only_pixel{"claudeFarOnly"};
+	// claude_far_leaf_medium: 1 = a far leaf cell is a statistical cloud of
+	// leaf sheets (light passes with the leaves' own geometric odds), 0 = a
+	// solid lump (far view v1). Judged, not assumed (spec/measured.md).
+	CachedPixelShaderSetting<float, 1, false> m_far_leaf_medium_pixel{"claudeFarLeafMedium"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
@@ -3080,6 +3084,10 @@ public:
 							? g_settings->getFloat("claude_far_only", 0.0f, 1.0f)
 							: 0.0f;
 					m_far_only_pixel.set(&fo, services);
+					float flm = g_settings->exists("claude_far_leaf_medium")
+							? g_settings->getFloat("claude_far_leaf_medium", 0.0f, 1.0f)
+							: 0.0f;
+					m_far_leaf_medium_pixel.set(&flm, services);
 					g_claude_grid.far_levels_live = nf;
 				}
 				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};

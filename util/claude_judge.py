@@ -114,12 +114,24 @@ def flip_still(test, ref, map_out=None):
     return float(mean)
 
 
+def clipped(img):
+    """share of pixels at the top of the range in any channel: a judge fed
+    a blown-out reference is blind there (CLAUDE.md: instruments must
+    check their inputs carry live signal)"""
+    return float((img.max(axis=2) >= 250).mean())
+
+
 def still(test, ref, map_out=None):
     """test, ref: HxWx3 uint8 sRGB. Returns the scorecard."""
     shape = display()["resolution"][::-1]
     t, r = fit(test, shape), fit(ref, shape)
-    return {"jod": jod_still(t, r), "flip": flip_still(test, fit(ref, test.shape[:2]), map_out),
-            "brightness": brightness_ratio(test, fit(ref, test.shape[:2]))}
+    out = {"jod": jod_still(t, r), "flip": flip_still(test, fit(ref, test.shape[:2]), map_out),
+           "brightness": brightness_ratio(test, fit(ref, test.shape[:2])),
+           "ref_clipped": clipped(ref)}
+    if out["ref_clipped"] > 0.05:
+        out["warning"] = "reference %.0f%% clipped: the judge is blind there; lower the exposure" \
+            % (100 * out["ref_clipped"])
+    return out
 
 
 def load_dump(d):
