@@ -2724,7 +2724,21 @@ void main(void)
 	float primaryT = DEPTH_MISS; // for the depth channel + view 4
 	vec3 primaryN = vec3(0.0);   // view 1
 	vec3 primaryAlb = vec3(0.0); // view 2
-	bool primaryClear = false;   // the denoiser leaves glass/water alone
+	bool primaryClear = false;   // the camera ray's first hit is glass/water
+	// THE DENOISER'S GUIDE SURFACE (2026-10-06): the first non-transmissive
+	// surface the camera ray reaches through any number of glass/water
+	// crossings -- the primary hit itself for an opaque first hit, the
+	// surface BEHIND the window for a window. Recorded only by samples that
+	// got there by transmitting (a sample that reflects off the glass, or
+	// scatters in the air first, records nothing this frame and the pixel
+	// keeps its previous guide), so a window is not "two surfaces".
+	bool guideOn = true;     // still on the camera's specular-transmit chain
+	bool guideSet = false;
+	bool guideSky = false;   // the chain escaped to the sky
+	vec3 guideN = vec3(0.0);
+	vec3 guideP = vec3(0.0);
+	vec3 guideAlb = vec3(1.0);
+	vec3 guideLe = vec3(0.0);
 	vec3 primaryLe = vec3(0.0);  // view 3
 	bool primaryHit = false;
 	float pathBounces = 0.0;     // view 5: scatters actually taken
@@ -3211,6 +3225,25 @@ void main(void)
 						vec3(1.0)), vec3(ALBEDO_FLOOR));
 			primaryAlb = a0;
 		}
+		if (guideOn && !guideSet && hitS) {
+			vec4 mp0 = curMed < 0.5 ? vec4(0.0) : matPalIdx(curMed);
+			bool iface = matTransmits(curMed, mp0)
+					&& matTransmits(hitIdx, hitPal) && hitIdx > 0.5;
+			if (!iface) {
+				vec3 g0 = alb;
+				if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
+						&& !matTransmits(hitIdx, hitPal))
+					g0 = max(min(g0 * pow(faceTileRatio(cell, hp, n),
+							vec3(2.2)), vec3(1.0)), vec3(ALBEDO_FLOOR));
+				guideSet = true;
+				guideN = n;
+				guideP = p + dir * tHit;
+				guideAlb = g0;
+				guideLe = le;
+			}
+		}
+		if (guideOn && !guideSet && !hitS)
+			guideSky = true;
 		// AIR (2026-10-04). On a segment travelled in air, sample where the
 		// ray would next interact with the air: s ~ sigma_t exp(-sigma_t s).
 		// Before the surface (or the grid's edge) it scatters or is
@@ -3255,6 +3288,7 @@ void main(void)
 				prevX = xa;
 				misArmed = nLights > 0 || skyNee;
 				coneArmed = false;   // air vertices do not aim at flames
+				guideOn = false;     // off the camera's transmit chain
 				dir = nd;
 				p = xa;
 				pathBounces += 1.0;
@@ -3447,6 +3481,7 @@ void main(void)
 			float ur = rnd1();
 			if (ur < R) {
 				dir = reflect(dir, n);
+				guideOn = false;  // a reflection is not the window's view
 				p = hp;           // the restart march() already clamped
 				                  // into the cell the ray came THROUGH
 			} else {
@@ -3717,17 +3752,20 @@ void main(void)
 	outDirect = vec4(mix(prevD, freshD, a), a < 1.0 ? min(nPix + 1.0, 4096.0) : 1.0);
 
 	// the denoiser's guide and moments (see historyGbuf / historyMom)
-	vec3 albNow = primaryHit ? max(primaryAlb, vec3(ALBEDO_FLOOR)) : vec3(1.0);
+	vec3 albNow = guideSet ? max(guideAlb, vec3(ALBEDO_FLOOR)) : vec3(1.0);
 	float faceCode = 0.0;
+	// no fresh guide this frame (a reflection, or fog before the window):
+	// keep what the pixel had
+	bool guideFresh = guideSet || guideSky;
 	// glowing surfaces get code 0 too (2026-10-05): their light is their
 	// own, so "radiance / albedo" there is not the light falling on them,
 	// and the eye's white (claude_exposure) must not read them as such
-	if (primaryHit && !primaryClear && view == 0
-			&& !any(greaterThan(primaryLe, vec3(0.0)))) {
-		vec3 an = abs(primaryN);
+	if (guideSet && view == 0
+			&& !any(greaterThan(guideLe, vec3(0.0)))) {
+		vec3 an = abs(guideN);
 		float ax = an.x > 0.5 ? 0.0 : (an.y > 0.5 ? 1.0 : 2.0);
-		float sgn = (primaryN.x + primaryN.y + primaryN.z) > 0.0 ? 1.0 : 0.0;
-		vec3 hpP = ro + rd * primaryT;
+		float sgn = (guideN.x + guideN.y + guideN.z) > 0.0 ? 1.0 : 0.0;
+		vec3 hpP = guideP;
 		float coord = ax < 0.5 ? hpP.x : (ax < 1.5 ? hpP.y : hpP.z);
 		float q = clamp(floor(coord * 16.0 + 0.5), 0.0, 4095.0);
 		faceCode = 1.0 + (ax * 2.0 + sgn) * 4096.0 + q;
@@ -3738,7 +3776,7 @@ void main(void)
 	// because code 0 is never filtered. A clear sky is analytic and has no
 	// variance, so the filter leaves it exactly alone. claude_exposure's
 	// eye white skips this code (sky radiance is not light on a surface).
-	if (!primaryHit && view == 0)
+	if (guideSky && view == 0)
 		faceCode = SKY_FACE_CODE;
 	vec3 albAcc = albNow;
 	float m2 = 0.0;
@@ -3751,6 +3789,14 @@ void main(void)
 		vec4 hm = texture2D(historyMom, huv);
 		if (all(lessThan(abs(hg.rgb), vec3(1e6))) && hm.g > 0.0
 				&& hm.g <= 1.0 && hm.r >= 0.0 && hm.r < 1e12) {
+			if (!guideFresh) {
+				// no guide this frame: the history's guide stands
+				faceCode = hg.a;
+				albNow = max(hg.rgb, vec3(ALBEDO_FLOOR));
+				lD = dot(fresh / albNow, vec3(0.2126, 0.7152, 0.0722));
+				m2 = lD * lD;
+				m1 = lD;
+			}
 			albAcc = mix(hg.rgb, albNow, a);
 			m2 = mix(hm.r, m2, a);
 			m1 = mix(hm.b, m1, a);
@@ -3765,7 +3811,8 @@ void main(void)
 			// "the denoiser"): letting its face-to-face contrast into the
 			// clean pixels' estimate blurred their real light gradients,
 			// and a 4000-frame image moved by up to 21/255 along edges.
-			if (faceCode > 0.5 && (hg.a < -0.5 || abs(hg.a - faceCode) > 0.5))
+			if (guideFresh && faceCode > 0.5
+					&& (hg.a < -0.5 || abs(hg.a - faceCode) > 0.5))
 				faceCode = -faceCode;
 		}
 	}
