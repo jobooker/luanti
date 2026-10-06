@@ -272,6 +272,8 @@ public:
 	// caller must do a full re-walk because the list it just got is not
 	// the whole truth. Half the changes is a corrupted grid.
 	bool takeClaudeDirtyBlocks(std::vector<v3s16> &out);
+	// cheap per-frame question: has the world changed since the last drain?
+	bool claudeHasDirty() const { return !m_claude_dirty_blocks.empty() || m_claude_dirty_overflow; }
 
 	void setPlayerControl(PlayerControl &control);
 

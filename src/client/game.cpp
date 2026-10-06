@@ -1416,6 +1416,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_far_leaf_medium_pixel{"claudeFarLeafMedium"};
 	// claude_far_plants: 1 (default) = far grass and flowers as a layer of blades
 	CachedPixelShaderSetting<float, 1, false> m_far_plants_pixel{"claudeFarPlants"};
+	// claude_pixel_reset: 1 (default) = a pixel whose surface changed drops
+	// its own history at rest, instead of the frame keeping a ghost
+	CachedPixelShaderSetting<float, 1, false> m_pixel_reset_pixel{"claudePixelReset"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
@@ -3167,6 +3170,10 @@ public:
 							? g_settings->getFloat("claude_far_plants", 0.0f, 1.0f)
 							: 1.0f;
 					m_far_plants_pixel.set(&fpl, services);
+					float pxr = g_settings->exists("claude_pixel_reset")
+							? g_settings->getFloat("claude_pixel_reset", 0.0f, 1.0f)
+							: 1.0f;
+					m_pixel_reset_pixel.set(&pxr, services);
 					g_claude_grid.far_levels_live = nf;
 				}
 				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};
@@ -5541,8 +5548,12 @@ static bool claudeTraceGridIncremental(Client *client)
 	u64 emit_us = porting::getTimeUs() - temit;
 	V.last_snap_ms = porting::getTimeMs();
 	// let the accumulator adapt to new world content within ~1s even
-	// when deeply converged (placed torches shouldn't fade in slowly)
-	if (V.still_frames > 10.0f)
+	// when deeply converged (placed torches shouldn't fade in slowly).
+	// claude_world_clamp = 0 (EXPERIMENT, 2026-10-06): no frame-wide
+	// clamp; changed surfaces restart per pixel (claude_pixel_reset) and
+	// changed light lingers until a light-change detector exists
+	if (V.still_frames > 10.0f && (!g_settings->exists("claude_world_clamp")
+			|| g_settings->getFloat("claude_world_clamp", 0.0f, 1.0f) > 0.5f))
 		V.still_frames = 10.0f;
 	actionstream << "[claude_grid] incremental " << changed << "/"
 			<< marked << " blocks box=(" << cx0 << "," << cy0 << ","
@@ -6450,6 +6461,16 @@ void Game::run()
 			pl->setPosition(v3f(k.x, k.y, k.z) * BS);
 			pl->setSpeed(v3f(0.0f, 0.0f, 0.0f));
 		}
+		// WORLD CHANGES REACH THE LIGHT WITHIN A FRAME (claude_grid_drain,
+		// default 1, 2026-10-06). The 1 Hz settings poll used to be the
+		// only drain, so a moving light stood still for the tracer for up
+		// to a second: the moving-light test's real-time arms never saw the
+		// light move in 1.6 s. One incremental update costs ~3 ms (one
+		// 16^3 grid block), paid only on frames that changed something.
+		if (g_claude_grid.valid && client->claudeHasDirty()
+				&& (!g_settings->exists("claude_grid_drain")
+					|| g_settings->getFloat("claude_grid_drain", 0.0f, 1.0f) > 0.5f))
+			claudeTraceGridIncremental(client);
 		if (g_mover_request_set) {
 			g_mover_request_set = false;
 			claudeLoadMover(client, g_mover_request);

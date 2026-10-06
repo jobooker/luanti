@@ -2519,6 +2519,7 @@ const vec3 LEAF_SIGMA = vec3(3.147, 1.695, 3.147);
 // mostly blades. Ferns are within 15 %.
 const vec3 GRASS_SIGMA = vec3(0.758, 0.116, 0.618);
 uniform float claudeFarPlants;      // 1 = far plants as a layer of blades
+uniform float claudePixelReset;     // 1 = a pixel whose surface changed drops its own history
 bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
@@ -4125,6 +4126,24 @@ void main(void)
 	vec3 fresh = max(L, vec3(0.0));
 	vec3 prev = fresh;
 	float a = 1.0;
+	// THE PIXEL'S SURFACE, NOW (the same code the denoiser's guide stores;
+	// glowing surfaces 0, the sky its own code). Computed here so a pixel
+	// can tell, at rest, that it is looking at something else than its
+	// history did.
+	float faceNow = -1.0;   // -1: no fresh guide this frame
+	if ((guideSet || guideSky) && view == 0) {
+		faceNow = 0.0;
+		if (guideSet && !any(greaterThan(guideLe, vec3(0.0)))) {
+			vec3 an0 = abs(guideN);
+			float ax0 = an0.x > 0.5 ? 0.0 : (an0.y > 0.5 ? 1.0 : 2.0);
+			float sg0 = (guideN.x + guideN.y + guideN.z) > 0.0 ? 1.0 : 0.0;
+			float co0 = ax0 < 0.5 ? guideP.x : (ax0 < 1.5 ? guideP.y : guideP.z);
+			faceNow = 1.0 + (ax0 * 2.0 + sg0) * 65536.0
+					+ clamp(floor((co0 + 1024.0) * 16.0 + 0.5), 0.0, 65535.0);
+		}
+		if (guideSky)
+			faceNow = SKY_FACE_CODE;
+	}
 	vec2 huv = uv;          // where this pixel's history lives
 	float nPix = 0.0;       // samples behind it (direct buffer alpha)
 	if (accumAlpha < 0.999) {
@@ -4178,7 +4197,46 @@ void main(void)
 				a = accumAlpha;
 #ifdef CLAUDE_SPLIT_OUT
 				nPix = texture2D(historyDirect, huv).a;
+				// THE PIXEL'S OWN COUNT RULES WHEN IT IS YOUNGER than the
+				// frame's: a pixel that started over (below) must average
+				// its next samples by 1/(n+1), not by the frame's 1/500,
+				// or it stays stuck near its first noisy sample (seen
+				// 2026-10-06: dark patches lasting 60+ frames where a
+				// light had been)
+				if (claudePixelReset > 0.5)
+					a = max(a, 1.0 / (nPix + 1.0));
 #endif
+				// A SURFACE CHANGE IS THIS PIXEL'S RESET, NOT THE FRAME'S
+				// (claude_pixel_reset, 2026-10-06): at rest the whole image
+				// shares one weight, so a moved light left glowing ghosts at
+				// every place it had been (moving-light test: +30 %
+				// brightness, -2.7 JOD). A pixel whose face code differs from
+				// its history's starts over; a MIXED pixel (negative code: an
+				// edge that sees two faces) is exempt, or edges would never
+				// converge.
+				// ...BUT ONLY FOR A SURFACE NO NEIGHBOUR HAD: the camera ray
+				// is jittered inside its pixel, so an edge pixel flips
+				// between two faces frame to frame, and resetting it on
+				// every flip would never let an edge converge. A face
+				// that a 3x3 neighbour's history already showed is that
+				// jitter; a face none of them showed is new.
+				float hFace = texture2D(historyGbuf, huv).a;
+				if (claudePixelReset > 0.5 && faceNow >= 0.0 && hFace >= 0.0
+						&& abs(hFace - faceNow) > 0.5) {
+					bool seen = false;
+					for (int dy = -1; dy <= 1; dy++)
+					for (int dx = -1; dx <= 1; dx++) {
+						float nf = texture2D(historyGbuf,
+								huv + vec2(float(dx), float(dy)) * texelSize0).a;
+						if (abs(abs(nf) - faceNow) < 0.5)
+							seen = true;
+					}
+					if (!seen) {
+						prev = fresh;
+						a = 1.0;
+						nPix = 0.0;
+					}
+				}
 			}
 		}
 	}
