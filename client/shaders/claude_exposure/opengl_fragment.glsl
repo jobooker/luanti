@@ -6,19 +6,16 @@
 // (geometric mean) because brightness is perceived in ratios: one bright
 // window must not set the exposure for a dark room.
 //
-// TARGET. The scene's average maps to a KEY value, and the key itself
-// falls in the dark: a dim scene is shown dimmer than a bright one,
-// which is how vision works (you see that it is night). Krawczyk,
-// Myszkowski & Seidel 2005, "Lightness perception in tone reproduction
-// for HDR images":  key = 1.03 - 2 / (2 + log10(L + 1)),  L in cd/m2.
-// LITERATURE VALUE, not fitted here.
+// TARGET. A camera's: ISO 2720 metering (see main()). Dimmed in the dark
+// by Krawczyk et al. 2005's key, key = 1.03 - 2 / (2 + log10(L + 1)), L in
+// cd/m2, relative to daylight -- a rule of thumb by its authors' account.
 //
 // ADAPT. In log brightness, toward the target with a time constant:
 // claudeAdaptBrighter when the scene got brighter (light adaptation, fast
 // in life), claudeAdaptDarker when it got darker (dark adaptation, slow).
 // Those two are John's call (game.cpp m_adapt_*).
 //
-// OUT: .r = the exposure factor (ACES input for the key, over adapted L),
+// OUT: .r = the exposure factor (ISO metering x the dark's dimming, / L),
 // .g = 1 (written), .b = log2 of the adapted luminance, .a = log2 of
 // this frame's measured luminance.
 
@@ -99,15 +96,21 @@ void main(void)
 	}
 	float L = exp2(adapted);                 // renderer units
 	float Lcd = L * claudeUnitCdm2;          // cd/m2
+	// THE CAMERA: ISO 2720 reflected-light metering, calibration K = 12.5
+	// at ISO 100 with the saturation-based constant q = 0.65 -> 1.2, the
+	// form Lagarde & de Rousiers (Frostbite, "Moving Frostbite to PBR")
+	// and Luanti's own update_exposure use: exposure = 1 / (9.6 L_avg).
+	// Scale-free, so it holds in renderer units too. (Until 2026-10-06 the
+	// target was Krawczyk's key mapped through Reinhard: a rule of thumb
+	// that made daylight about one stop too bright -- the sunlit forest
+	// floor clipped; at 0.5x it read like the raster renderer's colours.)
+	// THE DARK: Krawczyk 2005's key still falls in dim scenes, so night
+	// is shown darker than day. It is used RELATIVE to its value at
+	// 1000 cd/m2 (ordinary daylight), capped at 1, so it only ever dims.
+	// TUNED: the 1000 cd/m2 reference | learn by: John's eye at dusk.
 	float key = max(1.03 - 2.0 / (2.0 + log(Lcd + 1.0) / log(10.0)), 0.02);
-	// THE KEY BELONGS TO REINHARD'S CURVE, display = x / (1 + x), which is
-	// what Krawczyk et al. used it with. This renderer shows through ACES
-	// (claude_present), which lifts the same input higher (0.18 -> 0.27
-	// against Reinhard's 0.15). So aim for the same DISPLAY value the
-	// published method gives the average: y = key / (1 + key), and find
-	// the ACES input that produces it (the Narkowicz fit, inverted).
-	float y = key / (1.0 + key);
-	float qa = 2.51 - 2.43 * y, qb = 0.03 - 0.59 * y, qc = -0.14 * y;
-	float x = (-qb + sqrt(qb * qb - 4.0 * qa * qc)) / (2.0 * qa);
+	float keyDay = 1.03 - 2.0 / (2.0 + log(1001.0) / log(10.0));
+	float dim = min(key / keyDay, 1.0);
+	float x = dim / 9.6;
 	gl_FragColor = vec4(x / L, 1.0, adapted, now);
 }
