@@ -1491,6 +1491,14 @@ bool fineSolid(vec3 cell, vec3 sv)
 			: modelVoxelSolid(cell, sv);
 }
 
+// INSTRUMENT (claude_view 21, 2026-10-06): every walk step and every ray
+// this pixel spends in one frame, all bounces and shadow rays included.
+// John: "the math for the axis-aligned blocks is supposed to be so simple
+// that caching isn't that much different than a lookup table" -- each step
+// IS about a lookup; this counts how many lookups a frame actually takes.
+float g_steps = 0.0;
+float g_rays = 0.0;
+
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
@@ -1585,6 +1593,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 	}
 
 	for (int i = 0; i < WALK_STEPS; i++) {
+		g_steps += 1.0;
 		// ONE STEP OF THE WALK, at whatever size the walk is currently
 		// set to. These are the same three lines at 1 m and at 1/16 m;
 		// the rung is in delta and lim, not in a branch. Advance first,
@@ -1892,6 +1901,7 @@ bool march(vec3 ro, vec3 rd, out vec3 hp, out vec3 n, out vec3 alb,
 	vec4 pal;
 	float idx;
 	vec3 far;
+	g_rays += 1.0;
 	return marchMed(ro, rd, 0.0, hp, n, alb, le, tHit, cellOut, pal, idx,
 			far);
 }
@@ -2595,6 +2605,7 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 			: 128.0 * farCellSize(k - 1) / h;
 	pExit = p0;
 	for (int i = 0; i < FAR_STEPS; i++) {
+		g_steps += 1.0;
 		if (any(lessThan(c, vec3(0.0))) || any(greaterThanEqual(c, vec3(128.0)))
 				|| (fSize > 0.0 && all(greaterThanEqual(c, fLo))
 					&& all(lessThan(c, fLo + vec3(fSize))))) {
@@ -2767,6 +2778,7 @@ bool marchAll(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 {
 	g_lastFar = false;
 	g_farMedium = false;
+	g_rays += 1.0;
 	if (farLevelCount() == 0 && nearOn())
 		return marchMed(ro, rd, curMed, hp, n, alb, le, tHit, cellOut,
 				palOut, idxOut, hpFar);
@@ -4116,6 +4128,12 @@ void main(void)
 		L = dbg; // view 5 falls through into the accumulator
 	}
 
+	if (view == 21) {
+		// R = steps / 4096, G = rays / 64, B = steps per ray / 256 (linear)
+		gl_FragColor = vec4(g_steps / 4096.0, g_rays / 64.0,
+				(g_steps / max(g_rays, 1.0)) / 256.0, 1.0);
+		return;
+	}
 	// --- accumulate ---------------------------------------------------
 	// history is LINEAR radiance in a 16F target; averaging must happen
 	// in linear light or jittered noise converges biased dark.

@@ -178,7 +178,7 @@ void main(void)
 	// directly, so ACES must not touch them.
 	if ((claudeView > 0.5 && claudeView < 5.5)
 			|| (claudeView > 6.5 && claudeView < 8.5)
-			|| (claudeView > 18.5 && claudeView < 20.5)) {
+			|| (claudeView > 18.5 && claudeView < 21.5)) {
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}
