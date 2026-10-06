@@ -349,6 +349,8 @@ uniform float claudeUnits;
 // loop. Only inside the sub-voxel ring: a coarse 1 m leaf cube is not a
 // sheet and stays opaque.
 uniform float claudeLeafTransmit;
+// the denoiser's face code for "this pixel sees the sky" (see outGbuf)
+const float SKY_FACE_CODE = 1.0 + 6.0 * 4096.0;
 // MIS: the BSDF half's density at an NEE vertex, as a multiple of cos/pi
 // (0.5 at a leaf, which sends half its paths to each side)
 float g_neeBScale = 1.0;
@@ -3187,6 +3189,28 @@ void main(void)
 		vec3 hpFar;
 		bool hitS = marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
 				hitPal, hitIdx, hpFar);
+		// THE PIXEL'S SURFACE IS THE CAMERA RAY'S FIRST HIT, WHETHER OR NOT
+		// THIS SAMPLE REACHES IT (2026-10-06). In air a camera ray may
+		// scatter before the surface (the block below `continue`s), and the
+		// primary record used to be written only further down, so in fog a
+		// third of the samples recorded "no surface": every pixel's face
+		// code flipped between frames, every pixel was MIXED, and the
+		// denoiser had no neighbours anywhere (fog-dawn A/B: x1.00). The
+		// geometry is the same for every sample of the pixel, so record it
+		// here; the face-tile albedo is the one the surface block applies.
+		if (seg == 0 && hitS) {
+			primaryHit = true;
+			primaryT = tHit;
+			primaryN = n;
+			primaryLe = le;
+			primaryClear = hitIdx > 0.5 && matTransmits(hitIdx, hitPal);
+			vec3 a0 = alb;
+			if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
+					&& !matTransmits(hitIdx, hitPal))
+				a0 = max(min(a0 * pow(faceTileRatio(cell, hp, n), vec3(2.2)),
+						vec3(1.0)), vec3(ALBEDO_FLOOR));
+			primaryAlb = a0;
+		}
 		// AIR (2026-10-04). On a segment travelled in air, sample where the
 		// ray would next interact with the air: s ~ sigma_t exp(-sigma_t s).
 		// Before the surface (or the grid's edge) it scatters or is
@@ -3708,6 +3732,14 @@ void main(void)
 		float q = clamp(floor(coord * 16.0 + 0.5), 0.0, 4095.0);
 		faceCode = 1.0 + (ax * 2.0 + sgn) * 4096.0 + q;
 	}
+	// THE SKY IS ONE SURFACE TOO (2026-10-06): a camera ray that escaped
+	// gets a code of its own (above every face code), so the denoiser may
+	// smooth the AIR in front of it -- fog over the sky stayed grainy,
+	// because code 0 is never filtered. A clear sky is analytic and has no
+	// variance, so the filter leaves it exactly alone. claude_exposure's
+	// eye white skips this code (sky radiance is not light on a surface).
+	if (!primaryHit && view == 0)
+		faceCode = SKY_FACE_CODE;
 	vec3 albAcc = albNow;
 	float m2 = 0.0;
 	float vfac = 1.0;
