@@ -340,6 +340,18 @@ uniform float claudeWaterAbsorb;
 //   LAVA   Kilauea's thermocouple 1140-1150 C, emissivity 0.95 (Fresnel,
 //          basaltic glass n = 1.55): 3,069 cd/m2. It REFLECTS 4.65 %.
 uniform float claudeUnits;
+// LEAVES TRANSMIT (claude_leaf_transmit, 2026-10-05). A leaf's
+// transmittance spectrum closely matches its reflectance spectrum (Xu &
+// Ye 2023, Sci. Rep. 13:4972, "solar spectral reflectance and
+// transmittance of natural leaves exhibit dramatic similarity"; after
+// Knipling 1970). So a fine leaf voxel is a thin Lambertian sheet with
+// tau = rho = its albedo (clamped to 0.5 so rho + tau <= 1). See the path
+// loop. Only inside the sub-voxel ring: a coarse 1 m leaf cube is not a
+// sheet and stays opaque.
+uniform float claudeLeafTransmit;
+// MIS: the BSDF half's density at an NEE vertex, as a multiple of cos/pi
+// (0.5 at a leaf, which sends half its paths to each side)
+float g_neeBScale = 1.0;
 const vec3 FLAME_RGB = vec3(2.6389, 0.6135, 0.0);
 const float FLAME_L = 15.0;
 const vec3 LAVA_RGB = vec3(3.42, 0.3886, 0.0);
@@ -1322,7 +1334,7 @@ void hotLaw(float idx, vec3 cell, bool fine, vec3 sv, inout vec3 alb,
 	if (claudeUnits < 0.5 || idx < 0.5)
 		return;
 	float hot = matHot(idx);
-	if (hot > 1.5) {
+	if (hot > 1.5 && hot < 2.5) {
 		le = FLAME_RGB * FLAME_L;
 	} else if (hot > 0.5) {
 		alb = vec3(LAVA_RHO);
@@ -2094,7 +2106,7 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	// neeDirect() decline a direction neePdfSa() still prices — the one
 	// asymmetry that actually loses energy.
 	float pdfL = dist2 / (float(nLights) * float(k) * cosY); // p_l, sa
-	float pdfB = cosX / PI;                                  // p_b, sa
+	float pdfB = g_neeBScale * cosX / PI;                                  // p_b, sa
 	float w = 1.0;
 	if (misOn > 0.5)
 		w = pdfL / (pdfL + pdfB);                        // balance
@@ -2349,12 +2361,28 @@ vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
 	if (!matFine(shpal) || !any(greaterThan(shle, vec3(0.0))))
 		return vec3(0.0);         // not a flame: not this estimator's
 	float pdfL = ptPdfSa(x, wi, nPts);
-	float pdfB = cosX / PI;
+	float pdfB = g_neeBScale * cosX / PI;
 	if (pdfL <= 0.0)
 		return vec3(0.0);
 	vec3 tr = curMed < 0.5 ? vec3(airTr(sht)) : medTr(curMed, sht);
 	// f Le cos / p_L, times the balance weight p_L / (p_L + p_B)
 	return (rho / PI) * shle * cosX / (pdfL + pdfB) * tr;
+}
+
+// Is the point x inside anything a ray would stop at? (leaf transmission's
+// "is there air behind this sheet")
+bool pointSolid(vec3 x)
+{
+	vec3 c = floor(x);
+	if (any(lessThan(c, vec3(0.0))) || any(greaterThanEqual(c, vec3(GRID_S))))
+		return false;
+	vec4 s = texture3D(claudeTraceGrid, (c + 0.5) / GRID_S);
+	if (s.a <= MAT_AIR_MAX)
+		return false;
+	vec4 pal = matPal(s.a);
+	if (!(matFine(pal) && inSubvoxRing(c)))
+		return true;
+	return subvoxSolid(c - vec3(SUBV_R0), floor((x - c) * SUBV));
 }
 
 vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
@@ -2396,7 +2424,7 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	// THE LAW: one sky. skyBody() here is the same evaluation the camera
 	// ray's escape runs — there is no second radiance for the shadow ray.
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos)); // p_sky, sa
-	float pdfB = cosX / PI;                  // p_b, sa
+	float pdfB = g_neeBScale * cosX / PI;                  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
 	vec3 tr = curMed < 0.5 ? vec3(airTr(airExitT(x, wi)))
@@ -3402,6 +3430,33 @@ void main(void)
 		// (view 6) is CLAY_RHO, clamped above. The depth cap cuts this
 		// term at the same vertex it cuts the BSDF half, so claudeBounces
 		// means the same thing under either dial.
+		// LEAVES TRANSMIT (see claudeLeafTransmit). A fine leaf voxel
+		// scatters to BOTH sides: half the paths go back out the front,
+		// half out through the sheet, each cosine-distributed, so f = rho/pi
+		// either side and the density is 0.5 cos/pi. xb is the first air
+		// behind the sheet: leaf blocks meet back to back, so a sheet may be
+		// two voxels thick, and the second one passes light only through
+		// its own colour once more (its inter-reflection is dropped: it can
+		// lose light, never make it).
+		bool leafT = false;
+		vec3 xb = hp;
+		vec3 leafBack = vec3(1.0);
+		if (claudeLeafTransmit > 0.5 && hitIdx > 0.5 && view == 0
+				&& abs(matHot(hitIdx) - 3.0) < 0.5 && matFine(hitPal)
+				&& inSubvoxRing(cell)) {
+			alb = min(alb, vec3(0.5));
+			vec3 x1 = hp - n * (1.5 * RUNG_FINE);
+			vec3 x2 = hp - n * (2.5 * RUNG_FINE);
+			if (!pointSolid(x1)) {
+				leafT = true;
+				xb = x1;
+			} else if (!pointSolid(x2)) {
+				leafT = true;
+				xb = x2;
+				leafBack = alb;
+			}
+		}
+		g_neeBScale = leafT ? 0.5 : 1.0;
 		if (nLights > 0) {
 			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
 			L += cN;
@@ -3423,8 +3478,24 @@ void main(void)
 			if (nScat < 0.5)
 				Ld += cP;
 		}
+		// the same three light samplers from BEHIND the sheet
+		if (leafT) {
+			vec3 tb = tp * leafBack;
+			vec3 cB = vec3(0.0);
+			if (nLights > 0)
+				cB += neeDirect(xb, -n, alb, nLights, 1.0, curMed);
+			if (skyNee)
+				cB += neeSky(xb, -n, alb, curMed);
+			if (nPts > 0)
+				cB += neePoint(xb, -n, alb, nPts, curMed);
+			L += tb * cB;
+			if (nScat < 0.5)
+				Ld += tb * cB;
+		}
+		g_neeBScale = 1.0;
 
-		tp *= alb;
+		// f cos / pdf = 2 rho for either side of a leaf; rho otherwise
+		tp *= leafT ? 2.0 * alb : alb;
 
 		// Russian roulette, unbiased: survivors carry 1/q.
 		if (seg + 1 >= RR_START) {
@@ -3438,13 +3509,16 @@ void main(void)
 
 		float u1 = rnd1();
 		float u2 = rnd1();
-		dir = cosineHemisphere(n, u1, u2);
+		bool through = leafT && rnd1() < 0.5;
+		dir = cosineHemisphere(through ? -n : n, u1, u2);
+		if (through)
+			tp *= leafBack;
 		// Arm the BSDF half of the MIS pair. Russian roulette above does
 		// not enter these pdfs: it scales the estimate by 1/q on the
 		// survivors, which leaves the SAMPLING DENSITY of the direction
 		// untouched, and the weights are densities.
-		prevX = hp;
-		prevPdfB = max(dot(n, dir), 0.0) / PI;
+		prevX = through ? xb : hp;
+		prevPdfB = (leafT ? 0.5 : 1.0) * abs(dot(n, dir)) / PI;
 		// Armed when ANY light sampler ran at this vertex: the area list,
 		// the sky, or both. Outdoors the list is often empty and the sky
 		// is the only light there is — leaving this at `nLights > 0`
@@ -3452,7 +3526,7 @@ void main(void)
 		// sky sampler was also paying it, i.e. the double count.
 		misArmed = nLights > 0 || skyNee || nPts > 0;
 		coneArmed = nPts > 0;
-		p = hp;
+		p = through ? xb : hp;
 		pathBounces += 1.0;
 		nScat += 1.0;
 	}

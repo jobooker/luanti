@@ -365,6 +365,7 @@ struct ClaudeTraceGrid
 	float dial_torch_nee = 0.0f;
 	float dial_units = 0.0f;
 	float dial_white_balance = 0.0f, dial_night_vision = 0.0f;
+	float dial_leaf_transmit = 0.0f;
 	// what the units law delivered this frame (lux), for claude_stats
 	float units_sky_lux = 0.0f, units_sun_lux = 0.0f, units_moon_lux = 0.0f;
 	float units_moon_phase = -1.0f;
@@ -580,8 +581,9 @@ struct ClaudeMatTexel {
 	// ABSORPTION, per metre of travel inside the medium, R/G/B (palette
 	// row 1, 2026-10-05). 0 for everything that is not a medium.
 	float absorb_r = 0.0f, absorb_g = 0.0f, absorb_b = 0.0f;
-	// HOT (row 1 .a): 0 = the emission law above, 1 = lava, 2 = flame.
-	// Read by claude_trace only under claude_units.
+	// SPECIAL LAW (row 1 .a): 0 = none, 1 = lava, 2 = flame (both read by
+	// claude_trace only under claude_units), 3 = a thin translucent leaf
+	// (claude_leaf_transmit).
 	float hot = 0.0f;
 };
 
@@ -731,6 +733,8 @@ static void claudeMatTableBuild()
 			g_claude_matpal[idx].hot = 1.0f;
 		if (m.kind == MATK_FIRE)
 			g_claude_matpal[idx].hot = 2.0f;
+		if (m.kind == MATK_LEAVES)
+			g_claude_matpal[idx].hot = 3.0f;
 		if (m.kind == MATK_LIQUID) {
 			g_claude_matpal[idx].absorb_r = CLAUDE_WATER_ABSORB_R;
 			g_claude_matpal[idx].absorb_g = CLAUDE_WATER_ABSORB_G;
@@ -1191,6 +1195,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_adapt_colour: seconds to adapt to a new light colour.
 	// TUNED: 3 s | learn by: John's eye, torch room <-> daylight.
 	float m_white_balance = 1.0f;
+	// claude_leaf_transmit (2026-10-05): 1 = a leaf sheet transmits as much
+	// as it reflects (see claude_trace); 0 = opaque leaves, as before.
+	float m_leaf_transmit = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_leaf_transmit_pixel{"claudeLeafTransmit"};
 	float m_night_vision = 1.0f;
 	float m_adapt_colour = 3.0f;
 	CachedPixelShaderSetting<float, 1, false> m_white_balance_pixel{"claudeWhiteBalance"};
@@ -1425,6 +1433,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_auto_exposure",
 		"claude_torch_nee",
 		"claude_white_balance",
+		"claude_leaf_transmit",
 		"claude_night_vision",
 		"claude_adapt_colour",
 		"claude_adapt_brighter",
@@ -1942,6 +1951,31 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			units_sun_alt = std::asin(std::clamp(sd.Y, -1.0f, 1.0f))
 					* 57.2957795f;
 			float e_lux = claudeSkyLux(units_sun_alt);
+			// THE TINT, FROM THE GAME'S CONFIGURED COLOURS (2026-10-05).
+			// getBgColor()/getSkyColor() are the RASTER sky's: eased a
+			// little every frame and pulled toward an "indoor" colour
+			// while the player cannot see sunlight. So the dome's shape
+			// depended on where the camera had just been (CI
+			// skyfurnace-050-nee1-sky-invariant, 2026-10-06: x1.0726 one
+			// arm after a sealed room). Here the configured day, dawn and
+			// night colours are blended by sun altitude instead: day above
+			// +10 deg, dawn at 0, night below -10.
+			// TUNED: the +-10 deg blend points (tint only; the brightness is
+			// claudeSkyLux) | learn by: John's eye on a sunrise.
+			{
+				const SkyColor &sc = m_sky->getSkyColors();
+				float a = units_sun_alt;
+				float f = a >= 0.0f ? std::min(a / 10.0f, 1.0f)
+						: std::min(-a / 10.0f, 1.0f);
+				v3f wh = skyLinear(sc.dawn_horizon), ws = skyLinear(sc.dawn_sky);
+				v3f oh = a >= 0.0f ? skyLinear(sc.day_horizon)
+						: skyLinear(sc.night_horizon);
+				v3f os = a >= 0.0f ? skyLinear(sc.day_sky)
+						: skyLinear(sc.night_sky);
+				horizon = wh + (oh - wh) * f;
+				zenith = ws + (os - ws) * f;
+				dome_e = (horizon * 0.2f + zenith * 0.8f) * (float)M_PI;
+			}
 			float y = 0.2126f * dome_e.X + 0.7152f * dome_e.Y
 					+ 0.0722f * dome_e.Z;
 			if (y < 1e-7f) {
@@ -2287,6 +2321,8 @@ public:
 			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		if (name == "claude_motion_alpha")
 			m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
+		if (name == "claude_leaf_transmit")
+			m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		if (name == "claude_white_balance")
 			m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		if (name == "claude_night_vision")
@@ -2396,6 +2432,7 @@ public:
 		m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
+		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_night_vision = readAir("claude_night_vision", 1.0f, 1.0f);
 		m_adapt_colour = readAir("claude_adapt_colour", 3.0f, 600.0f);
 		m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
@@ -2682,6 +2719,8 @@ public:
 				m_exposure_pixel.set(&m_exposure, services);
 				m_auto_exposure_pixel.set(&m_auto_exposure, services);
 				m_white_balance_pixel.set(&m_white_balance, services);
+				m_leaf_transmit_pixel.set(&m_leaf_transmit, services);
+				g_claude_grid.dial_leaf_transmit = m_leaf_transmit;
 				m_night_vision_pixel.set(&m_night_vision, services);
 				m_adapt_colour_pixel.set(&m_adapt_colour, services);
 				g_claude_grid.dial_white_balance = m_white_balance;
@@ -5339,6 +5378,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_units\": " << g_claude_grid.dial_units
 			<< ", \"claude_white_balance\": " << g_claude_grid.dial_white_balance
 			<< ", \"claude_night_vision\": " << g_claude_grid.dial_night_vision
+			<< ", \"claude_leaf_transmit\": " << g_claude_grid.dial_leaf_transmit
 			<< ", \"eye_white\": [" << g_claude_white[0] << ","
 			<< g_claude_white[1] << "," << g_claude_white[2] << ","
 			<< g_claude_white[3] << "]"

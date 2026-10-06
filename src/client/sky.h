@@ -98,6 +98,9 @@ public:
 	f32 getSunScale() const { return m_sun_params.scale; }
 	f32 getMoonScale() const { return m_moon_params.scale; }
 	f32 getBodyOrbitTilt() const { return m_sky_params.body_orbit_tilt; }
+	// the CONFIGURED day/dawn/night colours, before any per-player easing
+	// or indoor blending (claude_trace's real-units sky reads these)
+	const SkyColor &getSkyColors() const { return m_sky_params.sky_color; }
 	f32 getTimeOfDay() const { return m_time_of_day; }
 
 	void setStarsVisible(bool stars_visible) { m_star_params.visible = stars_visible; }
