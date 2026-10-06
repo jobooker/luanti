@@ -364,6 +364,7 @@ struct ClaudeTraceGrid
 	float dial_auto_exposure = 0.0f;
 	float dial_torch_nee = 0.0f;
 	float dial_units = 0.0f;
+	float dial_white_balance = 0.0f, dial_night_vision = 0.0f;
 	// what the units law delivered this frame (lux), for claude_stats
 	float units_sky_lux = 0.0f, units_sun_lux = 0.0f, units_moon_lux = 0.0f;
 	float units_moon_phase = -1.0f;
@@ -1184,6 +1185,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// TUNED: 0.5 s and 2.5 s | learn by: John's eye, walking into a cave
 	// and back out (an objective, his to set).
 	float m_auto_exposure = 1.0f;
+	// THE EYE (2026-10-05, DECISIONS 0s b/c): claude_white_balance scales
+	// the CIECAM02 degree of adaptation (1 = the standard, 0 = off);
+	// claude_night_vision: 1 = rods take over in the dark (Krawczyk 2005);
+	// claude_adapt_colour: seconds to adapt to a new light colour.
+	// TUNED: 3 s | learn by: John's eye, torch room <-> daylight.
+	float m_white_balance = 1.0f;
+	float m_night_vision = 1.0f;
+	float m_adapt_colour = 3.0f;
+	CachedPixelShaderSetting<float, 1, false> m_white_balance_pixel{"claudeWhiteBalance"};
+	CachedPixelShaderSetting<float, 1, false> m_night_vision_pixel{"claudeNightVision"};
+	CachedPixelShaderSetting<float, 1, false> m_adapt_colour_pixel{"claudeAdaptColour"};
 	float m_adapt_brighter = 0.5f;
 	float m_adapt_darker = 2.5f;
 	float m_frame_dt = 0.016f;
@@ -1412,6 +1424,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_exposure",
 		"claude_auto_exposure",
 		"claude_torch_nee",
+		"claude_white_balance",
+		"claude_night_vision",
+		"claude_adapt_colour",
 		"claude_adapt_brighter",
 		"claude_adapt_darker",
 		"claude_reproject",
@@ -2272,6 +2287,12 @@ public:
 			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		if (name == "claude_motion_alpha")
 			m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
+		if (name == "claude_white_balance")
+			m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
+		if (name == "claude_night_vision")
+			m_night_vision = readAir("claude_night_vision", 1.0f, 1.0f);
+		if (name == "claude_adapt_colour")
+			m_adapt_colour = readAir("claude_adapt_colour", 3.0f, 600.0f);
 		if (name == "claude_torch_nee")
 			m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
 		if (name == "claude_auto_exposure")
@@ -2374,6 +2395,9 @@ public:
 		m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
 		m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
+		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
+		m_night_vision = readAir("claude_night_vision", 1.0f, 1.0f);
+		m_adapt_colour = readAir("claude_adapt_colour", 3.0f, 600.0f);
 		m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
 		m_adapt_darker = readAir("claude_adapt_darker", 2.5f, 600.0f);
 		m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
@@ -2657,6 +2681,11 @@ public:
 				m_still_pixel.set(&m_still, services);
 				m_exposure_pixel.set(&m_exposure, services);
 				m_auto_exposure_pixel.set(&m_auto_exposure, services);
+				m_white_balance_pixel.set(&m_white_balance, services);
+				m_night_vision_pixel.set(&m_night_vision, services);
+				m_adapt_colour_pixel.set(&m_adapt_colour, services);
+				g_claude_grid.dial_white_balance = m_white_balance;
+				g_claude_grid.dial_night_vision = m_night_vision;
 				m_adapt_brighter_pixel.set(&m_adapt_brighter, services);
 				m_adapt_darker_pixel.set(&m_adapt_darker, services);
 				{
@@ -5308,6 +5337,11 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_auto_exposure\": " << g_claude_grid.dial_auto_exposure
 			<< ", \"claude_torch_nee\": " << g_claude_grid.dial_torch_nee
 			<< ", \"claude_units\": " << g_claude_grid.dial_units
+			<< ", \"claude_white_balance\": " << g_claude_grid.dial_white_balance
+			<< ", \"claude_night_vision\": " << g_claude_grid.dial_night_vision
+			<< ", \"eye_white\": [" << g_claude_white[0] << ","
+			<< g_claude_white[1] << "," << g_claude_white[2] << ","
+			<< g_claude_white[3] << "]"
 			<< ", \"auto_exposure\": [" << g_claude_auto_exposure[0] << ","
 			<< g_claude_auto_exposure[1] << "," << g_claude_auto_exposure[2]
 			<< "," << g_claude_auto_exposure[3] << "]"

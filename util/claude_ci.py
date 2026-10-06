@@ -255,6 +255,10 @@ CANONICAL_DIALS = {
     # lamps kept their brightness, so their answers do not move; the arms
     # that see sky or flames carry a camera exposure (ARM_EXPOSURE).
     "claude_units": 1,
+    # the eye's perception is display only and every referee inverts one
+    # plain transform: off in measurement (2026-10-05)
+    "claude_white_balance": 0,
+    "claude_night_vision": 0,
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which

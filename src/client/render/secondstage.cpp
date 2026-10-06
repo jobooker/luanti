@@ -374,8 +374,9 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	buffer->setTexture(TEXTURE_MOM_2, scale * trace_scale, "claude_mom_2", accum_format);
 	buffer->setTexture(TEXTURE_DEN_A, scale * trace_scale, "claude_den_a", accum_format);
 	buffer->setTexture(TEXTURE_DEN_B, scale * trace_scale, "claude_den_b", accum_format);
-	buffer->setTexture(TEXTURE_EXP_1, core::dimension2du(1, 1), "claude_exp_1", accum_format, /*clear:*/ true);
-	buffer->setTexture(TEXTURE_EXP_2, core::dimension2du(1, 1), "claude_exp_2", accum_format, /*clear:*/ true);
+	// 2x1 (2026-10-05): texel 0 = exposure, texel 1 = the adapted white
+	buffer->setTexture(TEXTURE_EXP_1, core::dimension2du(2, 1), "claude_exp_1", accum_format, /*clear:*/ true);
+	buffer->setTexture(TEXTURE_EXP_2, core::dimension2du(2, 1), "claude_exp_2", accum_format, /*clear:*/ true);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
@@ -426,7 +427,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	// slot, now happens in claude_denoise's last pass).
 	shader_id = client->getShaderSource()->getShaderRaw("claude_exposure");
 	PostProcessingStep *expo = pipeline->addStep<PostProcessingStep>(shader_id,
-			std::vector<u8> { TEXTURE_DEN_B, TEXTURE_EXP_1 });
+			std::vector<u8> { TEXTURE_DEN_B, TEXTURE_EXP_1, TEXTURE_GBUF_2 });
 	expo->setRenderSource(buffer);
 	expo->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
 			TEXTURE_EXP_2));
@@ -453,6 +454,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 }
 
 float g_claude_auto_exposure[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+float g_claude_white[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 void ClaudeExposureReadback::run(PipelineContext &context)
 {
@@ -469,6 +471,11 @@ void ClaudeExposureReadback::run(PipelineContext &context)
 	g_claude_auto_exposure[1] = px[2];
 	g_claude_auto_exposure[2] = px[3];
 	g_claude_auto_exposure[3] = px[1];
+	// texel 1: the adapted white's chroma (unit luminance), written flag
+	g_claude_white[0] = px[4];
+	g_claude_white[1] = px[5];
+	g_claude_white[2] = px[6];
+	g_claude_white[3] = px[7];
 	tex->unlock();
 }
 

@@ -3546,7 +3546,11 @@ void main(void)
 	// the denoiser's guide and moments (see historyGbuf / historyMom)
 	vec3 albNow = primaryHit ? max(primaryAlb, vec3(ALBEDO_FLOOR)) : vec3(1.0);
 	float faceCode = 0.0;
-	if (primaryHit && !primaryClear && view == 0) {
+	// glowing surfaces get code 0 too (2026-10-05): their light is their
+	// own, so "radiance / albedo" there is not the light falling on them,
+	// and the eye's white (claude_exposure) must not read them as such
+	if (primaryHit && !primaryClear && view == 0
+			&& !any(greaterThan(primaryLe, vec3(0.0)))) {
 		vec3 an = abs(primaryN);
 		float ax = an.x > 0.5 ? 0.0 : (an.y > 0.5 ? 1.0 : 2.0);
 		float sgn = (primaryN.x + primaryN.y + primaryN.z) > 0.0 ? 1.0 : 0.0;

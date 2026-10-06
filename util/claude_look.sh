@@ -68,7 +68,9 @@ defer = ["claude_grid_debug", "claude_descend", "claude_rng",
          "claude_air_scatter", "claude_air_absorb", "claude_air_g",
          "claude_bounces", "claude_denoise", "claude_water_absorb",
          "claude_split", "claude_reproject", "claude_auto_exposure",
-         "claude_adapt_brighter", "claude_adapt_darker", "claude_exposure"]
+         "claude_adapt_brighter", "claude_adapt_darker", "claude_exposure",
+         "claude_units", "claude_torch_nee", "claude_white_balance",
+         "claude_night_vision", "claude_adapt_colour"]
 look = {
     "claude_stats":      "1",
     # A human seat is not a measurement seat:

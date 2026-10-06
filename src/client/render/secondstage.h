@@ -61,6 +61,7 @@ private:
 // claude_stats.json (auto_exposure): [factor, log2 adapted luminance,
 // log2 measured luminance, written]. Display data, never fed back.
 extern float g_claude_auto_exposure[4];
+extern float g_claude_white[4];   // the eye's adapted white (claude_exposure texel 1)
 
 class ClaudeExposureReadback : public TrivialRenderStep
 {

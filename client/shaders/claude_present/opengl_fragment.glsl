@@ -17,6 +17,37 @@ uniform sampler2D depthmap;
 // .r = the factor to multiply by, .g = 1 once written
 uniform sampler2D autoExposure;
 uniform float claudeAutoExposure;
+// THE EYE (2026-10-05), both display only, both need real units:
+// claude_white_balance: CAT16 (Li et al. 2017) chromatic adaptation from
+//   the adapted white (claude_exposure texel 1) to the display white, at
+//   the EFFECTIVE degree of adaptation measured by Zhai & Luo 2017 (CIC25,
+//   "A study of neutral white and degree of chromatic adaptation", Eq. 1,
+//   display-colour fit): D = 0.709 (1 - 814 K / CCT). The warmer the
+//   light, the less the eye adapts to it, so torchlight stays warm. Their
+//   data span 3000-16000 K: firelight (1300-1900 K) is an EXTRAPOLATION.
+//   CCT by McCamy 1992. (The first version used CIECAM02's D, which is
+//   >= 0.82 at any colour: lava light turned the room pink.) The dial
+//   scales D; 1 = the published fit.
+// claude_night_vision: rods. Per pixel, sigma = 0.04 / (0.04 + Y), Y in
+//   cd/m2 (Hunt 1995 via Krawczyk 2005 eq. 4.7), and the displayed colour
+//   moves toward a grey of the same displayed luminance tinted
+//   (1.05, 0.97, 1.27), the blue shift (Krawczyk eq. 4.15). Per pixel, so
+//   a torch flame stays coloured while the moonlit field goes grey-blue.
+//   Not modelled: the night's loss of sharpness.
+uniform float claudeUnits;
+uniform float claudeUnitCdm2;
+uniform float claudeWhiteBalance;
+uniform float claudeNightVision;
+const vec3 LUMA_P = vec3(0.2126, 0.7152, 0.0722);
+// CAT16 x (linear sRGB -> XYZ), rows; and its inverse (colour-science 0.4.7)
+const vec3 CAT_A0 = vec3(0.3027248, 0.6023702, 0.0704613);
+const vec3 CAT_A1 = vec3(0.1537329, 0.7773669, 0.0853695);
+const vec3 CAT_A2 = vec3(0.0279452, 0.1478798, 0.9091063);
+const vec3 CAT_I0 = vec3(5.4464547, -4.2153768, -0.0262889);
+const vec3 CAT_I1 = vec3(-1.0779672, 2.1441028, -0.1177927);
+const vec3 CAT_I2 = vec3(0.0079281, -0.2191933, 1.1199502);
+vec3 toLms(vec3 c) { return vec3(dot(CAT_A0, c), dot(CAT_A1, c), dot(CAT_A2, c)); }
+vec3 fromLms(vec3 l) { return vec3(dot(CAT_I0, l), dot(CAT_I1, l), dot(CAT_I2, l)); }
 // MEASUREMENT EXPOSURE (claude_exposure, 2026-10-05). Linear radiance is
 // scaled by this before the ACES curve. 1 = the look. The furnace referees
 // shoot at 0.25 so a rho = 0.73 room (L = 6.49) lands mid-curve instead of
@@ -154,15 +185,47 @@ void main(void)
 
 	// accum is LINEAR radiance now; the display transform is the ONE
 	// art knob (energy audit): ACES filmic fit (Narkowicz), then gamma
+	// THE EYE: white balance on radiance, then the rods' share per pixel
+	float sigma = 0.0;
+	if (claudeUnits > 0.5 && claudeView < 0.5) {
+		vec4 aw = texture2D(autoExposure, vec2(0.75, 0.5));
+		vec4 a0 = texture2D(autoExposure, vec2(0.25, 0.5));
+		if (claudeWhiteBalance > 0.0 && aw.a > 0.5 && a0.g > 0.5) {
+			// the white's CCT (McCamy 1992), from its CIE xy
+			vec3 wx = vec3(dot(vec3(0.4124, 0.3576, 0.1805), aw.rgb),
+					dot(vec3(0.2126, 0.7152, 0.0722), aw.rgb),
+					dot(vec3(0.0193, 0.1192, 0.9505), aw.rgb));
+			float sxyz = max(wx.x + wx.y + wx.z, 1e-6);
+			float cx = wx.x / sxyz, cy = wx.y / sxyz;
+			float mn = (cx - 0.3320) / (0.1858 - cy);
+			float cct = 449.0 * mn * mn * mn + 3525.0 * mn * mn
+					+ 6823.3 * mn + 5520.33;
+			float d = clamp(0.709 * (1.0 - 814.0 / max(cct, 814.0))
+					* claudeWhiteBalance, 0.0, 1.0);
+			vec3 lw = max(toLms(aw.rgb), vec3(1e-6));
+			vec3 lr = toLms(vec3(1.0));
+			c = max(fromLms((d * lr / lw + (1.0 - d)) * toLms(c)), vec3(0.0));
+		}
+		if (claudeNightVision > 0.5) {
+			float ycd = dot(max(c, vec3(0.0)), LUMA_P) * claudeUnitCdm2;
+			sigma = 0.04 / (0.04 + ycd);
+		}
+	}
+
 	// exposure: the manual dial, times the eye's adaptation when on
 	float ex = claudeExposure > 0.0 ? claudeExposure : 1.0;
 	if (claudeAutoExposure > 0.5) {
-		vec4 ae = texture2D(autoExposure, vec2(0.5));
+		vec4 ae = texture2D(autoExposure, vec2(0.25, 0.5));
 		if (ae.g > 0.5 && ae.r > 0.0 && ae.r < 1e9)
 			ex *= ae.r;
 	}
 	vec3 lin = max(c, vec3(0.0)) * ex;
 	vec3 aces = clamp(lin * (2.51 * lin + 0.03)
 			/ (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
+	if (sigma > 0.0) {
+		float lt = dot(aces, LUMA_P);
+		aces = clamp(aces * (1.0 - sigma)
+				+ vec3(1.05, 0.97, 1.27) * lt * sigma, 0.0, 1.0);
+	}
 	gl_FragColor = vec4(pow(aces, vec3(1.0 / 2.2)), 1.0);
 }
