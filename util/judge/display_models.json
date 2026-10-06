@@ -1,0 +1,12 @@
+{
+  "john_272up_1080p": {
+    "name": "John's MSI MAG 272UP (26.5-inch 4K QD-OLED) showing the game's 1920x1080 render full screen. ASSUMED until John confirms: viewing distance 0.65 m, SDR peak 250 cd/m^2, office light 250 lux",
+    "resolution": [1920, 1080],
+    "viewing_distance_meters": 0.65,
+    "diagonal_size_inches": 26.5,
+    "max_luminance": 250,
+    "contrast": 100000,
+    "E_ambient": 250,
+    "source": "hardware-inventory.md (panel size); distance, peak and ambient are assumptions"
+  }
+}

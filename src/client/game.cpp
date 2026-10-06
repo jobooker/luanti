@@ -6,6 +6,10 @@
 
 #include <cmath>
 #include <future>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <array>
 #include <csignal>
 #include "client/gameui.h"
@@ -433,6 +437,258 @@ static ClaudeTraceGrid g_claude_grid;
 // through the same flag because it sat in exactly the same place in the
 // loop and had exactly the same race.
 static bool g_claude_screenshot_pending = false;
+
+// MOTION, MADE MEASURABLE (2026-10-06; the 2026-08-15 handoff's frame dump
+// and waypoint path, built at last). John: "a perceptual judge for both
+// stills and movement/lag". A judge needs the same motion every time and
+// the frames as the player saw them, so:
+//   claude_path = <file>   a camera path, lines "frame x y z yaw pitch"
+//                          (vantage convention: pitch up positive). The
+//                          pose is a function of the FRAME INDEX since
+//                          the path started, never of the wall clock, so
+//                          two runs see the same poses and a still
+//                          reference can be shot at any frame's pose.
+//                          Holds the last key after the end. "" = off.
+//   claude_dump = N:token  dump the next N frames (the traced picture,
+//                          half resolution by default; claude_dump_scale
+//                          1 = full) to <user>/screenshots/dump/<token>/,
+//                          RGBA bottom-up raw + meta.jsonl (frame, path
+//                          frame, CPU frame interval us, pose,
+//                          still_frames). Readback is ASYNCHRONOUS: a ring
+//                          of three pixel-pack buffers read two frames
+//                          late, files written by a thread, so the dump
+//                          does not stall the frame it measures (gate:
+//                          frame time with the dump on vs off).
+struct ClaudePathKey { float f, x, y, z, yaw, pitch; };
+static std::vector<ClaudePathKey> g_claude_path;
+static long g_claude_path_frame = -1;
+
+static void claudeLoadPath(const std::string &file)
+{
+	g_claude_path.clear();
+	g_claude_path_frame = -1;
+	if (file.empty() || file == "0") {
+		actionstream << "[claude_path] off" << std::endl;
+		return;
+	}
+	std::ifstream f(file);
+	ClaudePathKey k;
+	while (f >> k.f >> k.x >> k.y >> k.z >> k.yaw >> k.pitch)
+		g_claude_path.push_back(k);
+	if (!g_claude_path.empty())
+		g_claude_path_frame = 0;
+	actionstream << "[claude_path] " << g_claude_path.size() << " keys from "
+			<< file << std::endl;
+}
+
+// pose at path frame fr (linear between keys, held past the last)
+static ClaudePathKey claudePathPose(long fr)
+{
+	const auto &P = g_claude_path;
+	if (fr <= P.front().f)
+		return P.front();
+	for (size_t i = 1; i < P.size(); i++) {
+		if (fr <= P[i].f) {
+			const ClaudePathKey &a = P[i - 1], &b = P[i];
+			float t = (fr - a.f) / std::max(1e-6f, b.f - a.f);
+			float dyaw = std::fmod(b.yaw - a.yaw + 540.0f, 360.0f) - 180.0f;
+			return {(float)fr, a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+					a.z + (b.z - a.z) * t, a.yaw + dyaw * t,
+					a.pitch + (b.pitch - a.pitch) * t};
+		}
+	}
+	return P.back();
+}
+
+struct ClaudeDump {
+	int left = 0;
+	long seq = 0;              // frames requested so far in this dump
+	std::string dir;
+	int w = 0, h = 0, scale = 2;
+	GLuint fbo = 0, rbo = 0, pbo[3] = {0, 0, 0};
+	decltype(GL.FenceSync(0, 0)) fence[3] = {nullptr, nullptr, nullptr};
+	std::string meta[3];
+	long slot_seq[3] = {-1, -1, -1};
+	u64 last_us = 0;
+	// writer thread
+	std::thread writer;
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<std::pair<std::string, std::vector<u8>>> q; // file, bytes
+	std::deque<std::pair<std::string, std::string>> mq;    // file, line
+	bool stop = false;
+};
+static ClaudeDump g_dump;
+static std::string g_claude_dump_request;
+
+static void claudeDumpWriter()
+{
+	for (;;) {
+		std::pair<std::string, std::vector<u8>> job;
+		std::pair<std::string, std::string> mjob;
+		bool have = false, mhave = false;
+		{
+			std::unique_lock<std::mutex> lk(g_dump.m);
+			g_dump.cv.wait(lk, [] {
+				return g_dump.stop || !g_dump.q.empty() || !g_dump.mq.empty(); });
+			if (!g_dump.q.empty()) {
+				job = std::move(g_dump.q.front());
+				g_dump.q.pop_front();
+				have = true;
+			}
+			if (!g_dump.mq.empty()) {
+				mjob = std::move(g_dump.mq.front());
+				g_dump.mq.pop_front();
+				mhave = true;
+			}
+			if (!have && !mhave && g_dump.stop)
+				return;
+		}
+		if (have) {
+			std::ofstream o(job.first, std::ios::binary);
+			o.write((const char *)job.second.data(), job.second.size());
+		}
+		if (mhave) {
+			std::ofstream o(mjob.first, std::ios::app);
+			o << mjob.second << "\n";
+		}
+	}
+}
+
+static void claudeDumpStop()
+{
+	if (!g_dump.writer.joinable())
+		return;
+	{
+		std::lock_guard<std::mutex> lk(g_dump.m);
+		g_dump.stop = true;
+	}
+	g_dump.cv.notify_all();
+	g_dump.writer.join();
+}
+
+// Called once per frame after the scene is drawn, before endScene.
+static void claudeDumpFrame(video::IVideoDriver *driver, LocalPlayer *player,
+		float still_frames, bool want = true)
+{
+	u64 now = porting::getTimeUs();
+	u64 dt_us = g_dump.last_us ? now - g_dump.last_us : 0;
+	g_dump.last_us = now;
+	if (!g_claude_dump_request.empty()) {
+		std::string req = g_claude_dump_request;
+		g_claude_dump_request.clear();
+		int n = atoi(req.c_str());
+		std::string token = req.substr(req.find(':') + 1);
+		for (char &c : token)
+			if (!isalnum((unsigned char)c) && c != '-' && c != '_')
+				c = '_';
+		g_dump.dir = porting::path_user + DIR_DELIM + "screenshots" + DIR_DELIM
+				+ "dump" + DIR_DELIM + token;
+		fs::CreateAllDirs(g_dump.dir);
+		g_dump.left = std::max(0, n);
+		g_dump.seq = 0;
+		g_dump.scale = g_settings->exists("claude_dump_scale")
+				? std::max(1, (int)g_settings->getFloat("claude_dump_scale", 1.0f, 4.0f)) : 2;
+		if (!g_dump.writer.joinable()) {
+			g_dump.stop = false;
+			g_dump.writer = std::thread(claudeDumpWriter);
+		}
+		actionstream << "[claude_dump] " << n << " frames -> " << g_dump.dir
+				<< std::endl;
+	}
+	bool pending = false;
+	for (int i = 0; i < 3; i++)
+		pending |= g_dump.fence[i] != nullptr;
+	if (g_dump.left <= 0 && !pending)
+		return;
+
+	GLint prev_read = 0, prev_draw = 0, prev_pack = 0;
+	GL.GetIntegerv(GL.READ_FRAMEBUFFER_BINDING, &prev_read);
+	GL.GetIntegerv(GL.DRAW_FRAMEBUFFER_BINDING, &prev_draw);
+	GL.GetIntegerv(GL.PIXEL_PACK_BUFFER_BINDING, &prev_pack);
+
+	v2u32 ss = driver->getScreenSize();
+	int w = ss.X / g_dump.scale, h = ss.Y / g_dump.scale;
+	if (w != g_dump.w || h != g_dump.h || !g_dump.pbo[0]) {
+		if (!g_dump.pbo[0])
+			GL.GenBuffers(3, g_dump.pbo);
+		for (int i = 0; i < 3; i++) {
+			GL.BindBuffer(GL.PIXEL_PACK_BUFFER, g_dump.pbo[i]);
+			GL.BufferData(GL.PIXEL_PACK_BUFFER, (size_t)w * h * 4, nullptr,
+					GL.STREAM_READ);
+		}
+		if (!g_dump.fbo) {
+			GL.GenFramebuffers(1, &g_dump.fbo);
+			GL.GenRenderbuffers(1, &g_dump.rbo);
+		}
+		GL.BindRenderbuffer(GL.RENDERBUFFER, g_dump.rbo);
+		GL.RenderbufferStorage(GL.RENDERBUFFER, GL.RGBA8, w, h);
+		GL.BindFramebuffer(GL.DRAW_FRAMEBUFFER, g_dump.fbo);
+		GL.FramebufferRenderbuffer(GL.DRAW_FRAMEBUFFER, GL.COLOR_ATTACHMENT0,
+				GL.RENDERBUFFER, g_dump.rbo);
+		g_dump.w = w;
+		g_dump.h = h;
+	}
+	const int slot = (int)(g_dump.seq % 3);
+	// 1. collect what this slot read three frames ago
+	for (int i = 0; i < 3; i++) {
+		int sidx = (slot + i) % 3;
+		if (!g_dump.fence[sidx])
+			continue;
+		// the slot about to be reused must be drained now; others only if
+		// already done
+		GLenum r = GL.ClientWaitSync(g_dump.fence[sidx],
+				sidx == slot ? GL.SYNC_FLUSH_COMMANDS_BIT : 0,
+				sidx == slot ? 1000000000ULL : 0);
+		if (r != GL.ALREADY_SIGNALED && r != GL.CONDITION_SATISFIED)
+			continue;
+		GL.DeleteSync(g_dump.fence[sidx]);
+		g_dump.fence[sidx] = nullptr;
+		GL.BindBuffer(GL.PIXEL_PACK_BUFFER, g_dump.pbo[sidx]);
+		size_t bytes = (size_t)g_dump.w * g_dump.h * 4;
+		const u8 *src = (const u8 *)GL.MapBufferRange(GL.PIXEL_PACK_BUFFER, 0,
+				bytes, GL.MAP_READ_BIT);
+		if (src) {
+			std::vector<u8> buf(src, src + bytes);
+			GL.UnmapBuffer(GL.PIXEL_PACK_BUFFER);
+			char name[32];
+			snprintf(name, sizeof(name), "%05ld.rgba", g_dump.slot_seq[sidx]);
+			std::lock_guard<std::mutex> lk(g_dump.m);
+			g_dump.q.emplace_back(g_dump.dir + DIR_DELIM + name, std::move(buf));
+			g_dump.mq.emplace_back(g_dump.dir + DIR_DELIM + "meta.jsonl",
+					g_dump.meta[sidx]);
+		}
+		g_dump.cv.notify_one();
+	}
+	// 2. start this frame's read
+	if (g_dump.left > 0 && want) {
+		GL.BindFramebuffer(GL.READ_FRAMEBUFFER, 0);
+		GL.ReadBuffer(GL.BACK);
+		if (g_dump.scale > 1) {
+			GL.BindFramebuffer(GL.DRAW_FRAMEBUFFER, g_dump.fbo);
+			GL.BlitFramebuffer(0, 0, ss.X, ss.Y, 0, 0, w, h,
+					GL.COLOR_BUFFER_BIT, GL.LINEAR);
+			GL.BindFramebuffer(GL.READ_FRAMEBUFFER, g_dump.fbo);
+		}
+		GL.BindBuffer(GL.PIXEL_PACK_BUFFER, g_dump.pbo[slot]);
+		GL.ReadPixels(0, 0, w, h, GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
+		g_dump.fence[slot] = GL.FenceSync(GL.SYNC_GPU_COMMANDS_COMPLETE, 0);
+		g_dump.slot_seq[slot] = g_dump.seq;
+		v3f pos = player->getPosition() / BS;
+		std::ostringstream os;
+		os << "{\"i\": " << g_dump.seq << ", \"path_frame\": " << g_claude_path_frame
+				<< ", \"dt_us\": " << dt_us << ", \"w\": " << w << ", \"h\": " << h
+				<< ", \"pos\": [" << pos.X << ", " << pos.Y << ", " << pos.Z
+				<< "], \"yaw\": " << player->getYaw() << ", \"pitch\": "
+				<< -player->getPitch() << ", \"still_frames\": " << still_frames << "}";
+		g_dump.meta[slot] = os.str();
+		g_dump.seq++;
+		g_dump.left--;
+	}
+	GL.BindFramebuffer(GL.READ_FRAMEBUFFER, prev_read);
+	GL.BindFramebuffer(GL.DRAW_FRAMEBUFFER, prev_draw);
+	GL.BindBuffer(GL.PIXEL_PACK_BUFFER, prev_pack);
+}
 
 // THE FRAME-EXACT SHUTTER (2026-10-04). `claude_shutter = N:token` resets
 // the accumulator where the request is applied and arms a target; the
@@ -3152,6 +3408,7 @@ Game::~Game()
 {
 	claudeCascadeJoin();
 	claude_lod::stopFarDb();
+	claudeDumpStop();
 	delete client;
 	soundmaker.reset();
 	sound_manager.reset();
@@ -5752,6 +6009,14 @@ static bool claudeApplyPatchFile(const std::string &path,
 	for (const std::string &name : patch.getNames()) {
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
+		if (name == "claude_dump") {
+			g_claude_dump_request = patch.get(name);
+			continue;
+		}
+		if (name == "claude_path") {
+			claudeLoadPath(patch.get(name));
+			continue;
+		}
 		if (name == "claude_shutter") {
 			const std::string v = patch.get(name);
 			const float n = (float)atoi(v.c_str());
@@ -6076,6 +6341,14 @@ void Game::run()
 					cam_damp_lambda
 			);
 		}
+		if (g_claude_path_frame >= 0 && !g_claude_path.empty()) {
+			ClaudePathKey k = claudePathPose(g_claude_path_frame);
+			cam_view.camera_yaw = cam_view_target.camera_yaw = k.yaw;
+			cam_view.camera_pitch = cam_view_target.camera_pitch = -k.pitch;
+			LocalPlayer *pl = client->getEnv().getLocalPlayer();
+			pl->setPosition(v3f(k.x, k.y, k.z) * BS);
+			pl->setSpeed(v3f(0.0f, 0.0f, 0.0f));
+		}
 		updatePlayerControl(cam_view);
 
 		updatePauseState();
@@ -6153,6 +6426,7 @@ void Game::shutdown()
 
 	claudeCascadeJoin();
 	claude_lod::stopFarDb();
+	claudeDumpStop();
 	delete client;
 	client = nullptr;
 	soundmaker.reset();
@@ -9401,6 +9675,19 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 		this->client->makeScreenshot();
 		actionstream << "[claude_settings_patch] screenshot taken"
 				<< std::endl;
+	}
+	// REFERENCE MODE (claude_path_hold = K): each path pose is held until
+	// it has K still frames, that one frame is dumped, then the path moves
+	// on -- the converged video of a camera path, made by the client in one
+	// unattended run (the motion judge's reference).
+	{
+		int hold = g_settings->exists("claude_path_hold")
+				? (int)g_settings->getFloat("claude_path_hold", 0.0f, 1e6f) : 0;
+		bool ready = hold <= 0 || g_claude_grid.still_frames >= hold;
+		claudeDumpFrame(this->driver, this->client->getEnv().getLocalPlayer(),
+				g_claude_grid.still_frames, g_claude_path_frame < 0 || ready);
+		if (g_claude_path_frame >= 0 && ready)
+			g_claude_path_frame++;
 	}
 
 	/*
