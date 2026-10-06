@@ -5,6 +5,8 @@
 #include "game_internal.h"
 
 #include <cmath>
+#include <future>
+#include <array>
 #include <csignal>
 #include "client/gameui.h"
 #include "client/inputhandler.h"
@@ -3144,8 +3146,11 @@ Game::Game() :
 }
 
 
+static void claudeCascadeJoin();
+
 Game::~Game()
 {
+	claudeCascadeJoin();
 	claude_lod::stopFarDb();
 	delete client;
 	soundmaker.reset();
@@ -5506,6 +5511,26 @@ void claudeGetTraceStats(float *still_frames, float *accum_alpha)
 // strayed. Runs from the 1 Hz settings poll and builds AT MOST ONE level
 // per invocation, so the worst frame eats one build (2 m is the big one,
 // tens of ms walking 16M nodes) per second — never more.
+struct CascJob {
+	int lv = 0;
+	v3s16 origin;
+	u64 ver = 0;
+	std::vector<u8> rgba, boxes;
+	u32 solid = 0;
+	float ms = 0.0f;
+};
+static std::future<CascJob> g_casc_job;
+static bool g_casc_job_on = false;
+
+// wait out a level build in flight; before the Client goes away
+static void claudeCascadeJoin()
+{
+	if (g_casc_job_on) {
+		g_casc_job.wait();
+		g_casc_job_on = false;
+	}
+}
+
 static void claudeCascadeUpdate(Client *client)
 {
 	// PURE 1 m MODE (claude_cascades = 0): the LOD ladder is not merely
@@ -5561,6 +5586,92 @@ static void claudeCascadeUpdate(Client *client)
 	const u8 matidx[4] = {
 		claudeMatIndex(MATK_SOLID, 0, 0), claudeMatIndex(MATK_LEAVES, 0, 0),
 		claudeMatIndex(MATK_LIQUID, 0, 0), claudeMatIndex(MATK_LAVA, 0, 14)};
+	// A BUILD IN FLIGHT (2026-10-06): the fold runs on a worker; this poll
+	// only uploads a finished one. With the world-file reader a level
+	// holds ~60k blocks and a build took up to 91 ms on the main thread, a
+	// visible hitch whenever a level re-centred.
+	if (g_casc_job_on) {
+		if (g_casc_job.wait_for(std::chrono::seconds(0))
+				!= std::future_status::ready)
+			return;
+		CascJob J = g_casc_job.get();
+		g_casc_job_on = false;
+		if (J.lv >= nlev)
+			return; // retired while it built
+		const int lv = J.lv;
+		auto &L = g_claude_grid.casc[lv];
+		const v3s16 origin = J.origin;
+		const u64 ver = J.ver;
+		const u64 t0 = porting::getTimeMs() - (u64)J.ms;
+		std::vector<u8> &rgba = J.rgba, &coarse = J.boxes;
+		const u32 solid = J.solid;
+		do {
+			// A REBUILD THAT CHANGED NOTHING MUST NOT RESET ANYTHING: the
+			// content version bumps on any block anywhere, so a level is
+			// rebuilt on cadence in a living world. Only a real change in what
+			// the level holds (or where it sits) clears the running average.
+			u64 h = 14695981039346656037ULL;
+			for (size_t q = 0; q < rgba.size(); q += 4)
+				h = (h ^ (rgba[q] | (rgba[q + 1] << 8) | (rgba[q + 2] << 16)
+						| ((u64)rgba[q + 3] << 24))) * 1099511628211ULL;
+			h ^= (u64)(u16)origin.X * 73856093ULL ^ (u64)(u16)origin.Y * 19349663ULL
+					^ (u64)(u16)origin.Z * 83492791ULL;
+			if (L.valid && h != L.content_hash) {
+				g_claude_grid.still_frames = 0.0f;
+				g_claude_grid.accum_resets++;
+				g_claude_grid.accum_alpha =
+						std::max(g_claude_grid.accum_alpha, 0.5f);
+			}
+			L.content_hash = h;
+			if (solid == 0 && !L.valid)
+				return; // no data yet; retry next poll (and skip coarser too)
+
+			GLint prev_active_unit = GL.TEXTURE0;
+			GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
+			bool fresh_alloc = !g_claude_grid.cascades_tex;
+			if (fresh_alloc) {
+				GL.GenTextures(1, &g_claude_grid.cascades_tex);
+				GL.GenTextures(1, &g_claude_grid.cascades_coarse_tex);
+			}
+			GL.ActiveTexture(GL.TEXTURE8);
+			GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_tex);
+			if (fresh_alloc) {
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+				GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
+						GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
+					GL.RGBA, GL.UNSIGNED_BYTE, rgba.data());
+			GL.ActiveTexture(GL.TEXTURE9);
+			GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_coarse_tex);
+			if (fresh_alloc) {
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
+				GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
+				// the per-cell solid boxes (2026-10-06; this unit used to hold
+				// an any-solid brick map nothing read any more)
+				GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
+						GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
+					GL.RGBA, GL.UNSIGNED_BYTE, coarse.data());
+			GL.ActiveTexture(prev_active_unit);
+
+			L.origin = origin;
+			L.valid = true;
+			L.version = ver;
+			L.build_time = porting::getTimeMs();
+			L.solid = solid;
+			L.ms = (float)(porting::getTimeMs() - t0);
+		} while (false);
+		return;
+	}
 	for (int lv = 0; lv < nlev; lv++) {
 		auto &L = g_claude_grid.casc[lv];
 		const int half = 128 * CELL[lv] / 2;
@@ -5578,7 +5689,6 @@ static void claudeCascadeUpdate(Client *client)
 		}
 		if (!need)
 			continue;
-		u64 t0 = porting::getTimeMs();
 		v3s16 origin = center - v3s16(half, half, half);
 		// snap to one coarse brick (4 cells) so brick boundaries and
 		// world-space cell identity are stable across recenters — AND to
@@ -5591,77 +5701,28 @@ static void claudeCascadeUpdate(Client *client)
 		const s16 snapv = (s16)std::max(CELL[lv] * 4, 16);
 		const s16 snap_mask = (s16)~(snapv - 1);
 		origin.X &= snap_mask; origin.Y &= snap_mask; origin.Z &= snap_mask;
-		static std::vector<u8> rgba, coarse;
+		const int lvj = lv;
+		const u64 verj = ver;
+		std::array<u8, 4> mi = {matidx[0], matidx[1], matidx[2], matidx[3]};
+		const int cellj = CELL[lv];
 		// ONE fold for every rung (John's consolidation, 2026-08-12):
 		// the 2m level now builds from summary fine-bits through the
 		// same scatter as every other level — one alignment contract,
 		// the origin-parity bug class is unrepresentable.
-		u32 solid = claude_lod::buildCascadeSummary(origin, CELL[lv],
-				rgba, coarse, matidx);
-		// A REBUILD THAT CHANGED NOTHING MUST NOT RESET ANYTHING: the
-		// content version bumps on any block anywhere, so a level is
-		// rebuilt on cadence in a living world. Only a real change in what
-		// the level holds (or where it sits) clears the running average.
-		u64 h = 14695981039346656037ULL;
-		for (size_t q = 0; q < rgba.size(); q += 4)
-			h = (h ^ (rgba[q] | (rgba[q + 1] << 8) | (rgba[q + 2] << 16)
-					| ((u64)rgba[q + 3] << 24))) * 1099511628211ULL;
-		h ^= (u64)(u16)origin.X * 73856093ULL ^ (u64)(u16)origin.Y * 19349663ULL
-				^ (u64)(u16)origin.Z * 83492791ULL;
-		if (L.valid && h != L.content_hash) {
-			g_claude_grid.still_frames = 0.0f;
-			g_claude_grid.accum_resets++;
-			g_claude_grid.accum_alpha =
-					std::max(g_claude_grid.accum_alpha, 0.5f);
-		}
-		L.content_hash = h;
-		if (solid == 0 && !L.valid)
-			return; // no data yet; retry next poll (and skip coarser too)
-
-		GLint prev_active_unit = GL.TEXTURE0;
-		GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active_unit);
-		bool fresh_alloc = !g_claude_grid.cascades_tex;
-		if (fresh_alloc) {
-			GL.GenTextures(1, &g_claude_grid.cascades_tex);
-			GL.GenTextures(1, &g_claude_grid.cascades_coarse_tex);
-		}
-		GL.ActiveTexture(GL.TEXTURE8);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_tex);
-		if (fresh_alloc) {
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-			GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
-					GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
-		}
-		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
-				GL.RGBA, GL.UNSIGNED_BYTE, rgba.data());
-		GL.ActiveTexture(GL.TEXTURE9);
-		GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_coarse_tex);
-		if (fresh_alloc) {
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MIN_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-			// the per-cell solid boxes (2026-10-06; this unit used to hold
-			// an any-solid brick map nothing read any more)
-			GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
-					GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
-		}
-		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
-				GL.RGBA, GL.UNSIGNED_BYTE, coarse.data());
-		GL.ActiveTexture(prev_active_unit);
-
-		L.origin = origin;
-		L.valid = true;
-		L.version = ver;
-		L.build_time = porting::getTimeMs();
-		L.solid = solid;
-		L.ms = (float)(porting::getTimeMs() - t0);
-		break; // one level per poll: bounded hitch
+		g_casc_job = std::async(std::launch::async,
+				[lvj, origin, verj, cellj, mi]() {
+			CascJob J;
+			J.lv = lvj;
+			J.origin = origin;
+			J.ver = verj;
+			u64 b0 = porting::getTimeMs();
+			J.solid = claude_lod::buildCascadeSummary(origin, cellj,
+					J.rgba, J.boxes, mi.data());
+			J.ms = (float)(porting::getTimeMs() - b0);
+			return J;
+		});
+		g_casc_job_on = true;
+		break; // one level in flight at a time
 	}
 }
 
@@ -6095,6 +6156,7 @@ void Game::shutdown()
 		}
 	}
 
+	claudeCascadeJoin();
 	claude_lod::stopFarDb();
 	delete client;
 	client = nullptr;
