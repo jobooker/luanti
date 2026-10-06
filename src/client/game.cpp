@@ -500,6 +500,76 @@ static ClaudePathKey claudePathPose(long fr)
 	return P.back();
 }
 
+// A MOVING LIGHT FOR THE JUDGE (2026-10-06, John: "a moving light ... can
+// it even accumulate?"). claude_mover = <file>: first line "node <name>",
+// then "frame x y z" keys; the node stands at the last key at or before
+// the path frame, placed through Client::addNode (the same route a server
+// change takes) and the cell it displaced restored when it moves on.
+// Keyed to the camera path's frame clock, so a run repeats exactly and
+// reference mode (claude_path_hold) holds the light still while it
+// converges. "0" = off (the last cell restored).
+struct ClaudeMoverKey { long f; v3s16 p; };
+static std::vector<ClaudeMoverKey> g_mover;
+static std::string g_mover_node;
+static bool g_mover_placed = false;
+static v3s16 g_mover_at;
+static MapNode g_mover_prev;
+static std::string g_mover_request;
+static bool g_mover_request_set = false;
+static void g_claude_mover_request_hook(const std::string &v)
+{
+	g_mover_request = v;
+	g_mover_request_set = true;
+}
+
+static void claudeMoverRestore(Client *client)
+{
+	if (g_mover_placed)
+		client->addNode(g_mover_at, g_mover_prev);
+	g_mover_placed = false;
+}
+
+static void claudeLoadMover(Client *client, const std::string &file)
+{
+	claudeMoverRestore(client);
+	g_mover.clear();
+	if (file.empty() || file == "0") {
+		actionstream << "[claude_mover] off" << std::endl;
+		return;
+	}
+	std::ifstream f(file);
+	std::string word;
+	f >> word >> g_mover_node;
+	ClaudeMoverKey k;
+	while (f >> k.f >> k.p.X >> k.p.Y >> k.p.Z)
+		g_mover.push_back(k);
+	actionstream << "[claude_mover] " << g_mover.size() << " keys of "
+			<< g_mover_node << " from " << file << std::endl;
+}
+
+// returns true when the node moved this frame
+static bool claudeMoverStep(Client *client, long frame)
+{
+	if (g_mover.empty())
+		return false;
+	v3s16 target = g_mover.front().p;
+	for (const auto &k : g_mover)
+		if (k.f <= std::max(frame, 0L))
+			target = k.p;
+	if (g_mover_placed && target == g_mover_at)
+		return false;
+	claudeMoverRestore(client);
+	bool ok = false;
+	g_mover_prev = client->getEnv().getMap().getNode(target, &ok);
+	content_t c = client->getNodeDefManager()->getId(g_mover_node);
+	if (c == CONTENT_IGNORE)
+		return false;
+	client->addNode(target, MapNode(c));
+	g_mover_at = target;
+	g_mover_placed = true;
+	return true;
+}
+
 struct ClaudeDump {
 	int left = 0;
 	long seq = 0;              // frames requested so far in this dump
@@ -6036,6 +6106,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 					<< patch.get(name) << ")" << std::endl;
 			continue;
 		}
+		if (name == "claude_mover") {
+			g_claude_mover_request_hook(patch.get(name));
+			continue;
+		}
 		if (name == "claude_dump") {
 			g_claude_dump_request = patch.get(name);
 			continue;
@@ -6375,6 +6449,21 @@ void Game::run()
 			LocalPlayer *pl = client->getEnv().getLocalPlayer();
 			pl->setPosition(v3f(k.x, k.y, k.z) * BS);
 			pl->setSpeed(v3f(0.0f, 0.0f, 0.0f));
+		}
+		if (g_mover_request_set) {
+			g_mover_request_set = false;
+			claudeLoadMover(client, g_mover_request);
+		}
+		if (claudeMoverStep(client, g_claude_path_frame)) {
+			int hold = g_settings->exists("claude_path_hold")
+					? (int)g_settings->getFloat("claude_path_hold", 0.0f, 1e6f) : 0;
+			if (hold > 0) {
+				// reference mode: the light's new place is in the grid NOW
+				// and the average starts over, so the held frame converges
+				// on this step's lighting alone
+				claudeTraceGridIncremental(client);
+				claudeResetAccumulation();
+			}
 		}
 		updatePlayerControl(cam_view);
 

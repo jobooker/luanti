@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--name", default="motion")
     ap.add_argument("--skip-seat", action="store_true")
     ap.add_argument("--nodump", action="store_true")
+    ap.add_argument("--mover", help="claude_mover file: a node moved on the path clock")
     args = ap.parse_args()
     path = os.path.abspath(args.path)
     n = args.frames or path_len(path)
@@ -70,6 +71,8 @@ def main():
     out = os.path.join(DUMP_ROOT, token)
     with open(lab.PATCH, "w") as f:
         f.write("claude_path = %s\n" % path)
+        if args.mover:
+            f.write("claude_mover = %s\n" % os.path.abspath(args.mover))
         if not args.nodump:
             f.write("claude_dump = %d:%s\n" % (n, token))
     # the client's own per-second stats, for the no-dump arm and for both
@@ -94,6 +97,8 @@ def main():
             break
     with open(lab.PATCH, "w") as f:
         f.write("claude_path = 0\n")
+        if args.mover:
+            f.write("claude_mover = 0\n")
     rep = {"token": token, "path": path, "frames": n, "dials": dials,
            "stats_frame_ms": stats}
     if not args.nodump:
