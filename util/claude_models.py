@@ -787,6 +787,14 @@ def _flower(name, tex):
 # texels are the colour. Tall grass and fern are NOT here: their tiles are
 # grayscale and take the biome tint through the cell colour, as the
 # rasteriser does.
+# Models whose emitting voxels are FLAME (2026-10-05, real light units):
+# under claude_units they glow with a flame's measured luminance and
+# colour, not "albedo x the light level's scale". Every emissive model in
+# this shop is a fire: the torch, the lantern's flame, the campfire and
+# the lit furnace's firebox.
+FLAME_MODELS = {"torch_baked", "lantern_floor", "campfire_lit",
+                "furnace_baked"}
+
 PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_oxeye_daisy", "flower_cornflower",
                          "flower_allium", "flower_tulip_red"}
@@ -977,6 +985,8 @@ def main():
                     voxels=v.tolist())
         if name in PALETTE_COLOUR_MODELS:
             data["colour"] = "palette"
+        if name in FLAME_MODELS:
+            data["light"] = "flame"
         jp = os.path.join(outdir, name + ".json")
         with open(jp, "w") as f:
             json.dump(data, f, separators=(",", ":"))

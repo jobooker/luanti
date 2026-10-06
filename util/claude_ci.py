@@ -247,6 +247,14 @@ CANONICAL_DIALS = {
     # referee must never judge a smoothed frame (roadmap "two conditions
     # on it", ii). Pinned OFF here whatever the play default is.
     "claude_denoise": 0,
+    # the camera does not adapt in a measurement: every referee inverts
+    # ONE fixed display transform (2026-10-05)
+    "claude_auto_exposure": 0,
+    # REAL LIGHT UNITS (2026-10-05): the default, so CI judges it. Sealed
+    # rooms (furnace, Cornell, sealed-plank) cannot see the sky and their
+    # lamps kept their brightness, so their answers do not move; the arms
+    # that see sky or flames carry a camera exposure (ARM_EXPOSURE).
+    "claude_units": 1,
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which
@@ -503,6 +511,21 @@ SEALED_SETTLE = 2000
 
 # measurement exposure for the furnace arms -- see FURNACE_PINNED
 FURNACE_EXPOSURE = 0.1
+# A CAMERA EXPOSURE PER ARM THAT SEES SKY OR FLAMES (2026-10-05, real light
+# units). MEASURED, not chosen: each is the factor claude_exposure (the
+# auto-exposure law) settled on at that vantage after 600 frames, read back
+# through claude_stats auto_exposure, rounded to a whole stop. Values:
+# cozy-ci 10.3, exterior-ci 0.0615, exterior-wall 16.7, cave-skylight-noon
+# 10.9, cave-skylight-night 1.12e7, cozy-night-ci 10.8, cozy-day-ci 7.40,
+# cozy-day-ci lamps off 64.9. cave-glass stays at 1: its golden is BLACK on
+# purpose (a sealed box), and its own auto value (3.7e7) would only
+# magnify noise. Re-measure (/tmp/ae_measure.py pattern) when the light
+# laws change.
+ARM_EXPOSURE = {
+    "cozy-ci": 8.0, "exterior-ci": 1.0 / 16.0, "exterior-wall": 16.0,
+    "cave-skylight-noon": 8.0, "cave-skylight-night": 2.0 ** 23,
+    "cozy-night-ci": 8.0, "cozy-day-ci": 8.0, "cozy-day-dark-ci": 64.0,
+}
 CI_SHOTS = [
     {"name": "furnace-050", "vantage": "furnace-050",
      "referee": ("furnace", "050"),
@@ -2945,6 +2968,8 @@ def cmd_run(args):
                       "%s MISSING from claude_vantages.json" % vname)
                 continue
             dials = dict(base, **shot_def.get("dials", {}))
+            if name in ARM_EXPOSURE:
+                dials["claude_exposure"] = ARM_EXPOSURE[name]
             lamps_off = shot_def.get("lamps_off")
             if lamps_off:
                 # cozy-day-dark-ci: swap the panel to its unlit twin for

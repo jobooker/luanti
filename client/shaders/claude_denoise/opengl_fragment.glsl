@@ -40,6 +40,8 @@ uniform sampler2D gbuf;
 uniform sampler2D aux;
 uniform sampler2D direct;
 uniform float claudeDenoise;
+uniform float claudeSplitFrames;  // the direct/bounced split (moved here
+uniform float claudeStillFrames;  // from claude_present, 2026-10-05)
 uniform float claudeView;
 uniform lowp float gridDebug;
 uniform vec2 texelSize0;      // this pass's input texel
@@ -162,10 +164,19 @@ void main(void)
 	}
 #if CLAUDE_DN_ITER == 5
 	// albedo back in; the primary distance where claude_present wants it
-	if (skip)
-		gl_FragColor = raw;
-	else
-		gl_FragColor = vec4(outv.rgb * max(gp.rgb, vec3(ALB_MIN)), raw.a);
+	vec3 c = skip ? raw.rgb : outv.rgb * max(gp.rgb, vec3(ALB_MIN));
+	// THE SPLIT (claude_split; moved here from claude_present 2026-10-05
+	// so the present pass has a slot for the exposure): direct light now,
+	// the bounced part faded in by THIS pixel's sample count. Exactly the
+	// total once the ramp is done, or when off. Debug views untouched.
+	if (claudeSplitFrames > 0.5 && claudeView < 0.5 && gridDebug > 2.5) {
+		vec4 dd = texture2D(direct, uv);
+		vec3 cd = min(dd.rgb, c);
+		float wb = clamp(max(claudeStillFrames, dd.a - 1.0)
+				/ claudeSplitFrames, 0.0, 1.0);
+		c = cd + (c - cd) * wb;
+	}
+	gl_FragColor = vec4(c, raw.a);
 #else
 	gl_FragColor = outv;
 #endif

@@ -39,7 +39,8 @@
 #include "particles.h"
 #include "porting.h"
 #include <fstream>
-#include <json/json.h> // claude_models manifest (phase 4.5)
+#include <json/json.h>
+#include "client/render/secondstage.h" // g_claude_auto_exposure // claude_models manifest (phase 4.5)
 #include <sstream>
 #include <array>
 #include <algorithm>
@@ -360,6 +361,12 @@ struct ClaudeTraceGrid
 	float dial_glass_flush = 0.0f;
 	float dial_water_absorb = 0.0f;
 	float dial_denoise = 0.0f;
+	float dial_auto_exposure = 0.0f;
+	float dial_torch_nee = 0.0f;
+	float dial_units = 0.0f;
+	// what the units law delivered this frame (lux), for claude_stats
+	float units_sky_lux = 0.0f, units_sun_lux = 0.0f, units_moon_lux = 0.0f;
+	float units_moon_phase = -1.0f;
 	float dial_texel = 0.0f;
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
@@ -466,12 +473,17 @@ enum ClaudeMatKind : u8 {
 	MATK_LEAVES = 3,  // NDT_ALLFACES
 	MATK_GLASS = 4,   // the NDT_GLASSLIKE family
 	MATK_NUB = 5,     // the small-emitter stub (the old class 165)
-	MATK_COUNT = 6
+	// HOT THINGS (2026-10-05, real light units): their light is their
+	// TEMPERATURE's, not "albedo x a scale". Appended, so no existing
+	// index moves (indices 1..150 are what they were).
+	MATK_LAVA = 6,    // group lava, emissive: Planck at 1150 C
+	MATK_FIRE = 7,    // group fire, emissive: a flame's measured luminance
+	MATK_COUNT = 8
 };
 // Luanti's light_source is 0..14, so 15 levels is the whole range.
 static constexpr int CLAUDE_MAT_LIGHTS = 15;
 static constexpr int CLAUDE_MAT_COUNT =
-		1 + (MATK_COUNT - 1) * 2 * CLAUDE_MAT_LIGHTS;   // 151
+		1 + (MATK_COUNT - 1) * 2 * CLAUDE_MAT_LIGHTS;   // 211 (151 before hot)
 static_assert(CLAUDE_MAT_COUNT <= 256,
 		"the material key space no longer fits one byte: fall back to "
 		"7 bits of index plus an explicit fine bit (handoff gate 4)");
@@ -530,6 +542,13 @@ static inline u8 claudeMatIndex(const ClaudeMat &m)
 // the nub into the model path and delete it. Until then a distant torch
 // is a coarser rung (§7 permits laddered geometry), and this is written
 // down rather than left to be found.
+// THE RENDERER'S RADIANCE UNIT (2026-10-05, "real light units"). One unit
+// of traced radiance is this many candela per square metre (nits) of
+// luminance. Chosen so the emission law below is unchanged: a light-15
+// gallery block (Le = rho x 2.4) is then ~2,000 cd/m2, a bright lamp face,
+// and every furnace/Cornell referee keeps its analytic answer. The sun,
+// sky and moon are set in REAL photometric values divided by this.
+static constexpr float CLAUDE_UNIT_CDM2 = 1000.0f;
 static constexpr float CLAUDE_EMIT_BASE = 0.4f;
 static constexpr float CLAUDE_EMIT_GAIN = 2.0f;
 static float claudeMatEmission(const ClaudeMat &m)
@@ -560,6 +579,9 @@ struct ClaudeMatTexel {
 	// ABSORPTION, per metre of travel inside the medium, R/G/B (palette
 	// row 1, 2026-10-05). 0 for everything that is not a medium.
 	float absorb_r = 0.0f, absorb_g = 0.0f, absorb_b = 0.0f;
+	// HOT (row 1 .a): 0 = the emission law above, 1 = lava, 2 = flame.
+	// Read by claude_trace only under claude_units.
+	float hot = 0.0f;
 };
 
 // THE TRANSMISSION COLUMN, and the two numbers in it.
@@ -704,6 +726,10 @@ static void claudeMatTableBuild()
 		g_claude_matpal[idx] = ClaudeMatTexel{claudeMatEmission(m),
 				m.fine ? 1.0f : 0.0f, claudeMatTransmission(m),
 				claudeMatIor(m)};
+		if (m.kind == MATK_LAVA)
+			g_claude_matpal[idx].hot = 1.0f;
+		if (m.kind == MATK_FIRE)
+			g_claude_matpal[idx].hot = 2.0f;
 		if (m.kind == MATK_LIQUID) {
 			g_claude_matpal[idx].absorb_r = CLAUDE_WATER_ABSORB_R;
 			g_claude_matpal[idx].absorb_g = CLAUDE_WATER_ABSORB_G;
@@ -889,6 +915,83 @@ static void claudeUploadMoonSprite(video::ITexture *tex)
 // its LUMINANCE only (Rec.709). Trade-off, stated: the old coupling also
 // lent the sun the sky's sunset orange; a deliberate low-sun reddening is a
 // separate step. 0 = the old per-channel coupling.
+// =====================================================================
+// REAL LIGHT UNITS (claude_units, 2026-10-05; John: "do all that").
+// Every number here is from luanti-docs spec/photometric-sources.md, by
+// section; illuminances in lux, converted to renderer units by
+// CLAUDE_UNIT_CDM2 (radiance unit = 1000 cd/m2, so illuminance unit =
+// 1000 lx).
+// =====================================================================
+
+// Sky (dome) illuminance on a horizontal surface, lux, by sun altitude.
+// Sun up: the IES clear-sky diffuse model, E_kh = A + B sin^C(alt) with
+// A = 0.8 klx, B = 15.5 klx, C = 0.5 (IESNA Lighting Handbook 9th ed.,
+// Rea 2000; IES RP-21-1984; sources §2). Sun down: Schlyter's clear-sky
+// twilight table (sources §3), 0 deg / -6 / -12 / -18 = (the IES value at
+// 0, 800) / 3.4 / 0.008 / 6.5e-4 lx, interpolated in log10 (his own
+// 759 lx at 0 deg is replaced by the IES 800 so the two halves meet).
+// Floor: the moonless clear night, starlight + airglow, 2e-3 lx (Roach &
+// Gordon 1973 via Schlyter; sources §4). Clear sky only: no weather.
+static float claudeSkyLux(float alt_deg)
+{
+	const float NIGHT_LUX = 2e-3f;
+	if (alt_deg > 0.0f)
+		return 800.0f + 15500.0f
+				* std::sqrt(std::sin(alt_deg * 0.0174532925f));
+	const float a[4] = {0.0f, -6.0f, -12.0f, -18.0f};
+	const float lg[4] = {2.90309f, 0.531479f, -2.09691f, -3.187087f};
+	float l = lg[3];
+	for (int i = 0; i < 3; i++)
+		if (alt_deg <= a[i] && alt_deg >= a[i + 1]) {
+			float f = (a[i] - alt_deg) / (a[i] - a[i + 1]);
+			l = lg[i] + (lg[i + 1] - lg[i]) * f;
+		}
+	return std::max(std::pow(10.0f, l), NIGHT_LUX);
+}
+
+// Kasten & Young 1989 relative air mass, from the zenith angle in degrees
+static float claudeAirMass(float zdeg)
+{
+	return 1.0f / (std::cos(zdeg * 0.0174532925f)
+			+ 0.50572f * std::pow(std::max(96.07995f - zdeg, 0.01f),
+					-1.6364f));
+}
+
+// Direct-beam illuminance normal to the sun, lux: E_xt exp(-c m), with
+// E_xt = 127.5 klx and c = 0.21 for a clear sky, the constants the IES
+// model was fitted with (sources §1-2; 133 klx is the physical luminous
+// solar constant, but A/B/c belong to 127.5). Air mass: Kasten & Young
+// rather than IES's 1/sin(alt), which is equal at high sun and does not
+// blow up at the horizon.
+static float claudeSunLux(float zdeg)
+{
+	return 127500.0f * std::exp(-0.21f * claudeAirMass(zdeg));
+}
+
+// Moon, lux normal to the moon, by phase angle alpha in degrees (0 =
+// full): Krisciunas & Schaefer 1991 (PASP 103:1033),
+// I = 10^(-0.4 (3.84 + 0.026|a| + 4e-9 a^4)) foot-candles x 10.764,
+// outside the air; then the V-band extinction they use, k = 0.172 mag per
+// air mass. Full moon at the zenith: 0.265 lx, against Kyba et al. 2017's
+// measured 0.26-0.30 (sources §4).
+static float claudeMoonLux(float alpha_deg, float zdeg)
+{
+	float a = std::fabs(alpha_deg);
+	float m = 3.84f + 0.026f * a + 4e-9f * a * a * a * a;
+	float lux = std::pow(10.0f, -0.4f * m) * 10.764f;
+	return lux * std::pow(10.0f, -0.4f * 0.172f * claudeAirMass(zdeg));
+}
+
+// Rayleigh colour of white light through `am` air masses (the sun's
+// claude_sun_redden law), normalised to unit LUMINANCE (Y = 1).
+static v3f claudeRayleighUnitY(float am)
+{
+	const float tauR = 0.0629f, tauG = 0.0979f, tauB = 0.1808f;
+	v3f t(std::exp(-tauR * am), std::exp(-tauG * am), std::exp(-tauB * am));
+	float y = 0.2126f * t.X + 0.7152f * t.Y + 0.0722f * t.Z;
+	return y > 1e-9f ? t * (1.0f / y) : v3f(1.0f, 1.0f, 1.0f);
+}
+
 static v3f claudeBodyCol(const v3f &dome_e, const v3f &tint, float scale,
 		bool tint_only)
 {
@@ -1048,6 +1151,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_body_colour (2026-10-04): 1 (default) = sun/moon colour is
 	// their tint, brightness from the dome; 0 = dome colour per channel.
 	float m_body_colour = 1.0f;
+	// claude_units (2026-10-05): 1 (default) = the sun, sky and moon in
+	// real photometric values (see claudeSkyLux and the laws above it);
+	// 0 = the game's own sky colours as radiance and the bodies at 4x the
+	// dome, as before.
+	float m_units = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_units_pixel{"claudeUnits"};
 	// AIR (2026-10-04): claude_air_scatter / claude_air_absorb in 1/m and
 	// claude_air_g (Henyey-Greenstein asymmetry). 0 / 0 = no medium.
 	// TUNED: the defaults are a look, not a measurement — scatter 0.004
@@ -1065,6 +1174,24 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_split = 48.0f;
 	float m_still = 0.0f;
 	float m_exposure = 1.0f;   // claude_exposure: see claude_present
+	// claude_auto_exposure (2026-10-05): 1 (default) = the camera adapts
+	// to the scene like an eye (client/shaders/claude_exposure); claude_
+	// exposure then MULTIPLIES what it picks. 0 = claude_exposure alone,
+	// which is what every CI arm uses.
+	// claude_adapt_brighter / claude_adapt_darker: time constants in
+	// seconds for the scene getting brighter (eye: light adaptation, fast)
+	// and darker (dark adaptation, slow in life: minutes).
+	// TUNED: 0.5 s and 2.5 s | learn by: John's eye, walking into a cave
+	// and back out (an objective, his to set).
+	float m_auto_exposure = 1.0f;
+	float m_adapt_brighter = 0.5f;
+	float m_adapt_darker = 2.5f;
+	float m_frame_dt = 0.016f;
+	CachedPixelShaderSetting<float, 1, false> m_auto_exposure_pixel{"claudeAutoExposure"};
+	CachedPixelShaderSetting<float, 1, false> m_adapt_brighter_pixel{"claudeAdaptBrighter"};
+	CachedPixelShaderSetting<float, 1, false> m_adapt_darker_pixel{"claudeAdaptDarker"};
+	CachedPixelShaderSetting<float, 1, false> m_frame_dt_pixel{"claudeFrameDt"};
+	CachedPixelShaderSetting<float, 1, false> m_unit_cdm2_pixel{"claudeUnitCdm2"};
 	// claude_reproject (2026-10-05): keep history through camera motion.
 	// claude_motion_alpha: the floor on the blend weight while moving.
 	// TUNED: 1/16 (history ~16 frames deep in motion) | learn by: John's
@@ -1190,6 +1317,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		{"claudeEmitter3"}, {"claudeEmitter4"}, {"claudeEmitter5"},
 		{"claudeEmitter6"}, {"claudeEmitter7"}};
 	CachedPixelShaderSetting<float> m_emitter_count_pixel{"claudeEmitterCount"};
+	CachedPixelShaderSetting<float> m_point_count_pixel{"claudePointCount"};
+	// claude_torch_nee (2026-10-05): 1 (default) = NEE also aims at the
+	// small emitters (flames); 0 = they are lit only by being hit, as before
+	float m_torch_nee = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_torch_nee_pixel{"claudeTorchNee"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
 	// AREA emitters for NEE — ONE UNIFORM PER SLOT, exactly the shape
 	// claudeEmitter0..7 has always had. Not a `uniform vec4 a[16]`: GL
@@ -1273,10 +1405,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_water_absorb",
 		"claude_texel_colour",
 		"claude_body_colour",
+		"claude_units",
 		"claude_air_scatter",
 		"claude_flame",
 		"claude_split",
 		"claude_exposure",
+		"claude_auto_exposure",
+		"claude_torch_nee",
+		"claude_adapt_brighter",
+		"claude_adapt_darker",
 		"claude_reproject",
 		"claude_sun_redden",
 		"claude_motion_alpha",
@@ -1774,7 +1911,38 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		// It is computed rather than guessed because the BODIES are
 		// scaled RELATIVE to it (see below), so this number decides the
 		// sun/sky balance and nothing else does.
-		const v3f dome_e = (horizon * 0.2f + zenith * 0.8f) * (float)M_PI;
+		v3f dome_e = (horizon * 0.2f + zenith * 0.8f) * (float)M_PI;
+
+		// REAL UNITS: the game's sky colours give the dome its SHAPE and
+		// TINT; its brightness is set so it lights a horizontal surface with
+		// claudeSkyLux(sun altitude) lux. Sun altitude by geometry, whether
+		// or not the sun is drawn.
+		float units_sun_alt = -90.0f;
+		g_claude_grid.units_sun_lux = 0.0f;    // set below only if up
+		g_claude_grid.units_moon_lux = 0.0f;
+		g_claude_grid.units_moon_phase = -1.0f;
+		if (m_units > 0.5f && m_sky) {
+			v3f sd = m_sky->getSunDirection();
+			sd.normalize();
+			units_sun_alt = std::asin(std::clamp(sd.Y, -1.0f, 1.0f))
+					* 57.2957795f;
+			float e_lux = claudeSkyLux(units_sun_alt);
+			float y = 0.2126f * dome_e.X + 0.7152f * dome_e.Y
+					+ 0.0722f * dome_e.Z;
+			if (y < 1e-7f) {
+				// a black game sky: a neutral dome of the right brightness
+				horizon = zenith = v3f(1.0f, 1.0f, 1.0f);
+				dome_e = v3f((float)M_PI, (float)M_PI, (float)M_PI);
+				y = (float)M_PI;
+			}
+			float k = (e_lux / CLAUDE_UNIT_CDM2) / y;
+			horizon *= k;
+			zenith *= k;
+			dome_e *= k;
+			m_sky_horizon_pixel.set(horizon, services);
+			m_sky_zenith_pixel.set(zenith, services);
+			g_claude_grid.units_sky_lux = e_lux;
+		}
 
 		// THE ONE FREE NUMBER IN THE SKY MODEL, and it is named because
 		// it changes an image. A body's NORMAL IRRADIANCE is this
@@ -1861,6 +2029,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 				g_claude_grid.sun_chroma = t;
 				sun_col = claudeBodyCol(dome_e, t, BODY_TO_DOME_E / omega,
 						m_body_colour > 0.5f);
+				if (m_units > 0.5f) {
+					// REAL UNITS: the IES direct beam, normal to the sun,
+					// spread over the disc Luanti draws (a larger disc than
+					// the real sun's, so a lower radiance for the same
+					// illuminance); colour = the Rayleigh law, unit luminance
+					float zdeg = std::acos(std::clamp(sun_dir.Y, -1.0f, 1.0f))
+							* 57.2957795f;
+					float e_lux = claudeSunLux(zdeg);
+					sun_col = claudeRayleighUnitY(claudeAirMass(zdeg))
+							* ((e_lux / CLAUDE_UNIT_CDM2) / omega);
+					g_claude_grid.units_sun_lux = e_lux;
+				}
 			}
 			if (m_sky->getMoonVisible() && moon_dir.Y > 0.0f) {
 				moon_cos = 1.0f / std::sqrt(1.0f + moon_half * moon_half);
@@ -1869,6 +2049,31 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 						+ MOON_TINT.Z));
 				moon_col = claudeBodyCol(dome_e, t, BODY_TO_DOME_E / omega,
 						m_body_colour > 0.5f);
+				if (m_units > 0.5f) {
+					// REAL UNITS: moonlight is sunlight reflected, so its
+					// colour is the sun's through the moon's own air mass
+					// (no blue: the blue night look is the eye's, a display
+					// matter). Phase from Mineclonia's texture name
+					// "...^[sheet:4x2:x,y", phase = x + 4y, 0 = full, each
+					// step 45 deg of phase angle; full if it does not parse.
+					float zdeg = std::acos(std::clamp(moon_dir.Y, -1.0f, 1.0f))
+							* 57.2957795f;
+					int phase = 0;
+					const std::string &mn = g_claude_grid.moon_name;
+					size_t sp = mn.rfind("sheet:4x2:");
+					if (sp != std::string::npos) {
+						int px = 0, py = 0;
+						if (std::sscanf(mn.c_str() + sp + 10, "%d,%d", &px,
+								&py) == 2)
+							phase = (px + 4 * py) % 8;
+					}
+					float alpha = 45.0f * (float)(phase <= 4 ? phase : 8 - phase);
+					float e_lux = claudeMoonLux(alpha, zdeg);
+					moon_col = claudeRayleighUnitY(claudeAirMass(zdeg))
+							* ((e_lux / CLAUDE_UNIT_CDM2) / omega);
+					g_claude_grid.units_moon_lux = e_lux;
+					g_claude_grid.units_moon_phase = (float)phase;
+				}
 				// The moon quad's TEXTURE-SPACE axes. sky.cpp winds the
 				// quad so texture u grows toward -x_local and v toward
 				// -y_local (draw_sky_body: the (p1,p1) vertex carries uv
@@ -1951,6 +2156,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		g_claude_grid.dial_water_absorb = m_water_absorb;
 		g_claude_grid.dial_texel = m_texel;
 		g_claude_grid.dial_body_colour = m_body_colour;
+		g_claude_grid.dial_units = m_units;
 		g_claude_grid.dial_air_scatter = m_air_scatter;
 		g_claude_grid.dial_flame = m_flame;
 		g_claude_grid.dial_air_absorb = m_air_absorb;
@@ -2058,14 +2264,24 @@ public:
 			m_texel = readTexel();
 		if (name == "claude_body_colour")
 			m_body_colour = readBodyColour();
+		if (name == "claude_units")
+			m_units = readAir("claude_units", 1.0f, 1.0f);
 		if (name == "claude_sun_redden")
 			m_sun_redden = readAir("claude_sun_redden", 1.0f, 1.0f);
 		if (name == "claude_reproject")
 			m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		if (name == "claude_motion_alpha")
 			m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
+		if (name == "claude_torch_nee")
+			m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
+		if (name == "claude_auto_exposure")
+			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
+		if (name == "claude_adapt_brighter")
+			m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
+		if (name == "claude_adapt_darker")
+			m_adapt_darker = readAir("claude_adapt_darker", 2.5f, 600.0f);
 		if (name == "claude_exposure")
-			m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
+			m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
 		if (name == "claude_split")
 			m_split = readAir("claude_split", 48.0f, 100000.0f);
 		if (name == "claude_flame")
@@ -2149,12 +2365,17 @@ public:
 		m_water_absorb = readAir("claude_water_absorb", 1.0f, 1.0f);
 		m_texel = readTexel();
 		m_body_colour = readBodyColour();
+		m_units = readAir("claude_units", 1.0f, 1.0f);
 		m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
 		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		m_split = readAir("claude_split", 48.0f, 100000.0f);
-		m_exposure = readAir("claude_exposure", 1.0f, 64.0f);
+		m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
+		m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
+		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
+		m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
+		m_adapt_darker = readAir("claude_adapt_darker", 2.5f, 600.0f);
 		m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
 		m_sun_redden = readAir("claude_sun_redden", 1.0f, 1.0f);
 		m_motion_alpha = readAir("claude_motion_alpha", 1.0f / 16.0f, 1.0f);
@@ -2275,6 +2496,10 @@ public:
 				m_emitter_pixel[e].set(g_claude_grid.emitters[e], services);
 			float ecount = (float)g_claude_grid.emitter_runtime;
 			m_emitter_count_pixel.set(&ecount, services);
+			float pcount = (float)g_claude_grid.emitter_count;
+			m_point_count_pixel.set(&pcount, services);
+			m_torch_nee_pixel.set(&m_torch_nee, services);
+			g_claude_grid.dial_torch_nee = m_torch_nee;
 			m_held_emitter_pixel.set(g_claude_grid.held_emitter, services);
 			// AREA emitters (claude_trace NEE). Sent whether or not the
 			// grid is valid: an invalid grid leaves area_count at 0,
@@ -2423,6 +2648,7 @@ public:
 				m_descend_pixel.set(&m_descend, services);
 				m_glass_flush_pixel.set(&m_glass_flush, services);
 				m_water_absorb_pixel.set(&m_water_absorb, services);
+				m_units_pixel.set(&m_units, services);
 				m_texel_pixel.set(&m_texel, services);
 				m_air_scatter_pixel.set(&m_air_scatter, services);
 				m_flame_pixel.set(&m_flame, services);
@@ -2430,6 +2656,29 @@ public:
 				m_still = g_claude_grid.still_frames;
 				m_still_pixel.set(&m_still, services);
 				m_exposure_pixel.set(&m_exposure, services);
+				m_auto_exposure_pixel.set(&m_auto_exposure, services);
+				m_adapt_brighter_pixel.set(&m_adapt_brighter, services);
+				m_adapt_darker_pixel.set(&m_adapt_darker, services);
+				{
+					// wall-clock seconds since the previous traced frame,
+					// for the exposure's adaptation; rolled once per frame
+					static u32 dt_frame = 0xFFFFFFFFu;
+					static u64 dt_last_us = 0;
+					if (dt_frame != g_claude_frame_no) {
+						u64 now = porting::getTimeUs();
+						if (dt_last_us)
+							m_frame_dt = std::min((float)(now - dt_last_us)
+									* 1e-6f, 0.25f);
+						dt_last_us = now;
+						dt_frame = g_claude_frame_no;
+					}
+				}
+				m_frame_dt_pixel.set(&m_frame_dt, services);
+				{
+					float u = CLAUDE_UNIT_CDM2;
+					m_unit_cdm2_pixel.set(&u, services);
+				}
+				g_claude_grid.dial_auto_exposure = m_auto_exposure;
 				m_reproject_pixel.set(&m_reproject, services);
 				m_motion_alpha_pixel.set(&m_motion_alpha, services);
 				g_claude_grid.dial_reproject = m_reproject;
@@ -3321,10 +3570,27 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 							mz = glow[r][2] * 16.0;
 					double var = glow_sq / n
 							- (mx * mx + my * my + mz * mz);
-					float rad = (float)(1.6 * std::sqrt(std::max(var, 0.0))
-							/ 16.0);
-					glow[0][4] = glow[1][4] = glow[2][4] = glow[3][4] =
-							std::clamp(rad, 0.03f, 0.45f);
+					// THE BOUND (2026-10-05, claude_torch_nee): the radius
+					// of a sphere about the centroid holding EVERY emitting
+					// voxel whole (centre distance + half a voxel diagonal).
+					// The flame sampler's cone is built from it, so it must
+					// contain the flame, not describe its typical size (the
+					// RMS x 1.6 this replaced was unread and not a bound).
+					(void)var;
+					double far2 = 0.0;
+					for (int z2 = 0; z2 < 16; z2++)
+					for (int y2 = 0; y2 < 16; y2++)
+					for (int x2 = 0; x2 < 16; x2++) {
+						int p2 = vox[z2][y2][x2].asInt();
+						if (p2 <= 0 || p2 >= npal || pal[p2].isNull()
+								|| pal[p2]["emit"].asInt() <= 0)
+							continue;
+						double dx = x2 + 0.5 - mx, dy = y2 + 0.5 - my,
+								dz = z2 + 0.5 - mz;
+						far2 = std::max(far2, dx * dx + dy * dy + dz * dz);
+					}
+					float rad = (float)((std::sqrt(far2) + 0.8660254) / 16.0);
+					glow[0][4] = glow[1][4] = glow[2][4] = glow[3][4] = rad;
 				}
 				glow[r][3] = glowmax / 14.0f;     // NEE intensity
 			}
@@ -3369,7 +3635,11 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 			// colour (the model file says "colour": "palette" -- flowers)
 			palrgba[2] = (md.isMember("colour")
 					&& md["colour"].asString() == "palette") ? 255 : 0;
-			palrgba[3] = 0;
+			// A: 255 = this model's emitting voxels are FLAME (the model
+			// file says "light": "flame"); claude_trace gives them a
+			// flame's measured light under claude_units
+			palrgba[3] = (md.isMember("light")
+					&& md["light"].asString() == "flame") ? 255 : 0;
 		}
 		V.models.push_back(rots);
 		V.model_vox.push_back(vrots);
@@ -3732,6 +4002,12 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 			// light — in an all-emissive furnace room the 8 nearest wall
 			// cells became extra lights. Area emitters are barn doors
 			// the ambient ray can't miss; they get no aimed slot.
+			// HOT (2026-10-05): lava and open fire, by the game's own
+			// groups, become their own kinds; still opaque, still emitting.
+			if (f.getGroup("lava") > 0)
+				mat.kind = MATK_LAVA;
+			else if (f.getGroup("fire") > 0)
+				mat.kind = MATK_FIRE;
 		} else if (f.isLiquid())
 			mat.kind = MATK_LIQUID;
 		else if (f.drawtype == NDT_ALLFACES
@@ -3939,8 +4215,11 @@ static void claudeTraceGridFinishEmitters()
 			});
 	V.emitter_count = std::min<size_t>(emitters.size(), 8);
 	for (int e = 0; e < 8; e++) {
-		for (int k = 0; k < 4; k++)
+		for (int k = 0; k < 3; k++)
 			V.emitters[e][k] = e < V.emitter_count ? emitters[e][k] : 0.0f;
+		// .w = the bounding radius (cells), what claude_trace's flame
+		// sampler needs; the scalar intensity that sat here was never read
+		V.emitters[e][3] = e < V.emitter_count ? emitters[e][4] : 0.0f;
 		V.emitter_rad[e] = e < V.emitter_count ? emitters[e][4] : 0.0f;
 	}
 
@@ -4231,6 +4510,7 @@ static void claudeMatPalUpload()
 		pal[(256 + i) * 4 + 0] = g_claude_matpal[i].absorb_r;
 		pal[(256 + i) * 4 + 1] = g_claude_matpal[i].absorb_g;
 		pal[(256 + i) * 4 + 2] = g_claude_matpal[i].absorb_b;
+		pal[(256 + i) * 4 + 3] = g_claude_matpal[i].hot;
 	}
 	bool fresh = !V.matpal_tex;
 	if (fresh)
@@ -5025,6 +5305,17 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_glass_flush\": " << g_claude_grid.dial_glass_flush
 			<< ", \"claude_water_absorb\": " << g_claude_grid.dial_water_absorb
 			<< ", \"claude_denoise\": " << g_claude_grid.dial_denoise
+			<< ", \"claude_auto_exposure\": " << g_claude_grid.dial_auto_exposure
+			<< ", \"claude_torch_nee\": " << g_claude_grid.dial_torch_nee
+			<< ", \"claude_units\": " << g_claude_grid.dial_units
+			<< ", \"auto_exposure\": [" << g_claude_auto_exposure[0] << ","
+			<< g_claude_auto_exposure[1] << "," << g_claude_auto_exposure[2]
+			<< "," << g_claude_auto_exposure[3] << "]"
+			<< ", \"sky_lux\": " << g_claude_grid.units_sky_lux
+			<< ", \"sun_lux\": " << g_claude_grid.units_sun_lux
+			<< ", \"moon_lux\": " << g_claude_grid.units_moon_lux
+			<< ", \"moon_phase\": " << g_claude_grid.units_moon_phase
+			<< ", \"point_emitters\": " << g_claude_grid.emitter_count
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass

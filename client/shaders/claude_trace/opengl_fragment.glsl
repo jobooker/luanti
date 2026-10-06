@@ -326,6 +326,25 @@ uniform float claudeGlassFlush;
 // there, a = the palette's row 1 (game.cpp CLAUDE_WATER_ABSORB_*: pure
 // water, measured). 0 = lossless media, as before.
 uniform float claudeWaterAbsorb;
+// REAL LIGHT UNITS (claude_units, 2026-10-05). Radiance unit = 1000 cd/m2.
+// HOT THINGS glow by their temperature (luanti-docs
+// spec/photometric-sources.md §5-6; colours = Planck through the CIE 1931
+// observer into linear sRGB, normalised to unit luminance, negative blue
+// clamped to 0):
+//   FLAME  a candle's measured bright-zone luminance, 1-2e4 cd/m2
+//          (Hollan / Schlyter), at its ~1900 K colour. A soot flame is
+//          thin: a 1900 K blackbody would be 2.4e5, so its emissivity is
+//          ~0.06. ONE measured flame stands for every flame (torch,
+//          lantern, campfire, furnace, fire): no wood-fire luminance was
+//          found.
+//   LAVA   Kilauea's thermocouple 1140-1150 C, emissivity 0.95 (Fresnel,
+//          basaltic glass n = 1.55): 3,069 cd/m2. It REFLECTS 4.65 %.
+uniform float claudeUnits;
+const vec3 FLAME_RGB = vec3(2.6389, 0.6135, 0.0);
+const float FLAME_L = 15.0;
+const vec3 LAVA_RGB = vec3(3.42, 0.3886, 0.0);
+const float LAVA_L = 3.069;
+const float LAVA_RHO = 0.0465;
 // FACE-TILE COLOUR (claude_texel_colour, 2026-10-04). claudeMaterials is
 // the per-cell material id (unit 12, R8 128^3, 0 = none); claudeAtlas
 // (unit 13, 256x768) holds three 16x16 tiles per id — top, bottom, side —
@@ -490,6 +509,20 @@ uniform float claudeRngFrame;
 // shadow ray's own march() hit supplies it via cellEmission(). A second
 // copy of Le on the CPU is the divergence the contract forbids.
 uniform float claudeAreaCount; // live slots, 0..AREA_CAP; 0 = no NEE
+// SMALL EMITTERS FOR NEE (2026-10-05): the 8 nearest point emitters --
+// torch and lantern flames, campfires, a lit furnace's fire -- each as
+// (centre in grid cells, radius of a sphere holding EVERY emitting voxel).
+// See neePoint(). claudePointCount = live slots; 0 = off.
+uniform vec4 claudeEmitter0;
+uniform vec4 claudeEmitter1;
+uniform vec4 claudeEmitter2;
+uniform vec4 claudeEmitter3;
+uniform vec4 claudeEmitter4;
+uniform vec4 claudeEmitter5;
+uniform vec4 claudeEmitter6;
+uniform vec4 claudeEmitter7;
+uniform float claudePointCount;
+uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
 uniform vec4 claudeArea0;
 uniform vec4 claudeArea1;
 uniform vec4 claudeArea2;
@@ -787,6 +820,16 @@ float rnd1()
 // give.
 const uint SKY_CTR_BASE = 1u << 24u;
 uint g_skyCtr;
+// the flames' light sample draws from its own reserved range, for the
+// same reason the sky's does: the path's own sequence is untouched
+const uint PT_CTR_BASE = 1u << 25u;
+uint g_ptCtr;
+float rndPt()
+{
+	g_ptCtr += 1u;
+	return float(pcgHash(g_rngKey ^ pcgHash(PT_CTR_BASE + g_ptCtr)))
+			* (1.0 / 4294967296.0);
+}
 
 float rndSky()
 {
@@ -1225,6 +1268,43 @@ float modelVoxelEmitScale(vec3 cell, vec3 sv)
 			/ 256.0;
 }
 
+// HOT: 0 = the emission law, 1 = lava, 2 = flame (palette row 1 .a)
+float matHot(float idx)
+{
+	return texture2D(claudeMatPal, vec2((idx + 0.5) / 256.0, 0.75)).a;
+}
+
+// Is this cell a model whose emitting voxels are FLAME? (slot 0 alpha)
+bool modelFlame(vec3 cell)
+{
+	float mid = floor(texture3D(claudeModelIds,
+			(cell + 0.5) / GRID_S).r * 255.0 + 0.5);
+	if (mid < 3.5)
+		return false;
+	float m = floor(mid / 4.0) - 1.0;
+	return texture2D(claudeModelPal,
+			(vec2(0.0, m) + 0.5) / vec2(256.0, 64.0)).a > 0.5;
+}
+
+// The hot law, if it applies: rewrites le (and lava's albedo). `fine`
+// = the hit is a sub-voxel of `cell` at `sv`.
+void hotLaw(float idx, vec3 cell, bool fine, vec3 sv, inout vec3 alb,
+		inout vec3 le)
+{
+	if (claudeUnits < 0.5 || idx < 0.5)
+		return;
+	float hot = matHot(idx);
+	if (hot > 1.5) {
+		le = FLAME_RGB * FLAME_L;
+	} else if (hot > 0.5) {
+		alb = vec3(LAVA_RHO);
+		le = LAVA_RGB * LAVA_L;
+	} else if (fine && modelFlame(cell)) {
+		le = modelVoxelEmitScale(cell, sv) > 0.0
+				? FLAME_RGB * FLAME_L : vec3(0.0);
+	}
+}
+
 // The VOXEL's own palette colour, for models flagged "colour": "palette"
 // (flowers, 2026-10-05). False (and `rgb` untouched) for every other cell.
 bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
@@ -1516,6 +1596,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 					le = alb * pal.r;   // the palette's emission column (§4: one Le)
 					if (claudeFlame > 0.5 && pal.r > 0.0)
 						le *= modelVoxelEmitScale(cellHi, ci);
+					if (pal.r > 0.0)
+						hotLaw(idxOut, cellHi, true, ci, alb, le);
 				}
 				tHit = t;
 				cellOut = cellHi;   // the COARSE cell, for neeDirect
@@ -1698,6 +1780,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)
 		if (claudeFlame > 0.5 && !hitAir && suHit.x >= 0.0 && pal.r > 0.0)
 			le *= modelVoxelEmitScale(ci, suHit);
+		if (!hitAir && pal.r > 0.0)
+			hotLaw(idxOut, ci, suHit.x >= 0.0, suHit, alb, le);
 
 		tHit = t;
 		cellOut = ci;
@@ -2137,6 +2221,104 @@ float skyPdfSa(vec3 wi)
 // the water. It still cannot see the sky THROUGH the surface of that
 // tank, and it should not — that path is refracted, and a straight ray is
 // not it.
+// =====================================================================
+// AIMING AT FLAMES (claude_torch_nee, 2026-10-05)
+// =====================================================================
+// A torch's light leaves through a few 1/16 m flame voxels, and a path
+// finds them only by chance: the sparkle. This aims at them. Pick one of
+// the nearest flames uniformly, then a direction uniformly inside the cone
+// that just contains the sphere around ALL its emitting voxels, and march
+// it. Light counts ONLY if the ray really hits an emitting fine voxel, so
+// the cone is a sampling region and never a light shape: nothing is
+// invented where the flame is not (the 2026-08-13 jittered-target attempt
+// aimed AT made-up points and was reverted for exactly that). Full-cube
+// lamps are the area list's (neeDirect) and are not counted here.
+//
+// The density of a direction is the MIXTURE over every cone that contains
+// it, ptPdfSa(), used identically by this estimator and by the BSDF ray
+// that hits a flame (balance heuristic), so the pair sums to one for every
+// direction and hit. A vertex inside a flame's sphere has no cone for it.
+vec4 ptEmitter(int i)
+{
+	if (i == 0) return claudeEmitter0;
+	if (i == 1) return claudeEmitter1;
+	if (i == 2) return claudeEmitter2;
+	if (i == 3) return claudeEmitter3;
+	if (i == 4) return claudeEmitter4;
+	if (i == 5) return claudeEmitter5;
+	if (i == 6) return claudeEmitter6;
+	return claudeEmitter7;
+}
+
+// cos of the cone's half angle from x, or 2.0 = no cone (x inside, or empty)
+float ptConeCos(vec4 e, vec3 x)
+{
+	if (e.w <= 0.0)
+		return 2.0;
+	vec3 d = e.xyz - x;
+	float d2 = dot(d, d);
+	float r2 = e.w * e.w;
+	if (d2 <= r2 * 1.0001)
+		return 2.0;
+	return sqrt(1.0 - r2 / d2);
+}
+
+float ptPdfSa(vec3 x, vec3 wi, int nPts)
+{
+	float p = 0.0;
+	for (int i = 0; i < 8; i++) {
+		if (i >= nPts)
+			break;
+		vec4 e = ptEmitter(i);
+		float cm = ptConeCos(e, x);
+		if (cm > 1.5)
+			continue;
+		if (dot(wi, normalize(e.xyz - x)) >= cm)
+			p += 1.0 / (float(nPts) * PI2 * (1.0 - cm));
+	}
+	return p;
+}
+
+vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
+{
+	float us = rndPt();
+	float u1 = rndPt();
+	float u2 = rndPt();
+	int li = min(int(float(nPts) * us), nPts - 1);
+	vec4 e = ptEmitter(li);
+	float cm = ptConeCos(e, x);
+	if (cm > 1.5)
+		return vec3(0.0);
+	vec3 w = normalize(e.xyz - x);
+	float ct = 1.0 - u1 * (1.0 - cm);
+	float st = sqrt(max(0.0, 1.0 - ct * ct));
+	float ph = PI2 * u2;
+	vec3 a = abs(w.x) > 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+	vec3 t = normalize(cross(a, w));
+	vec3 b = cross(w, t);
+	vec3 wi = normalize(t * (cos(ph) * st) + b * (sin(ph) * st) + w * ct);
+	float cosX = dot(nx, wi);
+	if (cosX <= 0.0)
+		return vec3(0.0);
+	vec3 shp, shn, shalb, shle, shcell;
+	float sht;
+	vec4 shpal;
+	float shidx;
+	vec3 shfar;
+	if (!marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+			shpal, shidx, shfar))
+		return vec3(0.0);
+	if (!matFine(shpal) || !any(greaterThan(shle, vec3(0.0))))
+		return vec3(0.0);         // not a flame: not this estimator's
+	float pdfL = ptPdfSa(x, wi, nPts);
+	float pdfB = cosX / PI;
+	if (pdfL <= 0.0)
+		return vec3(0.0);
+	vec3 tr = curMed < 0.5 ? vec3(airTr(sht)) : medTr(curMed, sht);
+	// f Le cos / p_L, times the balance weight p_L / (p_L + p_B)
+	return (rho / PI) * shle * cosX / (pdfL + pdfB) * tr;
+}
+
 vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 {
 	vec3 bdir;
@@ -2365,6 +2547,11 @@ void main(void)
 	// there are frequently no listed emitters at all, and that is exactly
 	// the scene where sampling the sun matters most.
 	bool skyNee = claudeNee > 0.5;
+	// the flames' own light sampler, under the same dial
+	int nPts = (claudeNee > 0.5 && claudeTorchNee > 0.5)
+			? min(int(claudePointCount + 0.5), 8) : 0;
+	g_ptCtr = 0u;
+	bool coneArmed = false;   // did the previous vertex aim at flames?
 
 	g_rngState = hash13(vec3(gl_FragCoord.xy,
 			// animationTimer is unbounded seconds; wrapped by an
@@ -2940,6 +3127,7 @@ void main(void)
 				prevPdfB = hgPhase(dot(dir, nd), claudeAirG);
 				prevX = xa;
 				misArmed = nLights > 0 || skyNee;
+				coneArmed = false;   // air vertices do not aim at flames
 				dir = nd;
 				p = xa;
 				pathBounces += 1.0;
@@ -3020,6 +3208,9 @@ void main(void)
 		if (misArmed && any(greaterThan(le, vec3(0.0)))) {
 			float cosY = dot(n, -dir);
 			float pdfL = neePdfSa(cell, n, prevX, tHit, cosY, nLights);
+			// a flame hit: the flame sampler could have chosen this too
+			if (coneArmed && matFine(hitPal))
+				pdfL += ptPdfSa(prevX, dir, nPts);
 			// A zero denominator means neither strategy claims a density
 			// for this direction, which can only happen at a degenerate
 			// cos; fall back to 1 rather than let a NaN into the history.
@@ -3160,6 +3351,7 @@ void main(void)
 				curMed = hitIdx;
 			}
 			misArmed = false;     // a delta lobe has no light-sampling
+			coneArmed = false;
 			                      // partner: the next Le arrives at
 			                      // weight 1
 			pathBounces += 1.0;
@@ -3186,6 +3378,12 @@ void main(void)
 			L += cS;
 			if (nScat < 0.5)
 				Ld += cS;
+		}
+		if (nPts > 0) {
+			vec3 cP = tp * neePoint(hp, n, alb, nPts, curMed);
+			L += cP;
+			if (nScat < 0.5)
+				Ld += cP;
 		}
 
 		tp *= alb;
@@ -3214,7 +3412,8 @@ void main(void)
 		// is the only light there is — leaving this at `nLights > 0`
 		// would have given the sun's BSDF half a weight of 1 while the
 		// sky sampler was also paying it, i.e. the double count.
-		misArmed = nLights > 0 || skyNee;
+		misArmed = nLights > 0 || skyNee || nPts > 0;
+		coneArmed = nPts > 0;
 		p = hp;
 		pathBounces += 1.0;
 		nScat += 1.0;

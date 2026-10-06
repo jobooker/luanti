@@ -326,6 +326,10 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	static const u8 TEXTURE_MOM_2 = 38;
 	static const u8 TEXTURE_DEN_A = 39;
 	static const u8 TEXTURE_DEN_B = 40;
+	// AUTO EXPOSURE (claude_auto_exposure, 2026-10-05): a 1x1 ping-pong
+	// holding the adapted scene brightness, written by claude_exposure.
+	static const u8 TEXTURE_EXP_1 = 41;
+	static const u8 TEXTURE_EXP_2 = 42;
 	// Trace resolution, relative to the render target. 0.5 was chosen on a
 	// retina laptop, where a 2x backing store downsampled the result and gave
 	// free supersampling; on a plain 1080p external monitor the same 0.5 is
@@ -370,6 +374,8 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	buffer->setTexture(TEXTURE_MOM_2, scale * trace_scale, "claude_mom_2", accum_format);
 	buffer->setTexture(TEXTURE_DEN_A, scale * trace_scale, "claude_den_a", accum_format);
 	buffer->setTexture(TEXTURE_DEN_B, scale * trace_scale, "claude_den_b", accum_format);
+	buffer->setTexture(TEXTURE_EXP_1, core::dimension2du(1, 1), "claude_exp_1", accum_format, /*clear:*/ true);
+	buffer->setTexture(TEXTURE_EXP_2, core::dimension2du(1, 1), "claude_exp_2", accum_format, /*clear:*/ true);
 
 	effect->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, TEXTURE_MERGED));
 
@@ -414,13 +420,25 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 				out));
 	}
 
+	// claude_exposure: one pixel. Reads what is about to be shown (DEN_B)
+	// and last frame's adapted brightness, writes this frame's. claude_
+	// present reads it as texture 3 (the split, which used to need that
+	// slot, now happens in claude_denoise's last pass).
+	shader_id = client->getShaderSource()->getShaderRaw("claude_exposure");
+	PostProcessingStep *expo = pipeline->addStep<PostProcessingStep>(shader_id,
+			std::vector<u8> { TEXTURE_DEN_B, TEXTURE_EXP_1 });
+	expo->setRenderSource(buffer);
+	expo->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
+			TEXTURE_EXP_2));
+	pipeline->addStep<ClaudeExposureReadback>(buffer, TEXTURE_EXP_2);
+
 	// claude_present is UNCHANGED in its slots: texture 1 is the traced
 	// lighting it upsamples and tonemaps. It used to be the denoiser's
 	// output; it is now the tracer's own, straight out of ACCUM_2.
 	shader_id = client->getShaderSource()->getShaderRaw("claude_present");
 	PostProcessingStep *present = pipeline->createOwned<PostProcessingStep>(shader_id,
 			std::vector<u8> { TEXTURE_MERGED, TEXTURE_DEN_B, TEXTURE_DEPTH,
-					TEXTURE_DIRECT_2 });
+					TEXTURE_EXP_2 });
 	pipeline->addStep(present);
 	// joint-bilateral upsample does its own tap weighting: keep NEAREST
 	present->setRenderSource(buffer);
@@ -429,8 +447,29 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_DIRECT_1, TEXTURE_DIRECT_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_GBUF_1, TEXTURE_GBUF_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_MOM_1, TEXTURE_MOM_2);
+	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_EXP_1, TEXTURE_EXP_2);
 
 	return present;
+}
+
+float g_claude_auto_exposure[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+void ClaudeExposureReadback::run(PipelineContext &context)
+{
+	if (frames++ % 30 != 0)
+		return;
+	video::ITexture *tex = buffer->getTexture(index);
+	if (!tex || tex->getColorFormat() != video::ECF_A32B32G32R32F)
+		return;
+	const float *px = (const float *)tex->lock(video::ETLM_READ_ONLY);
+	if (!px)
+		return;
+	// RGBA order in a 32F texel: .r factor, .g written, .b adapted, .a now
+	g_claude_auto_exposure[0] = px[0];
+	g_claude_auto_exposure[1] = px[2];
+	g_claude_auto_exposure[2] = px[3];
+	g_claude_auto_exposure[3] = px[1];
+	tex->unlock();
 }
 
 void ResolveMSAAStep::run(PipelineContext &context)

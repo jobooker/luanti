@@ -7,15 +7,16 @@
 #define merged texture0
 #define accum texture1
 #define depthmap texture2
-#define accumDirect texture3
+#define autoExposure texture3
 
 uniform sampler2D merged;
 uniform sampler2D accum;
 uniform sampler2D depthmap;
 // the direct part of accum (claude_trace historyDirect) and the ramp
-uniform sampler2D accumDirect;
-uniform float claudeSplitFrames;  // 0 = off: show the total, as before
-uniform float claudeStillFrames;
+// the adapted exposure, one pixel (client/shaders/claude_exposure):
+// .r = the factor to multiply by, .g = 1 once written
+uniform sampler2D autoExposure;
+uniform float claudeAutoExposure;
 // MEASUREMENT EXPOSURE (claude_exposure, 2026-10-05). Linear radiance is
 // scaled by this before the ACES curve. 1 = the look. The furnace referees
 // shoot at 0.25 so a rho = 0.73 room (L = 6.49) lands mid-curve instead of
@@ -94,8 +95,6 @@ void main(void)
 	vec2 base = (floor(uv / ht - 0.5) + 0.5) * ht;
 	vec2 f = clamp((uv - base) / ht, 0.0, 1.0);
 	vec3 sum = vec3(0.0);
-	vec3 sumD = vec3(0.0);
-	float sumN = 0.0;
 	float wsum = 0.0;
 	for (int i = 0; i < 4; i++) {
 		vec2 o = vec2(i == 1 || i == 3 ? 1.0 : 0.0,
@@ -111,23 +110,10 @@ void main(void)
 				/ max(1.7, 0.008 * guide));
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
-		vec4 dd = texture2D(accumDirect, base + o * ht);
-		sumD += dd.rgb * w;
-		sumN += dd.a * w;
 		wsum += w;
 	}
 	vec3 c = sum / wsum;
-	// THE SPLIT: direct now, bounced light faded in over claudeSplitFrames
-	// of stillness; exactly the total once the ramp is done (or when off)
-	if (claudeSplitFrames > 0.5 && claudeView < 0.5) {
-		vec3 cd = min(sumD / wsum, c);
-		// per pixel: the samples behind THIS pixel (reprojected history
-		// counts), so a pixel that kept its history while moving keeps its
-		// bounced light too
-		float wb = clamp(max(claudeStillFrames, sumN / wsum - 1.0)
-				/ claudeSplitFrames, 0.0, 1.0);
-		c = cd + (c - cd) * wb;
-	}
+	// THE SPLIT now happens in claude_denoise's last pass, per trace pixel.
 
 	// DIAGNOSTIC VIEWS (claude_view 1-5) present LINEARLY. Their values
 	// are the message: a 6-step gray normal ladder, a linear Le, a
@@ -168,7 +154,14 @@ void main(void)
 
 	// accum is LINEAR radiance now; the display transform is the ONE
 	// art knob (energy audit): ACES filmic fit (Narkowicz), then gamma
-	vec3 lin = max(c, vec3(0.0)) * (claudeExposure > 0.0 ? claudeExposure : 1.0);
+	// exposure: the manual dial, times the eye's adaptation when on
+	float ex = claudeExposure > 0.0 ? claudeExposure : 1.0;
+	if (claudeAutoExposure > 0.5) {
+		vec4 ae = texture2D(autoExposure, vec2(0.5));
+		if (ae.g > 0.5 && ae.r > 0.0 && ae.r < 1e9)
+			ex *= ae.r;
+	}
+	vec3 lin = max(c, vec3(0.0)) * ex;
 	vec3 aces = clamp(lin * (2.51 * lin + 0.03)
 			/ (lin * (2.43 * lin + 0.59) + 0.14), 0.0, 1.0);
 	gl_FragColor = vec4(pow(aces, vec3(1.0 / 2.2)), 1.0);

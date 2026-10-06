@@ -57,4 +57,22 @@ private:
 };
 
 
+// claude_exposure's one pixel, read back to the CPU every 30th frame for
+// claude_stats.json (auto_exposure): [factor, log2 adapted luminance,
+// log2 measured luminance, written]. Display data, never fed back.
+extern float g_claude_auto_exposure[4];
+
+class ClaudeExposureReadback : public TrivialRenderStep
+{
+public:
+	ClaudeExposureReadback(TextureBuffer *_buffer, u8 _index) :
+			buffer(_buffer), index(_index) {};
+	void run(PipelineContext &context) override;
+
+private:
+	TextureBuffer *buffer;
+	u8 index;
+	u32 frames = 0;
+};
+
 RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep, v2f scale, Client *client);
