@@ -14,7 +14,6 @@
 #include "filesys.h"
 #include "porting.h"
 
-#include <json/json.h>
 #include "gamedef.h"
 #include "content/mods.h"
 #include "database/database-sqlite3.h"
@@ -25,7 +24,6 @@
 #include <sstream>
 #include <thread>
 #include <cstring>
-#include <fstream>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,7 +60,7 @@ struct BlockSummary
 	// per-octant mean color, RGB565 (0 = unset -> fall back to the
 	// subcell mean): real 2m-scale variation folded from real nodes —
 	// John's law: "variation comes from more voxels, not texture"
-	u32 fineCol[64][8]; // 0 = unset, else 0xFF<<24 | sRGB r<<16 | g<<8 | b
+	u8 fineCol[64][8][3]; // sRGB r, g, b (set wherever the octant holds nodes)
 	u32 rsum[64], gsum[64], bsum[64]; // summed LINEAR colour (x LIN) of the colour nodes
 	// how many nodes the colour sums hold: the TOP-EXPOSED ones (a node with
 	// open air above it) when the subcell has any, else all of them
@@ -89,6 +87,11 @@ static inline u32 toSrgb(u32 v)
 
 static std::mutex g_mutex;
 static std::unordered_map<v3s16, BlockSummary> g_summaries;
+// ALL-AIR BLOCKS (2026-10-06): 68 % of the 67k blocks the world-file
+// reader folded held nothing, at ~3.8 KB each. They are remembered as
+// known-empty (so neither the reader nor the builder looks again) instead
+// of stored.
+static std::unordered_set<v3s16> g_empty;
 static u64 g_version = 0;
 
 void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
@@ -247,11 +250,11 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 			(void)n;
 			bool ex = en[sub][o] > 0;
 			u32 cn = ex ? en[sub][o] : an[sub][o];
-			if (cn > 0)
-				s.fineCol[sub][o] = 0xFF000000u
-					| (toSrgb(((ex ? erc : rc)[sub][o] + cn / 2) / cn) << 16)
-					| (toSrgb(((ex ? egc : gc)[sub][o] + cn / 2) / cn) << 8)
-					| toSrgb(((ex ? ebc : bc)[sub][o] + cn / 2) / cn);
+			if (cn > 0) {
+				s.fineCol[sub][o][0] = (u8)toSrgb(((ex ? erc : rc)[sub][o] + cn / 2) / cn);
+				s.fineCol[sub][o][1] = (u8)toSrgb(((ex ? egc : gc)[sub][o] + cn / 2) / cn);
+				s.fineCol[sub][o][2] = (u8)toSrgb(((ex ? ebc : bc)[sub][o] + cn / 2) / cn);
+			}
 		}
 	for (int sub = 0; sub < 64; sub++) {
 		u32 er = 0, eg = 0, eb = 0, ar = 0, ag = 0, ab = 0, ne = 0, na = 0;
@@ -267,11 +270,23 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 		s.ccount[sub] = (u8)(ex ? ne : na);
 	}
 	{
+		const v3s16 bp = block->getPos();
+		bool empty = true;
+		for (int i = 0; i < 64 && empty; i++)
+			empty = s.occ[i] == 0 && s.water[i] == 0 && s.lava[i] == 0;
 		std::lock_guard<std::mutex> lock(g_mutex);
-		if (fill_only && g_summaries.count(block->getPos()))
+		if (fill_only && (g_summaries.count(bp) || g_empty.count(bp)))
 			return;
-		g_summaries[block->getPos()] = s;
-		g_version++;
+		if (empty) {
+			// a block that held something and was emptied changes the view
+			if (g_summaries.erase(bp))
+				g_version++;
+			g_empty.insert(bp);
+		} else {
+			g_empty.erase(bp);
+			g_summaries[bp] = s;
+			g_version++;
+		}
 	}
 }
 
@@ -337,13 +352,22 @@ static void farDbLoop(Client *client, std::string dir)
 		v3s16 c(g_fd_cx / MAP_BLOCKSIZE, g_fd_cy / MAP_BLOCKSIZE,
 				g_fd_cz / MAP_BLOCKSIZE);
 		int rb = g_fd_r / MAP_BLOCKSIZE;
+		// what eviction drops, the reader must be free to load again
+		for (auto it = tried.begin(); it != tried.end();) {
+			v3s16 d = *it - c;
+			if (std::max({std::abs(d.X), std::abs(d.Y), std::abs(d.Z)}) > 2 * rb)
+				it = tried.erase(it);
+			else
+				++it;
+		}
 		todo.clear();
 		{
 			std::lock_guard<std::mutex> lock(g_mutex);
 			for (const v3s16 &p : all) {
 				v3s16 d = p - c;
 				int m = std::max({std::abs(d.X), std::abs(d.Y), std::abs(d.Z)});
-				if (m > rb || tried.count(p) || g_summaries.count(p))
+				if (m > rb || tried.count(p) || g_summaries.count(p)
+						|| g_empty.count(p))
 					continue;
 				todo.emplace_back(d.X * d.X + d.Y * d.Y + d.Z * d.Z, p);
 			}
@@ -416,102 +440,45 @@ size_t farDbLoaded()
 	return g_fd_loaded;
 }
 
-// ---- far-data feed: JSON dropped by tooling (server bridge sample ->
-// scp) becomes synthetic summaries. File format, one object per file:
-// {"blocks":[{"p":[bx,by,bz],"sub":[[idx,occ,water,"node:name",p2],..]},..]}
-static std::unordered_set<std::string> g_far_loaded;
-
-size_t ingestFarDir(Client *client)
-{
-	std::string dir = porting::path_user + DIR_DELIM + "claude_far";
-	if (!fs::PathExists(dir))
-		return 0;
-	const NodeDefManager *ndef = client->getNodeDefManager();
-	size_t added = 0;
-	for (const auto &e : fs::GetDirListing(dir)) {
-		if (e.dir || e.name.size() < 6
-				|| e.name.substr(e.name.size() - 5) != ".json")
-			continue;
-		if (g_far_loaded.count(e.name))
-			continue;
-		g_far_loaded.insert(e.name);
-		std::ifstream f(dir + DIR_DELIM + e.name);
-		Json::Value root;
-		try {
-			f >> root;
-		} catch (...) {
-			continue;
-		}
-		for (const Json::Value &b : root["blocks"]) {
-			if (!b["p"].isArray() || b["p"].size() != 3)
-				continue;
-			v3s16 bp(b["p"][0].asInt(), b["p"][1].asInt(),
-					b["p"][2].asInt());
-			BlockSummary s = {};
-			for (const Json::Value &sc : b["sub"]) {
-				if (!sc.isArray() || sc.size() < 5)
-					continue;
-				int idx = sc[0].asInt();
-				if (idx < 0 || idx >= 64)
-					continue;
-				int occ = std::min(sc[1].asInt(), 64);
-				int water = std::min(sc[2].asInt(), 64);
-				content_t c = ndef->getId(sc[3].asString());
-				video::SColor col(255, 180, 180, 180);
-				if (c != CONTENT_IGNORE) {
-					const ContentFeatures &cf = ndef->get(c);
-					if (cf.visuals
-							&& cf.visuals->minimap_color.getAlpha() > 0)
-						col = cf.visuals->minimap_color;
-					if (cf.visuals) {
-						video::SColor tint(255, 255, 255, 255);
-						cf.visuals->getColor((u8)sc[4].asInt(), &tint);
-						if (tint.getRed() != 255 || tint.getGreen() != 255
-								|| tint.getBlue() != 255) {
-							col.setRed(col.getRed() * tint.getRed() / 255);
-							col.setGreen(col.getGreen()
-									* tint.getGreen() / 255);
-							col.setBlue(col.getBlue()
-									* tint.getBlue() / 255);
-						}
-					}
-				}
-				s.occ[idx] = (u8)occ;
-				s.water[idx] = (u8)water;
-				int cnt = occ + water;
-				// linear sums and their count, as the received-block fold
-				s.rsum[idx] = toLin(col.getRed()) * cnt;
-				s.gsum[idx] = toLin(col.getGreen()) * cnt;
-				s.bsum[idx] = toLin(col.getBlue()) * cnt;
-				s.ccount[idx] = (u8)cnt;
-			}
-			{
-				std::lock_guard<std::mutex> lock(g_mutex);
-				// real received blocks win: only fill holes
-				if (!g_summaries.count(bp)) {
-					g_summaries[bp] = s;
-					added++;
-				}
-			}
-		}
-	}
-	if (added) {
-		std::lock_guard<std::mutex> lock(g_mutex);
-		g_version++;
-	}
-	return added;
-}
-
 u64 contentVersion()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
 	return g_version;
 }
 
+size_t evictFar(v3s16 center_nodes, int radius_nodes)
+{
+	v3s16 c(center_nodes.X / MAP_BLOCKSIZE, center_nodes.Y / MAP_BLOCKSIZE,
+			center_nodes.Z / MAP_BLOCKSIZE);
+	const int lim = 2 * radius_nodes / MAP_BLOCKSIZE;
+	auto far = [&](const v3s16 &p) {
+		v3s16 d = p - c;
+		return std::max({std::abs(d.X), std::abs(d.Y), std::abs(d.Z)}) > lim;
+	};
+	size_t n = 0;
+	std::lock_guard<std::mutex> lock(g_mutex);
+	for (auto it = g_summaries.begin(); it != g_summaries.end();) {
+		if (far(it->first)) { it = g_summaries.erase(it); n++; }
+		else ++it;
+	}
+	for (auto it = g_empty.begin(); it != g_empty.end();) {
+		if (far(*it)) { it = g_empty.erase(it); n++; }
+		else ++it;
+	}
+	// no version bump: nothing evicted lies inside any level
+	return n;
+}
+
+size_t summaryBytes()
+{
+	std::lock_guard<std::mutex> lock(g_mutex);
+	return g_summaries.size() * sizeof(BlockSummary);
+}
+
 size_t summaryCount()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
-	return g_summaries.size();
+	return g_summaries.size() + g_empty.size();
 }
 
 u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
@@ -603,19 +570,12 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 					// shared from the subcell (color grain at 2m is
 					// invisible past the 64-node promotion distance)
 					bool leafdom = s.leaf[sub] * 2 > s.occ[sub];
-					u32 ccn = std::max<u32>(s.ccount[sub], 1);
-					u32 smr = (s.rsum[sub] + ccn / 2) / ccn,
-						smg = (s.gsum[sub] + ccn / 2) / ccn,
-						smb = (s.bsum[sub] + ccn / 2) / ccn;
 					for (int o = 0; o < 8; o++) {
-						// real octant color; 0 = unset (far-fed data)
-						u32 mr = smr, mg = smg, mb = smb;
-						u32 fc = s.fineCol[sub][o];
-						if (fc != 0) {
-							mr = toLin((fc >> 16) & 255);
-							mg = toLin((fc >> 8) & 255);
-							mb = toLin(fc & 255);
-						}
+						// the octant's own colour (an octant that folds to
+						// anything holds >= 4 nodes, so it is always set)
+						u32 mr = toLin(s.fineCol[sub][o][0]),
+							mg = toLin(s.fineCol[sub][o][1]),
+							mb = toLin(s.fineCol[sub][o][2]);
 						bool fs = (s.fine[sub] >> o) & 1;
 						bool fw = (s.finew[sub] >> o) & 1;
 						bool fl = (s.finel[sub] >> o) & 1;

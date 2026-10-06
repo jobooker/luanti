@@ -5484,7 +5484,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< "," << g_claude_grid.casc[3].ms
 			<< "," << g_claude_grid.casc[4].ms
 			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
-			<< ", \"far_db_blocks\": " << claude_lod::farDbLoaded();
+			<< ", \"far_db_blocks\": " << claude_lod::farDbLoaded()
+			<< ", \"summary_mb\": " << claude_lod::summaryBytes() / (1024 * 1024);
 	os << ", \"draw_ms\": " << (draw_total / frames / 1000.0f)
 			<< ", \"busy_ms\": " << (busy_total / frames / 1000.0f);
 	os << ", \"pass_ms\": [";
@@ -5558,17 +5559,11 @@ static void claudeCascadeUpdate(Client *client)
 	static const int CELL[5] = {2, 4, 8, 16, 32};
 	static const u64 CADENCE[5] = {8000, 6000, 4000, 12000, 20000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
-	// far-data feed: sweep <path_user>/claude_far/ for new server-sampled
-	// terrain every ~5 s (each file ingested once; version bump triggers
-	// the normal cascade rebuild below)
-	static u64 far_last = 0;
-	u64 now_ms = porting::getTimeMs();
-	if (now_ms - far_last > 5000) {
-		far_last = now_ms;
-		size_t n = claude_lod::ingestFarDir(client);
-		if (n)
-			infostream << "claude_far: ingested " << n << " blocks"
-					<< std::endl;
+	// eviction, every ~10 s: what lies past twice the coarsest window goes
+	static u64 evict_last = 0;
+	if (nlev > 0 && porting::getTimeMs() - evict_last > 10000) {
+		evict_last = porting::getTimeMs();
+		claude_lod::evictFar(center, 128 * CELL[nlev - 1] / 2);
 	}
 	// far terrain from the world file: the window is the coarsest level
 	if (g_settings->exists("claude_far_world")) {

@@ -31,13 +31,6 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only = false);
 u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		std::vector<u8> &rgba, std::vector<u8> &boxes, const u8 matidx[4]);
 
-// Far-data feed (2026-08-12): ingest server-sampled terrain summaries
-// from <path_user>/claude_far/*.json — synthetic BlockSummaries for
-// terrain the client has never visited, entering the SAME summary map
-// the cascade builder folds (real received blocks overwrite by key).
-// Returns blocks added; bumps contentVersion when nonzero. Each file
-// is read once per session (name-keyed).
-size_t ingestFarDir(Client *client);
 
 // Bumped whenever a block summary changes; cheap staleness gate for
 // the cascade rebuild schedule.
@@ -45,6 +38,12 @@ u64 contentVersion();
 
 // Blocks currently summarized (stats).
 size_t summaryCount();
+// bytes held by stored (non-empty) summaries (stats)
+size_t summaryBytes();
+// drop summaries farther than TWICE radius_nodes from center (Chebyshev,
+// in blocks): a camera that walks away does not keep the old world.
+// Twice, so a camera wandering at a window's edge does not thrash.
+size_t evictFar(v3s16 center_nodes, int radius_nodes);
 
 // FAR TERRAIN FROM THE WORLD FILE (2026-10-06). The server sends only the
 // blocks inside the camera's view cone and not occluded (clientiface.cpp

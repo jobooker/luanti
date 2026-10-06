@@ -2846,6 +2846,14 @@ def bring_up_seat(rundir, run, args):
         if deploy_hash_err:
             return deploy_hash_err
 
+    # A DEAD PLAYER ruins every arm and reads as dozens of unrelated
+    # failures (2026-10-06: a probe teleport fell 50 nodes and the next
+    # run opened on "You died", 61 red). revive respawns only at hp 0,
+    # so on a live player it changes nothing.
+    try:
+        run["revive"] = lab.rpc("revive")
+    except Exception as e:
+        run["revive"] = {"error": str(e)}
     run["shader_failures"] = shader_compile_failures()
     run["freeze"] = do_freeze()
     if not run["freeze"].get("deepening"):
