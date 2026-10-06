@@ -1268,6 +1268,34 @@ float modelVoxelEmitScale(vec3 cell, vec3 sv)
 			/ 256.0;
 }
 
+// LAVA BY TEMPERATURE, TEXEL BY TEXEL (2026-10-05). The texture's
+// brightness is read as a temperature map: a texel's linear luminance
+// relative to the texture's average, r, spans 0.252..4.227 on Mineclonia's
+// default_lava_source_animated.png (all frames, measured), and that range
+// is mapped in log(r) onto 850..1150 C: the crust-to-core span of
+// Hawaiian lava (Pinkerton et al. 2002; core 1140-1150 C by thermocouple;
+// spec/photometric-sources.md §5). That MAPPING is judgement (the texture
+// says which texel is hotter, not by how much): TUNED, learn by John's eye
+// / a photo of real pahoehoe. The rest is physics: luminance and colour
+// are Planck at that temperature through the CIE 1931 observer, x 0.95
+// emissivity, tabulated every 50 C (colour-science 0.4.7; log-luminance
+// and chroma interpolated linearly). 850 C glows ~90x dimmer and deep
+// red; 1150 C is 3,069 cd/m2, orange-yellow.
+const float LAVA_LOGL[7] = float[7](-3.38051, -2.47741, -1.64501, -0.87539, -0.16159, 0.50227, 1.12126);
+const float LAVA_CR[7] = float[7](4.1901, 4.0410, 3.9010, 3.7695, 3.6458, 3.5295, 3.4200);
+const float LAVA_CG[7] = float[7](0.1613, 0.2055, 0.2470, 0.2858, 0.3223, 0.3565, 0.3886);
+vec3 lavaLe(float r)
+{
+	float f = clamp((log(max(r, 1e-4)) - log(0.252))
+			/ (log(4.227) - log(0.252)), 0.0, 1.0) * 6.0;
+	int i = min(int(f), 5);
+	float w = f - float(i);
+	float ll = mix(LAVA_LOGL[i], LAVA_LOGL[i + 1], w);
+	vec3 ch = vec3(mix(LAVA_CR[i], LAVA_CR[i + 1], w),
+			mix(LAVA_CG[i], LAVA_CG[i + 1], w), 0.0);
+	return ch * exp(ll);
+}
+
 // HOT: 0 = the emission law, 1 = lava, 2 = flame (palette row 1 .a)
 float matHot(float idx)
 {
@@ -1782,6 +1810,16 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			le *= modelVoxelEmitScale(ci, suHit);
 		if (!hitAir && pal.r > 0.0)
 			hotLaw(idxOut, ci, suHit.x >= 0.0, suHit, alb, le);
+		// LAVA'S TEXTURE IS ITS TEMPERATURE MAP (2026-10-05): see lavaLe().
+		// HERE, in the walk, so a shadow ray and an eye ray see the same
+		// lava and NEE stays consistent.
+		if (claudeUnits > 0.5 && claudeTexel > 0.5 && !hitAir
+				&& suHit.x < 0.0 && pal.r > 0.0) {
+			float hot = matHot(idxOut);
+			if (hot > 0.5 && hot < 1.5)
+				le = lavaLe(dot(pow(faceTileRatio(ci, hp, n), vec3(2.2)),
+						vec3(0.2126, 0.7152, 0.0722)));
+		}
 
 		tHit = t;
 		cellOut = ci;
