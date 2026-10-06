@@ -52,6 +52,22 @@ def main():
             "time": args.time}
     vs = lab.load_vantages()
     if args.pin:
+        # the capture resets by teleporting away and back, which a pinned
+        # camera never does: reset explicitly instead, after the arm's
+        # dials are on (capture calls this right after pushing them), and
+        # prove it with the client's reset counter
+        def pinned_reset(vantage, park):
+            before = (lab.read_stats() or {}).get("accum_resets")
+            with open(lab.PATCH, "w") as f:
+                f.write("claude_reset_accum = %d\n" % time.time_ns())
+            t0 = time.time()
+            while time.time() - t0 < 5:
+                time.sleep(0.2)
+                now = (lab.read_stats() or {}).get("accum_resets")
+                if before is not None and now is not None and now > before:
+                    return None
+            return "pinned reset not seen (accum_resets %s)" % before
+        ci.reset_accumulation = pinned_reset
         pf = os.path.join("/tmp", "claude_pin_%d.txt" % os.getpid())
         with open(pf, "w") as f:
             f.write("0 %r %r %r %r %r\n" % (args.pos[0], args.pos[1], args.pos[2],
@@ -67,6 +83,10 @@ def main():
     if args.pin:
         with open(lab.PATCH, "w") as f:
             f.write("claude_path = 0\n")
+    if cap.get("reset_error"):
+        # an unproven reset means the frame may hold the previous shot
+        print("REFUSED: %s" % cap["reset_error"])
+        return 2
     print("frames", (cap.get("settle") or {}).get("still_frames"))
     print(png)
     return 0

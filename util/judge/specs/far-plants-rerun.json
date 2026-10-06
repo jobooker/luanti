@@ -1,0 +1,8 @@
+{"name": "far-plants-rerun", "frames": 4096,
+ "views": {"treeline": {"pos": [100, 12, 123.5], "yaw": 270, "pitch": -3, "time": 0.5, "crop": [300, 760]}},
+ "reference": "near",
+ "arms": {"near": {"claude_cascades": 1, "claude_exposure": 0.06},
+          "bare": {"claude_cascades": 1, "claude_far_only": 1, "claude_exposure": 0.06},
+          "plants": {"claude_cascades": 1, "claude_far_only": 1, "claude_far_plants": 1, "claude_exposure": 0.06},
+          "bare2": {"claude_cascades": 1, "claude_far_only": 1, "claude_exposure": 0.06},
+          "plants2": {"claude_cascades": 1, "claude_far_only": 1, "claude_far_plants": 1, "claude_exposure": 0.06}}}

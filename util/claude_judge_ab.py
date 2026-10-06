@@ -54,6 +54,22 @@ def shoot(v, frames, dials, name, first):
     return out
 
 
+def wait_reader(limit=900):
+    """after a seat start the world-file reader fills the far levels for
+    a minute or two, and every level it changes resets the accumulator, so
+    a parked shot cannot freeze (2026-10-06: an arm refused four times).
+    Wait until the count of blocks it folded stops moving."""
+    sys.path.insert(0, HERE)
+    import claude_lab as lab
+    prev, same, t0 = None, 0, time.time()
+    while time.time() - t0 < limit and same < 3:
+        time.sleep(10)
+        n = (lab.read_stats() or {}).get("far_db_blocks")
+        same = same + 1 if n == prev else 0
+        prev = n
+    print("reader settled at %s blocks after %.0f s" % (prev, time.time() - t0), flush=True)
+
+
 def capture(spec_path):
     spec = json.load(open(spec_path))
     run = os.path.join(OUT, "%s_%s" % (spec["name"], time.strftime("%Y%m%d-%H%M%S")))
@@ -67,10 +83,27 @@ def capture(spec_path):
         for an, arm in spec["arms"].items():
             d = {k: arm.get(k, 0) for k in keys}
             png = shoot(v, spec.get("frames", 2048), d, "%s-%s" % (vn, an), first)
-            first = False
+            if first:
+                # A STILL WORLD: the server's active block modifiers (grass
+                # spreading, leaves decaying) re-send blocks near trees,
+                # and every change resets the accumulator -- 2 resets per
+                # 40 s at the treeline, 0 with them off (2026-10-06). CI
+                # does the same; restored at the end.
+                sys.path.insert(0, HERE)
+                import claude_lab as lab
+                lab.rpc("abm", on=False)
+                wait_reader()
+                # the first arm was shot while the reader was filling
+                png = shoot(v, spec.get("frames", 2048), d, "%s-%s" % (vn, an), False)
             shots["%s/%s" % (vn, an)] = png
+            first = False
             print(vn, an, png, flush=True)
     json.dump(shots, open(os.path.join(run, "shots.json"), "w"), indent=1)
+    try:
+        import claude_lab as lab
+        lab.rpc("abm", on=True)
+    except Exception:
+        pass
     print(run)
 
 

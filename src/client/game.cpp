@@ -1344,6 +1344,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// leaf sheets (light passes with the leaves' own geometric odds), 0 = a
 	// solid lump (far view v1). Judged, not assumed (spec/measured.md).
 	CachedPixelShaderSetting<float, 1, false> m_far_leaf_medium_pixel{"claudeFarLeafMedium"};
+	// claude_far_plants: 1 = far grass and flowers as a layer of blades
+	CachedPixelShaderSetting<float, 1, false> m_far_plants_pixel{"claudeFarPlants"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
@@ -3088,6 +3090,10 @@ public:
 							? g_settings->getFloat("claude_far_leaf_medium", 0.0f, 1.0f)
 							: 0.0f;
 					m_far_leaf_medium_pixel.set(&flm, services);
+					float fpl = g_settings->exists("claude_far_plants")
+							? g_settings->getFloat("claude_far_plants", 0.0f, 1.0f)
+							: 0.0f;
+					m_far_plants_pixel.set(&fpl, services);
 					g_claude_grid.far_levels_live = nf;
 				}
 				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};
@@ -6017,6 +6023,16 @@ static bool claudeApplyPatchFile(const std::string &path,
 	for (const std::string &name : patch.getNames()) {
 		// Pseudo-key: any value change triggers a screenshot (same call as
 		// the F12 keybind), saved to the usual screenshots directory.
+		// an explicit, counted reset of the running average, for captures
+		// whose camera never moves (a pinned pose): the teleport-away-and-
+		// back reset cannot work there (2026-10-06: two identical plants
+		// arms scored 4.53 and 5.67 JOD, one blended with the arm before)
+		if (name == "claude_reset_accum") {
+			claudeResetAccumulation();
+			actionstream << "[claude_settings_patch] accumulation reset ("
+					<< patch.get(name) << ")" << std::endl;
+			continue;
+		}
 		if (name == "claude_dump") {
 			g_claude_dump_request = patch.get(name);
 			continue;

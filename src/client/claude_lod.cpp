@@ -65,6 +65,15 @@ struct BlockSummary
 	// how many nodes the colour sums hold: the TOP-EXPOSED ones (a node with
 	// open air above it) when the subcell has any, else all of them
 	u8 ccount[64];
+	// PLANTS (2026-10-06): plantlike nodes (tall grass, flowers, ferns) per
+	// subcell, which octants hold any, and their mean colour (sRGB of the
+	// linear mean, biome tint applied). The far levels fold them into a
+	// cloud of blades over the ground (claude_far_plants); before this they
+	// were skipped, and the judge measured the missing grass as the far
+	// field's largest error.
+	u8 plant[64];
+	u8 plantFine[64];
+	u8 plantCol[64][3];
 };
 
 // sRGB byte <-> linear * LIN, for summing albedo in LINEAR light.
@@ -104,6 +113,7 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 	// the same sums over TOP-EXPOSED nodes only, and their counts
 	static thread_local u32 erc[64][8], egc[64][8], ebc[64][8];
 	static thread_local u8 en[64][8], an[64][8];
+	static thread_local u32 pr[64], pg[64], pb[64];
 	memset(so, 0, sizeof(so));
 	memset(wo, 0, sizeof(wo));
 	memset(lo, 0, sizeof(lo));
@@ -117,6 +127,9 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 	memset(ebc, 0, sizeof(ebc));
 	memset(en, 0, sizeof(en));
 	memset(an, 0, sizeof(an));
+	memset(pr, 0, sizeof(pr));
+	memset(pg, 0, sizeof(pg));
+	memset(pb, 0, sizeof(pb));
 	// does this node count as matter for the fold (the same skips as the
 	// walk below)? Used to ask "is the node above open air"
 	auto counts = [&](MapNode m) -> bool {
@@ -146,6 +159,27 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 		if (c == CONTENT_AIR || c == CONTENT_IGNORE)
 			continue;
 		const ContentFeatures &f = ndef->get(c);
+		if (f.light_source == 0 && f.drawtype == NDT_PLANTLIKE) {
+			int psub = (z / 4) * 16 + (y / 4) * 4 + (x / 4);
+			int poct = ((z % 4) / 2) * 4 + ((y % 4) / 2) * 2 + (x % 4) / 2;
+			video::SColor pc(255, 120, 160, 80);
+			if (f.visuals && f.visuals->minimap_color.getAlpha() > 0)
+				pc = f.visuals->minimap_color;
+			if (f.visuals) {
+				video::SColor tint(255, 255, 255, 255);
+				f.visuals->getColor(n.getParam2(), &tint);
+				pc.setRed(pc.getRed() * tint.getRed() / 255);
+				pc.setGreen(pc.getGreen() * tint.getGreen() / 255);
+				pc.setBlue(pc.getBlue() * tint.getBlue() / 255);
+			}
+			pr[psub] += toLin(pc.getRed());
+			pg[psub] += toLin(pc.getGreen());
+			pb[psub] += toLin(pc.getBlue());
+			if (s.plant[psub] < 255)
+				s.plant[psub]++;
+			s.plantFine[psub] |= (u8)(1 << poct);
+			continue;
+		}
 		// Same skip rules as claudeTraceGridSnapshot: decorations are quads,
 		// not cubes, and airlike light nodes are invisible.
 		if (f.light_source == 0
@@ -272,6 +306,12 @@ void summarizeBlock(Client *client, MapBlock *block, bool fill_only)
 		s.gsum[sub] = ex ? eg : ag;
 		s.bsum[sub] = ex ? eb : ab;
 		s.ccount[sub] = (u8)(ex ? ne : na);
+		if (s.plant[sub] > 0) {
+			u32 pn = s.plant[sub];
+			s.plantCol[sub][0] = (u8)toSrgb((pr[sub] + pn / 2) / pn);
+			s.plantCol[sub][1] = (u8)toSrgb((pg[sub] + pn / 2) / pn);
+			s.plantCol[sub][2] = (u8)toSrgb((pb[sub] + pn / 2) / pn);
+		}
 	}
 	{
 		const v3s16 bp = block->getPos();
@@ -531,7 +571,8 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// which breaks the one-block-per-cell gather — is handled for free.
 	// Accumulators are static and reused (u16 counts: max 32^3 = 32768
 	// nodes per cell fits; u32 color sums).
-	static std::vector<u16> occ_acc, water_acc, leaf_acc, lava_acc;
+	static std::vector<u16> occ_acc, water_acc, leaf_acc, lava_acc, plant_acc;
+	static std::vector<u32> pr_acc, pg_acc, pb_acc;
 	static std::vector<u32> r_acc, g_acc, b_acc;
 	static std::vector<s16> top_acc;   // highest occupied subcell layer
 	static std::vector<u16> top_n;     // counted nodes in that layer
@@ -539,6 +580,10 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	occ_acc.assign(NC, 0);
 	water_acc.assign(NC, 0);
 	leaf_acc.assign(NC, 0);
+	plant_acc.assign(NC, 0);
+	pr_acc.assign(NC, 0);
+	pg_acc.assign(NC, 0);
+	pb_acc.assign(NC, 0);
 	lava_acc.assign(NC, 0);
 	r_acc.assign(NC, 0);
 	g_acc.assign(NC, 0);
@@ -583,12 +628,22 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 						bool fs = (s.fine[sub] >> o) & 1;
 						bool fw = (s.finew[sub] >> o) & 1;
 						bool fl = (s.finel[sub] >> o) & 1;
-						if (!fs && !fw && !fl)
-							continue;
 						int cxo = (rel.X + sx * 4 + (o & 1) * 2) / 2;
 						int cyo = (rel.Y + sy * 4 + ((o >> 1) & 1) * 2) / 2;
 						int czo = (rel.Z + sz * 4 + ((o >> 2) & 1) * 2) / 2;
 						size_t ci2 = ((size_t)czo * N + cyo) * N + cxo;
+						if ((s.plantFine[sub] >> o) & 1) {
+							// the subcell's plants, shared among the octants
+							// that hold any
+							u32 share = s.plant[sub]
+									/ std::max(1, __builtin_popcount(s.plantFine[sub]));
+							plant_acc[ci2] += (u16)share;
+							pr_acc[ci2] += toLin(s.plantCol[sub][0]) * share;
+							pg_acc[ci2] += toLin(s.plantCol[sub][1]) * share;
+							pb_acc[ci2] += toLin(s.plantCol[sub][2]) * share;
+						}
+						if (!fs && !fw && !fl)
+							continue;
 						if (fs) {
 							occ_acc[ci2] += 8;
 							if (leafdom)
@@ -621,6 +676,12 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 				water_acc[ci] += s.water[sub];
 				lava_acc[ci] += s.lava[sub];
 				leaf_acc[ci] += s.leaf[sub];
+				if (s.plant[sub] > 0) {
+					plant_acc[ci] += s.plant[sub];
+					pr_acc[ci] += toLin(s.plantCol[sub][0]) * s.plant[sub];
+					pg_acc[ci] += toLin(s.plantCol[sub][1]) * s.plant[sub];
+					pb_acc[ci] += toLin(s.plantCol[sub][2]) * s.plant[sub];
+				}
 				// COLOR = the cell's TOP occupied layer only. The grid
 				// average mixed one white snow cap with seven dirt nodes
 				// into green-brown ("snow at 1m rendered as maybe green,
@@ -651,13 +712,13 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// MAJORITY, at least half the cell (ADR-0010; was >= 62 %, see the
 	// octant rule in summarizeBlock for why)
 	const u32 half = (u32)((u32)CELL * CELL * CELL / 2);
-	u32 solid_cells = 0, leaf_cells = 0;
+	u32 solid_cells = 0, leaf_cells = 0, plant_cells = 0;
 	size_t i = 0;
 	for (int cz = 0; cz < N; cz++)
 	for (int cy = 0; cy < N; cy++)
 	for (int cx = 0; cx < N; cx++, i++) {
 		u32 counted = (u32)occ_acc[i] + water_acc[i] + lava_acc[i];
-		if (counted == 0)
+		if (counted == 0 && plant_acc[i] == 0)
 			continue;
 		// THE CELL'S BYTE IS A MATERIAL INDEX (2026-10-06), the same index
 		// into the same palette as the near grid's, so a far cell is lit
@@ -677,7 +738,23 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			cls = matidx[3];
 		else if (water_acc[i] >= half && water_acc[i] > occ_acc[i])
 			cls = matidx[2];
-		else
+		else if (!has_box && plant_acc[i] > 0) {
+			// ONLY PLANTS: a cloud of blades filling the cell, with the leaf
+			// material (a blade is a leaf: it reflects and transmits)
+			u32 pn = plant_acc[i];
+			rgba[i * 4 + 0] = (u8)toSrgb(std::min((pr_acc[i] + pn / 2) / pn, LIN));
+			rgba[i * 4 + 1] = (u8)toSrgb(std::min((pg_acc[i] + pn / 2) / pn, LIN));
+			rgba[i * 4 + 2] = (u8)toSrgb(std::min((pb_acc[i] + pn / 2) / pn, LIN));
+			rgba[i * 4 + 3] = matidx[1];
+			const int unitp = std::max(1, CELL / 16);
+			for (int a = 0; a < 3; a++)
+				boxes[i * 4 + a] = (u8)(0 | ((CELL / unitp - 1) << 4));
+			float rho = std::min(1.0f, (float)pn / (float)(CELL * CELL * CELL));
+			boxes[i * 4 + 3] = (u8)(127 + std::clamp((int)std::lround(rho * 127.0f), 1, 127));
+			solid_cells++;
+			plant_cells++;
+			continue;
+		} else
 			continue;
 		u32 tn = std::max(top_n[i], (u16)1);
 		rgba[i * 4 + 0] = (u8)toSrgb(std::min((r_acc[i] + tn / 2) / tn, LIN));
@@ -706,13 +783,27 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 				vol *= (u32)((bxmax[i * 3 + a] / unit) - (bxmin[i * 3 + a] / unit) + 1)
 						* unit;
 			float rho = std::min(1.0f, (float)leaf_acc[i] / (float)std::max(vol, 1u));
-			boxes[i * 4 + 3] = (u8)std::clamp((int)std::lround(rho * 254.0f), 1, 254);
+			boxes[i * 4 + 3] = (u8)std::clamp((int)std::lround(rho * 127.0f), 1, 127);
 			leaf_cells++;
+		} else if (cls == matidx[0] && plant_acc[i] > 0) {
+			// GROUND WITH GRASS ON IT: the solid box, and a layer of blades
+			// in the room between the box top and the cell top.
+			// alpha 128..254 = that layer's plant density
+			int top = ((bxmax[i * 3 + 1] / unit) + 1) * unit;
+			int room = CELL - top;
+			if (room > 0) {
+				float rho = std::min(1.0f, (float)plant_acc[i]
+						/ (float)(CELL * CELL * room));
+				boxes[i * 4 + 3] = (u8)(127
+						+ std::clamp((int)std::lround(rho * 127.0f), 1, 127));
+				plant_cells++;
+			}
 		}
 	}
 	// INSTRUMENT: how many cells the leaf medium can act on
 	infostream << "[claude_lod] level cell " << CELL << " m: " << solid_cells
-			<< " cells, " << leaf_cells << " leaf" << std::endl;
+			<< " cells, " << leaf_cells << " leaf, " << plant_cells << " plant"
+			<< std::endl;
 	return solid_cells;
 }
 

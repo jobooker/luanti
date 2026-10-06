@@ -2513,6 +2513,13 @@ uniform float claudeFarLeafMedium;  // 1 = far leaf cells are a cloud of sheets
 // APPROXIMATION: sheet families treated as independently placed; the
 // oblique transmission of one real block is not measured yet.
 const vec3 LEAF_SIGMA = vec3(3.147, 1.695, 3.147);
+// THE SAME FOR A TALL-GRASS NODE (claude_models crossed_cutout of
+// mcl_flowers_tallgrass): straight-through T = 0.469 / 0.891 / 0.539, so
+// the sun mostly reaches the ground through grass while a low view sees
+// mostly blades. Ferns are within 15 %.
+const vec3 GRASS_SIGMA = vec3(0.758, 0.116, 0.618);
+uniform float claudeFarPlants;      // 1 = far plants as a layer of blades
+bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
 bool g_lastFar = false;
@@ -2608,8 +2615,27 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 						(vec3(c.x, c.y, c.z + 128.0 * float(k)) + 0.5)
 						/ vec3(128.0, 128.0, 640.0));
 				vec3 bb = floor(bx4.rgb * 255.0 + 0.5);
-				float rho = (claudeFarLeafMedium > 0.5 && bx4.a < 0.999)
-						? bx4.a * 255.0 / 254.0 : -1.0;
+				// alpha: 255 solid box; 1..127 a leaf cell's leaf density;
+				// 128..254 plant density (a plant-only leaf-material cell,
+				// or the blade layer above a solid cell's box)
+				float code = floor(bx4.a * 255.0 + 0.5);
+				bool leafCell = abs(matHot(idx) - 3.0) < 0.5;
+				float rhoL = (code >= 1.0 && code <= 127.0) ? code / 127.0 : 0.0;
+				float rhoP = (code >= 128.0 && code <= 254.0) ? (code - 127.0) / 127.0 : 0.0;
+				float mRho = 0.0;
+				vec3 mSig = LEAF_SIGMA;
+				bool mWhole = false, mAbove = false, skipCell = false;
+				if (leafCell && rhoL > 0.0 && claudeFarLeafMedium > 0.5) {
+					mRho = rhoL; mWhole = true;
+				} else if (leafCell && rhoP > 0.0) {
+					if (claudeFarPlants > 0.5) {
+						mRho = rhoP; mSig = GRASS_SIGMA; mWhole = true;
+					} else {
+						skipCell = true;
+					}
+				} else if (!leafCell && rhoP > 0.0 && claudeFarPlants > 0.5) {
+					mRho = rhoP; mSig = GRASS_SIGMA; mAbove = true;
+				}
 				float unit = max(1.0, h / 16.0);
 				vec3 blo = org + c * h + mod(bb, 16.0) * unit;
 				vec3 bhi = org + c * h + (floor(bb / 16.0) + 1.0) * unit;
@@ -2622,29 +2648,73 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 				float tx = min(min(tf.x, tf.y), tf.z);
 				float c0 = t * h;
 				float c1 = min(sideDist.x, min(sideDist.y, sideDist.z)) * h;
-				if (te <= tx && tx >= c0 && te <= c1 && rho > 0.0) {
-					// a cloud of leaf sheets: free flight inside the box's
-					// stretch of this cell; the sheet family met is the
-					// one whose exponential came first
-					vec3 w3 = abs(rd) * LEAF_SIGMA * rho;
-					float sig = w3.x + w3.y + w3.z;
-					float a0 = max(te, c0), a1 = min(tx, c1);
-					float s = -log(max(1e-7, 1.0 - rnd1())) / max(sig, 1e-6);
-					if (a0 + s < a1) {
-						tIn = (a0 + s) / h;
-						float u = rnd1() * sig;
-						ax = u < w3.x ? 0 : (u < w3.x + w3.y ? 1 : 2);
-					} else {
-						hitHere = false;
-					}
-				} else if (te <= tx && tx >= c0 && te <= c1) {
-					if (te > c0) {
-						tIn = te / h;
-						ax = (tn.x >= tn.y && tn.x >= tn.z) ? 0
-								: (tn.y >= tn.z ? 1 : 2);
+				bool boxSeg = te <= tx && tx >= c0 && te <= c1;
+				if (skipCell) {
+					hitHere = false;
+				} else if (mWhole) {
+					// a cloud of sheets filling the box: free flight inside
+					// its stretch of this cell; the sheet family met is
+					// the one whose exponential came first
+					hitHere = false;
+					if (boxSeg) {
+						vec3 w3 = abs(rd) * mSig * mRho;
+						float sig = w3.x + w3.y + w3.z;
+						float a0 = max(te, c0), a1 = min(tx, c1);
+						float s = -log(max(1e-7, 1.0 - rnd1())) / max(sig, 1e-6);
+						if (a0 + s < a1) {
+							hitHere = true;
+							tIn = (a0 + s) / h;
+							float u = rnd1() * sig;
+							ax = u < w3.x ? 0 : (u < w3.x + w3.y ? 1 : 2);
+							g_farMedium = true;
+						}
 					}
 				} else {
-					hitHere = false;   // the empty part of the cell
+					// the solid box, and (mAbove) a layer of blades between
+					// the box top and the cell top; the nearer event wins
+					float tBox = 1e30;
+					int axBox = ax;
+					if (boxSeg) {
+						if (te > c0) {
+							tBox = te;
+							axBox = (tn.x >= tn.y && tn.x >= tn.z) ? 0
+									: (tn.y >= tn.z ? 1 : 2);
+						} else {
+							tBox = c0;
+						}
+					}
+					float tMed = 1e30;
+					int axMed = 1;
+					if (mAbove) {
+						vec3 slo = vec3(org.x + c.x * h, bhi.y, org.z + c.z * h);
+						vec3 shi = org + (c + 1.0) * h;
+						if (shi.y > slo.y + 1e-4) {
+							vec3 s0 = (slo - p0) * inv, s1 = (shi - p0) * inv;
+							vec3 sn = min(s0, s1), sf = max(s0, s1);
+							float a0 = max(max(max(sn.x, sn.y), sn.z), c0);
+							float a1 = min(min(min(sf.x, sf.y), sf.z), c1);
+							if (a0 < a1) {
+								vec3 w3 = abs(rd) * mSig * mRho;
+								float sig = w3.x + w3.y + w3.z;
+								float s = -log(max(1e-7, 1.0 - rnd1())) / max(sig, 1e-6);
+								if (a0 + s < a1) {
+									tMed = a0 + s;
+									float u = rnd1() * sig;
+									axMed = u < w3.x ? 0 : (u < w3.x + w3.y ? 1 : 2);
+								}
+							}
+						}
+					}
+					if (tMed < tBox) {
+						tIn = tMed / h;
+						ax = axMed;
+						g_farMedium = true;
+					} else if (tBox < 1e29) {
+						tIn = tBox / h;
+						ax = axBox;
+					} else {
+						hitHere = false;   // the empty part of the cell
+					}
 				}
 			}
 		}
@@ -2695,6 +2765,7 @@ bool marchAll(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
 {
 	g_lastFar = false;
+	g_farMedium = false;
 	if (farLevelCount() == 0 && nearOn())
 		return marchMed(ro, rd, curMed, hp, n, alb, le, tHit, cellOut,
 				palOut, idxOut, hpFar);
@@ -3560,6 +3631,7 @@ void main(void)
 		bool hitS = marchAll(p, dir, curMed, hp, n, alb, le, tHit, cell,
 				hitPal, hitIdx, hpFar);
 		bool hitFar = g_lastFar;
+		bool hitFarMed = hitFar && g_farMedium;
 		// THE PIXEL'S SURFACE IS THE CAMERA RAY'S FIRST HIT, WHETHER OR NOT
 		// THIS SAMPLE REACHES IT (2026-10-06). In air a camera ray may
 		// scatter before the surface (the block below `continue`s), and the
@@ -3911,6 +3983,13 @@ void main(void)
 				xb = x2;
 				leafBack = alb;
 			}
+		}
+		// A FAR CLOUD HIT is a leaf or a blade: the same two-sided law, the
+		// back side being the far side of the virtual sheet (hpFar)
+		if (!leafT && claudeLeafTransmit > 0.5 && hitFarMed && view == 0) {
+			alb = min(alb, vec3(0.5));
+			leafT = true;
+			xb = hpFar;
 		}
 		g_neeBScale = leafT ? 0.5 : 1.0;
 		// a FAR vertex aims at the sun and sky only: the lamp and flame
