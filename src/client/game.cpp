@@ -339,6 +339,7 @@ struct ClaudeTraceGrid
 		u64 build_time = 0;
 		u32 solid = 0;
 		float ms = 0.0f;         // last build+upload cost (stats)
+		u64 content_hash = 0;    // of the uploaded texels + origin
 	} casc[5];                   // [0]=2m [1]=4m [2]=8m [3]=16m [4]=32m
 	// THE EFFECTIVE PIPELINE STATE, as last DELIVERED to the shader --
 	// not what minetest.conf says, and not what a settings read says
@@ -367,6 +368,7 @@ struct ClaudeTraceGrid
 	float dial_white_balance = 0.0f, dial_night_vision = 0.0f;
 	float dial_leaf_transmit = 0.0f;
 	float dial_model_far = 0.0f;
+	float far_levels_live = 0.0f;   // far rungs the shader walked this frame
 	// what the units law delivered this frame (lux), for claude_stats
 	float units_sky_lux = 0.0f, units_sun_lux = 0.0f, units_moon_lux = 0.0f;
 	float units_moon_phase = -1.0f;
@@ -1068,13 +1070,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t> m_atlas_sampler_pixel{"claudeAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_matparams_sampler_pixel{"claudeMatParams"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_sampler_pixel{"claudeCascades"};
-	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_coarse_sampler_pixel{"claudeCascadeCoarse"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_cascades_coarse_sampler_pixel{"claudeCascadeBox"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade0_origin_pixel{"cascade0Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade1_origin_pixel{"cascade1Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade2_origin_pixel{"cascade2Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade3_origin_pixel{"cascade3Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade4_origin_pixel{"cascade4Origin"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid_pixel{"cascadeValid"};
+	CachedPixelShaderSetting<float, 1, false> m_far_levels_pixel{"claudeFarLevels"};
+	// claude_far_only: INSTRUMENT. 1 = the 1 m grid is skipped and every
+	// ray starts in the far ladder, so one scene can be photographed at
+	// 1 m and folded to 2 m from the same camera (the LOD energy referee).
+	CachedPixelShaderSetting<float, 1, false> m_far_only_pixel{"claudeFarOnly"};
 	CachedPixelShaderSetting<float, 3, false> m_cascade_valid2_pixel{"cascadeValidB"};
 	CachedPixelShaderSetting<float, 3, false> m_grid_origin_pixel{"gridOrigin"};
 	CachedPixelShaderSetting<float, 1, false> m_texture_amount_pixel{"textureAmount"};
@@ -2806,6 +2813,17 @@ public:
 					cvalid[lv] = g_claude_grid.casc[lv].valid ? 1.0f : 0.0f;
 				}
 				m_cascade_valid_pixel.set(cvalid, services);
+				{
+					float nf = 0.0f;
+					for (int lv = 0; lv < 5 && g_claude_grid.casc[lv].valid; lv++)
+						nf += 1.0f;
+					m_far_levels_pixel.set(&nf, services);
+					float fo = g_settings->exists("claude_far_only")
+							? g_settings->getFloat("claude_far_only", 0.0f, 1.0f)
+							: 0.0f;
+					m_far_only_pixel.set(&fo, services);
+					g_claude_grid.far_levels_live = nf;
+				}
 				float cvalid2[3] = {cvalid[3], cvalid[4], 0.0f};
 				m_cascade_valid2_pixel.set(cvalid2, services);
 			}
@@ -4942,6 +4960,12 @@ static void claudeTraceGridSnapshot(Client *client)
 	// other. Every phase is timed in us and printed.
 	u64 tu0 = porting::getTimeUs();
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
+	// EVEN ORIGIN (2026-10-06, far view): the near grid's faces must lie
+	// on 2 m cell faces of the first far level, so a ray leaving the near
+	// grid starts the far walk on a clean cell boundary and no coarse cell
+	// straddles the seam (the half-in coarse cell was the 2026-08-12
+	// "rampart"). Far levels already snap to whole MapBlocks.
+	center.X &= ~1; center.Y &= ~1; center.Z &= ~1;
 	v3s16 origin = center - v3s16(S / 2, S / 2, S / 2);
 	// ORIGIN DEADBAND (John, 2026-08-13: "things shift when I move
 	// around"): the detail ring rides grid-local coords, so an
@@ -5392,6 +5416,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_night_vision\": " << g_claude_grid.dial_night_vision
 			<< ", \"claude_leaf_transmit\": " << g_claude_grid.dial_leaf_transmit
 			<< ", \"claude_model_far\": " << g_claude_grid.dial_model_far
+			<< ", \"far_levels\": " << g_claude_grid.far_levels_live
 			<< ", \"eye_white\": [" << g_claude_white[0] << ","
 			<< g_claude_white[1] << "," << g_claude_white[2] << ","
 			<< g_claude_white[3] << "]"
@@ -5487,12 +5512,22 @@ static void claudeCascadeUpdate(Client *client)
 	// grid edge (sky beyond). Without the invalidation, flipping the
 	// dial off at runtime only stopped REBUILDS and the stale ladder kept
 	// being marched, which would read as "the dial does nothing".
-	if (!g_settings->exists("claude_cascades")
-			|| g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f) {
+	// FAR VIEW (2026-10-06, John: "infinite draw distance should be
+	// possible"): ON by default now; claude_far_levels says how many
+	// rungs (2 m to +-128, 4 m to +-256, 8 m to +-512, ...). First target
+	// +-512 m = 3 levels. A level beyond the count is retired.
+	if (g_settings->exists("claude_cascades")
+			&& g_settings->getFloat("claude_cascades", 0.0f, 1.0f) < 0.5f) {
 		for (int lv = 0; lv < 5; lv++)
 			g_claude_grid.casc[lv].valid = false;
 		return;
 	}
+	int nlev = 3;
+	if (g_settings->exists("claude_far_levels"))
+		nlev = (int)std::clamp(g_settings->getFloat("claude_far_levels",
+				0.0f, 5.0f), 0.0f, 5.0f);
+	for (int lv = nlev; lv < 5; lv++)
+		g_claude_grid.casc[lv].valid = false;
 	static const int CELL[5] = {2, 4, 8, 16, 32};
 	static const u64 CADENCE[5] = {8000, 6000, 4000, 12000, 20000};
 	v3s16 center = floatToInt(client->getCamera()->getPosition(), BS);
@@ -5510,7 +5545,10 @@ static void claudeCascadeUpdate(Client *client)
 	}
 	u64 ver = claude_lod::contentVersion();
 
-	for (int lv = 0; lv < 5; lv++) {
+	const u8 matidx[4] = {
+		claudeMatIndex(MATK_SOLID, 0, 0), claudeMatIndex(MATK_LEAVES, 0, 0),
+		claudeMatIndex(MATK_LIQUID, 0, 0), claudeMatIndex(MATK_LAVA, 0, 14)};
+	for (int lv = 0; lv < nlev; lv++) {
 		auto &L = g_claude_grid.casc[lv];
 		const int half = 128 * CELL[lv] / 2;
 		const int stray = 16 * CELL[lv]; // 32 / 64 / 128 nodes
@@ -5546,7 +5584,24 @@ static void claudeCascadeUpdate(Client *client)
 		// same scatter as every other level — one alignment contract,
 		// the origin-parity bug class is unrepresentable.
 		u32 solid = claude_lod::buildCascadeSummary(origin, CELL[lv],
-				rgba, coarse);
+				rgba, coarse, matidx);
+		// A REBUILD THAT CHANGED NOTHING MUST NOT RESET ANYTHING: the
+		// content version bumps on any block anywhere, so a level is
+		// rebuilt on cadence in a living world. Only a real change in what
+		// the level holds (or where it sits) clears the running average.
+		u64 h = 14695981039346656037ULL;
+		for (size_t q = 0; q < rgba.size(); q += 4)
+			h = (h ^ (rgba[q] | (rgba[q + 1] << 8) | (rgba[q + 2] << 16)
+					| ((u64)rgba[q + 3] << 24))) * 1099511628211ULL;
+		h ^= (u64)(u16)origin.X * 73856093ULL ^ (u64)(u16)origin.Y * 19349663ULL
+				^ (u64)(u16)origin.Z * 83492791ULL;
+		if (L.valid && h != L.content_hash) {
+			g_claude_grid.still_frames = 0.0f;
+			g_claude_grid.accum_resets++;
+			g_claude_grid.accum_alpha =
+					std::max(g_claude_grid.accum_alpha, 0.5f);
+		}
+		L.content_hash = h;
 		if (solid == 0 && !L.valid)
 			return; // no data yet; retry next poll (and skip coarser too)
 
@@ -5578,14 +5633,13 @@ static void claudeCascadeUpdate(Client *client)
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
 			GL.TexParameteri(GL.TEXTURE_3D, GL.TEXTURE_WRAP_R, GL.CLAMP_TO_EDGE);
-			GL.TexImage3D(GL.TEXTURE_3D, 0,
-					claudeUseR8() ? GL.R8 : GL_LUMINANCE8, 32, 32, 160, 0,
-					claudeUseR8() ? GL.RED : GL_LUMINANCE,
-					GL.UNSIGNED_BYTE, nullptr);
+			// the per-cell solid boxes (2026-10-06; this unit used to hold
+			// an any-solid brick map nothing read any more)
+			GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RGBA8, 128, 128, 640, 0,
+					GL.RGBA, GL.UNSIGNED_BYTE, nullptr);
 		}
-		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 32, 32, 32, 32,
-				claudeUseR8() ? GL.RED : GL_LUMINANCE,
-				GL.UNSIGNED_BYTE, coarse.data());
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, lv * 128, 128, 128, 128,
+				GL.RGBA, GL.UNSIGNED_BYTE, coarse.data());
 		GL.ActiveTexture(prev_active_unit);
 
 		L.origin = origin;

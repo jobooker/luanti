@@ -350,7 +350,7 @@ uniform float claudeUnits;
 // sheet and stays opaque.
 uniform float claudeLeafTransmit;
 // the denoiser's face code for "this pixel sees the sky" (see outGbuf)
-const float SKY_FACE_CODE = 1.0 + 6.0 * 4096.0;
+const float SKY_FACE_CODE = 1.0 + 6.0 * 65536.0;
 // MIS: the BSDF half's density at an NEE vertex, as a multiple of cos/pi
 // (0.5 at a leaf, which sends half its paths to each side)
 float g_neeBScale = 1.0;
@@ -2062,6 +2062,13 @@ float g_neeDiagK;
 // That is a variance cost and never an energy one — a face reachable only
 // through glass is reached by the BSDF technique at MIS weight 1, since
 // the interface disarms MIS (see the path loop's dielectric block).
+// THE ONE WALK, declared here and defined with the far ladder below:
+// every light sampler walks through it.
+bool marchAll(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
+		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
+		out vec4 palOut, out float idxOut, out vec3 hpFar);
+float farExitT(vec3 p, vec3 d);
+
 vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 		float curMed)
 {
@@ -2130,7 +2137,7 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
-	if (!marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+	if (!marchAll(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
@@ -2213,7 +2220,7 @@ vec3 neeDirectAir(vec3 x, vec3 dir, int nLights)
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
-	if (!marchMed(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
+	if (!marchAll(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
@@ -2441,7 +2448,7 @@ vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
-	if (!marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+	if (!marchAll(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0);
 	if (!matFine(shpal) || !any(greaterThan(shle, vec3(0.0))))
@@ -2453,6 +2460,278 @@ vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
 	vec3 tr = curMed < 0.5 ? vec3(airTr(sht)) : medTr(curMed, sht);
 	// f Le cos / p_L, times the balance weight p_L / (p_L + p_B)
 	return (rho / PI) * shle * cosX / (pdfL + pdfB) * tr;
+}
+
+// =====================================================================
+// THE FAR LADDER (claude_far_levels, 2026-10-06; John: "infinite draw
+// distance should be possible right? By scaling lod?")
+// =====================================================================
+// Past the 128^3 1 m grid the world continues in coarser copies of
+// itself: level k has 128^3 cells of 2^(k+1) m (2 m to +-128, 4 m to
+// +-256, 8 m to +-512, ...), built by claude_lod's fold. Each cell's byte
+// is a MATERIAL INDEX into the SAME palette as the near grid, read by the
+// SAME arrival rule and lit by the SAME law -- physics-contract §7,
+// "geometry may be laddered with distance; the light law may not". Every
+// ray type uses this one walk: eye, bounce, and every shadow ray
+// (marchAll() below), so no ray sees a different world from another.
+//
+// SEAMS ARE STRUCTURAL, NOT TUNED: the near grid's corner sits on even
+// nodes and every level snaps to whole MapBlocks, so each boundary lies on
+// cell faces of the next level out. A ray handed across a boundary starts
+// on a clean face: no coarse cell straddles the seam (the half-in coarse
+// cell was 2026-08-12's "rampart"). A ray always walks the FINEST level
+// that holds its current point, stepping finer again if it heads inward.
+//
+// What a coarse cell is, today: a box, solid when at least half its
+// volume was (claude_lod, majority fold), coloured by its top layer. Known
+// to be approximate (opaque boxes thicken silhouettes and cannot carry the
+// tilt of a hillside; spec/far-field-plan.md, research 2026-10-06); the
+// 1 m vs 2 m energy referee measures how approximate before anything is
+// added.
+uniform sampler3D claudeCascades;   // unit 8: 128 x 128 x 640, level k = slab k
+// unit 9, same layout: each solid cell's TIGHT BOX (min | max << 4 per
+// axis, in units of max(1, cell/16) nodes). A solid far cell is hit where
+// its box is, so one layer of ground in a 2 m cell is a 1 m slab and a 1 m
+// trunk a 1 m column -- the box test is the "AABB math", and its entry
+// face is the normal.
+uniform sampler3D claudeCascadeBox;
+uniform vec3 cascade0Origin;        // grid-local node coords of each
+uniform vec3 cascade1Origin;        // level's cell (0,0,0)
+uniform vec3 cascade2Origin;
+uniform vec3 cascade3Origin;
+uniform vec3 cascade4Origin;
+uniform float claudeFarLevels;      // valid levels from 0 out (0 = none)
+uniform float claudeFarOnly;        // INSTRUMENT: 1 = skip the 1 m grid
+const int FAR_STEPS = 400;
+// set by marchAll(): did the last hit land on a far level?
+bool g_lastFar = false;
+// a far hit's cellOut: no near-grid lookup may be made with it
+const vec3 FAR_CELL = vec3(-10000.0);
+
+vec3 farOrigin(int k)
+{
+	if (k == 0) return cascade0Origin;
+	if (k == 1) return cascade1Origin;
+	if (k == 2) return cascade2Origin;
+	if (k == 3) return cascade3Origin;
+	return cascade4Origin;
+}
+float farCellSize(int k) { return exp2(float(k + 1)); }
+int farLevelCount() { return int(claudeFarLevels + 0.5); }
+bool inBoxW(vec3 p, vec3 lo, float size)
+{
+	return all(greaterThanEqual(p, lo)) && all(lessThan(p, lo + vec3(size)));
+}
+bool nearOn() { return claudeFarOnly < 0.5; }
+// the finest representation holding grid-local point p: -1 = the 1 m
+// grid, 0.. = a far level, 99 = nothing (past the ladder)
+int levelAt(vec3 p)
+{
+	if (nearOn() && inBoxW(p, vec3(0.0), GRID_S))
+		return -1;
+	int L = farLevelCount();
+	for (int k = 0; k < 5; k++) {
+		if (k >= L)
+			break;
+		if (inBoxW(p, farOrigin(k), 128.0 * farCellSize(k)))
+			return k;
+	}
+	return 99;
+}
+// distance from p along d to the edge of everything that exists (the
+// outermost level, or the 1 m grid when there is no ladder): where AIR
+// ends for the free-flight sampler, and where sky light starts
+float farExitT(vec3 p, vec3 d)
+{
+	int L = farLevelCount();
+	vec3 lo = L > 0 ? farOrigin(L - 1) : vec3(0.0);
+	float size = L > 0 ? 128.0 * farCellSize(L - 1) : GRID_S;
+	vec3 room = mix(p - lo, lo + vec3(size) - p, step(0.0, d));
+	vec3 tt = room / max(abs(d), vec3(1e-6));
+	return max(min(tt.x, min(tt.y, tt.z)), 0.0);
+}
+
+// One level's walk. Starts AT p0 (tested, unlike the near walk's origin
+// exclusion: a hand-off point lies on a cell face and its cell has not
+// been seen; a surface restart lies in the air cell it came through, so
+// testing it costs nothing). Returns 1 on a hit/interface, 0 when the ray
+// leaves the level (pExit) -- outward, or inward into a finer region.
+int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
+		int entryAxis, out vec3 hp, out vec3 n, out vec3 alb, out vec3 le,
+		out float tHit, out vec4 palOut, out float idxOut, out vec3 hpFar,
+		out vec3 pExit)
+{
+	float h = farCellSize(k);
+	vec3 org = farOrigin(k);
+	vec3 q = (p0 - org) / h;
+	vec3 stepDir = sign(rd);
+	vec3 delta = 1.0 / max(abs(rd), vec3(DDA_MIN_ABS));
+	vec3 c = floor(q + rd * 1e-4);
+	vec3 sideDist = (stepDir * (c - q) + stepDir * 0.5 + 0.5) * delta;
+	float t = 0.0;
+	int axis = entryAxis;
+	// the finer region inside this level, in this level's cell units
+	vec3 fLo = k == 0 ? (vec3(0.0) - org) / h : (farOrigin(k - 1) - org) / h;
+	float fSize = k == 0 ? (nearOn() ? GRID_S / h : 0.0)
+			: 128.0 * farCellSize(k - 1) / h;
+	pExit = p0;
+	for (int i = 0; i < FAR_STEPS; i++) {
+		if (any(lessThan(c, vec3(0.0))) || any(greaterThanEqual(c, vec3(128.0)))
+				|| (fSize > 0.0 && all(greaterThanEqual(c, fLo))
+					&& all(lessThan(c, fLo + vec3(fSize))))) {
+			pExit = p0 + rd * (t * h);
+			return 0;
+		}
+		vec4 sv = texture3D(claudeCascades,
+				(vec3(c.x, c.y, c.z + 128.0 * float(k)) + 0.5)
+				/ vec3(128.0, 128.0, 640.0));
+		float idx = matIndex(sv.a);
+		bool hitHere = idx != curMed;
+		float tIn = t;              // where the ray is along the cell (level units)
+		int ax = axis >= 0 ? axis : 1;
+		if (hitHere) {
+			vec4 pal0 = matPalIdx(idx);
+			if (!matTransmits(idx, pal0)) {
+				// the box test, inside this cell's stretch of the ray
+				vec3 bb = floor(texture3D(claudeCascadeBox,
+						(vec3(c.x, c.y, c.z + 128.0 * float(k)) + 0.5)
+						/ vec3(128.0, 128.0, 640.0)).rgb * 255.0 + 0.5);
+				float unit = max(1.0, h / 16.0);
+				vec3 blo = org + c * h + mod(bb, 16.0) * unit;
+				vec3 bhi = org + c * h + (floor(bb / 16.0) + 1.0) * unit;
+				vec3 inv = 1.0 / (sign(rd) * max(abs(rd), vec3(1e-7))
+						+ vec3(rd.x == 0.0 ? 1e-7 : 0.0, rd.y == 0.0 ? 1e-7 : 0.0,
+							rd.z == 0.0 ? 1e-7 : 0.0));
+				vec3 t0 = (blo - p0) * inv, t1 = (bhi - p0) * inv;
+				vec3 tn = min(t0, t1), tf = max(t0, t1);
+				float te = max(max(tn.x, tn.y), tn.z);
+				float tx = min(min(tf.x, tf.y), tf.z);
+				float c0 = t * h;
+				float c1 = min(sideDist.x, min(sideDist.y, sideDist.z)) * h;
+				if (te <= tx && tx >= c0 && te <= c1) {
+					if (te > c0) {
+						tIn = te / h;
+						ax = (tn.x >= tn.y && tn.x >= tn.z) ? 0
+								: (tn.y >= tn.z ? 1 : 2);
+					}
+				} else {
+					hitHere = false;   // the empty part of the cell
+				}
+			}
+		}
+		if (hitHere) {
+			vec4 pal = matPalIdx(idx);
+			n = vec3(0.0);
+			if (ax == 0) n.x = -stepDir.x;
+			else if (ax == 1) n.y = -stepDir.y;
+			else n.z = -stepDir.z;
+			vec3 ph = p0 + rd * (tIn * h);
+			// off the face by a hair: the face may sit inside this cell (a
+			// box), so the cell-clamping restart is not the right tool
+			hp = ph + n * (1e-3 * h);
+			hpFar = ph - n * (1e-3 * h);
+			alb = cellAlbedo(sv.rgb);
+			le = alb * pal.r;
+			if (pal.r > 0.0)
+				hotLaw(idx, FAR_CELL, false, vec3(0.0), alb, le);
+			tHit = tBase + tIn * h;
+			palOut = pal;
+			idxOut = idx;
+			return 1;
+		}
+		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
+			t = sideDist.x; sideDist.x += delta.x; c.x += stepDir.x; axis = 0;
+		} else if (sideDist.y < sideDist.z) {
+			t = sideDist.y; sideDist.y += delta.y; c.y += stepDir.y; axis = 1;
+		} else {
+			t = sideDist.z; sideDist.z += delta.z; c.z += stepDir.z; axis = 2;
+		}
+	}
+	pExit = p0 + rd * (t * h);
+	return 0;
+}
+
+// which face of the box [lo, lo+size) a ray from inside leaves through
+int boxExitAxis(vec3 p, vec3 d, vec3 lo, float size)
+{
+	vec3 room = mix(p - lo, lo + vec3(size) - p, step(0.0, d));
+	vec3 tt = room / max(abs(d), vec3(1e-6));
+	return tt.x < tt.y ? (tt.x < tt.z ? 0 : 2) : (tt.y < tt.z ? 1 : 2);
+}
+
+// THE ONE WALK every ray takes. The 1 m grid (with its 1/16 m rung) where
+// it holds the point; the ladder everywhere else; the sky past both.
+bool marchAll(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
+		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
+		out vec4 palOut, out float idxOut, out vec3 hpFar)
+{
+	g_lastFar = false;
+	if (farLevelCount() == 0 && nearOn())
+		return marchMed(ro, rd, curMed, hp, n, alb, le, tHit, cellOut,
+				palOut, idxOut, hpFar);
+	hp = ro; n = vec3(0.0, 1.0, 0.0); alb = vec3(0.0); le = vec3(0.0);
+	tHit = DEPTH_MISS; cellOut = vec3(-1.0); palOut = vec4(0.0);
+	idxOut = 0.0; hpFar = ro;
+	vec3 p = ro;
+	float tb = 0.0;
+	int lv = levelAt(ro);
+	int axis = -1;
+	for (int pass = 0; pass < 12; pass++) {
+		if (lv == 99)
+			return false;
+		if (lv == -1) {
+			if (pass > 0) {
+				// ENTERING the 1 m grid from outside: the near walk never
+				// tests its first cell, so test it here (a solid boundary
+				// cell is a hit on its outer face; its 1/16 m rung is not
+				// walked on this one arrival)
+				vec3 cs = floor(p + rd * 1e-4);
+				vec4 s0 = texture3D(claudeTraceGrid, (cs + 0.5) / GRID_S);
+				float i0 = matIndex(s0.a);
+				if (i0 != curMed) {
+					vec4 pal0 = matPalIdx(i0);
+					n = vec3(0.0);
+					vec3 sd = sign(rd);
+					if (axis == 0) n.x = -sd.x;
+					else if (axis == 1) n.y = -sd.y;
+					else n.z = -sd.z;
+					hp = restartPoint(p, n, cs + n, 1.0);
+					hpFar = restartPoint(p, -n, cs, 1.0);
+					alb = cellAlbedo(s0.rgb);
+					le = alb * pal0.r;
+					tHit = tb;
+					cellOut = cs;
+					palOut = pal0;
+					idxOut = i0;
+					return true;
+				}
+			}
+			if (marchMed(p, rd, curMed, hp, n, alb, le, tHit, cellOut,
+					palOut, idxOut, hpFar)) {
+				tHit += tb;
+				return true;
+			}
+			float te = airExitT(p, rd);
+			axis = boxExitAxis(p, rd, vec3(0.0), GRID_S);
+			p += rd * te;
+			tb += te;
+		} else {
+			vec3 pe;
+			if (marchFarLevel(lv, p, rd, tb, curMed, axis, hp, n, alb, le,
+					tHit, palOut, idxOut, hpFar, pe) == 1) {
+				cellOut = FAR_CELL;
+				g_lastFar = true;
+				return true;
+			}
+			// which face it left by: the axis whose boundary pe sits on
+			vec3 fr = abs(fract((pe - farOrigin(lv)) / farCellSize(lv) + 0.5) - 0.5);
+			axis = fr.x < fr.y ? (fr.x < fr.z ? 0 : 2) : (fr.y < fr.z ? 1 : 2);
+			tb += length(pe - p);
+			p = pe;
+		}
+		lv = levelAt(p + rd * 1e-3);
+	}
+	return false;
 }
 
 // Is the point x inside anything a ray would stop at? (leaf transmission's
@@ -2503,7 +2782,7 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
-	if (marchMed(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
+	if (marchAll(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0); // occluded
 
@@ -2513,8 +2792,8 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float pdfB = g_neeBScale * cosX / PI;                  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
-	vec3 tr = curMed < 0.5 ? vec3(airTr(airExitT(x, wi)))
-			: medTr(curMed, airExitT(x, wi));
+	vec3 tr = curMed < 0.5 ? vec3(airTr(farExitT(x, wi)))
+			: medTr(curMed, farExitT(x, wi));
 	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL) * tr;
 }
 
@@ -2542,13 +2821,13 @@ vec3 neeSkyAir(vec3 x, vec3 dir)
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
-	if (marchMed(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
+	if (marchAll(x, wi, 0.0, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0);
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos));
 	float ph = hgPhase(dot(dir, wi), claudeAirG);
 	float w = pdfL / (pdfL + ph);
-	return w * ph * skyBody(wi) * airTr(airExitT(x, wi)) / pdfL;
+	return w * ph * skyBody(wi) * airTr(farExitT(x, wi)) / pdfL;
 }
 
 // =====================================================================
@@ -2704,6 +2983,7 @@ void main(void)
 			? min(int(claudePointCount + 0.5), 8) : 0;
 	g_ptCtr = 0u;
 	bool coneArmed = false;   // did the previous vertex aim at flames?
+	bool areaArmed = false;   // ...at the area (lamp) list?
 
 	g_rngState = hash13(vec3(gl_FragCoord.xy,
 			// animationTimer is unbounded seconds; wrapped by an
@@ -3248,8 +3528,9 @@ void main(void)
 		vec4 hitPal;
 		float hitIdx;
 		vec3 hpFar;
-		bool hitS = marchMed(p, dir, curMed, hp, n, alb, le, tHit, cell,
+		bool hitS = marchAll(p, dir, curMed, hp, n, alb, le, tHit, cell,
 				hitPal, hitIdx, hpFar);
+		bool hitFar = g_lastFar;
 		// THE PIXEL'S SURFACE IS THE CAMERA RAY'S FIRST HIT, WHETHER OR NOT
 		// THIS SAMPLE REACHES IT (2026-10-06). In air a camera ray may
 		// scatter before the surface (the block below `continue`s), and the
@@ -3268,7 +3549,7 @@ void main(void)
 			vec3 a0 = alb;
 			if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
 					&& !matTransmits(hitIdx, hitPal))
-				a0 = max(min(a0 * pow(faceTileRatio(cell, hp, n), vec3(2.2)),
+				a0 = max(min(a0 * pow((cell.x > -5000.0 ? faceTileRatio(cell, hp, n) : vec3(1.0)), vec3(2.2)),
 						vec3(1.0)), vec3(ALBEDO_FLOOR));
 			primaryAlb = a0;
 		}
@@ -3280,7 +3561,7 @@ void main(void)
 				vec3 g0 = alb;
 				if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
 						&& !matTransmits(hitIdx, hitPal))
-					g0 = max(min(g0 * pow(faceTileRatio(cell, hp, n),
+					g0 = max(min(g0 * pow((cell.x > -5000.0 ? faceTileRatio(cell, hp, n) : vec3(1.0)),
 							vec3(2.2)), vec3(1.0)), vec3(ALBEDO_FLOOR));
 				guideSet = true;
 				guideN = n;
@@ -3300,7 +3581,7 @@ void main(void)
 		// can be invented: a non-absorbing medium cannot move a sealed
 		// furnace (the furnace-050-air arm). Debug views see geometry only.
 		if (airSigT() > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)) {
-			float tSeg = hitS ? tHit : airExitT(p, dir);
+			float tSeg = hitS ? tHit : farExitT(p, dir);
 			float ua = rnd1();
 			float sAir = -log(max(1.0 - ua, 1e-12)) / airSigT();
 			if (sAir < tSeg) {
@@ -3335,6 +3616,7 @@ void main(void)
 				prevX = xa;
 				misArmed = nLights > 0 || skyNee;
 				coneArmed = false;   // air vertices do not aim at flames
+				areaArmed = nLights > 0;
 				guideOn = false;     // off the camera's transmit chain
 				dir = nd;
 				p = xa;
@@ -3386,7 +3668,7 @@ void main(void)
 		// pow(c, 2.2), so the sRGB ratio enters as ratio^2.2.
 		if (claudeTexel > 0.5 && hitIdx > 0.5 && !matFine(hitPal)
 				&& !matTransmits(hitIdx, hitPal))
-			alb = max(min(alb * pow(faceTileRatio(cell, hp, n), vec3(2.2)),
+			alb = max(min(alb * pow((cell.x > -5000.0 ? faceTileRatio(cell, hp, n) : vec3(1.0)), vec3(2.2)),
 					vec3(1.0)), vec3(ALBEDO_FLOOR));
 
 		// clay: march computed le from the TRUE albedo above; clamping
@@ -3415,7 +3697,8 @@ void main(void)
 		float misW = 1.0;
 		if (misArmed && any(greaterThan(le, vec3(0.0)))) {
 			float cosY = dot(n, -dir);
-			float pdfL = neePdfSa(cell, n, prevX, tHit, cosY, nLights);
+			float pdfL = areaArmed
+					? neePdfSa(cell, n, prevX, tHit, cosY, nLights) : 0.0;
 			// a flame hit: the flame sampler could have chosen this too
 			if (coneArmed && matFine(hitPal))
 				pdfL += ptPdfSa(prevX, dir, nPts);
@@ -3561,6 +3844,7 @@ void main(void)
 			}
 			misArmed = false;     // a delta lobe has no light-sampling
 			coneArmed = false;
+			areaArmed = false;
 			                      // partner: the next Le arrives at
 			                      // weight 1
 			pathBounces += 1.0;
@@ -3600,7 +3884,12 @@ void main(void)
 			}
 		}
 		g_neeBScale = leafT ? 0.5 : 1.0;
-		if (nLights > 0) {
+		// a FAR vertex aims at the sun and sky only: the lamp and flame
+		// lists are near emitters, and a hillside 300 m out gains nothing
+		// from them. The MIS arms below say so (areaArmed / coneArmed),
+		// so a BSDF ray from that vertex that does hit a lamp counts in
+		// full: no light is lost, it is only found the slow way.
+		if (!hitFar && nLights > 0) {
 			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
 			L += cN;
 			if (nScat < 0.5)
@@ -3615,7 +3904,7 @@ void main(void)
 			if (nScat < 0.5)
 				Ld += cS;
 		}
-		if (nPts > 0) {
+		if (!hitFar && nPts > 0) {
 			vec3 cP = tp * neePoint(hp, n, alb, nPts, curMed);
 			L += cP;
 			if (nScat < 0.5)
@@ -3667,8 +3956,9 @@ void main(void)
 		// is the only light there is — leaving this at `nLights > 0`
 		// would have given the sun's BSDF half a weight of 1 while the
 		// sky sampler was also paying it, i.e. the double count.
-		misArmed = nLights > 0 || skyNee || nPts > 0;
-		coneArmed = nPts > 0;
+		misArmed = (!hitFar && (nLights > 0 || nPts > 0)) || skyNee;
+		coneArmed = !hitFar && nPts > 0;
+		areaArmed = !hitFar && nLights > 0;
 		p = through ? xb : hp;
 		pathBounces += 1.0;
 		nScat += 1.0;
@@ -3814,8 +4104,9 @@ void main(void)
 		float sgn = (guideN.x + guideN.y + guideN.z) > 0.0 ? 1.0 : 0.0;
 		vec3 hpP = guideP;
 		float coord = ax < 0.5 ? hpP.x : (ax < 1.5 ? hpP.y : hpP.z);
-		float q = clamp(floor(coord * 16.0 + 0.5), 0.0, 4095.0);
-		faceCode = 1.0 + (ax * 2.0 + sgn) * 4096.0 + q;
+		// plane in 1/16 m from -1024 m (far levels reach past the grid)
+		float q = clamp(floor((coord + 1024.0) * 16.0 + 0.5), 0.0, 65535.0);
+		faceCode = 1.0 + (ax * 2.0 + sgn) * 65536.0 + q;
 	}
 	// THE SKY IS ONE SURFACE TOO (2026-10-06): a camera ray that escaped
 	// gets a code of its own (above every face code), so the denoiser may

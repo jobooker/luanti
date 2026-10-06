@@ -26,7 +26,7 @@ void summarizeBlock(Client *client, MapBlock *block);
 // occupancy-weighted average color, a = class: 0 air, 100 water, 255
 // solid). coarse: 32^3 any-solid. Returns the number of solid cells.
 u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
-		std::vector<u8> &rgba, std::vector<u8> &coarse);
+		std::vector<u8> &rgba, std::vector<u8> &boxes, const u8 matidx[4]);
 
 // Far-data feed (2026-08-12): ingest server-sampled terrain summaries
 // from <path_user>/claude_far/*.json — synthetic BlockSummaries for

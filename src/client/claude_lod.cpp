@@ -37,6 +37,18 @@ struct BlockSummary
 	// lets ONE fold build every rung — the separate 2m block-walker
 	// (whose alignment contract caused the origin-parity wall) is gone.
 	u8 fine[64], finew[64];
+	// LAVA, apart from water (2026-10-06): a liquid that emits. Folded
+	// to the lava material so far lava glows by the same law as near lava
+	// instead of reading as a lake.
+	u8 lava[64];
+	u8 finel[64];
+	// TIGHT BOX of the solid nodes in each octant (2026-10-06, far view):
+	// bits 0-2 = min x/y/z node (0 or 1), bits 3-5 = max x/y/z, bit 7 =
+	// the octant holds a solid at all. Folded into every level's per-cell
+	// box, so a coarse cell carries WHERE its solid sits, not just that it
+	// exists: one layer of ground in a 2 m cell is a 1 m slab, a 1 m trunk
+	// is a 1 m column, and the far ground meets the near ground flush.
+	u8 sbox[64][8];
 	// per-octant mean color, RGB565 (0 = unset -> fall back to the
 	// subcell mean): real 2m-scale variation folded from real nodes —
 	// John's law: "variation comes from more voxels, not texture"
@@ -52,10 +64,14 @@ void summarizeBlock(Client *client, MapBlock *block)
 {
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	BlockSummary s = {};
-	static thread_local u8 so[64][8], wo[64][8];
+	static thread_local u8 so[64][8], wo[64][8], lo[64][8];
+	static thread_local u8 bmn[64][8][3], bmx[64][8][3];
 	static thread_local u32 rc[64][8], gc[64][8], bc[64][8];
 	memset(so, 0, sizeof(so));
 	memset(wo, 0, sizeof(wo));
+	memset(lo, 0, sizeof(lo));
+	memset(bmn, 1, sizeof(bmn));
+	memset(bmx, 0, sizeof(bmx));
 	memset(rc, 0, sizeof(rc));
 	memset(gc, 0, sizeof(gc));
 	memset(bc, 0, sizeof(bc));
@@ -105,12 +121,22 @@ void summarizeBlock(Client *client, MapBlock *block)
 				col.setBlue(col.getBlue() * tint.getBlue() / 255);
 			}
 		}
-		if (f.isLiquid()) {
+		if (f.isLiquid() && f.light_source > 0) {
+			s.lava[sub]++;
+			lo[sub][oct]++;
+		} else if (f.isLiquid()) {
 			s.water[sub]++;
 			wo[sub][oct]++;
 		} else {
 			s.occ[sub]++;
 			so[sub][oct]++;
+			u8 lx = (u8)(x & 1), ly = (u8)(y & 1), lz = (u8)(z & 1);
+			bmn[sub][oct][0] = std::min(bmn[sub][oct][0], lx);
+			bmn[sub][oct][1] = std::min(bmn[sub][oct][1], ly);
+			bmn[sub][oct][2] = std::min(bmn[sub][oct][2], lz);
+			bmx[sub][oct][0] = std::max(bmx[sub][oct][0], lx);
+			bmx[sub][oct][1] = std::max(bmx[sub][oct][1], ly);
+			bmx[sub][oct][2] = std::max(bmx[sub][oct][2], lz);
 			if (f.drawtype == NDT_ALLFACES_OPTIONAL)
 				s.leaf[sub]++;
 		}
@@ -123,11 +149,24 @@ void summarizeBlock(Client *client, MapBlock *block)
 	}
 	for (int sub = 0; sub < 64; sub++)
 		for (int o = 0; o < 8; o++) {
-			if (so[sub][o] >= 5)
+			// MAJORITY (2026-10-06): an octant is solid when at least half
+			// of its 8 nodes are (ADR-0010's fold). The >= 5/8 rule it
+			// replaces biased every coarse surface DOWN on purpose (the
+			// 2026-08-12 "rampart" fix), which shifts mean height; the
+			// rampart's real cause, a misaligned seam, is fixed by aligned
+			// origins instead (the near grid now snaps to even nodes).
+			if (so[sub][o] >= 4)
 				s.fine[sub] |= (u8)(1 << o);
-			if (wo[sub][o] >= 5)
+			else if (lo[sub][o] >= 4)
+				s.finel[sub] |= (u8)(1 << o);
+			else if (wo[sub][o] >= 4)
 				s.finew[sub] |= (u8)(1 << o);
-			u32 n = (u32)so[sub][o] + wo[sub][o];
+			if (so[sub][o] > 0)
+				s.sbox[sub][o] = (u8)(0x80 | bmn[sub][o][0]
+						| (bmn[sub][o][1] << 1) | (bmn[sub][o][2] << 2)
+						| (bmx[sub][o][0] << 3) | (bmx[sub][o][1] << 4)
+						| (bmx[sub][o][2] << 5));
+			u32 n = (u32)so[sub][o] + wo[sub][o] + lo[sub][o];
 			if (n > 0)
 				s.fineCol[sub][o] = (u16)(
 					(((rc[sub][o] / n) >> 3) << 11)
@@ -238,12 +277,44 @@ size_t summaryCount()
 }
 
 u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
-		std::vector<u8> &rgba, std::vector<u8> &coarse)
+		std::vector<u8> &rgba, std::vector<u8> &boxes, const u8 matidx[4])
 {
 	constexpr int N = 128; // cells per axis
 	const int CELL = cell_nodes;
 	rgba.assign((size_t)N * N * N * 4, 0);
-	coarse.assign(32 * 32 * 32, 0);
+	// per cell: the tight box of its solid nodes, packed min | max << 4
+	// per axis in units of max(1, CELL/16) nodes (see the shader's
+	// marchFarLevel); a=255 marks a box
+	boxes.assign((size_t)N * N * N * 4, 0);
+	static std::vector<u8> bxmin, bxmax;
+	bxmin.assign((size_t)N * N * N * 3, 255);
+	bxmax.assign((size_t)N * N * N * 3, 0);
+	auto boxAdd = [&](size_t ci, int nx, int ny, int nz) {
+		// node offsets inside the cell, 0 .. CELL-1
+		u8 v[3] = {(u8)nx, (u8)ny, (u8)nz};
+		for (int a = 0; a < 3; a++) {
+			bxmin[ci * 3 + a] = std::min(bxmin[ci * 3 + a], v[a]);
+			bxmax[ci * 3 + a] = std::max(bxmax[ci * 3 + a], v[a]);
+		}
+	};
+	// every solid octant's box, deposited into the cell that holds it
+	auto octBoxes = [&](const BlockSummary &s, int sub, int sx, int sy,
+			int sz, v3s16 rel) {
+		for (int o = 0; o < 8; o++) {
+			u8 b = s.sbox[sub][o];
+			if (!(b & 0x80))
+				continue;
+			int ox = rel.X + sx * 4 + (o & 1) * 2;
+			int oy = rel.Y + sy * 4 + ((o >> 1) & 1) * 2;
+			int oz = rel.Z + sz * 4 + ((o >> 2) & 1) * 2;
+			int cx = ox / CELL, cy = oy / CELL, cz = oz / CELL;
+			size_t ci = ((size_t)cz * N + cy) * N + cx;
+			int bx = ox - cx * CELL, by = oy - cy * CELL, bz = oz - cz * CELL;
+			boxAdd(ci, bx + (b & 1), by + ((b >> 1) & 1), bz + ((b >> 2) & 1));
+			boxAdd(ci, bx + ((b >> 3) & 1), by + ((b >> 4) & 1),
+					bz + ((b >> 5) & 1));
+		}
+	};
 
 	// SCATTER, not gather: iterate the blocks we actually HAVE (a few
 	// thousand) and deposit their 4-node subcells into cells. Cost is
@@ -251,7 +322,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// which breaks the one-block-per-cell gather — is handled for free.
 	// Accumulators are static and reused (u16 counts: max 32^3 = 32768
 	// nodes per cell fits; u32 color sums).
-	static std::vector<u16> occ_acc, water_acc, leaf_acc;
+	static std::vector<u16> occ_acc, water_acc, leaf_acc, lava_acc;
 	static std::vector<u32> r_acc, g_acc, b_acc;
 	static std::vector<s16> top_acc;   // highest occupied subcell layer
 	static std::vector<u16> top_n;     // counted nodes in that layer
@@ -259,6 +330,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	occ_acc.assign(NC, 0);
 	water_acc.assign(NC, 0);
 	leaf_acc.assign(NC, 0);
+	lava_acc.assign(NC, 0);
 	r_acc.assign(NC, 0);
 	g_acc.assign(NC, 0);
 	b_acc.assign(NC, 0);
@@ -282,9 +354,11 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			for (int sy = 0; sy < 4; sy++)
 			for (int sx = 0; sx < 4; sx++) {
 				int sub = sz * 16 + sy * 4 + sx;
-				u32 cnt = (u32)s.occ[sub] + s.water[sub];
+				u32 cnt = (u32)s.occ[sub] + s.water[sub] + s.lava[sub];
 				if (cnt == 0)
 					continue;
+				if (s.occ[sub] > 0)
+					octBoxes(s, sub, sx, sy, sz, rel);
 				if (CELL == 2) {
 					// octant expansion: one 4m subcell = 8 2m cells,
 					// occupancy from the fine bit-sets, color/class
@@ -304,7 +378,8 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 						}
 						bool fs = (s.fine[sub] >> o) & 1;
 						bool fw = (s.finew[sub] >> o) & 1;
-						if (!fs && !fw)
+						bool fl = (s.finel[sub] >> o) & 1;
+						if (!fs && !fw && !fl)
 							continue;
 						int cxo = (rel.X + sx * 4 + (o & 1) * 2) / 2;
 						int cyo = (rel.Y + sy * 4 + ((o >> 1) & 1) * 2) / 2;
@@ -314,6 +389,8 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 							occ_acc[ci2] += 8;
 							if (leafdom)
 								leaf_acc[ci2] += 8;
+						} else if (fl) {
+							lava_acc[ci2] += 8;
 						} else {
 							water_acc[ci2] += 8;
 						}
@@ -338,6 +415,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 						+ ((rel.X + sx * 4) / CELL);
 				occ_acc[ci] += s.occ[sub];
 				water_acc[ci] += s.water[sub];
+				lava_acc[ci] += s.lava[sub];
 				leaf_acc[ci] += s.leaf[sub];
 				// COLOR = the cell's TOP occupied layer only. The grid
 				// average mixed one white snow cap with seven dirt nodes
@@ -366,23 +444,35 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// boundary that rounding stood next to exact 1m terrain as a raised
 	// rampart (John: "a tall border wall" at the 1m/2m seam). A slight
 	// dip at the seam reads as terrain; a wall reads as a wall.
-	const u32 half = (u32)((u32)CELL * CELL * CELL * 62 / 100);
+	// MAJORITY, at least half the cell (ADR-0010; was >= 62 %, see the
+	// octant rule in summarizeBlock for why)
+	const u32 half = (u32)((u32)CELL * CELL * CELL / 2);
 	u32 solid_cells = 0;
 	size_t i = 0;
 	for (int cz = 0; cz < N; cz++)
 	for (int cy = 0; cy < N; cy++)
 	for (int cx = 0; cx < N; cx++, i++) {
-		u32 counted = (u32)occ_acc[i] + water_acc[i];
+		u32 counted = (u32)occ_acc[i] + water_acc[i] + lava_acc[i];
 		if (counted == 0)
 			continue;
+		// THE CELL'S BYTE IS A MATERIAL INDEX (2026-10-06), the same index
+		// into the same palette as the near grid's, so a far cell is lit
+		// by the one light law (physics-contract §7). matidx = {solid,
+		// leaves, water, lava}, from game.cpp claudeMatIndex. The old
+		// class bytes (255 / 180 / 100) had their own far-only shading.
 		u8 cls = 0;
-		if (occ_acc[i] >= half)
-			// leaf-dominant solids are FOLIAGE (180): the far shader
-			// lights them as sky-bathed canopy and lets sun through —
-			// opaque-black forest ramparts were "the LOD 2 wall"
-			cls = leaf_acc[i] * 2 > occ_acc[i] ? 180 : 255;
+		// SOLID IF ANYTHING SOLID IS IN IT, and the box says where
+		// (research 2026-10-06: conservative occupancy for the hit test,
+		// a tight per-cell box to keep coverage honest for terrain). The
+		// majority rule this replaces had to round flat ground to whole
+		// cells, which put the far ground up to 1 m off the near ground.
+		bool has_box = bxmin[i * 3] != 255;
+		if (has_box && occ_acc[i] * 4 >= (u32)water_acc[i] + lava_acc[i])
+			cls = leaf_acc[i] * 2 > occ_acc[i] ? matidx[1] : matidx[0];
+		else if (lava_acc[i] >= half)
+			cls = matidx[3];
 		else if (water_acc[i] >= half && water_acc[i] > occ_acc[i])
-			cls = 100;
+			cls = matidx[2];
 		else
 			continue;
 		u32 tn = std::max(top_n[i], (u16)1);
@@ -391,7 +481,17 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		rgba[i * 4 + 2] = (u8)std::min(b_acc[i] / tn, 255u);
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
-		coarse[((cz / 4) * 32 + (cy / 4)) * 32 + (cx / 4)] = 255;
+		const int unit = std::max(1, CELL / 16);
+		if (cls == matidx[0] || cls == matidx[1]) {
+			for (int a = 0; a < 3; a++)
+				boxes[i * 4 + a] = (u8)((bxmin[i * 3 + a] / unit)
+						| ((bxmax[i * 3 + a] / unit) << 4));
+		} else {
+			// liquids fill their whole cell (their surface is not boxed yet)
+			for (int a = 0; a < 3; a++)
+				boxes[i * 4 + a] = (u8)(0 | ((CELL / unit - 1) << 4));
+		}
+		boxes[i * 4 + 3] = 255;
 	}
 	return solid_cells;
 }

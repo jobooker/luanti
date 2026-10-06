@@ -264,6 +264,10 @@ CANONICAL_DIALS = {
     "claude_leaf_transmit": 1,
     # model shapes past the ring (2026-10-06): geometry, on
     "claude_model_far": 1,
+    # far view (2026-10-06) is ON by default in play; pinned OFF in CI
+    # until it has its own referee arms (the scored rooms are sealed, and
+    # a level rebuild must not clamp a capture)
+    "claude_cascades": 0,
     "claude_glass_flush": 1,  # glass sits flush against carved wood (2026-10-04);
                               # pinned so a conf default can never decide it
     # THE SKY (roadmap coverage 3, 2026-08-17). 0 = the real sky, which

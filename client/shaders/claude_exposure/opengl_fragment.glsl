@@ -51,8 +51,8 @@ void whitePixel()
 		vec2 q = (vec2(float(i), float(j)) + 0.5) / vec2(48.0, 27.0);
 		vec4 g = texture2D(guide, q);
 		// code 0 (glass, water, emitters) and the sky's own code
-		// (1 + 6 * 4096) carry no light-on-a-surface
-		if (abs(g.a) < 0.5 || abs(abs(g.a) - 24577.0) < 0.5)
+		// (1 + 6 * 65536) carry no light-on-a-surface
+		if (abs(g.a) < 0.5 || abs(abs(g.a) - 393217.0) < 0.5)
 			continue;
 		vec3 e = max(texture2D(shown, q).rgb, vec3(0.0))
 				/ max(g.rgb, vec3(0.005));
