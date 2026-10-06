@@ -8,6 +8,7 @@
 #include "mapnode.h"
 #include "nodedef.h"
 #include "client/node_visuals.h" // minimap_color
+#include <cmath>
 #include "util/numeric.h"
 
 #include "filesys.h"
@@ -52,9 +53,30 @@ struct BlockSummary
 	// per-octant mean color, RGB565 (0 = unset -> fall back to the
 	// subcell mean): real 2m-scale variation folded from real nodes —
 	// John's law: "variation comes from more voxels, not texture"
-	u16 fineCol[64][8];
-	u16 rsum[64], gsum[64], bsum[64]; // summed minimap color of counted nodes
+	u32 fineCol[64][8]; // 0 = unset, else 0xFF<<24 | sRGB r<<16 | g<<8 | b
+	u32 rsum[64], gsum[64], bsum[64]; // summed LINEAR colour (x LIN) of the colour nodes
+	// how many nodes the colour sums hold: the TOP-EXPOSED ones (a node with
+	// open air above it) when the subcell has any, else all of them
+	u8 ccount[64];
 };
+
+// sRGB byte <-> linear * LIN, for summing albedo in LINEAR light.
+// PRECISION (2026-10-06): linear at 255 steps and RGB565 octant colours
+// that TRUNCATED their low bits cost the far ground half a quantum per
+// channel -- the LOD energy referee read the 2 m plains 6 % darker than the
+// 1 m, and the albedo-only view showed the whole deficit in the colours
+// (spec/measured.md). Linear sums now carry 16 bits; octant colours are
+// rounded 8-bit sRGB.
+static constexpr u32 LIN = 65535;
+static inline u32 toLin(u32 v)
+{
+	return (u32)(LIN * std::pow(v / 255.0, 2.2) + 0.5);
+}
+static inline u32 toSrgb(u32 v)
+{
+	return (u32)std::clamp(255.0 * std::pow(v / (double)LIN, 1.0 / 2.2) + 0.5,
+			0.0, 255.0);
+}
 
 static std::mutex g_mutex;
 static std::unordered_map<v3s16, BlockSummary> g_summaries;
@@ -67,6 +89,9 @@ void summarizeBlock(Client *client, MapBlock *block)
 	static thread_local u8 so[64][8], wo[64][8], lo[64][8];
 	static thread_local u8 bmn[64][8][3], bmx[64][8][3];
 	static thread_local u32 rc[64][8], gc[64][8], bc[64][8];
+	// the same sums over TOP-EXPOSED nodes only, and their counts
+	static thread_local u32 erc[64][8], egc[64][8], ebc[64][8];
+	static thread_local u8 en[64][8], an[64][8];
 	memset(so, 0, sizeof(so));
 	memset(wo, 0, sizeof(wo));
 	memset(lo, 0, sizeof(lo));
@@ -75,6 +100,32 @@ void summarizeBlock(Client *client, MapBlock *block)
 	memset(rc, 0, sizeof(rc));
 	memset(gc, 0, sizeof(gc));
 	memset(bc, 0, sizeof(bc));
+	memset(erc, 0, sizeof(erc));
+	memset(egc, 0, sizeof(egc));
+	memset(ebc, 0, sizeof(ebc));
+	memset(en, 0, sizeof(en));
+	memset(an, 0, sizeof(an));
+	// does this node count as matter for the fold (the same skips as the
+	// walk below)? Used to ask "is the node above open air"
+	auto counts = [&](MapNode m) -> bool {
+		content_t cc = m.getContent();
+		if (cc == CONTENT_AIR || cc == CONTENT_IGNORE)
+			return false;
+		const ContentFeatures &ff = ndef->get(cc);
+		if (ff.light_source == 0
+				&& (ff.drawtype == NDT_PLANTLIKE
+					|| ff.drawtype == NDT_PLANTLIKE_ROOTED
+					|| ff.drawtype == NDT_FIRELIKE
+					|| ff.drawtype == NDT_SIGNLIKE
+					|| ff.drawtype == NDT_RAILLIKE
+					|| ff.drawtype == NDT_TORCHLIKE))
+			return false;
+		if (ff.light_source > 0 && ff.drawtype == NDT_AIRLIKE)
+			return false;
+		if (ff.param_type_2 == CPT2_LEVELED)
+			return false;
+		return true;
+	};
 	for (s16 z = 0; z < MAP_BLOCKSIZE; z++)
 	for (s16 y = 0; y < MAP_BLOCKSIZE; y++)
 	for (s16 x = 0; x < MAP_BLOCKSIZE; x++) {
@@ -140,12 +191,27 @@ void summarizeBlock(Client *client, MapBlock *block)
 			if (f.drawtype == NDT_ALLFACES_OPTIONAL)
 				s.leaf[sub]++;
 		}
-		rc[sub][oct] += col.getRed();
-		gc[sub][oct] += col.getGreen();
-		bc[sub][oct] += col.getBlue();
-		s.rsum[sub] += col.getRed();
-		s.gsum[sub] += col.getGreen();
-		s.bsum[sub] += col.getBlue();
+		// COLOUR IS WHAT YOU SEE: a node's colour counts toward its cell
+		// when its TOP is open air (ADR-0010: albedo weighted by exposed
+		// face area; from above, the area is the tops). The LOD energy
+		// referee read the 2 m plains 5 % darker than the 1 m: each octant
+		// averaged the grass with the dirt under it. Summed in LINEAR light.
+		// At the block's top layer the node above is in another block:
+		// counted as open.
+		bool topOpen = (y == MAP_BLOCKSIZE - 1)
+				|| !counts(block->getNodeNoCheck(x, y + 1, z));
+		u32 lr = toLin(col.getRed()), lg = toLin(col.getGreen()),
+				lb = toLin(col.getBlue());
+		rc[sub][oct] += lr;
+		gc[sub][oct] += lg;
+		bc[sub][oct] += lb;
+		an[sub][oct]++;
+		if (topOpen) {
+			erc[sub][oct] += lr;
+			egc[sub][oct] += lg;
+			ebc[sub][oct] += lb;
+			en[sub][oct]++;
+		}
 	}
 	for (int sub = 0; sub < 64; sub++)
 		for (int o = 0; o < 8; o++) {
@@ -167,12 +233,30 @@ void summarizeBlock(Client *client, MapBlock *block)
 						| (bmx[sub][o][0] << 3) | (bmx[sub][o][1] << 4)
 						| (bmx[sub][o][2] << 5));
 			u32 n = (u32)so[sub][o] + wo[sub][o] + lo[sub][o];
-			if (n > 0)
-				s.fineCol[sub][o] = (u16)(
-					(((rc[sub][o] / n) >> 3) << 11)
-					| (((gc[sub][o] / n) >> 2) << 5)
-					| ((bc[sub][o] / n) >> 3));
+			// stored as sRGB (RGB565) of the octant's MEAN LINEAR colour,
+			// over its top-exposed nodes when it has any
+			(void)n;
+			bool ex = en[sub][o] > 0;
+			u32 cn = ex ? en[sub][o] : an[sub][o];
+			if (cn > 0)
+				s.fineCol[sub][o] = 0xFF000000u
+					| (toSrgb(((ex ? erc : rc)[sub][o] + cn / 2) / cn) << 16)
+					| (toSrgb(((ex ? egc : gc)[sub][o] + cn / 2) / cn) << 8)
+					| toSrgb(((ex ? ebc : bc)[sub][o] + cn / 2) / cn);
 		}
+	for (int sub = 0; sub < 64; sub++) {
+		u32 er = 0, eg = 0, eb = 0, ar = 0, ag = 0, ab = 0, ne = 0, na = 0;
+		for (int o = 0; o < 8; o++) {
+			er += erc[sub][o]; eg += egc[sub][o]; eb += ebc[sub][o];
+			ar += rc[sub][o]; ag += gc[sub][o]; ab += bc[sub][o];
+			ne += en[sub][o]; na += an[sub][o];
+		}
+		bool ex = ne > 0;
+		s.rsum[sub] = ex ? er : ar;
+		s.gsum[sub] = ex ? eg : ag;
+		s.bsum[sub] = ex ? eb : ab;
+		s.ccount[sub] = (u8)(ex ? ne : na);
+	}
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
 		g_summaries[block->getPos()] = s;
@@ -243,9 +327,11 @@ size_t ingestFarDir(Client *client)
 				s.occ[idx] = (u8)occ;
 				s.water[idx] = (u8)water;
 				int cnt = occ + water;
-				s.rsum[idx] = (u16)(col.getRed() * cnt);
-				s.gsum[idx] = (u16)(col.getGreen() * cnt);
-				s.bsum[idx] = (u16)(col.getBlue() * cnt);
+				// linear sums and their count, as the received-block fold
+				s.rsum[idx] = toLin(col.getRed()) * cnt;
+				s.gsum[idx] = toLin(col.getGreen()) * cnt;
+				s.bsum[idx] = toLin(col.getBlue()) * cnt;
+				s.ccount[idx] = (u8)cnt;
 			}
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
@@ -365,16 +451,18 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 					// shared from the subcell (color grain at 2m is
 					// invisible past the 64-node promotion distance)
 					bool leafdom = s.leaf[sub] * 2 > s.occ[sub];
-					u32 smr = s.rsum[sub] / cnt, smg = s.gsum[sub] / cnt,
-						smb = s.bsum[sub] / cnt;
+					u32 ccn = std::max<u32>(s.ccount[sub], 1);
+					u32 smr = (s.rsum[sub] + ccn / 2) / ccn,
+						smg = (s.gsum[sub] + ccn / 2) / ccn,
+						smb = (s.bsum[sub] + ccn / 2) / ccn;
 					for (int o = 0; o < 8; o++) {
 						// real octant color; 0 = unset (far-fed data)
 						u32 mr = smr, mg = smg, mb = smb;
-						u16 fc = s.fineCol[sub][o];
+						u32 fc = s.fineCol[sub][o];
 						if (fc != 0) {
-							mr = ((fc >> 11) & 31) << 3;
-							mg = ((fc >> 5) & 63) << 2;
-							mb = (fc & 31) << 3;
+							mr = toLin((fc >> 16) & 255);
+							mg = toLin((fc >> 8) & 255);
+							mb = toLin(fc & 255);
 						}
 						bool fs = (s.fine[sub] >> o) & 1;
 						bool fw = (s.finew[sub] >> o) & 1;
@@ -424,12 +512,12 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 				s16 subY = (s16)(rel.Y + sy * 4);
 				if (subY > top_acc[ci]) {
 					top_acc[ci] = subY;
-					top_n[ci] = (u16)cnt;
+					top_n[ci] = (u16)s.ccount[sub];
 					r_acc[ci] = s.rsum[sub];
 					g_acc[ci] = s.gsum[sub];
 					b_acc[ci] = s.bsum[sub];
 				} else if (subY == top_acc[ci]) {
-					top_n[ci] = (u16)(top_n[ci] + cnt);
+					top_n[ci] = (u16)(top_n[ci] + s.ccount[sub]);
 					r_acc[ci] += s.rsum[sub];
 					g_acc[ci] += s.gsum[sub];
 					b_acc[ci] += s.bsum[sub];
@@ -476,9 +564,9 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		else
 			continue;
 		u32 tn = std::max(top_n[i], (u16)1);
-		rgba[i * 4 + 0] = (u8)std::min(r_acc[i] / tn, 255u);
-		rgba[i * 4 + 1] = (u8)std::min(g_acc[i] / tn, 255u);
-		rgba[i * 4 + 2] = (u8)std::min(b_acc[i] / tn, 255u);
+		rgba[i * 4 + 0] = (u8)toSrgb(std::min((r_acc[i] + tn / 2) / tn, LIN));
+		rgba[i * 4 + 1] = (u8)toSrgb(std::min((g_acc[i] + tn / 2) / tn, LIN));
+		rgba[i * 4 + 2] = (u8)toSrgb(std::min((b_acc[i] + tn / 2) / tn, LIN));
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
 		const int unit = std::max(1, CELL / 16);

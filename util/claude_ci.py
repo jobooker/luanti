@@ -1826,10 +1826,11 @@ def aim_ok(start, now, vantage):
           and dturn <= AIM_TOL_DEG
           and -AIM_REST_DROP <= p["y"] - vantage["pos"][1] <= AIM_TOL_NODES)
     return ok, ("yaw %.2f/%.2f pitch %.2f/%.2f pos (%.2f,%.2f,%.2f) | "
-                "vs vantage: %.2f deg, %.2f deg, %.2f nodes | moved since "
-                "teleport: %.3f nodes, %.2f deg"
+                "vs vantage: %.2f deg, %.2f deg, %.2f nodes, y %+.2f | moved "
+                "since teleport: %.3f nodes, %.2f deg"
                 % (now["yaw"], vantage["yaw"], now["pitch"], vantage["pitch"],
-                   p["x"], p["y"], p["z"], dyaw, dpitch, dpos, dmove, dturn))
+                   p["x"], p["y"], p["z"], dyaw, dpitch, dpos,
+                   p["y"] - vantage["pos"][1], dmove, dturn))
 
 
 # Rooms that are fully sealed boxes (walls/floor/ceiling close around the
