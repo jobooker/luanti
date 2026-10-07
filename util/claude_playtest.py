@@ -189,6 +189,25 @@ def score(run_dir):
                 ages.setdefault(a, []).append((t_, r_, int(m.sum())))
         curve = {a: float(sum(t for t, r, c in v) / max(sum(r for t, r, c in v), 1e-9))
                  for a, v in sorted(ages.items())}
+        # DARK PATCHES (what John saw: "starts off all dark"): locally
+        # smoothed brightness, real time vs the truth at the same pose, and
+        # the share of the frame below 80 % / 50 % of the truth. The reveal
+        # curve above only catches faces that are NEW to the screen; backing
+        # up showed a dark band over ground that WAS on screen the frame
+        # before (its history lost while moving), which this sees.
+        def smooth(x, k=8):
+            h, w = x.shape
+            hh, ww = h // k, w // k
+            return x[:hh * k, :ww * k].reshape(hh, k, ww, k).mean((1, 3))
+        dark80, dark50 = [], []
+        for i in range(n):
+            st, sr = smooth(lumT[i]), smooth(lumR[i])
+            lit = sr > 1e-3
+            ratio = np.where(lit, st / np.maximum(sr, 1e-6), 1.0)
+            dark80.append(float(((ratio < 0.8) & lit).mean()))
+            dark50.append(float(((ratio < 0.5) & lit).mean()))
+        moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
+                  or rows[i]["yaw"] != rows[i - 1]["yaw"]]
         # settling: per-frame JOD after the last move
         last_move = max(i for i, r in enumerate(rows[:n]) if i > 0 and
                         (r["pos"] != rows[i - 1]["pos"] or r["yaw"] != rows[i - 1]["yaw"])) \
@@ -199,13 +218,19 @@ def score(run_dir):
             if q >= 9.0:
                 settle = i - last_move
                 break
+        dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
+        after = list(range(last_move + 1, n))
         report[name] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
+                            dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
+                            dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
                             frames_to_jod9_after_stop=settle, frames=n,
                             fps_at_start=sc["fps_at_start"])
         print("%-12s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
               % (name, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
                  jod, settle))
-        print("             revealed pixels, brightness vs truth by frames since revealed: " +
+        print("             dark patches (share of frame below 80%% / 50%% of truth): moving %.3f / %.3f, first 10 frames after stop %.3f"
+              % (report[name]["dark80_moving"], report[name]["dark50_moving"], report[name]["dark80_after_stop"]))
+        print("             new-face reveal curve (catches only faces new to the screen): " +
               " ".join("%d:%.2f" % (a, v) for a, v in list(curve.items())[:12]))
         # the GIF: real time | reference
         frames = []

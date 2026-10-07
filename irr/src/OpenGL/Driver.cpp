@@ -233,6 +233,8 @@ void COpenGL3DriverBase::initVersion()
 {
 	Name = GL.GetString(GL_VERSION);
 	printVersion();
+	// which context the driver actually granted (the 4.6 request, 2026-10-06)
+	os::Printer::log("OpenGL context", Name.c_str(), ELL_WARNING);
 
 	// print renderer information
 	VendorName = GL.GetString(GL_RENDERER);

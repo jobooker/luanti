@@ -1512,10 +1512,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_units_pixel{"claudeUnits"};
 	// AIR (2026-10-04): claude_air_scatter / claude_air_absorb in 1/m and
 	// claude_air_g (Henyey-Greenstein asymmetry). 0 / 0 = no medium.
-	// TUNED: the defaults are a look, not a measurement — scatter 0.004
-	// (a 250 m mean free path: haze you notice past ~30 m), g 0.6 (haze
-	// scatters forward) | learn by: John's eye on the shafts/haze frames.
-	float m_air_scatter = 0.004f;
+	// THE DEFAULT IS THE WEATHER, NOT A LOOK (2026-10-06). It was a TUNED
+	// 0.004 /m (a 250 m mean free path), ~100x thicker than clear air, and in
+	// PLAY it was the single largest cost: rays crossing the far view kept
+	// scattering (plains trace 24.8 ms with it, 7.4 ms at a clear day). Now,
+	// with no explicit claude_air_scatter, the scattering follows from the
+	// day's VISIBILITY by Koschmieder's relation, extinction = 3.912 / V
+	// (contrast threshold 2 %): claude_visibility_km, default 50 (a clear
+	// day). How hazy the day is, is weather -- John's to set.
+	float m_air_scatter = airFromVisibility();
 	// claude_flame (2026-10-05, DECISIONS 0e): 1 (default) = a modelled
 	// emitter glows only from its emitting voxels, flux preserved; 0 =
 	// the whole object glows, as before.
@@ -2118,6 +2123,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		return g_settings->getFloat("claude_descend", 0.0f, 1.0f);
 	}
 
+	static float airFromVisibility()
+	{
+		float v_km = g_settings->exists("claude_visibility_km")
+				? g_settings->getFloat("claude_visibility_km", 0.01f, 10000.0f) : 50.0f;
+		return 3.912f / (v_km * 1000.0f);
+	}
+
 	static float readAir(const char *key, float dflt, float hi)
 	{
 		if (!g_settings->exists(key))
@@ -2702,7 +2714,9 @@ public:
 		if (name == "claude_flame")
 			m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		if (name == "claude_air_scatter")
-			m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
+			m_air_scatter = readAir("claude_air_scatter", airFromVisibility(), 10.0f);
+		if (name == "claude_visibility_km")
+			m_air_scatter = readAir("claude_air_scatter", airFromVisibility(), 10.0f);
 		if (name == "claude_air_absorb")
 			m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		if (name == "claude_air_g")
@@ -2781,7 +2795,7 @@ public:
 		m_texel = readTexel();
 		m_body_colour = readBodyColour();
 		m_units = readAir("claude_units", 1.0f, 1.0f);
-		m_air_scatter = readAir("claude_air_scatter", 0.004f, 10.0f);
+		m_air_scatter = readAir("claude_air_scatter", airFromVisibility(), 10.0f);
 		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);

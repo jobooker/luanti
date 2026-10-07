@@ -674,8 +674,17 @@ bool CIrrDeviceSDL::createWindowWithContext()
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
 		break;
 	case video::EDT_OPENGL3:
+#ifdef __APPLE__
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+#else
+		// OpenGL 4.6 (John, 2026-10-06: "let's go to 4.6 ... vulkan later but
+		// a measured move"): compute shaders, storage buffers and image
+		// writes are what a world-space light cache and a fast denoiser need.
+		// macOS stops at 4.1 and keeps 3.2 core above.
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 6);
+#endif
 #ifdef __APPLE__
 		// macOS never grants compatibility contexts above GL 2.1; 3.2+ is
 		// only available as a core profile, so request that here (SDL maps
