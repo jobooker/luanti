@@ -1790,6 +1790,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_guide (2026-10-07, roadmap 3d-i): 1 = guided bounce directions
 	float m_guide = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_guide_pixel{"claudeGuide"};
+	// claude_boost (2026-10-07): 1 = the extra-sample passes (claude_subpasses)
+	// give young pixels more paths
+	float m_boost = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_boost_pixel{"claudeBoost"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
@@ -1884,6 +1888,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_torch_nee",
 		"claude_area_nee",
 		"claude_guide",
+		"claude_boost",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2800,6 +2805,8 @@ public:
 			m_area_nee = readAir("claude_area_nee", 1.0f, 1.0f);
 		if (name == "claude_guide")
 			m_guide = readAir("claude_guide", 0.0f, 2.0f);
+		if (name == "claude_boost")
+			m_boost = readAir("claude_boost", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -2904,6 +2911,7 @@ public:
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
 		m_area_nee = readAir("claude_area_nee", 1.0f, 1.0f);
 		m_guide = readAir("claude_guide", 0.0f, 2.0f);
+		m_boost = readAir("claude_boost", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3036,6 +3044,7 @@ public:
 			m_torch_nee_pixel.set(&m_torch_nee, services);
 			m_area_nee_pixel.set(&m_area_nee, services);
 			m_guide_pixel.set(&m_guide, services);
+			m_boost_pixel.set(&m_boost, services);
 			{
 				// image units 0 (write) and 1 (read): separate from the
 				// texture units, so they alias nothing above

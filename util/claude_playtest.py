@@ -119,8 +119,10 @@ def capture(args):
         # 1. park there in play settings and read fps + the eye's exposure
         pin = os.path.join(d, "park.txt")
         open(pin, "w").write("0 %s %s %s %s %s\n" % (x, y, z, yaw, pitch))
+        # extra dials for an A/B arm (--dial k=v), on every capture of the run
+        extra = sum([["--dial", kv] for kv in (args.dial or [])], [])
         out = run(["python3", "util/claude_motion.py", "--play", "--path", pin, "--nodump",
-                   "--frames", "120", "--name", name + "-park"] + ([] if first else ["--skip-seat"]))
+                   "--frames", "120", "--name", name + "-park"] + extra + ([] if first else ["--skip-seat"]))
         if first:
             lab.rpc("abm", on=False)
             time.sleep(60)            # the world-file reader fills the far levels
@@ -137,7 +139,7 @@ def capture(args):
         with open(pf, "w") as f:
             for k in pk:
                 f.write("%d %r %r %r %r %r\n" % k)
-        fixed = ["--dial", "claude_auto_exposure=0"] + (["--dial", "claude_exposure=%r" % expo] if expo else [])
+        fixed = ["--dial", "claude_auto_exposure=0"] + (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
         rt = run(common + ["--name", name + "-rt"])
         ref = run(common + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
@@ -249,6 +251,7 @@ if __name__ == "__main__":
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--hold", type=int, default=256)
     ap.add_argument("--score")
+    ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
     a = ap.parse_args()
     if a.score:
         score(a.score)

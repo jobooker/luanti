@@ -546,6 +546,12 @@ uniform vec4 claudeEmitter6;
 uniform vec4 claudeEmitter7;
 uniform float claudePointCount;
 uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
+// claude_subpasses (2026-10-07): this program is extra-sample pass k when
+// CLAUDE_SUBPASS = k > 0 (secondstage.cpp compiles it twice more)
+#ifndef CLAUDE_SUBPASS
+#define CLAUDE_SUBPASS 0
+#endif
+uniform float claudeBoost;      // claude_boost: 1 = extra-sample passes give young pixels more paths
 uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
 #ifdef GL_ARB_shader_image_load_store
 layout(r32ui) uniform uimage2D claudeGuideW;           // this epoch's tallies (written)
@@ -3349,6 +3355,26 @@ void main(void)
 
 	int view = int(claudeView + 0.5);
 	int maxBounces = int(claudeBounces + 0.5);
+#if CLAUDE_SUBPASS > 0
+	// WHO GETS AN EXTRA PATH IN THIS PASS. nBefore = the samples the pixel
+	// had before this frame (pass 0 and each earlier extra pass added one).
+	// TUNED: fewer than 8 -> a second path, fewer than 4 -> a third |
+	// learn by: the sampling-map network (DECISIONS 0w), trained on
+	// reference-mode walks, judged by claude_playtest's dark-reveal number
+	{
+#ifdef CLAUDE_SPLIT_OUT
+		float nBefore = texture2D(historyDirect, uv).a - float(CLAUDE_SUBPASS);
+		bool go = claudeBoost > 0.5 && view == 0
+				&& nBefore < (CLAUDE_SUBPASS == 1 ? 8.0 : 4.0);
+#else
+		bool go = false;
+#endif
+		if (!go) {
+			gl_FragColor = texture2D(history, uv);
+			return;
+		}
+	}
+#endif
 	// nLights is the ONE gate on the whole rung-2 block. 0 means the pure
 	// path: with claudeNee = 0, or an empty/invalid list, not a single
 	// line below behaves differently from rung 1 — including the RNG draw
@@ -3390,6 +3416,10 @@ void main(void)
 		g_rngKey = pcgHash((uint(gl_FragCoord.x)
 				^ (uint(gl_FragCoord.y) << 11u))
 				^ pcgHash(uint(claudeRngFrame) + 2654435769u));
+#if CLAUDE_SUBPASS > 0
+	// an independent stream for the extra pass
+	g_rngKey = pcgHash(g_rngKey ^ (uint(CLAUDE_SUBPASS) * 2654435769u));
+#endif
 	g_rngCtr = 0u;
 	g_skyCtr = 0u;
 
@@ -4564,6 +4594,23 @@ void main(void)
 	// rest — a true running average, so a parked camera converges by
 	// 1/N rather than sitting at an EMA's perpetual noise floor.
 	vec3 fresh = max(L, vec3(0.0));
+#if CLAUDE_SUBPASS > 0
+	// ONE MORE SAMPLE OF THIS FRAME: same camera as pass 0, so no
+	// reprojection; averaged in by the pixel's own count. Depth, guide and
+	// moments stay pass 0's (outGbuf / outMom were set from history above).
+	{
+		vec4 hS = texture2D(history, uv);
+		vec4 hdS = texture2D(historyDirect, uv);
+		float nS = hdS.a;
+		float aS = 1.0 / (nS + 1.0);
+		gl_FragColor = vec4(mix(max(hS.rgb, vec3(0.0)), fresh, aS), hS.a);
+#ifdef CLAUDE_SPLIT_OUT
+		outDirect = vec4(mix(max(hdS.rgb, vec3(0.0)), max(Ld, vec3(0.0)), aS),
+				min(nS + 1.0, 4096.0));
+#endif
+		return;
+	}
+#endif
 	vec3 prev = fresh;
 	float a = 1.0;
 	// THE PIXEL'S SURFACE, NOW (the same code the denoiser's guide stores;

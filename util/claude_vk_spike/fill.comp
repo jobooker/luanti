@@ -1,0 +1,10 @@
+#version 450
+// writes a pattern GL can check exactly: (x, y, frame, 1)
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0, rgba32f) uniform writeonly image2D img;
+layout(push_constant) uniform PC { float frame; } pc;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, imageSize(img)))) return;
+    imageStore(img, p, vec4(float(p.x), float(p.y), pc.frame, 1.0));
+}

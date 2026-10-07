@@ -235,6 +235,10 @@ void COpenGL3DriverBase::initVersion()
 	printVersion();
 	// which context the driver actually granted (the 4.6 request, 2026-10-06)
 	os::Printer::log("OpenGL context", Name.c_str(), ELL_WARNING);
+	// which GPU (2026-10-07): this machine has two, and headless GL picks
+	// the integrated one by default (claude_vk_spike found it)
+	if (const GLubyte *r = GL.GetString(GL_RENDERER))
+		os::Printer::log("OpenGL renderer", (const char *)r, ELL_WARNING);
 
 	// print renderer information
 	VendorName = GL.GetString(GL_RENDERER);

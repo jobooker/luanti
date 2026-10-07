@@ -394,6 +394,34 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 			std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2,
 					TEXTURE_GBUF_2, TEXTURE_MOM_2 }));
 
+	// EXTRA SAMPLES FOR THE PIXELS THAT NEED THEM (claude_subpasses,
+	// 2026-10-07; DECISIONS 0w, "rays per pixel"). Two more passes of the
+	// same tracer, compiled with CLAUDE_SUBPASS 1 and 2. Pass k re-traces
+	// only the pixels its rule picks (later: a learned sampling map) and
+	// copies every other pixel through. Ping-pong _2 -> _1 -> _2, so the
+	// denoiser, the present step and the swap below still find the result
+	// in the _2 textures. Read at pipeline construction (restart to change);
+	// claude_boost switches the rule on and off live.
+	int subpasses = 0;
+	if (g_settings->exists("claude_subpasses")
+			&& g_settings->getFloat("claude_subpasses", 0.0f, 2.0f) > 0.5f)
+		subpasses = 2;
+	for (int sp = 1; sp <= subpasses; sp++) {
+		ShaderConstants sc;
+		sc["CLAUDE_SUBPASS"] = sp;
+		u32 sid = client->getShaderSource()->getShader("claude_trace", sc,
+				video::EMT_TRANSPARENT_ALPHA_CHANNEL_REF);
+		std::vector<u8> from = (sp % 2 == 1)
+				? std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2, TEXTURE_GBUF_2, TEXTURE_MOM_2 }
+				: std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1, TEXTURE_GBUF_1, TEXTURE_MOM_1 };
+		std::vector<u8> to = (sp % 2 == 1)
+				? std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1, TEXTURE_GBUF_1, TEXTURE_MOM_1 }
+				: std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_DIRECT_2, TEXTURE_GBUF_2, TEXTURE_MOM_2 };
+		PostProcessingStep *extra = pipeline->addStep<PostProcessingStep>(sid, from);
+		extra->setRenderSource(buffer);
+		extra->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer, to));
+	}
+
 	// claude_denoise: DISPLAY ONLY. It reads the running average and never
 	// writes it, so the history the tracer accumulates — and every referee
 	// — is exactly what it was; only what is SHOWN is filtered. Pass 0
