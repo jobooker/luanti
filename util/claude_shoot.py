@@ -57,6 +57,20 @@ def main():
         # dials are on (capture calls this right after pushing them), and
         # prove it with the client's reset counter
         def pinned_reset(vantage, park):
+            # THE SERVER MUST KNOW WHERE THE CAMERA IS (2026-10-06): the
+            # teleport-away-and-back this replaces also moved the SERVER's
+            # player, and the server sends blocks around that position. A
+            # pinned camera with no teleport sat in an empty grid wherever
+            # the last shot had not been (plains: grid_solid 0 from 14:45 on,
+            # unnoticed by every shot until an ML export view found it).
+            # Teleport, then wait for the blocks to stop arriving.
+            lab.goto(vantage)
+            prev, same, t0 = None, 0, time.time()
+            while same < 4 and time.time() - t0 < 30:
+                time.sleep(0.5)
+                n = (lab.read_stats() or {}).get("grid_solid")
+                same = same + 1 if (n == prev and n) else 0
+                prev = n
             before = (lab.read_stats() or {}).get("accum_resets")
             with open(lab.PATCH, "w") as f:
                 f.write("claude_reset_accum = %d\n" % time.time_ns())
@@ -86,6 +100,18 @@ def main():
     if cap.get("reset_error"):
         # an unproven reset means the frame may hold the previous shot
         print("REFUSED: %s" % cap["reset_error"])
+        return 2
+    # an empty bubble is not a picture of the place (CI asserts this; the
+    # shoot tool did not, and an afternoon of plains shots were empty)
+    g = cap.get("grid") or {}
+    try:
+        import json
+        solid_now = json.load(open(png.replace(".png", ".capture.json")))["stats"].get("grid_solid")
+    except Exception:
+        solid_now = None
+    if not g.get("ok", True) or solid_now == 0:
+        print("REFUSED: empty or missing grid (grid %s, grid_solid at the shutter %s)"
+              % (g.get("error") or g.get("grid_solid"), solid_now))
         return 2
     print("frames", (cap.get("settle") or {}).get("still_frames"))
     print(png)

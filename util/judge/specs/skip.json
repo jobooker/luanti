@@ -1,0 +1,9 @@
+{"name": "skip", "frames": 2048,
+ "views": {"plains": {"pos": [5, 8.5, -25], "yaw": 0, "pitch": -12, "time": 0.5},
+           "forest": {"pos": [146.5, 8.5, 123.5], "yaw": 270, "pitch": -5, "time": 0.5},
+           "torchroom": {"pos": [241.7, 9, 231.7], "yaw": 315, "pitch": -12, "time": 0.5},
+           "overlook": {"pos": [60, 44.5, 60], "yaw": 45, "pitch": -6, "time": 0.45}},
+ "reference": "walk",
+ "arms": {"walk": {"claude_cascades": 1, "claude_exposure": 0.06, "claude_pyramid": 0},
+          "skip": {"claude_cascades": 1, "claude_exposure": 0.06, "claude_pyramid": 1},
+          "walk-again": {"claude_cascades": 1, "claude_exposure": 0.06, "claude_pyramid": 0}}}

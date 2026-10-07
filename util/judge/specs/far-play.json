@@ -1,0 +1,10 @@
+{"name": "far-play", "frames": 2048,
+ "views": {"plains": {"pos": [5, 8.5, -25], "yaw": 0, "pitch": -12, "time": 0.5},
+           "horizon": {"pos": [60, 44.5, 60], "yaw": 45, "pitch": -6, "time": 0.45},
+           "forest": {"pos": [146.5, 8.5, 123.5], "yaw": 270, "pitch": -5, "time": 0.5},
+           "treeline": {"pos": [100, 12, 123.5], "yaw": 270, "pitch": -3, "time": 0.5}},
+ "reference": "far-noexit",
+ "arms": {"nofar": {"claude_cascades": 1, "claude_nee": 1, "claude_exposure": 0.06, "claude_far_levels": 0, "claude_far_skyexit": 1},
+          "far-noexit": {"claude_cascades": 1, "claude_nee": 1, "claude_exposure": 0.06, "claude_far_levels": 3, "claude_far_skyexit": 0},
+          "far-exit": {"claude_cascades": 1, "claude_nee": 1, "claude_exposure": 0.06, "claude_far_levels": 3, "claude_far_skyexit": 1},
+          "far-exit-again": {"claude_cascades": 1, "claude_nee": 1, "claude_exposure": 0.06, "claude_far_levels": 3, "claude_far_skyexit": 1}}}

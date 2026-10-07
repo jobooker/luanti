@@ -345,6 +345,7 @@ struct ClaudeTraceGrid
 		u64 build_time = 0;
 		u32 solid = 0;
 		float ms = 0.0f;         // last build+upload cost (stats)
+		int top_y = INT_MIN;     // world y above which the level holds nothing
 		u64 content_hash = 0;    // of the uploaded texels + origin
 	} casc[5];                   // [0]=2m [1]=4m [2]=8m [3]=16m [4]=32m
 	// THE EFFECTIVE PIPELINE STATE, as last DELIVERED to the shader --
@@ -1416,6 +1417,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_far_leaf_medium_pixel{"claudeFarLeafMedium"};
 	// claude_far_plants: 1 (default) = far grass and flowers as a layer of blades
 	CachedPixelShaderSetting<float, 1, false> m_far_plants_pixel{"claudeFarPlants"};
+	// claudeFarTop: grid-local y above which no far level holds anything
+	CachedPixelShaderSetting<float, 1, false> m_far_top_pixel{"claudeFarTop"};
 	// claude_pixel_reset: 1 (default) = a pixel whose surface changed drops
 	// its own history at rest, instead of the frame keeping a ghost
 	CachedPixelShaderSetting<float, 1, false> m_pixel_reset_pixel{"claudePixelReset"};
@@ -1987,8 +1990,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// 4-cell brick leap only, 1 = climb mips for 8/16/32-cell leaps.
 	static float readPyramid()
 	{
+		// ON by default (2026-10-06): the ladder walk, picture-identical to
+		// the plain walk (judged) and 30-60 % less trace time
 		if (!g_settings->exists("claude_pyramid"))
-			return 0.0f;
+			return 1.0f;
 		return g_settings->getFloat("claude_pyramid", 0.0f, 1.0f);
 	}
 
@@ -2175,7 +2180,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 21.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 23.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3170,6 +3175,20 @@ public:
 							? g_settings->getFloat("claude_far_plants", 0.0f, 1.0f)
 							: 1.0f;
 					m_far_plants_pixel.set(&fpl, services);
+					{
+						int top = INT_MIN;
+						for (int lv = 0; lv < 5; lv++)
+							if (g_claude_grid.casc[lv].valid)
+								top = std::max(top, g_claude_grid.casc[lv].top_y);
+						float ft = top == INT_MIN ? 1e9f
+								: (float)(top - g_claude_grid.origin.Y);
+						// claude_far_skyexit = 0: no exit (for the A/B that
+						// proves it changes nothing)
+						if (g_settings->exists("claude_far_skyexit")
+								&& g_settings->getFloat("claude_far_skyexit", 0.0f, 1.0f) < 0.5f)
+							ft = 1e9f;
+						m_far_top_pixel.set(&ft, services);
+					}
 					float pxr = g_settings->exists("claude_pixel_reset")
 							? g_settings->getFloat("claude_pixel_reset", 0.0f, 1.0f)
 							: 1.0f;
@@ -5874,6 +5893,7 @@ struct CascJob {
 	std::vector<u8> rgba, boxes;
 	u32 solid = 0;
 	float ms = 0.0f;
+	int top = INT_MIN;
 };
 static std::future<CascJob> g_casc_job;
 static bool g_casc_job_on = false;
@@ -5955,6 +5975,7 @@ static void claudeCascadeUpdate(Client *client)
 		const u64 t0 = porting::getTimeMs() - (u64)J.ms;
 		std::vector<u8> &rgba = J.rgba, &coarse = J.boxes;
 		const u32 solid = J.solid;
+		L.top_y = J.top;
 		do {
 			// A REBUILD THAT CHANGED NOTHING MUST NOT RESET ANYTHING: the
 			// content version bumps on any block anywhere, so a level is
@@ -6068,6 +6089,7 @@ static void claudeCascadeUpdate(Client *client)
 			u64 b0 = porting::getTimeMs();
 			J.solid = claude_lod::buildCascadeSummary(origin, cellj,
 					J.rgba, J.boxes, mi.data());
+			J.top = claude_lod::lastBuildTopY();
 			J.ms = (float)(porting::getTimeMs() - b0);
 			return J;
 		});
@@ -6111,6 +6133,27 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// whose camera never moves (a pinned pose): the teleport-away-and-
 		// back reset cannot work there (2026-10-06: two identical plants
 		// arms scored 4.53 and 5.67 JOD, one blended with the arm before)
+		// ML DATA EXPORT: the grid as the tracer sees it, now. Header
+		// (text line: "claude_grid S ox oy oz"), then S^3 RGBA bytes (rgb =
+		// cell colour, a = material index), then the 256-entry material
+		// table as 8 floats each (emit fine transmit ior absorb_rgb hot).
+		if (name == "claude_export_grid") {
+			const std::string path = patch.get(name);
+			const ClaudeTraceGrid &V = g_claude_grid;
+			std::ofstream o(path, std::ios::binary);
+			o << "claude_grid " << ClaudeTraceGrid::SIZE << " " << V.origin.X
+					<< " " << V.origin.Y << " " << V.origin.Z << "\n";
+			o.write((const char *)V.occ.data(), V.occ.size());
+			for (int i = 0; i < 256; i++) {
+				const ClaudeMatTexel &m = g_claude_matpal[i];
+				float f[8] = {m.emit, m.fine, m.transmit, m.ior, m.absorb_r,
+						m.absorb_g, m.absorb_b, m.hot};
+				o.write((const char *)f, sizeof(f));
+			}
+			actionstream << "[claude_settings_patch] grid exported to " << path
+					<< std::endl;
+			continue;
+		}
 		if (name == "claude_reset_accum") {
 			claudeResetAccumulation();
 			actionstream << "[claude_settings_patch] accumulation reset ("
@@ -6227,7 +6270,10 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 		};
 		bool follow = !g_settings->exists("claude_grid_follow")
 				|| g_settings->getFloat("claude_grid_follow", 0.0f, 1.0f) > 0.0f;
-		bool consumer_on = setting_on("claude_grid_debug")
+		// claude_grid_debug ABSENT means traced (the reader's default, 3):
+		// setting_on() reads absent as off, so a look seat built no grid
+		bool consumer_on = !g_settings->exists("claude_grid_debug")
+				|| setting_on("claude_grid_debug")
 				|| setting_on("claude_water_reflections")
 				|| setting_on("claude_gi")
 				|| setting_on("claude_clay");
@@ -7724,7 +7770,12 @@ void Game::toggleMinimap(bool shift_pressed)
 // IS the toggle — no restart, no second build.
 void Game::toggleClaudeTrace()
 {
-	float cur = g_settings->getFloat("claude_grid_debug", 0.0f, 10.0f);
+	// ABSENT means the default, traced (3) -- as the uniform reader says.
+	// Reading it unguarded threw "Setting [claude_grid_debug] not found"
+	// and killed the client on the first O press of a look seat, which
+	// deletes the key on purpose so the game's defaults apply (2026-10-06).
+	float cur = g_settings->exists("claude_grid_debug")
+			? g_settings->getFloat("claude_grid_debug", 0.0f, 10.0f) : 3.0f;
 	bool to_traced = cur < 2.5f;
 	g_settings->set("claude_grid_debug", to_traced ? "3" : "0");
 	if (to_traced)

@@ -1,0 +1,8 @@
+{"name": "far-cost-play", "frames": 1024,
+ "views": {"horizon": {"pos": [60, 44.5, 60], "yaw": 45, "pitch": -6, "time": 0.45},
+           "treeline": {"pos": [100, 12, 123.5], "yaw": 270, "pitch": -3, "time": 0.5}},
+ "reference": "default",
+ "arms": {"default": {"claude_cascades": 1, "claude_exposure": 0.06},
+          "plants": {"claude_cascades": 1, "claude_far_plants": 1, "claude_exposure": 0.06},
+          "plants+leafcloud": {"claude_cascades": 1, "claude_far_plants": 1, "claude_far_leaf_medium": 1, "claude_exposure": 0.06},
+          "default-again": {"claude_cascades": 1, "claude_exposure": 0.06}}}

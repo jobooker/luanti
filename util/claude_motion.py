@@ -49,6 +49,9 @@ def main():
     ap.add_argument("--skip-seat", action="store_true")
     ap.add_argument("--nodump", action="store_true")
     ap.add_argument("--mover", help="claude_mover file: a node moved on the path clock")
+    ap.add_argument("--play", action="store_true",
+                    help="PLAY settings: push only the capture mechanics, so the "
+                         "renderer runs the game's defaults (as claude_look.sh)")
     args = ap.parse_args()
     path = os.path.abspath(args.path)
     n = args.frames or path_len(path)
@@ -58,7 +61,11 @@ def main():
     if not fr.get("deepening"):
         print("REFUSED: time did not freeze: %r" % (fr,))
         return 2
-    dials = dict(ci.CANONICAL_DIALS)
+    dials = dict(ci.CANONICAL_DIALS) if not args.play else {
+        k: ci.CANONICAL_DIALS[k] for k in ("claude_input_lock", "claude_show_hud",
+                                           "claude_show_chat", "claude_stats",
+                                           "recent_chat_messages", "node_highlighting")
+        if k in ci.CANONICAL_DIALS}
     for kv in args.dial:
         k, _, v = kv.partition("=")
         dials[k.strip()] = float(v)

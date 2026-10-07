@@ -178,7 +178,11 @@ void main(void)
 	// directly, so ACES must not touch them.
 	if ((claudeView > 0.5 && claudeView < 5.5)
 			|| (claudeView > 6.5 && claudeView < 8.5)
-			|| (claudeView > 18.5 && claudeView < 21.5)) {
+			|| (claudeView > 18.5 && claudeView < 23.5)) {
+		// view 23 is a radiance-like value: stored as x/(1+x), exactly
+		// invertible, so 8 bits keep a wide range
+		if (claudeView > 22.5)
+			c = c / (vec3(1.0) + c);
 		gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
 		return;
 	}

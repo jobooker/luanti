@@ -285,6 +285,15 @@ layout(location = 2) out vec4 outGbuf;
 layout(location = 3) out vec4 outMom;
 #define CLAUDE_SPLIT_OUT 1
 #endif      // previous frame's accumulated radiance
+// EMPTY-SPACE SKIPPING (claude_pyramid, 2026-10-06). game.cpp has built
+// and uploaded an occupancy pyramid since 2026-08-12 -- level 0 = "this
+// cell's material is not air" (the same byte the walk tests), levels 1..5
+// = "anything non-air in this 2^L block" -- and until now nothing read it:
+// the walk crossed every empty cell one at a time (~200 steps per ray,
+// claude_view 21). John: "why does a ray have to cross each empty block of
+// air? It's supposed to skip ahead."
+uniform sampler3D claudeCoarse;   // unit 11: R8 128^3, mips 0..5
+uniform float claudePyramid;      // 1 = leap across empty blocks
 uniform sampler3D claudeTraceGrid; // unit 10: RGBA8 128^3, rgb = cell colour,
                                 // a = MATERIAL INDEX / 255 (see matIndex)
 // THE MATERIAL PALETTE, unit 20: 256x1 RGBA32F, one texel per material
@@ -1499,6 +1508,19 @@ bool fineSolid(vec3 cell, vec3 sv)
 float g_steps = 0.0;
 float g_rays = 0.0;
 
+// THE ONE FORMULA of the ladder walk (2026-10-06): the time at which the ray
+// crosses an integer plane, per axis. Every cell at every size is found by
+// comparing times from this function -- never by rounding a position, which
+// is the class of bug the first empty-space leap had (it rounded a point to
+// a cell, landed behind itself, and looped; util/claude_hdda_equiv.py proves
+// the ladder against the plain walk in float32, edge-on rays included). An
+// axis the ray does not move along gets a huge time ADDED: mix(1e30, x, 1)
+// rounds x away on this GPU.
+vec3 tcross(vec3 plane, vec3 ro, vec3 stepDir, vec3 delta0)
+{
+	return (plane - ro) * stepDir * delta0 + (vec3(1.0) - abs(stepDir)) * 1e30;
+}
+
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
@@ -1524,6 +1546,10 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 	float t = 0.0;
 	float lim = GRID_S;
 	int axis = -1;
+	// the ladder above 1 m (claude_pyramid): the walk is on cells of 2^L m,
+	// ci in units of that size; L = 0 is the plain 1 m walk
+	int L = 0;
+	vec3 delta0 = 1.0 / max(abs(rd), vec3(DDA_MIN_ABS));
 
 	// THE STARTING CELL, and it is tested for exactly one thing. The
 	// loop below never tests the cell the ray starts in, which is what
@@ -1611,8 +1637,11 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			ci.z += stepDir.z; axis = 2;
 		}
 
+		if (L > 0)
+			sideDist = tcross((ci + step(0.0, stepDir)) * float(1 << L), ro,
+					stepDir, delta0);
 		bool escaped = any(lessThan(ci, vec3(0.0)))
-				|| any(greaterThanEqual(ci, vec3(lim)));
+				|| any(greaterThanEqual(ci, vec3(L > 0 ? GRID_S / float(1 << L) : lim)));
 
 		if (lim < GRID_S) {
 			// ---- the walk is on the 1/16 m rung, inside cellHi ----
@@ -1714,6 +1743,42 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		if (escaped)
 			return false; // escaped: contributes nothing (sky is punted)
 
+		if (L > 0) {
+			if (texelFetch(claudeCoarse, ivec3(ci), L).r == 0.0) {
+				// empty: climb while the parent is empty too, then go on
+				while (L < 5 && texelFetch(claudeCoarse, ivec3(ci) >> 1, L + 1).r == 0.0) {
+					L++;
+					ci = floor(ci * 0.5);
+				}
+				sideDist = tcross((ci + step(0.0, stepDir)) * float(1 << L), ro,
+						stepDir, delta0);
+				continue;
+			}
+			// occupied: down to the child the ray is in at its entry time t.
+			// Per axis: has the ray crossed the middle plane by t? A middle
+			// plane crossed at the SAME instant as the entry face counts only
+			// if its axis outranks the entry axis -- the plain walk's own tie
+			// rule (z, then y, then x)
+			vec3 rank = vec3(greaterThan(vec3(0.0, 1.0, 2.0), vec3(float(axis))));
+			while (L > 0 && texelFetch(claudeCoarse, ivec3(ci), L).r > 0.0) {
+				L--;
+				vec3 mid = (2.0 * ci + 1.0) * float(1 << L);
+				vec3 tm = tcross(mid, ro, stepDir, delta0);
+				vec3 crossed = vec3(lessThan(tm, vec3(t)))
+						+ vec3(equal(tm, vec3(t))) * rank;
+				crossed = min(crossed, vec3(1.0));
+				vec3 up = stepDir * (2.0 * crossed - 1.0) * 0.5 + 0.5;   // +: crossed, -: not crossed
+				up = mix(up, vec3(greaterThanEqual(ro, mid)), vec3(equal(stepDir, vec3(0.0))));
+				ci = 2.0 * ci + up;
+			}
+			sideDist = tcross((ci + step(0.0, stepDir)) * float(1 << L), ro,
+					stepDir, delta0);
+			if (L > 0)
+				continue;   // an empty child: walk on at its size
+			// L == 0: ci is the 1 m cell the ray is in at t; the arrival
+			// test below takes it from here
+		}
+
 		// ARRIVAL AT A 1 M CELL. s stays live across a descent — a fine
 		// hit takes its colour and its class from the cell that owns
 		// the mask — and it is only ever written here, on the coarse
@@ -1735,8 +1800,21 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// per step. With curMed = 0, idx == curMed means idx == 0 means
 		// air, so this is the old test verbatim for every caller that
 		// never entered a medium.
-		if (idx == curMed && curMed < 0.5)
+		if (idx == curMed && curMed < 0.5) {
+			// EMPTY SPACE: climb the ladder while the parent block is
+			// empty, and walk on at that size (see tcross and the block
+			// arrival above). Only air-in-air on the 1 m rung.
+			if (claudePyramid > 0.5
+					&& texelFetch(claudeCoarse, ivec3(ci) >> 1, 1).r == 0.0) {
+				while (L < 5 && texelFetch(claudeCoarse, ivec3(ci) >> 1, L + 1).r == 0.0) {
+					L++;
+					ci = floor(ci * 0.5);
+				}
+				sideDist = tcross((ci + step(0.0, stepDir)) * float(1 << L), ro,
+						stepDir, delta0);
+			}
 			continue;
+		}
 		// A boundary, or a cell of the ray's own medium that may still
 		// have an INTERIOR. Ask the table which. ONE palette fetch per
 		// arrival, kept live across a descent for the same reason `s` is:
@@ -2529,6 +2607,13 @@ const vec3 LEAF_SIGMA = vec3(3.147, 1.695, 3.147);
 // mostly blades. Ferns are within 15 %.
 const vec3 GRASS_SIGMA = vec3(0.758, 0.116, 0.618);
 uniform float claudeFarPlants;      // 1 = far plants as a layer of blades
+// "NOTHING ABOVE HERE" (2026-10-06): grid-local y above which no far level
+// holds anything. A ray outside the near grid that is above it and not
+// moving down can hit nothing more -- the grid is a convex box it cannot
+// re-enter -- so it has escaped to the sky. Exact. Found because the far
+// view cost ~130 ms a frame in PLAY (direct light on): every sun shadow ray
+// walked the far levels cell by cell (spec/measured.md 2026-10-06).
+uniform float claudeFarTop;
 uniform float claudePixelReset;     // 1 = a pixel whose surface changed drops its own history
 bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
@@ -2606,6 +2691,10 @@ int marchFarLevel(int k, vec3 p0, vec3 rd, float tBase, float curMed,
 	pExit = p0;
 	for (int i = 0; i < FAR_STEPS; i++) {
 		g_steps += 1.0;
+		if (rd.y >= 0.0 && p0.y + rd.y * (t * h) >= claudeFarTop) {
+			pExit = p0 + rd * (t * h);
+			return 2;   // above everything: escaped
+		}
 		if (any(lessThan(c, vec3(0.0))) || any(greaterThanEqual(c, vec3(128.0)))
 				|| (fSize > 0.0 && all(greaterThanEqual(c, fLo))
 					&& all(lessThan(c, fLo + vec3(fSize))))) {
@@ -2830,12 +2919,15 @@ bool marchAll(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			tb += te;
 		} else {
 			vec3 pe;
-			if (marchFarLevel(lv, p, rd, tb, curMed, axis, hp, n, alb, le,
-					tHit, palOut, idxOut, hpFar, pe) == 1) {
+			int far = marchFarLevel(lv, p, rd, tb, curMed, axis, hp, n, alb, le,
+					tHit, palOut, idxOut, hpFar, pe);
+			if (far == 1) {
 				cellOut = FAR_CELL;
 				g_lastFar = true;
 				return true;
 			}
+			if (far == 2)
+				return false;   // above everything: the sky
 			// which face it left by: the axis whose boundary pe sits on
 			vec3 fr = abs(fract((pe - farOrigin(lv)) / farCellSize(lv) + 0.5) - 0.5);
 			axis = fr.x < fr.y ? (fr.x < fr.z ? 0 : 2) : (fr.y < fr.z ? 1 : 2);
@@ -4128,6 +4220,35 @@ void main(void)
 		L = dbg; // view 5 falls through into the accumulator
 	}
 
+	// ML DATA EXPORT (2026-10-06, John: "AABB voxel stuff plus machine
+	// learning can do something crazy"; the first test asks how much of the
+	// BOUNCED light at a face its block neighbourhood predicts).
+	//   view 22: which grid cell and face the camera sees, EXACT in 24 bits:
+	//            R = x | fx<<7, G = y | fy<<7, B = z | fz<<7, face = fz fy fx
+	//            (0..5 = -x +x -y +y -z +z); all 255 = no grid surface.
+	//   view 23: the bounced light at that surface, demodulated:
+	//            (L - Ld) / albedo, accumulated like a photo (Ld holds all the
+	//            direct light at the first surface, its own glow included).
+	if (view == 22) {
+		vec3 code = vec3(255.0);
+		if (guideSet && !guideSky) {
+			vec3 cc = floor(guideP - guideN * 1e-3);
+			if (all(greaterThanEqual(cc, vec3(0.0))) && all(lessThan(cc, vec3(GRID_S)))) {
+				vec3 an = abs(guideN);
+				float ax = an.x > 0.5 ? 0.0 : (an.y > 0.5 ? 1.0 : 2.0);
+				float sg = (guideN.x + guideN.y + guideN.z) > 0.0 ? 1.0 : 0.0;
+				float face = ax * 2.0 + sg;
+				code = cc + 128.0 * vec3(mod(face, 2.0), mod(floor(face / 2.0), 2.0),
+						floor(face / 4.0));
+			}
+		}
+		gl_FragColor = vec4(code / 255.0, 1.0);
+		return;
+	}
+	if (view == 23)
+		L = (guideSet && !guideSky)
+				? max(L - Ld, vec3(0.0)) / max(guideAlb, vec3(ALBEDO_FLOOR))
+				: vec3(0.0);
 	if (view == 21) {
 		// R = steps / 4096, G = rays / 64, B = steps per ray / 256 (linear)
 		gl_FragColor = vec4(g_steps / 4096.0, g_rays / 64.0,

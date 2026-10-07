@@ -95,6 +95,9 @@ static inline u32 toSrgb(u32 v)
 }
 
 static std::mutex g_mutex;
+// the top of the highest occupied cell of the last level built (world y,
+// exclusive; INT_MIN = empty): see lastBuildTopY in claude_lod.h
+static int g_last_top = INT_MIN;
 static std::unordered_map<v3s16, BlockSummary> g_summaries;
 // ALL-AIR BLOCKS (2026-10-06): 68 % of the 67k blocks the world-file
 // reader folded held nothing, at ~3.8 KB each. They are remembered as
@@ -519,6 +522,11 @@ size_t summaryBytes()
 	return g_summaries.size() * sizeof(BlockSummary);
 }
 
+int lastBuildTopY()
+{
+	return g_last_top;
+}
+
 size_t summaryCount()
 {
 	std::lock_guard<std::mutex> lock(g_mutex);
@@ -713,6 +721,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 	// octant rule in summarizeBlock for why)
 	const u32 half = (u32)((u32)CELL * CELL * CELL / 2);
 	u32 solid_cells = 0, leaf_cells = 0, plant_cells = 0;
+	int top_cy = -1;
 	size_t i = 0;
 	for (int cz = 0; cz < N; cz++)
 	for (int cy = 0; cy < N; cy++)
@@ -753,6 +762,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			boxes[i * 4 + 3] = (u8)(127 + std::clamp((int)std::lround(rho * 127.0f), 1, 127));
 			solid_cells++;
 			plant_cells++;
+			top_cy = std::max(top_cy, cy);
 			continue;
 		} else
 			continue;
@@ -762,6 +772,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 		rgba[i * 4 + 2] = (u8)toSrgb(std::min((b_acc[i] + tn / 2) / tn, LIN));
 		rgba[i * 4 + 3] = cls;
 		solid_cells++;
+		top_cy = std::max(top_cy, cy);
 		const int unit = std::max(1, CELL / 16);
 		if (cls == matidx[0] || cls == matidx[1]) {
 			for (int a = 0; a < 3; a++)
@@ -800,6 +811,7 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 			}
 		}
 	}
+	g_last_top = top_cy < 0 ? INT_MIN : origin_nodes.Y + (top_cy + 1) * CELL;
 	// INSTRUMENT: how many cells the leaf medium can act on
 	infostream << "[claude_lod] level cell " << CELL << " m: " << solid_cells
 			<< " cells, " << leaf_cells << " leaf, " << plant_cells << " plant"

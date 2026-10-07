@@ -36,6 +36,12 @@ u32 buildCascadeSummary(v3s16 origin_nodes, int cell_nodes,
 // the cascade rebuild schedule.
 u64 contentVersion();
 
+// The top (world y, exclusive) of the highest occupied cell of the level
+// buildCascadeSummary last built on this thread; INT_MIN when it was empty.
+// A ray above every level's top, not moving down, can hit nothing more: the
+// shader's "nothing above here" exit (claudeFarTop).
+int lastBuildTopY();
+
 // Blocks currently summarized (stats).
 size_t summaryCount();
 // bytes held by stored (non-empty) summaries (stats)
