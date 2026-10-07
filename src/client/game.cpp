@@ -818,6 +818,40 @@ static void claudeGuideBind()
 			GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
 		}
 	}
+	{
+		// INSTRUMENT (2026-10-07): which image unit does each of the
+		// program's guide uniforms ACTUALLY hold? Logged a few times.
+		static int logged = 0;
+		GLint prog = 0;
+		GL.GetIntegerv(GL.CURRENT_PROGRAM, &prog);
+		// THE UNITS, SET ON THE PROGRAM ITSELF (2026-10-07). Set through
+		// the cached-uniform path they never arrived: the log below read
+		// claudeGuideR = unit 0, the WRITE table, so every guided bounce
+		// sampled from the table being filled that same frame and the
+		// image came out 0.3% dark. Image uniforms are plain ints on the
+		// bound program; set them here and read them back.
+		if (prog) {
+			GLint lw0 = GL.GetUniformLocation(prog, "claudeGuideW");
+			GLint lr0 = GL.GetUniformLocation(prog, "claudeGuideR");
+			if (lw0 >= 0)
+				GL.Uniform1i(lw0, 0);
+			if (lr0 >= 0)
+				GL.Uniform1i(lr0, 1);
+		}
+		if (prog && logged < 6) {
+			GLint lw = GL.GetUniformLocation(prog, "claudeGuideW");
+			GLint lr = GL.GetUniformLocation(prog, "claudeGuideR");
+			GLint vw = -1, vr = -1;
+			if (lw >= 0) GL.GetUniformiv(prog, lw, &vw);
+			if (lr >= 0) GL.GetUniformiv(prog, lr, &vr);
+			if (lw >= 0 || lr >= 0) {
+				logged++;
+				actionstream << "[claude_guide] program " << prog << ": claudeGuideW loc "
+						<< lw << " unit " << vw << ", claudeGuideR loc " << lr << " unit " << vr
+						<< std::endl;
+			}
+		}
+	}
 	GL.BindImageTexture(0, g_guide_tex[g_guide_read ^ 1], 0, 0, 0,
 			GL.READ_WRITE, GL.R32UI);
 	GL.BindImageTexture(1, g_guide_tex[g_guide_read], 0, 0, 0,
@@ -6273,6 +6307,24 @@ static bool claudeApplyPatchFile(const std::string &path,
 			}
 			actionstream << "[claude_settings_patch] grid exported to " << path
 					<< std::endl;
+			continue;
+		}
+		// INSTRUMENT (2026-10-07): the guide's READ table (the one every
+		// guided bounce this epoch samples from), raw: 4080 x 3856 u32,
+		// 80 per table (64 bins, 8 row sums, total), 51 tables per row
+		if (name == "claude_guide_dump") {
+			const std::string path = patch.get(name);
+			if (g_guide_tex[0]) {
+				std::vector<u32> buf((size_t)4080 * 3856);
+				GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+				GL.BindTexture(GL.TEXTURE_2D, g_guide_tex[g_guide_read]);
+				GL.GetTexImage(GL.TEXTURE_2D, 0, GL.RED_INTEGER, GL.UNSIGNED_INT, buf.data());
+				GL.BindTexture(GL.TEXTURE_2D, 0);
+				std::ofstream o(path, std::ios::binary);
+				o.write((const char *)buf.data(), buf.size() * 4);
+				actionstream << "[claude_settings_patch] guide table dumped to " << path
+						<< " (frame " << g_claude_frame_no << ")" << std::endl;
+			}
 			continue;
 		}
 		if (name == "claude_reset_accum") {

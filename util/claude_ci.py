@@ -2877,6 +2877,13 @@ def cmd_run(args):
 
     base = dict(CANONICAL_DIALS)
     base["claude_nee"] = args.nee
+    # SCRATCH ONLY (2026-10-07): extra dials on every arm, for asking an
+    # analytic referee about an experimental dial (claude_guide). A run
+    # that uses this is not a CI run; it says so loudly.
+    if os.environ.get("CLAUDE_CI_SCRATCH_DIALS"):
+        extra = json.loads(os.environ["CLAUDE_CI_SCRATCH_DIALS"])
+        print("!! SCRATCH DIALS ON EVERY ARM: %r -- not a CI result" % (extra,))
+        base.update(extra)
     run = dict(git, run_id=run_id, settle=args.settle,
                scored_only=scored_only(args),
                started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -3267,6 +3274,13 @@ def cmd_calibrate(args):
     print("run dir: %s" % rundir)
     base = dict(CANONICAL_DIALS)
     base["claude_nee"] = args.nee
+    # SCRATCH ONLY (2026-10-07): extra dials on every arm, for asking an
+    # analytic referee about an experimental dial (claude_guide). A run
+    # that uses this is not a CI run; it says so loudly.
+    if os.environ.get("CLAUDE_CI_SCRATCH_DIALS"):
+        extra = json.loads(os.environ["CLAUDE_CI_SCRATCH_DIALS"])
+        print("!! SCRATCH DIALS ON EVERY ARM: %r -- not a CI result" % (extra,))
+        base.update(extra)
     run = dict(git, run_id=run_id, settle=args.settle, calibrate=True,
                started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                dials=base, shots={}, defects=PLANTED_DEFECTS, results=[])
