@@ -546,6 +546,13 @@ uniform vec4 claudeEmitter6;
 uniform vec4 claudeEmitter7;
 uniform float claudePointCount;
 uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
+uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
+#ifdef GL_ARB_shader_image_load_store
+layout(r32ui) uniform uimage2D claudeGuideW;           // this epoch's tallies (written)
+layout(r32ui) readonly uniform uimage2D claudeGuideR;  // last epoch's (read: sampling and pdf)
+#define CLAUDE_GUIDE_OK 1
+#endif
+uniform float claudeAreaNee;    // claude_area_nee: 0 = no area-light samples (A/B; nLights is the one gate, so MIS stays consistent)
 uniform vec4 claudeArea0;
 uniform vec4 claudeArea1;
 uniform vec4 claudeArea2;
@@ -1507,6 +1514,12 @@ bool fineSolid(vec3 cell, vec3 sv)
 // IS about a lookup; this counts how many lookups a frame actually takes.
 float g_steps = 0.0;
 float g_rays = 0.0;
+// 3d-0 (roadmap: measure before building any learned sampling): per pixel
+// per frame, bounce rays after which the path gathered no more light (the
+// ceiling of what guiding could recover), and light samples that returned
+// nothing (the ceiling of a better light choice). claude_view 27 / 28.
+float g_bounces = 0.0, g_bounceWasted = 0.0, g_neeCalls = 0.0, g_neeZero = 0.0;
+vec3 g_neeCallsT = vec3(0.0), g_neeZeroT = vec3(0.0); // area, sky, flame
 
 // THE ONE FORMULA of the ladder walk (2026-10-06): the time at which the ray
 // crosses an integer plane, per axis. Every cell at every size is found by
@@ -2002,6 +2015,171 @@ vec3 cosineHemisphere(vec3 n, float u1, float u2)
 			+ n * sqrt(max(0.0, 1.0 - u1)));
 }
 
+
+// =====================================================================
+// GUIDED BOUNCES (claude_guide, roadmap 3d-i, 2026-10-07)
+// ---------------------------------------------------------------------
+// Each 4 m block keeps, per face direction (6), a table of where light
+// came back from: 8x8 bins over the square that the concentric map turns
+// into a cosine-weighted hemisphere. Every bin is therefore equally likely
+// under plain matte bouncing, and because every surface here is matte
+// with a cardinal normal, sampling a bin in proportion to its incoming
+// light IS sampling light x reflection (the "product" RCPG works for).
+//
+// THE RULES (exact, not tuned):
+//  - mixture pdf: a bounce is plain cosine with probability 1 - ALPHA,
+//    guided otherwise, so pdf/cosine-pdf = (1 - ALPHA) + 64 ALPHA g(bin)
+//    and no lit direction ever has zero probability (unbiased).
+//  - the table read is LAST epoch's, never written this frame, so the pdf
+//    used to sample and the pdf every light sampler's MIS weight
+//    evaluates are the same number.
+//  - tallies are importance-weighted (light / pdf factor), so a bin's sum
+//    estimates its light no matter how often the guide picked it.
+// A stale or wrong table costs noise, never wrong light.
+// =====================================================================
+const float GUIDE_ALPHA = 0.5; // TUNED: share of guided bounces | learn by: error-at-equal-time sweep 0.25/0.5/0.75, doorway room
+const int GUIDE_BLOCK = 4;     // TUNED: cells per table side | learn by: same sweep at 2/4/8
+const int GUIDE_GRID = 32;     // tables per axis, toroidal in world cells: 128 / GUIDE_BLOCK
+const int GUIDE_W = 80;        // texels per table: 64 bins, 8 row sums, 1 total
+const int GUIDE_PER_ROW = 51;  // tables per image row: 51 * 80 = 4080 wide
+int g_guideTab = -1;           // table of the current vertex, -1 = not guided
+float g_guideT = 0.0;          // its total (read table)
+vec3 g_guideN = vec3(0.0);
+float g_guideT0 = -1.0, g_guided = 0.0, g_guideMis = 0.0, g_guideMis2 = 0.0; // claude_view 30
+float g_guideTest = -1.0; // claude_view 31: a known integral through the first guided bounce
+vec3 g_guidePair = vec3(0.0); // claude_view 32: guided bounces, ones whose re-evaluated pdf != the sampled one, worst |diff|
+
+#ifdef CLAUDE_GUIDE_OK
+ivec2 guideTexel(int t, int i)
+{
+	return ivec2((t % GUIDE_PER_ROW) * GUIDE_W + i, t / GUIDE_PER_ROW);
+}
+float guideLoad(int t, int i)
+{
+	return float(imageLoad(claudeGuideR, guideTexel(t, i)).r);
+}
+#else
+float guideLoad(int t, int i) { return 0.0; }
+#endif
+
+int guideFace(vec3 n)
+{
+	return abs(n.x) > 0.5 ? (n.x > 0.0 ? 0 : 1)
+		: abs(n.y) > 0.5 ? (n.y > 0.0 ? 2 : 3) : (n.z > 0.0 ? 4 : 5);
+}
+int guideTable(vec3 cellW, vec3 n)
+{
+	ivec3 b = ivec3(floor(cellW / float(GUIDE_BLOCK))) & ivec3(GUIDE_GRID - 1);
+	return ((b.z * GUIDE_GRID + b.y) * GUIDE_GRID + b.x) * 6 + guideFace(n);
+}
+// fixed tangents per axis: sampling and evaluation use the same frame
+void guideFrame(vec3 n, out vec3 t1, out vec3 t2)
+{
+	if (abs(n.x) > 0.5) { t1 = vec3(0.0, 1.0, 0.0); t2 = vec3(0.0, 0.0, 1.0); }
+	else if (abs(n.y) > 0.5) { t1 = vec3(1.0, 0.0, 0.0); t2 = vec3(0.0, 0.0, 1.0); }
+	else { t1 = vec3(1.0, 0.0, 0.0); t2 = vec3(0.0, 1.0, 0.0); }
+}
+// Shirley-Chiu concentric map, square -> disk, and its inverse
+// (round trip checked in Python to 4e-7)
+vec2 concentric(vec2 sq)
+{
+	vec2 ab = 2.0 * sq - 1.0;
+	if (ab.x == 0.0 && ab.y == 0.0)
+		return vec2(0.0);
+	float r, phi;
+	if (abs(ab.x) > abs(ab.y)) { r = ab.x; phi = (PI / 4.0) * (ab.y / ab.x); }
+	else { r = ab.y; phi = PI / 2.0 - (PI / 4.0) * (ab.x / ab.y); }
+	return r * vec2(cos(phi), sin(phi));
+}
+vec2 concentricInv(vec2 d)
+{
+	float r = length(d);
+	if (r < 1e-9)
+		return vec2(0.5);
+	float phi = atan(d.y, d.x);
+	if (phi < -PI / 4.0)
+		phi += PI2;
+	vec2 ab;
+	if (phi < PI / 4.0) ab = vec2(r, phi * 4.0 / PI * r);
+	else if (phi < 3.0 * PI / 4.0) ab = vec2(-(phi - PI / 2.0) * 4.0 / PI * r, r);
+	else if (phi < 5.0 * PI / 4.0) ab = vec2(-r, -(phi - PI) * 4.0 / PI * r);
+	else ab = vec2((phi - 1.5 * PI) * 4.0 / PI * r, -r);
+	return clamp(0.5 * ab + 0.5, 0.0, 0.999999);
+}
+int guideBinOf(vec2 sq)
+{
+	ivec2 c = ivec2(sq * 8.0);
+	return c.y * 8 + c.x;
+}
+// the bounce pdf at this vertex divided by the plain cosine pdf
+float guideFactorBin(int bin)
+{
+	if (g_guideTab < 0)
+		return 1.0;
+	float g = g_guideT > 0.0 ? guideLoad(g_guideTab, bin) / g_guideT : 1.0 / 64.0;
+	return (1.0 - GUIDE_ALPHA) + 64.0 * GUIDE_ALPHA * g;
+}
+float guideFactorDir(vec3 wi)
+{
+	if (g_guideTab < 0)
+		return 1.0;
+	vec3 t1, t2;
+	guideFrame(g_guideN, t1, t2);
+	return guideFactorBin(guideBinOf(concentricInv(vec2(dot(wi, t1), dot(wi, t2)))));
+}
+vec3 guideSample(vec3 n, float u1, float u2, float uc, out float factor, out int bin)
+{
+	vec2 sq = vec2(u1, u2);
+	if (g_guideT > 0.0 && uc < GUIDE_ALPHA) {
+		float rs[8];
+		float sum = 0.0;
+		for (int r = 0; r < 8; r++) { rs[r] = guideLoad(g_guideTab, 64 + r); sum += rs[r]; }
+		float t = u1 * sum, acc = 0.0;
+		int row = 7;
+		for (int r = 0; r < 8; r++) {
+			if (rs[r] > 0.0 && t < acc + rs[r]) { row = r; break; }
+			acc += rs[r];
+		}
+		float fy = rs[row] > 0.0 ? clamp((t - acc) / rs[row], 0.0, 0.999999) : 0.5;
+		float cs[8];
+		float csum = 0.0;
+		for (int c = 0; c < 8; c++) { cs[c] = guideLoad(g_guideTab, row * 8 + c); csum += cs[c]; }
+		t = u2 * csum;
+		acc = 0.0;
+		int col = 7;
+		for (int c = 0; c < 8; c++) {
+			if (cs[c] > 0.0 && t < acc + cs[c]) { col = c; break; }
+			acc += cs[c];
+		}
+		float fx = cs[col] > 0.0 ? clamp((t - acc) / cs[col], 0.0, 0.999999) : 0.5;
+		sq = (vec2(float(col), float(row)) + vec2(fx, fy)) / 8.0;
+	}
+	bin = guideBinOf(sq);
+	factor = guideFactorBin(bin);
+	vec2 d = concentric(sq);
+	vec3 t1, t2;
+	guideFrame(n, t1, t2);
+	return normalize(t1 * d.x + t2 * d.y + n * sqrt(max(0.0, 1.0 - dot(d, d))));
+}
+float guideLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+// one tally: the light that came back along the bounce, per unit
+// throughput, importance-weighted. Fixed point 1/16 per unit radiance;
+// one deposit is capped at 2^20 (the cap shapes the guide only).
+void guideDeposit(int tab, int bin, float tpl, float l0, float f, vec3 lNow)
+{
+#ifdef CLAUDE_GUIDE_OK
+	if (tab < 0 || tpl <= 0.0)
+		return;
+	float li = max(guideLum(lNow) - l0, 0.0) / (tpl * f);
+	uint v = uint(min(li * 16.0, 1048576.0));
+	if (v == 0u)
+		return;
+	imageAtomicAdd(claudeGuideW, guideTexel(tab, bin), v);
+	imageAtomicAdd(claudeGuideW, guideTexel(tab, 64 + bin / 8), v);
+	imageAtomicAdd(claudeGuideW, guideTexel(tab, 72), v);
+#endif
+}
+
 // ---------------------------------------------------------------------
 // NEXT-EVENT ESTIMATION + MIS (rung 2). See the header for the math.
 // Every function below is dead code when claudeNee = 0: main() never
@@ -2240,7 +2418,7 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	// neeDirect() decline a direction neePdfSa() still prices — the one
 	// asymmetry that actually loses energy.
 	float pdfL = dist2 / (float(nLights) * float(k) * cosY); // p_l, sa
-	float pdfB = g_neeBScale * cosX / PI;                                  // p_b, sa
+	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;             // p_b, sa
 	float w = 1.0;
 	if (misOn > 0.5)
 		w = pdfL / (pdfL + pdfB);                        // balance
@@ -2542,7 +2720,7 @@ vec3 neePoint(vec3 x, vec3 nx, vec3 rho, int nPts, float curMed)
 	if (!matFine(shpal) || !any(greaterThan(shle, vec3(0.0))))
 		return vec3(0.0);         // not a flame: not this estimator's
 	float pdfL = ptPdfSa(x, wi, nPts);
-	float pdfB = g_neeBScale * cosX / PI;
+	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;
 	if (pdfL <= 0.0)
 		return vec3(0.0);
 	vec3 tr = curMed < 0.5 ? vec3(airTr(sht)) : medTr(curMed, sht);
@@ -2994,7 +3172,7 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	// THE LAW: one sky. skyBody() here is the same evaluation the camera
 	// ray's escape runs — there is no second radiance for the shadow ray.
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos)); // p_sky, sa
-	float pdfB = g_neeBScale * cosX / PI;                  // p_b, sa
+	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
 	vec3 tr = curMed < 0.5 ? vec3(airTr(farExitT(x, wi)))
@@ -3176,7 +3354,7 @@ void main(void)
 	// line below behaves differently from rung 1 — including the RNG draw
 	// order, which is what makes the A/B a real A/B and not two images
 	// that merely look alike.
-	int nLights = claudeNee > 0.5
+	int nLights = (claudeNee > 0.5 && claudeAreaNee > 0.5)
 			? min(int(claudeAreaCount + 0.5), AREA_CAP) : 0;
 	// The sky's own light-sampling technique rides the SAME dial and
 	// nothing else. It is deliberately NOT gated on nLights: outdoors
@@ -3724,7 +3902,17 @@ void main(void)
 		maxBounces = -1;
 	}
 
+	float wB = 0.0, wGain = 0.0, wLprev = 0.0;
+	// guide tallies waiting for their light: each bounce is credited with
+	// what the next two vertices bring back (TUNED: 2 | learn by: 1/2/3
+	// in the same error-at-equal-time sweep)
+	int gpTab0 = -1, gpTab1 = -1, gpBin0 = 0, gpBin1 = 0;
+	float gpTp0 = 0.0, gpTp1 = 0.0, gpL0 = 0.0, gpL1 = 0.0, gpF0 = 1.0, gpF1 = 1.0;
 	for (int seg = 0; seg <= BOUNCE_CAP; seg++) {
+		{
+			float ln = L.r + L.g + L.b;
+			if (ln > wLprev) { wGain = wB; wLprev = ln; }
+		}
 		if (seg > maxBounces)
 			break;
 
@@ -4097,13 +4285,43 @@ void main(void)
 			xb = hpFar;
 		}
 		g_neeBScale = leafT ? 0.5 : 1.0;
+		g_guideTab = -1;
+		g_guideT = 0.0;
+#ifdef CLAUDE_GUIDE_OK
+		// on in the picture (0), its linear readouts (25, 26) and its own
+		// instrument (30); off in every other instrument view
+		if (claudeGuide > 0.5 && !leafT && !hitFar && curMed < 0.5
+				&& (view == 0 || view == 25 || view == 26 || view == 30 || view == 31 || view == 32)) {
+			g_guideTab = guideTable(floor(cell + gridOrigin + vec3(0.5)), n);
+			g_guideT = guideLoad(g_guideTab, 72);
+			g_guideN = n;
+			if (seg == 0 && view == 30) {
+				g_guideT0 = g_guideT;
+				// INSTRUMENT: do this table's row sums add up to its total?
+				float rsum = 0.0, bsum = 0.0;
+				for (int r = 0; r < 8; r++)
+					rsum += guideLoad(g_guideTab, 64 + r);
+				for (int i = 0; i < 64; i++)
+					bsum += guideLoad(g_guideTab, i);
+				// SIGNED, relative to the bins' own sum: total and row sums
+				g_guideMis = (g_guideT - bsum) / max(bsum, 1.0);
+				g_guideMis2 = (rsum - bsum) / max(bsum, 1.0);
+			}
+			// BISECTION (claude_guide 2): the same sampler and books, the
+			// table ignored -- pdf factor exactly 1
+			if (claudeGuide > 1.5)
+				g_guideT = 0.0;
+		}
+#endif
 		// a FAR vertex aims at the sun and sky only: the lamp and flame
 		// lists are near emitters, and a hillside 300 m out gains nothing
 		// from them. The MIS arms below say so (areaArmed / coneArmed),
 		// so a BSDF ray from that vertex that does hit a lamp counts in
 		// full: no light is lost, it is only found the slow way.
 		if (!hitFar && nLights > 0) {
+			float r0cN = g_rays;
 			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
+			g_neeCalls += 1.0; g_neeZero += all(equal(cN, vec3(0.0))) ? 1.0 : 0.0; if (g_rays > r0cN) { g_neeCallsT[0] += 1.0; g_neeZeroT[0] += all(equal(cN, vec3(0.0))) ? 1.0 : 0.0; }
 			L += cN;
 			if (nScat < 0.5)
 				Ld += cN;
@@ -4112,13 +4330,17 @@ void main(void)
 		// same depth cap, drawing from the RESERVED counter range so the
 		// path's own random sequence is untouched (see rndSky()).
 		if (skyNee) {
+			float r0cS = g_rays;
 			vec3 cS = tp * neeSky(hp, n, alb, curMed);
+			g_neeCalls += 1.0; g_neeZero += all(equal(cS, vec3(0.0))) ? 1.0 : 0.0; if (g_rays > r0cS) { g_neeCallsT[1] += 1.0; g_neeZeroT[1] += all(equal(cS, vec3(0.0))) ? 1.0 : 0.0; }
 			L += cS;
 			if (nScat < 0.5)
 				Ld += cS;
 		}
 		if (!hitFar && nPts > 0) {
+			float r0cP = g_rays;
 			vec3 cP = tp * neePoint(hp, n, alb, nPts, curMed);
+			g_neeCalls += 1.0; g_neeZero += all(equal(cP, vec3(0.0))) ? 1.0 : 0.0; if (g_rays > r0cP) { g_neeCallsT[2] += 1.0; g_neeZeroT[2] += all(equal(cP, vec3(0.0))) ? 1.0 : 0.0; }
 			L += cP;
 			if (nScat < 0.5)
 				Ld += cP;
@@ -4155,15 +4377,46 @@ void main(void)
 		float u1 = rnd1();
 		float u2 = rnd1();
 		bool through = leafT && rnd1() < 0.5;
-		dir = cosineHemisphere(through ? -n : n, u1, u2);
+		float gF = 1.0;
+		int gBin = 0;
+		if (g_guideTab >= 0) {
+			dir = guideSample(n, u1, u2, rnd1(), gF, gBin);
+			tp /= gF;
+			g_guided += 1.0;
+			if (view == 32) {
+				// INSTRUMENT: the light samplers re-evaluate the bounce pdf
+				// for a direction; for the direction just sampled it must
+				// be the factor the sampler used
+				float fe = guideFactorDir(dir);
+				g_guidePair.x += 1.0;
+				if (abs(fe - gF) > 1e-4 * gF)
+					g_guidePair.y += 1.0;
+				g_guidePair.z = max(g_guidePair.z, abs(fe - gF) / gF);
+			}
+			if (view == 31 && g_guideTest < 0.0) {
+				// INSTRUMENT: E[h(dir) / factor] over the guided pdf is the
+				// cosine-weighted integral of h whatever the table holds; a
+				// lobe at disk point (0.6, -0.3) so it is not flat
+				vec3 t1, t2;
+				guideFrame(n, t1, t2);
+				vec2 dd = vec2(dot(dir, t1), dot(dir, t2)) - vec2(0.6, -0.3);
+				g_guideTest = (1.0 + 50.0 * exp(-dot(dd, dd) / 0.02)) / gF;
+			}
+		} else
+			dir = cosineHemisphere(through ? -n : n, u1, u2);
 		if (through)
 			tp *= leafBack;
+		// the guide's books: settle the bounce two back, queue this one
+		guideDeposit(gpTab1, gpBin1, gpTp1, gpL1, gpF1, L);
+		gpTab1 = gpTab0; gpBin1 = gpBin0; gpTp1 = gpTp0; gpL1 = gpL0; gpF1 = gpF0;
+		gpTab0 = g_guideTab; gpBin0 = gBin; gpTp0 = guideLum(tp); gpL0 = guideLum(L); gpF0 = gF;
 		// Arm the BSDF half of the MIS pair. Russian roulette above does
 		// not enter these pdfs: it scales the estimate by 1/q on the
 		// survivors, which leaves the SAMPLING DENSITY of the direction
 		// untouched, and the weights are densities.
 		prevX = through ? xb : hp;
-		prevPdfB = (leafT ? 0.5 : 1.0) * abs(dot(n, dir)) / PI;
+		prevPdfB = (leafT ? 0.5 : 1.0) * gF * abs(dot(n, dir)) / PI;
+		g_guideTab = -1;
 		// Armed when ANY light sampler ran at this vertex: the area list,
 		// the sky, or both. Outdoors the list is often empty and the sky
 		// is the only light there is — leaving this at `nLights > 0`
@@ -4175,6 +4428,15 @@ void main(void)
 		p = through ? xb : hp;
 		pathBounces += 1.0;
 		nScat += 1.0;
+		wB += 1.0;
+	}
+	guideDeposit(gpTab0, gpBin0, gpTp0, gpL0, gpF0, L);
+	guideDeposit(gpTab1, gpBin1, gpTp1, gpL1, gpF1, L);
+	{
+		float ln = L.r + L.g + L.b;
+		if (ln > wLprev) wGain = wB;
+		g_bounces += wB;
+		g_bounceWasted += wB - wGain;
 	}
 
 	float tPack = primaryHit
@@ -4245,10 +4507,49 @@ void main(void)
 		gl_FragColor = vec4(code / 255.0, 1.0);
 		return;
 	}
+	// THE DARK-START INSTRUMENT (2026-10-06, John: "it starts off all
+	// dark"): view 25 = this frame's raw linear radiance, written straight
+	// out (no averaging, no denoiser); view 26 = the same radiance through
+	// the normal averaging. Both presented as x/(1+x), exactly invertible.
+	// The mean of many view-25 frames equals view 26's converged value iff
+	// the per-frame estimate is unbiased.
+	if (view == 25) {
+		gl_FragColor = vec4(max(L, vec3(0.0)), 1.0);
+		return;
+	}
+	if (view == 31)
+		L = vec3(max(g_guideTest, 0.0) * 0.25);
 	if (view == 23)
 		L = (guideSet && !guideSky)
 				? max(L - Ld, vec3(0.0)) / max(guideAlb, vec3(ALBEDO_FLOOR))
 				: vec3(0.0);
+	if (view == 32) {
+		gl_FragColor = vec4(g_guidePair.x / 16.0, g_guidePair.y / 16.0, min(g_guidePair.z, 1.0), 1.0);
+		return;
+	}
+	if (view == 30) {
+		// R: first surface has a table with light in it; G: how far its
+		// row sums are from its total, x1000 (0 = consistent); B: guided
+		// bounces this path / 8
+		// R: (total - sum of bins) / sum of bins, G: (sum of row sums - sum
+		// of bins) / sum of bins, both as 0.5 + 50 x (so +-1% spans the
+		// range); B: 1 where the first surface has a table with light
+		gl_FragColor = vec4(clamp(0.5 + 50.0 * g_guideMis, 0.0, 1.0),
+				clamp(0.5 + 50.0 * g_guideMis2, 0.0, 1.0), g_guideT0 > 0.0 ? 1.0 : 0.0, 1.0);
+		return;
+	}
+	if (view == 27) {
+		gl_FragColor = vec4(g_bounceWasted / 16.0, g_bounces / 16.0, g_neeZero / 32.0, 1.0);
+		return;
+	}
+	if (view == 28) {
+		gl_FragColor = vec4(g_neeCallsT / 16.0, 1.0);
+		return;
+	}
+	if (view == 29) {
+		gl_FragColor = vec4(g_neeZeroT / 16.0, 1.0);
+		return;
+	}
 	if (view == 21) {
 		// R = steps / 4096, G = rays / 64, B = steps per ray / 256 (linear)
 		gl_FragColor = vec4(g_steps / 4096.0, g_rays / 64.0,

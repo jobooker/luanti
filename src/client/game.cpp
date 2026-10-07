@@ -205,6 +205,14 @@ struct ClaudeTraceGrid
 	// two reads bracket every reset between them. Instruments terminate;
 	// thresholds loop.
 	u32 accum_resets = 0;
+	// which site zeroed it (2026-10-07), in file order: 0 explicit,
+	// 1 sky colour, 2 sun, 3 rebase/teleport, 4 camera moved, 5 far level
+	u32 reset_why[8] = {};
+	// how far the camera has wandered since the accumulator last restarted
+	// (2026-10-07): moves under the 0.05 "moved" threshold blend into the
+	// average instead of restarting it, so a still shot must prove this ~0
+	v3f still_anchor;
+	float still_drift = 0.0f;
 	// ---- INCREMENTAL RE-SNAP (2026-08-16) ------------------------------
 	// The CPU mirrors of the uploaded grids, kept alive BETWEEN
 	// snapshots so a changed 16^3 block can be re-walked in place and
@@ -775,6 +783,46 @@ static void claudeDumpFrame(video::IVideoDriver *driver, LocalPlayer *player,
 static float g_claude_shutter_at = 0.0f;
 // every traced frame, for claudeRngFrame while the camera moves
 static u32 g_claude_frame_no = 0;
+
+// claude_guide's tallies (roadmap 3d-i): two R32UI tables, 32^3 blocks x 6
+// faces x 80 texels, laid out 51 tables per row. One is written this
+// epoch, the other (last epoch's, complete) is read; every GUIDE_EPOCH
+// frames they swap and the new write target is cleared.
+static GLuint g_guide_tex[2] = {0, 0};
+static int g_guide_read = 0;
+static u32 g_guide_frame = ~0u;
+static constexpr u32 GUIDE_EPOCH = 8; // TUNED: frames per tally epoch | learn by: error-at-equal-time, parked and moving
+static void claudeGuideBind()
+{
+	constexpr int W = 4080, H = 3856; // 196608 tables / 51 per row
+	if (!g_guide_tex[0]) {
+		GL.GenTextures(2, g_guide_tex);
+		for (int i = 0; i < 2; i++) {
+			GL.BindTexture(GL.TEXTURE_2D, g_guide_tex[i]);
+			GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.R32UI, W, H);
+			GL.ClearTexImage(g_guide_tex[i], 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+		}
+		GL.BindTexture(GL.TEXTURE_2D, 0);
+		infostream << "[claude_guide] tallies allocated, 2 x " << W << "x" << H
+				<< " R32UI" << std::endl;
+	}
+	if (g_guide_frame != g_claude_frame_no) {
+		g_guide_frame = g_claude_frame_no;
+		// image atomics are incoherent: every barrier the spec names for
+		// "shader wrote, then a texture update / another shader reads"
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		if (g_claude_frame_no % GUIDE_EPOCH == 0) {
+			g_guide_read ^= 1;
+			GL.ClearTexImage(g_guide_tex[g_guide_read ^ 1], 0, GL.RED_INTEGER,
+					GL.UNSIGNED_INT, nullptr);
+			GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		}
+	}
+	GL.BindImageTexture(0, g_guide_tex[g_guide_read ^ 1], 0, 0, 0,
+			GL.READ_WRITE, GL.R32UI);
+	GL.BindImageTexture(1, g_guide_tex[g_guide_read], 0, 0, 0,
+			GL.READ_ONLY, GL.R32UI);
+}
 static std::string g_claude_shutter_token;
 static float g_claude_shutter_fired = -1.0f;
 static std::string g_claude_shutter_fired_token;
@@ -1344,6 +1392,7 @@ static void claudeResetAccumulation()
 	g_claude_grid.accum_alpha = 1.0f;
 	g_claude_grid.still_frames = 0.0f;
 	g_claude_grid.accum_resets++;
+	g_claude_grid.reset_why[0]++;
 }
 
 class GameGlobalShaderUniformSetter : public IShaderUniformSetter
@@ -1700,6 +1749,15 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// small emitters (flames); 0 = they are lit only by being hit, as before
 	float m_torch_nee = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_torch_nee_pixel{"claudeTorchNee"};
+	// claude_area_nee (2026-10-07, roadmap 3d-0): 1 (default) = NEE samples
+	// the listed area emitters; 0 = it does not (an A/B for pricing them)
+	float m_area_nee = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_area_nee_pixel{"claudeAreaNee"};
+	// claude_guide (2026-10-07, roadmap 3d-i): 1 = guided bounce directions
+	float m_guide = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_guide_pixel{"claudeGuide"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
+	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
 	// AREA emitters for NEE — ONE UNIFORM PER SLOT, exactly the shape
 	// claudeEmitter0..7 has always had. Not a `uniform vec4 a[16]`: GL
@@ -1790,6 +1848,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_exposure",
 		"claude_auto_exposure",
 		"claude_torch_nee",
+		"claude_area_nee",
+		"claude_guide",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2192,7 +2252,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 23.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 32.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -2558,6 +2618,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 						> 1e-5f) {
 			g_claude_grid.still_frames = 0.0f;
 			g_claude_grid.accum_resets++;
+			g_claude_grid.reset_why[1]++;
 			g_claude_grid.accum_alpha =
 					std::max(g_claude_grid.accum_alpha, 0.5f);
 		}
@@ -2701,6 +2762,10 @@ public:
 			m_adapt_colour = readAir("claude_adapt_colour", 3.0f, 600.0f);
 		if (name == "claude_torch_nee")
 			m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
+		if (name == "claude_area_nee")
+			m_area_nee = readAir("claude_area_nee", 1.0f, 1.0f);
+		if (name == "claude_guide")
+			m_guide = readAir("claude_guide", 0.0f, 2.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -2803,6 +2868,8 @@ public:
 		m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
 		m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
+		m_area_nee = readAir("claude_area_nee", 1.0f, 1.0f);
+		m_guide = readAir("claude_guide", 0.0f, 2.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -2933,6 +3000,17 @@ public:
 			float pcount = (float)g_claude_grid.emitter_count;
 			m_point_count_pixel.set(&pcount, services);
 			m_torch_nee_pixel.set(&m_torch_nee, services);
+			m_area_nee_pixel.set(&m_area_nee, services);
+			m_guide_pixel.set(&m_guide, services);
+			{
+				// image units 0 (write) and 1 (read): separate from the
+				// texture units, so they alias nothing above
+				SamplerLayer_t gw = 0, gr = 1;
+				m_guide_w_pixel.set(&gw, services);
+				m_guide_r_pixel.set(&gr, services);
+			}
+			if (m_guide > 0.5f)
+				claudeGuideBind();
 			g_claude_grid.dial_torch_nee = m_torch_nee;
 			m_held_emitter_pixel.set(g_claude_grid.held_emitter, services);
 			// AREA emitters (claude_trace NEE). Sent whether or not the
@@ -3140,8 +3218,15 @@ public:
 				m_nee_pixel.set(&m_nee, services);
 				m_rng_pixel.set(&m_rng, services);
 				{
+					// claude_rng_seed (2026-10-07): a different seed draws an
+					// independent sample sequence for the same still frames.
+					// Without it two shots of one pose are the SAME picture,
+					// pixel for pixel, and a repeat arm measures nothing.
+					// Exact in float: still_frames < 65536, seed <= 255.
+					float seed = g_settings->exists("claude_rng_seed")
+							? std::floor(g_settings->getFloat("claude_rng_seed", 0.0f, 255.0f)) : 0.0f;
 					float rf = g_claude_grid.still_frames > 0.0f
-							? g_claude_grid.still_frames
+							? g_claude_grid.still_frames + 65536.0f * seed
 							: 8388608.0f + (float)(g_claude_frame_no % 8388608u);
 					m_rng_frame_pixel.set(&rf, services);
 				}
@@ -3316,6 +3401,7 @@ public:
 								> 1e-4f) {
 					g_claude_grid.still_frames = 0.0f;
 					g_claude_grid.accum_resets++;
+					g_claude_grid.reset_why[2]++;
 					g_claude_grid.accum_alpha =
 							std::max(g_claude_grid.accum_alpha, 0.5f);
 				}
@@ -5611,6 +5697,9 @@ static void claudeUpdateAccum(Client *client)
 	v3f p = cam->getPosition();
 	v3f d = cam->getDirection();
 	float moved = p.getDistanceFrom(g_claude_grid.prev_cam_pos);
+	if (g_claude_grid.still_frames < 0.5f)
+		g_claude_grid.still_anchor = p;
+	g_claude_grid.still_drift = p.getDistanceFrom(g_claude_grid.still_anchor);
 	float turned = (d - g_claude_grid.prev_cam_dir).getLength();
 	bool origin_changed = g_claude_grid.origin != g_claude_grid.prev_origin;
 	v3s16 odelta = g_claude_grid.origin - g_claude_grid.prev_origin;
@@ -5648,10 +5737,23 @@ static void claudeUpdateAccum(Client *client)
 		g_claude_grid.accum_alpha = 1.0f;
 		g_claude_grid.still_frames = 0.0f;
 		g_claude_grid.accum_resets++;
+		g_claude_grid.reset_why[3]++;
 	} else if (moved > 0.05f || turned > 1e-4f) {
+		{
+			// 2026-10-07 instrument: what "moved" a pinned camera
+			static int logged = 0;
+			if (logged < 40) {
+				logged++;
+				actionstream << "[claude_moved] moved=" << moved << " turned=" << turned
+						<< " pos=(" << p.X << "," << p.Y << "," << p.Z << ") dir=("
+						<< d.X << "," << d.Y << "," << d.Z << ") frame=" << g_claude_frame_no
+						<< std::endl;
+			}
+		}
 		g_claude_grid.accum_alpha = 0.5f;
 		g_claude_grid.still_frames = 0.0f;
 		g_claude_grid.accum_resets++;
+		g_claude_grid.reset_why[4]++;
 	} else {
 		g_claude_grid.still_frames += 1.0f;
 		// True 1/N running average, NO floor. The old renderer floored
@@ -5852,6 +5954,10 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"still_frames\": " << g_claude_grid.still_frames
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
+			<< ", \"still_drift\": " << g_claude_grid.still_drift
+			<< ", \"reset_why\": [" << g_claude_grid.reset_why[0] << "," << g_claude_grid.reset_why[1] << ","
+					<< g_claude_grid.reset_why[2] << "," << g_claude_grid.reset_why[3] << ","
+					<< g_claude_grid.reset_why[4] << "," << g_claude_grid.reset_why[5] << "]"
 			// the frame-exact shutter: depth and token of the last shot it
 			// fired (-1 / "" until one has)
 			<< ", \"shutter_frames\": " << g_claude_shutter_fired
@@ -6004,6 +6110,7 @@ static void claudeCascadeUpdate(Client *client)
 			if (L.valid && h != L.content_hash) {
 				g_claude_grid.still_frames = 0.0f;
 				g_claude_grid.accum_resets++;
+				g_claude_grid.reset_why[5]++;
 				g_claude_grid.accum_alpha =
 						std::max(g_claude_grid.accum_alpha, 0.5f);
 			}

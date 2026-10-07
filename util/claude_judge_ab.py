@@ -78,11 +78,14 @@ def capture(spec_path):
     shots = {}
     first = not spec.get("skip_seat", False)
     # every arm's dials are spelled out in full: dials persist on the seat
-    keys = sorted({k for a in spec["arms"].values() for k in a})
+    # an arm may set its own "_frames" (equal-frames noise tests against a
+    # long reference); it is not a dial
+    keys = sorted({k for a in spec["arms"].values() for k in a if k != "_frames"})
     for vn, v in spec["views"].items():
         for an, arm in spec["arms"].items():
             d = {k: arm.get(k, 0) for k in keys}
-            png = shoot(v, spec.get("frames", 2048), d, "%s-%s" % (vn, an), first)
+            nf = arm.get("_frames", spec.get("frames", 2048))
+            png = shoot(v, nf, d, "%s-%s" % (vn, an), first)
             if first:
                 # A STILL WORLD: the server's active block modifiers (grass
                 # spreading, leaves decaying) re-send blocks near trees,
@@ -94,7 +97,7 @@ def capture(spec_path):
                 lab.rpc("abm", on=False)
                 wait_reader()
                 # the first arm was shot while the reader was filling
-                png = shoot(v, spec.get("frames", 2048), d, "%s-%s" % (vn, an), False)
+                png = shoot(v, nf, d, "%s-%s" % (vn, an), False)
             shots["%s/%s" % (vn, an)] = png
             first = False
             print(vn, an, png, flush=True)

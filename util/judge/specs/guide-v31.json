@@ -1,0 +1,59 @@
+{
+ "name": "guide-v31",
+ "frames": 1024,
+ "views": {
+  "doorway-room": {
+   "pos": [
+    241.7,
+    8.5,
+    231.7
+   ],
+   "yaw": 315,
+   "pitch": -12,
+   "time": 0.5
+  }
+ },
+ "reference": "uni-s1",
+ "arms": {
+  "uni-s1": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 1,
+   "claude_view": 31,
+   "claude_guide": 2,
+   "claude_rng_seed": 1
+  },
+  "uni-s2": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 1,
+   "claude_view": 31,
+   "claude_guide": 2,
+   "claude_rng_seed": 2
+  },
+  "on-s1": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 1,
+   "claude_view": 31,
+   "claude_guide": 1,
+   "claude_rng_seed": 1
+  },
+  "on-s2": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 1,
+   "claude_view": 31,
+   "claude_guide": 1,
+   "claude_rng_seed": 2
+  }
+ }
+}

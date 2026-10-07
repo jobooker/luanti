@@ -25,11 +25,14 @@ VIEWS = {
     "forest": (146.5, 8.5, 123.5, 270, -5),
     "horizon": (60, 44.5, 60, 45, -6),
     "spawn-cabin": (0, 9.5, -12, 0, -5),
+    "torchroom": (241.7, 8.5, 231.7, 315, -12),
 }
 if os.environ.get("PERF_VIEWS"):
     VIEWS = {k: v for k, v in VIEWS.items() if k in os.environ["PERF_VIEWS"].split(",")}
 PLAY = {"claude_nee": 1, "claude_bounces": 24, "claude_far_levels": 3, "claude_denoise": 1,
-        "claude_descend": 1, "claude_model_far": 1, "claude_torch_nee": 1, "claude_pyramid": 1}
+        "claude_descend": 1, "claude_model_far": 1, "claude_torch_nee": 1, "claude_pyramid": 1,
+        # every dial an arm can change is spelled out, or it leaks from the arm before
+        "claude_area_nee": 1, "claude_guide": 0}
 ARMS = [("play", {}), ("play-again", {}), ("nee 0", {"claude_nee": 0}),
         ("bounces 2", {"claude_bounces": 2}), ("bounces 4", {"claude_bounces": 4}),
         ("far 0", {"claude_far_levels": 0}), ("denoise 0", {"claude_denoise": 0}),
@@ -43,6 +46,13 @@ if os.environ.get("PERF_ARMS") == "air":
 if os.environ.get("PERF_ARMS") == "time":
     ARMS = [("noon", {"time": 0.5}), ("morning 0.30", {"time": 0.30}), ("low sun 0.27", {"time": 0.27}),
             ("evening 0.72", {"time": 0.72}), ("night 0.0", {"time": 0.0}), ("noon-again", {"time": 0.5})]
+if os.environ.get("PERF_ARMS") == "lights":
+    # roadmap 3d-0: what each light sampler costs
+    ARMS = [("play", {}), ("area 0", {"claude_area_nee": 0}), ("flame 0", {"claude_torch_nee": 0}),
+            ("area 0 + flame 0", {"claude_area_nee": 0, "claude_torch_nee": 0}), ("play-again", {})]
+if os.environ.get("PERF_ARMS") == "guide":
+    # roadmap 3d-i: what guided bounces cost
+    ARMS = [("play", {}), ("guide 1", {"claude_guide": 1}), ("play-again", {}), ("guide 1 again", {"claude_guide": 1})]
 if os.environ.get("PERF_ARMS") == "split":
     ARMS = [("play", {}), ("split 0", {"claude_split": 0}), ("reproject 0", {"claude_reproject": 0}),
             ("split 0 + reproject 0", {"claude_split": 0, "claude_reproject": 0}), ("play-again", {})]

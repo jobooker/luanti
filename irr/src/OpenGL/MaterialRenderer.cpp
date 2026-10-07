@@ -421,6 +421,7 @@ bool COpenGL3MaterialRenderer::setPixelShaderConstant(s32 index, const s32 *ints
 	case GL_SAMPLER_2D:
 	case GL_SAMPLER_3D: // claude: same gap as the f32 variant above
 	case GL_SAMPLER_CUBE:
+	case 0x9067: // claude: GL_UNSIGNED_INT_IMAGE_2D (claude_guide), an image unit
 		GL.Uniform1iv(UniformInfo[index].location, 1, ints);
 		break;
 	default:

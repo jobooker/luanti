@@ -1,0 +1,79 @@
+{
+ "name": "guide-linear-bytype",
+ "frames": 4096,
+ "views": {
+  "doorway-room": {
+   "pos": [
+    241.7,
+    8.5,
+    231.7
+   ],
+   "yaw": 315,
+   "pitch": -12,
+   "time": 0.5
+  }
+ },
+ "reference": "sky-off",
+ "arms": {
+  "sky-off": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 0,
+   "claude_torch_nee": 0,
+   "claude_guide": 0
+  },
+  "sky-on": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 0,
+   "claude_torch_nee": 0,
+   "claude_guide": 1
+  },
+  "sky+area-off": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 0,
+   "claude_guide": 0
+  },
+  "sky+area-on": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 1,
+   "claude_torch_nee": 0,
+   "claude_guide": 1
+  },
+  "sky+flame-off": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 0,
+   "claude_torch_nee": 1,
+   "claude_guide": 0
+  },
+  "sky+flame-on": {
+   "claude_exposure": 1.85,
+   "claude_cascades": 1,
+   "claude_nee": 1,
+   "claude_view": 26,
+   "claude_rng_seed": 1,
+   "claude_area_nee": 0,
+   "claude_torch_nee": 1,
+   "claude_guide": 1
+  }
+ }
+}

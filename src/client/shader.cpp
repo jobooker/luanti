@@ -849,7 +849,13 @@ void ShaderSource::generateShader(ShaderInfo &shaderinfo)
 			// #extension after the first declaration. Without it the single
 			// output keeps its implicit location 0 and claude_trace drops
 			// the second one (CLAUDE_MRT_OK unset).
-			fragment_header += "#define VARYING_ in\n"
+			// claude_guide (2026-10-07) writes per-block tallies with image
+			// atomics: GL 4.2 core, an extension under 1.50, enabled here
+			// for the same reason as the one below.
+			fragment_header += "#ifdef GL_ARB_shader_image_load_store\n"
+				"#extension GL_ARB_shader_image_load_store : enable\n"
+				"#endif\n"
+				"#define VARYING_ in\n"
 				"#define gl_FragColor outFragColor\n"
 				"#ifdef GL_ARB_explicit_attrib_location\n"
 				"#extension GL_ARB_explicit_attrib_location : enable\n"

@@ -113,6 +113,23 @@ def main():
         print("REFUSED: empty or missing grid (grid %s, grid_solid at the shutter %s)"
               % (g.get("error") or g.get("grid_solid"), solid_now))
         return 2
+    # A STILL SHOT IS STILL (2026-10-07): the doorway-room vantage stood the
+    # player half a metre above the floor; it fell and was re-pinned all
+    # through a 4096-frame "truth" that held 61 accumulated frames. Two
+    # rules: the frames asked for were accumulated, and the camera did not
+    # drift (sub-threshold drift blends instead of restarting).
+    try:
+        st = json.load(open(png.replace(".png", ".capture.json")))["stats"]
+    except Exception:
+        st = {}
+    sf, drift = st.get("still_frames"), st.get("still_drift")
+    if sf is not None and sf < args.frames:
+        print("REFUSED: accumulated %s of %d frames (restarts by cause %s)"
+              % (sf, args.frames, st.get("reset_why")))
+        return 2
+    if drift is not None and drift > 0.01:
+        print("REFUSED: camera drifted %.3f units during the shot" % drift)
+        return 2
     print("frames", (cap.get("settle") or {}).get("still_frames"))
     print(png)
     return 0

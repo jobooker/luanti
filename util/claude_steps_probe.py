@@ -21,7 +21,7 @@ import claude_lab as lab  # noqa: E402
 VIEWS = {
     "plains (sunlit, open)": ["5", "8.5", "-25", "0", "-12", "0.5"],
     "forest (leaves, grass)": ["146.5", "8.5", "123.5", "270", "-5", "0.5"],
-    "torch room (one torch)": ["241.7", "9", "231.7", "315", "-12", "0.5"],
+    "torch room (one torch)": ["241.7", "8.5", "231.7", "315", "-12", "0.5"],
     "overlook (horizon)": ["60", "44.5", "60", "45", "-6", "0.45"],
 }
 
