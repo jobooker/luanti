@@ -789,9 +789,215 @@ static u32 g_claude_frame_no = 0;
 // epoch, the other (last epoch's, complete) is read; every GUIDE_EPOCH
 // frames they swap and the new write target is cleared.
 static GLuint g_guide_tex[2] = {0, 0};
+static GLuint g_guide_alias = 0;     // alias table of the READ epoch
+static GLuint g_guide_finalize = 0;  // compute program, see claudeGuideFinalize()
+// THE EPOCH'S BOOKS, CLOSED ONCE (2026-10-07). During an epoch a bounce adds
+// only to its own bin. At the swap this compute pass, over every table of
+// the table just completed: rebuilds the 8 row sums and the total from the
+// bins (exact by construction), and builds the alias table (Vose) that lets
+// a guided bounce pick bin j with probability count_j / total in two reads.
+// GL 4.6 compute (the context is 4.6); the same few lines move to Vulkan.
+static const char *GUIDE_FINALIZE_SRC = R"GLSL(#version 460
+layout(local_size_x = 64) in;
+layout(r32ui, binding = 5) uniform uimage2D tabR;
+layout(r32ui, binding = 6) uniform writeonly uimage2D aliasT;
+const int TW = 80, PER_ROW = 51, NT = 196608;
+ivec2 tx(int t, int i) { return ivec2((t % PER_ROW) * TW + i, t / PER_ROW); }
+void put(int t, int i, float prob, int al) {
+	uint q = min(uint(prob * 16777216.0), 16777215u);
+	imageStore(aliasT, tx(t, i), uvec4(q | (uint(al) << 24u)));
+}
+void main() {
+	int t = int(gl_GlobalInvocationID.x);
+	if (t >= NT) return;
+	uint c[64];
+	uint rows[8];
+	uint tot = 0u;
+	for (int r = 0; r < 8; r++) rows[r] = 0u;
+	for (int i = 0; i < 64; i++) {
+		c[i] = imageLoad(tabR, tx(t, i)).r;
+		tot += c[i];
+		rows[i / 8] += c[i];
+	}
+	for (int r = 0; r < 8; r++) imageStore(tabR, tx(t, 64 + r), uvec4(rows[r]));
+	imageStore(tabR, tx(t, 72), uvec4(tot));
+	if (tot == 0u) return;
+	float p[64];
+	int sm[64], lg[64];
+	int ns = 0, nl = 0;
+	for (int i = 0; i < 64; i++) {
+		p[i] = float(c[i]) * 64.0 / float(tot);
+		if (p[i] < 1.0) sm[ns++] = i; else lg[nl++] = i;
+	}
+	while (ns > 0 && nl > 0) {
+		int a = sm[--ns];
+		int b = lg[--nl];
+		put(t, a, p[a], b);
+		p[b] = (p[b] + p[a]) - 1.0;
+		if (p[b] < 1.0) sm[ns++] = b; else lg[nl++] = b;
+	}
+	while (nl > 0) { int b = lg[--nl]; put(t, b, 1.0, b); }
+	while (ns > 0) { int a = sm[--ns]; put(t, a, 1.0, a); }
+}
+)GLSL";
+static void claudeGuideFinalize(GLuint tabR)
+{
+	if (!g_guide_finalize) {
+		GLuint sh = GL.CreateShader(GL.COMPUTE_SHADER);
+		GL.ShaderSource(sh, 1, &GUIDE_FINALIZE_SRC, nullptr);
+		GL.CompileShader(sh);
+		GLint ok = 0;
+		GL.GetShaderiv(sh, GL.COMPILE_STATUS, &ok);
+		if (!ok) {
+			char log[2048] = {};
+			GL.GetShaderInfoLog(sh, sizeof(log), nullptr, log);
+			errorstream << "[claude_guide] finalize shader: " << log << std::endl;
+			return;
+		}
+		g_guide_finalize = GL.CreateProgram();
+		GL.AttachShader(g_guide_finalize, sh);
+		GL.LinkProgram(g_guide_finalize);
+		GL.GetProgramiv(g_guide_finalize, GL.LINK_STATUS, &ok);
+		if (!ok) {
+			errorstream << "[claude_guide] finalize program failed to link" << std::endl;
+			g_guide_finalize = 0;
+			return;
+		}
+		actionstream << "[claude_guide] finalize pass compiled" << std::endl;
+	}
+	GLint prev = 0;
+	GL.GetIntegerv(GL.CURRENT_PROGRAM, &prev);
+	GL.UseProgram(g_guide_finalize);
+	GL.BindImageTexture(5, tabR, 0, 0, 0, GL.READ_WRITE, GL.R32UI);
+	GL.BindImageTexture(6, g_guide_alias, 0, 0, 0, GL.WRITE_ONLY, GL.R32UI);
+	GL.DispatchCompute((196608 + 63) / 64, 1, 1);
+	GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+	GL.UseProgram(prev);
+}
 static int g_guide_read = 0;
 static u32 g_guide_frame = ~0u;
-static constexpr u32 GUIDE_EPOCH = 8; // TUNED: frames per tally epoch | learn by: error-at-equal-time, parked and moving
+static constexpr u32 GUIDE_EPOCH = 8;
+// LIGHT VISIBILITY TALLIES (claude_area_pick 2, 2026-10-07): per 4 m block
+// (32^3) and area-list slot (16), shadow-ray tries and hits: 1024 x 1024
+// R32UI, double-buffered by the guide's epoch. Slots name list positions,
+// so both are cleared when the list's contents change.
+static GLuint g_vis_tex[2] = {0, 0};
+static int g_vis_read = 0;
+static GLuint g_vis_p = 0;          // per-block estimates + p_call (R32F, 1024 x 544)
+static GLuint g_vis_finalize = 0;
+// THE WINDOW'S VISIBILITY BOOKS, CLOSED ONCE (2026-10-07). Per block: the 16
+// slot estimates (hits + 1) / (tries + 2) (Laplace), and p_call, how often
+// the block samples area lights at all: clamp(4 x the best slot's estimate,
+// 1/16, 1). Before this the tracer computed both at every light sample (a
+// 16-slot loop, 32 reads) and the skip saved nothing.
+// TUNED: p_call = clamp(4 max_j v_j, 1/16, 1) | learn by: equal-time error
+// sweep, then the learned effort model (DECISIONS 0w)
+static const char *VIS_FINALIZE_SRC = R"GLSL(#version 460
+layout(local_size_x = 64) in;
+layout(r32ui, binding = 5) uniform readonly uimage2D visR;
+layout(r32f, binding = 6) uniform writeonly image2D visP;
+ivec2 tx(int i) { return ivec2(i & 1023, i >> 10); }
+void main() {
+	int blk = int(gl_GlobalInvocationID.x);
+	if (blk >= 32768) return;
+	float best = 0.0;
+	for (int s = 0; s < 16; s++) {
+		float tr = float(imageLoad(visR, tx(blk * 32 + s * 2)).r);
+		float hi = float(imageLoad(visR, tx(blk * 32 + s * 2 + 1)).r);
+		float v = (hi + 1.0) / (tr + 2.0);
+		best = max(best, v);
+		imageStore(visP, tx(blk * 17 + s), vec4(v));
+	}
+	imageStore(visP, tx(blk * 17 + 16), vec4(clamp(4.0 * best, 1.0 / 16.0, 1.0)));
+}
+)GLSL";
+static void claudeVisFinalize()
+{
+	if (!g_vis_finalize) {
+		GLuint sh = GL.CreateShader(GL.COMPUTE_SHADER);
+		GL.ShaderSource(sh, 1, &VIS_FINALIZE_SRC, nullptr);
+		GL.CompileShader(sh);
+		GLint ok = 0;
+		GL.GetShaderiv(sh, GL.COMPILE_STATUS, &ok);
+		if (!ok) {
+			char log[2048] = {};
+			GL.GetShaderInfoLog(sh, sizeof(log), nullptr, log);
+			errorstream << "[claude_vis] finalize shader: " << log << std::endl;
+			return;
+		}
+		g_vis_finalize = GL.CreateProgram();
+		GL.AttachShader(g_vis_finalize, sh);
+		GL.LinkProgram(g_vis_finalize);
+		actionstream << "[claude_vis] finalize pass compiled" << std::endl;
+	}
+	GLint prev = 0;
+	GL.GetIntegerv(GL.CURRENT_PROGRAM, &prev);
+	GL.UseProgram(g_vis_finalize);
+	GL.BindImageTexture(5, g_vis_tex[g_vis_read], 0, 0, 0, GL.READ_ONLY, GL.R32UI);
+	GL.BindImageTexture(6, g_vis_p, 0, 0, 0, GL.WRITE_ONLY, GL.R32F);
+	GL.DispatchCompute(32768 / 64, 1, 1);
+	GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+	GL.UseProgram(prev);
+}
+static u32 g_vis_frame = ~0u;
+static bool g_vis_list_changed = false;
+static void claudeVisBind()
+{
+	if (!g_vis_tex[0]) {
+		GL.GenTextures(2, g_vis_tex);
+		for (int i = 0; i < 2; i++) {
+			GL.BindTexture(GL.TEXTURE_2D, g_vis_tex[i]);
+			GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.R32UI, 1024, 1024);
+			GL.ClearTexImage(g_vis_tex[i], 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+		}
+		GL.GenTextures(1, &g_vis_p);
+		GL.BindTexture(GL.TEXTURE_2D, g_vis_p);
+		GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.R32F, 1024, 544);   // 32768 x 17 floats
+		GL.BindTexture(GL.TEXTURE_2D, 0);
+		claudeVisFinalize();   // empty tallies -> 0.5 everywhere, p_call 1
+	}
+	if (g_vis_frame != g_claude_frame_no) {
+		g_vis_frame = g_claude_frame_no;
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		if (g_vis_list_changed) {
+			g_vis_list_changed = false;
+			for (int i = 0; i < 2; i++)
+				GL.ClearTexImage(g_vis_tex[i], 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+			claudeVisFinalize();
+		} else if (g_claude_frame_no % 8 == 0) {
+			g_vis_read ^= 1;
+			claudeVisFinalize();   // close the completed window before anyone reads it
+			GL.ClearTexImage(g_vis_tex[g_vis_read ^ 1], 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+		}
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+	}
+	GL.BindImageTexture(3, g_vis_tex[g_vis_read ^ 1], 0, 0, 0, GL.READ_WRITE, GL.R32UI);
+	GL.BindImageTexture(4, g_vis_tex[g_vis_read], 0, 0, 0, GL.READ_ONLY, GL.R32UI);
+	GL.BindImageTexture(7, g_vis_p, 0, 0, 0, GL.READ_ONLY, GL.R32F);
+	GLint prog = 0;
+	GL.GetIntegerv(GL.CURRENT_PROGRAM, &prog);
+	if (prog) {
+		// set on the program itself and read back once (the guide's lesson)
+		GLint lw = GL.GetUniformLocation(prog, "claudeVisW");
+		GLint lr = GL.GetUniformLocation(prog, "claudeVisR");
+		if (lw >= 0)
+			GL.Uniform1i(lw, 3);
+		if (lr >= 0)
+			GL.Uniform1i(lr, 4);
+		GLint lp = GL.GetUniformLocation(prog, "claudeVisP");
+		if (lp >= 0)
+			GL.Uniform1i(lp, 7);
+		static int logged = 0;
+		if (logged < 2 && lr >= 0) {
+			logged++;
+			GLint vw = -1, vr = -1;
+			GL.GetUniformiv(prog, lw, &vw);
+			GL.GetUniformiv(prog, lr, &vr);
+			actionstream << "[claude_vis] program " << prog << ": claudeVisW unit " << vw
+					<< ", claudeVisR unit " << vr << std::endl;
+		}
+	}
+} // TUNED: frames per tally epoch | learn by: error-at-equal-time, parked and moving
 static void claudeGuideBind()
 {
 	constexpr int W = 4080, H = 3856; // 196608 tables / 51 per row
@@ -802,6 +1008,10 @@ static void claudeGuideBind()
 			GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.R32UI, W, H);
 			GL.ClearTexImage(g_guide_tex[i], 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
 		}
+		GL.GenTextures(1, &g_guide_alias);
+		GL.BindTexture(GL.TEXTURE_2D, g_guide_alias);
+		GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.R32UI, W, H);
+		GL.ClearTexImage(g_guide_alias, 0, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
 		GL.BindTexture(GL.TEXTURE_2D, 0);
 		infostream << "[claude_guide] tallies allocated, 2 x " << W << "x" << H
 				<< " R32UI" << std::endl;
@@ -813,6 +1023,8 @@ static void claudeGuideBind()
 		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
 		if (g_claude_frame_no % GUIDE_EPOCH == 0) {
 			g_guide_read ^= 1;
+			// close the completed epoch's books before anyone reads them
+			claudeGuideFinalize(g_guide_tex[g_guide_read]);
 			GL.ClearTexImage(g_guide_tex[g_guide_read ^ 1], 0, GL.RED_INTEGER,
 					GL.UNSIGNED_INT, nullptr);
 			GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
@@ -837,6 +1049,9 @@ static void claudeGuideBind()
 				GL.Uniform1i(lw0, 0);
 			if (lr0 >= 0)
 				GL.Uniform1i(lr0, 1);
+			GLint la0 = GL.GetUniformLocation(prog, "claudeGuideA");
+			if (la0 >= 0)
+				GL.Uniform1i(la0, 2);
 		}
 		if (prog && logged < 6) {
 			GLint lw = GL.GetUniformLocation(prog, "claudeGuideW");
@@ -856,6 +1071,7 @@ static void claudeGuideBind()
 			GL.READ_WRITE, GL.R32UI);
 	GL.BindImageTexture(1, g_guide_tex[g_guide_read], 0, 0, 0,
 			GL.READ_ONLY, GL.R32UI);
+	GL.BindImageTexture(2, g_guide_alias, 0, 0, 0, GL.READ_ONLY, GL.R32UI);
 }
 static std::string g_claude_shutter_token;
 static float g_claude_shutter_fired = -1.0f;
@@ -1610,9 +1826,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_flame = 1.0f;
 	// claude_split (2026-10-05): frames of stillness over which the
 	// bounced light fades in on top of the direct light; 0 = off.
-	// TUNED: 48 (about half a second at the look seat's frame rate) | learn
-	// by: John's eye, moving and stopping in the cabin and the forest.
-	float m_split = 48.0f;
+	// DEFAULT 0 since 2026-10-07 (John, after the indoor play test): the
+	// ramp showed newly revealed walls at 6-11% of their true brightness
+	// (indoors bounce light is most of the light), the "starts off all
+	// dark" of 2026-10-06. Zero lag (DECISIONS 0t) means noise, never
+	// wrong light. The dial stays for A/Bs.
+	float m_split = 0.0f;
 	float m_still = 0.0f;
 	float m_exposure = 1.0f;   // claude_exposure: see claude_present
 	// claude_auto_exposure (2026-10-05): 1 (default) = the camera adapts
@@ -1794,6 +2013,26 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// give young pixels more paths
 	float m_boost = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_boost_pixel{"claudeBoost"};
+	// claude_area_pick (2026-10-07): 0 = area lights picked uniformly, 1 = by
+	// each light's physical bound at the receiving point
+	float m_area_pick = 0.0f;
+	// claude_area_skip (2026-10-07): 1 = blocks that rarely see their lights
+	// sample them less often (needs claude_area_pick 2)
+	float m_area_skip = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_area_skip_pixel{"claudeAreaSkip"};
+	CachedPixelShaderSetting<float, 1, false> m_area_pick_pixel{"claudeAreaPick"};
+	// claude_guide_deposit (2026-10-07): 0 = the guide writes nothing (price instrument)
+	float m_guide_deposit = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_guide_deposit_pixel{"claudeGuideDeposit"};
+	// claude_guide_keep (2026-10-07): share of paths that write to the guide
+	float m_guide_keep = 0.25f;
+	CachedPixelShaderSetting<float, 1, false> m_guide_keep_pixel{"claudeGuideKeep"};
+	// claude_guide_impl (2026-10-07): 1 = v1, 2 = v2 (kept side by side for A/Bs)
+	float m_guide_impl = 2.0f;
+	CachedPixelShaderSetting<float, 1, false> m_guide_impl_pixel{"claudeGuideImpl"};
+	// claude_guide_alpha (2026-10-07): share of bounces drawn from the table
+	float m_guide_alpha = 0.5f;
+	CachedPixelShaderSetting<float, 1, false> m_guide_alpha_pixel{"claudeGuideAlpha"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
@@ -1889,6 +2128,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_area_nee",
 		"claude_guide",
 		"claude_boost",
+		"claude_area_pick",
+		"claude_area_skip",
+		"claude_guide_deposit",
+		"claude_guide_keep",
+		"claude_guide_impl",
+		"claude_guide_alpha",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2807,6 +3052,18 @@ public:
 			m_guide = readAir("claude_guide", 0.0f, 2.0f);
 		if (name == "claude_boost")
 			m_boost = readAir("claude_boost", 0.0f, 1.0f);
+		if (name == "claude_area_pick")
+			m_area_pick = readAir("claude_area_pick", 0.0f, 2.0f);
+		if (name == "claude_area_skip")
+			m_area_skip = readAir("claude_area_skip", 0.0f, 1.0f);
+		if (name == "claude_guide_deposit")
+			m_guide_deposit = readAir("claude_guide_deposit", 1.0f, 1.0f);
+		if (name == "claude_guide_keep")
+			m_guide_keep = readAir("claude_guide_keep", 0.25f, 1.0f);
+		if (name == "claude_guide_impl")
+			m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
+		if (name == "claude_guide_alpha")
+			m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -2816,7 +3073,7 @@ public:
 		if (name == "claude_exposure")
 			m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
 		if (name == "claude_split")
-			m_split = readAir("claude_split", 48.0f, 100000.0f);
+			m_split = readAir("claude_split", 0.0f, 100000.0f);
 		if (name == "claude_flame")
 			m_flame = readAir("claude_flame", 1.0f, 1.0f);
 		if (name == "claude_air_scatter")
@@ -2905,13 +3162,19 @@ public:
 		m_air_absorb = readAir("claude_air_absorb", 0.0f, 10.0f);
 		m_air_g = readAir("claude_air_g", 0.6f, 0.95f);
 		m_flame = readAir("claude_flame", 1.0f, 1.0f);
-		m_split = readAir("claude_split", 48.0f, 100000.0f);
+		m_split = readAir("claude_split", 0.0f, 100000.0f);
 		m_exposure = readAir("claude_exposure", 1.0f, 1048576.0f);
 		m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		m_torch_nee = readAir("claude_torch_nee", 1.0f, 1.0f);
 		m_area_nee = readAir("claude_area_nee", 1.0f, 1.0f);
 		m_guide = readAir("claude_guide", 0.0f, 2.0f);
 		m_boost = readAir("claude_boost", 0.0f, 1.0f);
+		m_area_pick = readAir("claude_area_pick", 0.0f, 2.0f);
+		m_area_skip = readAir("claude_area_skip", 0.0f, 1.0f);
+		m_guide_deposit = readAir("claude_guide_deposit", 1.0f, 1.0f);
+		m_guide_keep = readAir("claude_guide_keep", 0.25f, 1.0f);
+		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
+		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3045,6 +3308,14 @@ public:
 			m_area_nee_pixel.set(&m_area_nee, services);
 			m_guide_pixel.set(&m_guide, services);
 			m_boost_pixel.set(&m_boost, services);
+			m_area_pick_pixel.set(&m_area_pick, services);
+			m_area_skip_pixel.set(&m_area_skip, services);
+			if (m_area_pick > 1.5f)
+				claudeVisBind();
+			m_guide_deposit_pixel.set(&m_guide_deposit, services);
+			m_guide_keep_pixel.set(&m_guide_keep, services);
+			m_guide_impl_pixel.set(&m_guide_impl, services);
+			m_guide_alpha_pixel.set(&m_guide_alpha, services);
 			{
 				// image units 0 (write) and 1 (read): separate from the
 				// texture units, so they alias nothing above
@@ -4930,9 +5201,14 @@ static void claudeTraceGridFinishEmitters()
 		V.area_total = (int)areas.size();
 		V.area_count = (int)std::min<size_t>(areas.size(),
 				ClaudeTraceGrid::AREA_CAP);
+		float before[ClaudeTraceGrid::AREA_CAP][4];
+		memcpy(before, V.area, sizeof(before));
 		for (int e = 0; e < ClaudeTraceGrid::AREA_CAP; e++)
 			for (int k = 0; k < 4; k++)
 				V.area[e][k] = e < V.area_count ? areas[e][k] : 0.0f;
+		// the visibility tallies name list slots: a changed list clears them
+		if (memcmp(before, V.area, sizeof(before)) != 0)
+			g_vis_list_changed = true;
 		// NO SILENT TRUNCATION. Overflow is not a correctness failure —
 		// the shader's light-sampling pdf is zero for an unlisted cell, so
 		// the balance heuristic hands those emitters' full radiance to the
@@ -6329,10 +6605,30 @@ static bool claudeApplyPatchFile(const std::string &path,
 				GL.BindTexture(GL.TEXTURE_2D, g_guide_tex[g_guide_read]);
 				GL.GetTexImage(GL.TEXTURE_2D, 0, GL.RED_INTEGER, GL.UNSIGNED_INT, buf.data());
 				GL.BindTexture(GL.TEXTURE_2D, 0);
-				std::ofstream o(path, std::ios::binary);
-				o.write((const char *)buf.data(), buf.size() * 4);
+				// SPARSE (2026-10-07, the ML guide test): only tables that
+				// hold anything (~2,000 of 196,608). Header line, then per
+				// table: int32 index, 80 x u32. The grid origin maps a
+				// table's mod-32 block back to the world block it is.
+				const ClaudeTraceGrid &V = g_claude_grid;
+				std::vector<int> live;
+				for (int t = 0; t < 196608; t++) {
+					size_t at = (size_t)(t / 51) * 4080 + (t % 51) * 80;
+					u32 tot = 0;
+					for (int i = 0; i < 64; i++)
+						tot += buf[at + i];
+					if (tot)
+						live.push_back(t);
+				}
+				std::ofstream o(path, std::ios::binary | std::ios::app);
+				o << "claude_guide_sparse 1 origin " << V.origin.X << " " << V.origin.Y << " "
+						<< V.origin.Z << " frame " << g_claude_frame_no << " count " << live.size() << "\n";
+				for (int t : live) {
+					size_t at = (size_t)(t / 51) * 4080 + (t % 51) * 80;
+					o.write((const char *)&t, 4);
+					o.write((const char *)&buf[at], 80 * 4);
+				}
 				actionstream << "[claude_settings_patch] guide table dumped to " << path
-						<< " (frame " << g_claude_frame_no << ")" << std::endl;
+						<< " (frame " << g_claude_frame_no << ", " << live.size() << " live tables)" << std::endl;
 			}
 			continue;
 		}

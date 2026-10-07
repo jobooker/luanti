@@ -1375,6 +1375,16 @@ def do_freeze():
         lab.rpc("cmd", command="set", param="time_speed 0")
     except Exception as e:
         return {"error": str(e), "deepening": False}
+    # THE WEATHER TOO (2026-10-07): Mineclonia's weather cycle runs with time
+    # frozen. A shower hid the sun for ~2 minutes of a 15-minute truth
+    # capture (the doorway room's truth halved for 28 poses), and refused a
+    # 16k-frame shot this morning ("sky colour changed twice"). Stop the
+    # cycle and clear whatever weather the world was left in.
+    try:
+        lab.rpc("cmd", command="set", param="mcl_doWeatherCycle false")
+        lab.rpc("cmd", command="weather", param="clear")
+    except Exception:
+        pass
     lab.doorway(claude_stats=1)
     time.sleep(1.5)
     a = lab.read_stats() or {}

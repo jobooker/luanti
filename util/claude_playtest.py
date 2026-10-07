@@ -58,6 +58,10 @@ SCENARIOS = {
     "forward": ((5, 8.5, -32, 0, -10), [("hold", 1.0), ("move", 0, 6, 1.5), ("hold", 1.5)]),
     "turn": ((60, 44.5, 60, 45, -10), [("hold", 1.0), ("turn", 90, 1.0), ("hold", 1.5)]),
     "forest-walk": ((146.5, 8.5, 123.5, 270, -5), [("hold", 1.0), ("move", 5, 0, 1.25), ("hold", 1.5)]),
+    # INDOORS, where bounce light dominates (2026-10-07): the doorway room,
+    # backing 1.5 m straight away from the doorway (yaw 315 looks +x +z);
+    # 3 m put the camera inside the back wall (all-black frames, 2026-10-07)
+    "room-backup": ((241.7, 8.5, 231.7, 315, -12), [("hold", 1.0), ("move", -1.06, -1.06, 1.0), ("hold", 1.5)]),
 }
 
 DEFER_RE = r'defer = \[(.*?)\]'
@@ -167,6 +171,14 @@ def score(run_dir):
     for name, sc in meta["scenarios"].items():
         T, rows = J.load_dump(sc["realtime"])
         R, _ = J.load_dump(sc["reference"])
+        # AN INSTRUMENT MUST SEE SOMETHING (2026-10-07): a path that walks the
+        # camera into a solid block records black in BOTH arms, and two black
+        # frames "agree" perfectly. Refuse instead of scoring them.
+        black = [i for i, f in enumerate(R) if float(np.asarray(f).mean()) < 2.0]
+        if black:
+            print("%-12s REFUSED: %d reference frames are black (first at %d): the camera "
+                  "path enters something solid" % (name, len(black), black[0]))
+            continue
         Fc, _ = J.load_dump(sc["faces"])
         n = min(len(T), len(R), len(Fc))
         pace = J.pacing(rows)

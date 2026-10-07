@@ -518,6 +518,12 @@ def cmd_freeze(args):
     zeroes still_frames every frame, so the accumulator never deepens and
     photo mode never engages — every capture is frame 1, repeated."""
     rpc("cmd", command="set", param="time_speed 0")
+    # and the weather (see claude_ci.do_freeze)
+    try:
+        rpc("cmd", command="set", param="mcl_doWeatherCycle false")
+        rpc("cmd", command="weather", param="clear")
+    except Exception:
+        pass
     print("set: %s" % get_time_speed())
     doorway(claude_stats=1)
     time.sleep(1.5)

@@ -128,6 +128,15 @@ def score(run):
                 continue
             img = J.load_png(png)
             st = json.load(open(png.replace(".png", ".capture.json")))["stats"]
+            # SAME SKY OR NO COMPARISON (2026-10-07, the weather): every arm of
+            # a view must have been lit by the same sky and sun as the reference
+            rst = json.load(open(shots["%s/%s" % (vn, spec["reference"])].replace(".png", ".capture.json")))["stats"]
+            for key in ("sky_lux", "light_lum"):
+                va, vr = st.get(key), rst.get(key)
+                if isinstance(va, (int, float)) and isinstance(vr, (int, float)) and vr \
+                        and abs(va / vr - 1) > 0.01:
+                    print("    WARNING: %s differs from the reference arm's (%.4g vs %.4g): weather or "
+                          "time changed between shots; this comparison is not valid" % (key, va, vr))
             m = os.path.join(run, "flip_%s_%s.png" % (vn, an))
             s = J.still(img, ref, m) if an != spec["reference"] else \
                 {"jod": 10.0, "flip": 0.0, "brightness": 1.0}

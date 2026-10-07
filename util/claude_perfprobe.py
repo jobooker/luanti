@@ -32,7 +32,8 @@ if os.environ.get("PERF_VIEWS"):
 PLAY = {"claude_nee": 1, "claude_bounces": 24, "claude_far_levels": 3, "claude_denoise": 1,
         "claude_descend": 1, "claude_model_far": 1, "claude_torch_nee": 1, "claude_pyramid": 1,
         # every dial an arm can change is spelled out, or it leaks from the arm before
-        "claude_area_nee": 1, "claude_guide": 0}
+        "claude_area_nee": 1, "claude_guide": 0, "claude_guide_deposit": 1,
+        "claude_guide_impl": 2, "claude_guide_keep": 0.25, "claude_area_pick": 0, "claude_area_skip": 0}
 ARMS = [("play", {}), ("play-again", {}), ("nee 0", {"claude_nee": 0}),
         ("bounces 2", {"claude_bounces": 2}), ("bounces 4", {"claude_bounces": 4}),
         ("far 0", {"claude_far_levels": 0}), ("denoise 0", {"claude_denoise": 0}),
@@ -53,6 +54,18 @@ if os.environ.get("PERF_ARMS") == "lights":
 if os.environ.get("PERF_ARMS") == "guide":
     # roadmap 3d-i: what guided bounces cost
     ARMS = [("play", {}), ("guide 1", {"claude_guide": 1}), ("play-again", {}), ("guide 1 again", {"claude_guide": 1})]
+if os.environ.get("PERF_ARMS") == "guide-cost":
+    # where the guide's milliseconds go: writing, picking, pricing
+    ARMS = [("off", {"claude_guide": 0}), ("on", {"claude_guide": 1}),
+            ("books only (table ignored)", {"claude_guide": 2}),
+            ("on, writing off", {"claude_guide": 1, "claude_guide_deposit": 0}),
+            ("off-again", {"claude_guide": 0}), ("on-again", {"claude_guide": 1}),
+            ("v1 on", {"claude_guide": 1, "claude_guide_impl": 1}),
+            ("v2 keep 1.0", {"claude_guide": 1, "claude_guide_keep": 1.0})]
+if os.environ.get("PERF_ARMS") == "pick":
+    # light lists: even / by bound / bound x visibility / + skipping
+    ARMS = [("even", {}), ("bound", {"claude_area_pick": 1}), ("bound x visibility", {"claude_area_pick": 2}),
+            ("+ skip", {"claude_area_pick": 2, "claude_area_skip": 1}), ("even-again", {})]
 if os.environ.get("PERF_ARMS") == "split":
     ARMS = [("play", {}), ("split 0", {"claude_split": 0}), ("reproject 0", {"claude_reproject": 0}),
             ("split 0 + reproject 0", {"claude_split": 0, "claude_reproject": 0}), ("play-again", {})]

@@ -551,12 +551,23 @@ uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
 #ifndef CLAUDE_SUBPASS
 #define CLAUDE_SUBPASS 0
 #endif
+uniform float claudeGuideImpl;    // claude_guide_impl: 1 = v1 (walk, 3 atomics, every path writes), 2 = v2 (alias, bin only, claude_guide_keep)
+uniform float claudeGuideKeep;    // claude_guide_keep: share of paths that write to the tables
+uniform float claudeGuideDeposit; // claude_guide_deposit: 0 = the guide reads its tables but writes nothing (price instrument)
 uniform float claudeBoost;      // claude_boost: 1 = extra-sample passes give young pixels more paths
 uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
 #ifdef GL_ARB_shader_image_load_store
 layout(r32ui) uniform uimage2D claudeGuideW;           // this epoch's tallies (written)
 layout(r32ui) readonly uniform uimage2D claudeGuideR;  // last epoch's (read: sampling and pdf)
+layout(r32ui) readonly uniform uimage2D claudeGuideA;  // its alias table (claude_guide_finalize, once per epoch)
 #define CLAUDE_GUIDE_OK 1
+#endif
+uniform float claudeAreaPick;   // claude_area_pick: 0 = uniform over the list, 1 = by each light's physical bound (light lists stage 1), 2 = bound x learned visibility (stage 2)
+uniform float claudeAreaSkip;   // claude_area_skip: 1 = a block that rarely sees its lights samples them less often (stage 2, needs pick 2)
+#ifdef GL_ARB_shader_image_load_store
+layout(r32ui) uniform uimage2D claudeVisW;             // this epoch's shadow-ray tallies (tries, hits) per block and list slot
+layout(r32ui) readonly uniform uimage2D claudeVisR;    // last epoch's
+layout(r32f) readonly uniform image2D claudeVisP;      // per block: 16 visibility estimates + the call probability, closed once per epoch
 #endif
 uniform float claudeAreaNee;    // claude_area_nee: 0 = no area-light samples (A/B; nLights is the one gate, so MIS stays consistent)
 uniform vec4 claudeArea0;
@@ -2043,12 +2054,19 @@ vec3 cosineHemisphere(vec3 n, float u1, float u2)
 //    estimates its light no matter how often the guide picked it.
 // A stale or wrong table costs noise, never wrong light.
 // =====================================================================
-const float GUIDE_ALPHA = 0.5; // TUNED: share of guided bounces | learn by: error-at-equal-time sweep 0.25/0.5/0.75, doorway room
+// claude_guide_alpha: the share of bounces drawn from the table. MEASURED
+// 2026-10-07 on live tables at three places (util/claude_ml_guide_train.py
+// data, importance-sampling efficiency): 0.5 -> 0.9 lifts doorway room 0.836
+// -> 0.946, lamp room 0.783 -> 0.959, plains 0.945 -> 0.986. Default stays
+// 0.5 until the in-engine A/B (still and moving) confirms it.
+uniform float claudeGuideAlpha;
+#define GUIDE_ALPHA claudeGuideAlpha
 const int GUIDE_BLOCK = 4;     // TUNED: cells per table side | learn by: same sweep at 2/4/8
 const int GUIDE_GRID = 32;     // tables per axis, toroidal in world cells: 128 / GUIDE_BLOCK
 const int GUIDE_W = 80;        // texels per table: 64 bins, 8 row sums, 1 total
 const int GUIDE_PER_ROW = 51;  // tables per image row: 51 * 80 = 4080 wide
 int g_guideTab = -1;           // table of the current vertex, -1 = not guided
+bool g_guideKeep = true;       // does this path write to the tables (claude_guide_keep)
 float g_guideT = 0.0;          // its total (read table)
 vec3 g_guideN = vec3(0.0);
 float g_guideT0 = -1.0, g_guided = 0.0, g_guideMis = 0.0, g_guideMis2 = 0.0; // claude_view 30
@@ -2064,8 +2082,13 @@ float guideLoad(int t, int i)
 {
 	return float(imageLoad(claudeGuideR, guideTexel(t, i)).r);
 }
+uint guideAlias(int t, int i)
+{
+	return imageLoad(claudeGuideA, guideTexel(t, i)).r;
+}
 #else
 float guideLoad(int t, int i) { return 0.0; }
+uint guideAlias(int t, int i) { return 0u; }
 #endif
 
 int guideFace(vec3 n)
@@ -2136,6 +2159,20 @@ float guideFactorDir(vec3 wi)
 vec3 guideSample(vec3 n, float u1, float u2, float uc, out float factor, out int bin)
 {
 	vec2 sq = vec2(u1, u2);
+	if (g_guideT > 0.0 && uc < GUIDE_ALPHA && claudeGuideImpl > 1.5) {
+		// v2, ALIAS METHOD (2026-10-07): the table's alias, built once per epoch
+		// by claude_guide_finalize from the same counts, picks bin j with
+		// probability count_j / total in two reads; the within-bin point
+		// takes u2 and one more draw
+		float uj = u1 * 64.0;
+		int j = min(int(uj), 63);
+		uint a = guideAlias(g_guideTab, j);
+		float prob = float(a & 0xFFFFFFu) * (1.0 / 16777216.0);
+		int b = (fract(uj) < prob) ? j : int(a >> 24u);
+		float u3 = rnd1();
+		sq = (vec2(float(b % 8), float(b / 8)) + vec2(u2, min(u3, 0.999999))) / 8.0;
+	} else
+	// v1 (claude_guide_impl 1): walk the row sums, then the row (16 reads)
 	if (g_guideT > 0.0 && uc < GUIDE_ALPHA) {
 		float rs[8];
 		float sum = 0.0;
@@ -2174,15 +2211,21 @@ float guideLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 void guideDeposit(int tab, int bin, float tpl, float l0, float f, vec3 lNow)
 {
 #ifdef CLAUDE_GUIDE_OK
-	if (tab < 0 || tpl <= 0.0)
+	if (tab < 0 || tpl <= 0.0 || claudeGuideDeposit < 0.5
+			|| (claudeGuideImpl > 1.5 && !g_guideKeep))
 		return;
 	float li = max(guideLum(lNow) - l0, 0.0) / (tpl * f);
 	uint v = uint(min(li * 16.0, 1048576.0));
 	if (v == 0u)
 		return;
 	imageAtomicAdd(claudeGuideW, guideTexel(tab, bin), v);
-	imageAtomicAdd(claudeGuideW, guideTexel(tab, 64 + bin / 8), v);
-	imageAtomicAdd(claudeGuideW, guideTexel(tab, 72), v);
+	// v1 also keeps row sums and the total live; v2 adds to the bin only
+	// (rebuilt once per epoch by claude_guide_finalize, exact by
+	// construction, and the shared total no longer serialises a block)
+	if (claudeGuideImpl < 1.5) {
+		imageAtomicAdd(claudeGuideW, guideTexel(tab, 64 + bin / 8), v);
+		imageAtomicAdd(claudeGuideW, guideTexel(tab, 72), v);
+	}
 #endif
 }
 
@@ -2257,6 +2300,108 @@ bool faceCandidate(vec3 c, int mask, int f, vec3 x)
 	return dot(nf, x - (c + vec3(0.5) + nf * 0.5)) > 0.0;
 }
 
+// LIGHT CHOICE BY PHYSICAL BOUND (claude_area_pick 1, 2026-10-07; light
+// lists stage 1, DECISIONS 0w). The most light emitter i can send to x,
+// with nothing in the way: its emitted luminance x the number of its
+// exposed faces turned toward x (unit area each) / distance^2, the
+// distance floored at one cell. A RULE (geometry and the emission law),
+// not a tuned weight. Visibility is what it leaves out; stage 2 learns
+// that. The sampler and neePdfSa() call this same function from the same
+// x, so the pair stays exact.
+float areaBound(vec4 e, vec3 x, out int k)
+{
+	vec3 c = e.xyz;
+	int mask = int(e.w + 0.5);
+	k = 0;
+	for (int f = 0; f < 6; f++) {
+		if (faceCandidate(c, mask, f, x))
+			k++;
+	}
+	if (k == 0)
+		return 0.0;
+	vec4 sc = texture3D(claudeTraceGrid, (c + 0.5) / GRID_S);
+	vec3 le = cellEmission(sc.a, cellAlbedo(sc.rgb));
+	vec3 d = c + vec3(0.5) - x;
+	return dot(le, vec3(0.2126, 0.7152, 0.0722)) * float(k) / max(dot(d, d), 1.0);
+}
+// LEARNED VISIBILITY (claude_area_pick 2, light lists stage 2). Per 4 m
+// block and list slot, last epoch's shadow rays: tries and hits. The
+// estimate is (hits + 1) / (tries + 2), Laplace's rule (the mean under a
+// flat prior): a statistics rule, not a tuned number, and never zero, so
+// every light with a bound keeps a probability.
+int visBlock(vec3 x)
+{
+	ivec3 b = ivec3(floor((x + gridOrigin) / 4.0)) & ivec3(31);
+	return (b.z * 32 + b.y) * 32 + b.x;
+}
+ivec2 visTexel(int blk, int slot, int k)
+{
+	int i = blk * 32 + slot * 2 + k;
+	return ivec2(i & 1023, i >> 10);
+}
+// claudeVisP: per block, 17 floats (16 slot estimates, then p_call), laid
+// out blk * 17 + i over a 1024-wide image; written by claude_vis_finalize
+ivec2 visPTexel(int blk, int i)
+{
+	int k = blk * 17 + i;
+	return ivec2(k & 1023, k >> 10);
+}
+float visEst(int blk, int slot)
+{
+#ifdef CLAUDE_GUIDE_OK
+	return imageLoad(claudeVisP, visPTexel(blk, slot)).r;
+#else
+	return 1.0;
+#endif
+}
+void visDeposit(int blk, int slot, int k)
+{
+#ifdef CLAUDE_GUIDE_OK
+	imageAtomicAdd(claudeVisW, visTexel(blk, slot, k), 1u);
+#endif
+}
+// slot j's weight at x: its bound, times its learned visibility at pick 2
+float areaW(int j, vec3 x, int blk, out int k)
+{
+	float w = areaBound(areaEmitter(j), x, k);
+	if (claudeAreaPick > 1.5 && w > 0.0)
+		w *= visEst(blk, j);
+	return w;
+}
+// HOW OFTEN TO SAMPLE AREA LIGHTS AT ALL (claude_area_skip). s = the
+// expected share of this block's light samples that will reach a light;
+// a block whose lights are all walled off stops paying a shadow ray per
+// bounce. Both sides of the MIS pair fold it into p_l, so it costs noise,
+// never light. TUNED: p_call = clamp(4 s, 1/16, 1) | learn by: equal-time
+// error sweep, then the learned effort model (DECISIONS 0w)
+float areaCall(vec3 x, int nLights)
+{
+	if (claudeAreaSkip < 0.5 || claudeAreaPick < 1.5)
+		return 1.0;
+#ifdef CLAUDE_GUIDE_OK
+	return imageLoad(claudeVisP, visPTexel(visBlock(x), 16)).r;
+#else
+	return 1.0;
+#endif
+}
+// the sum over the list, and emitter i's share of it
+float areaPickProb(int i, vec3 x, int nLights)
+{
+	if (claudeAreaPick < 0.5)
+		return 1.0 / float(nLights);
+	float wsum = 0.0, wi = 0.0;
+	int kk;
+	for (int j = 0; j < AREA_CAP; j++) {
+		if (j >= nLights)
+			break;
+		float w = areaW(j, x, visBlock(x), kk);
+		wsum += w;
+		if (j == i)
+			wi = w;
+	}
+	return wsum > 0.0 ? wi / wsum : 0.0;
+}
+
 // p_l for a point the BSDF sampler found, in SOLID ANGLE about x — the
 // density neeDirect() WOULD have had, had it aimed at this exact face
 // from this exact x. Zero when the light sampler cannot generate the
@@ -2285,6 +2430,21 @@ float neePdfSa(vec3 cellHit, vec3 nHit, vec3 x, float dist, float cosY,
 		return 0.0;
 	if (!faceCandidate(cellHit, mask, faceIndex(nHit), x))
 		return 0.0;
+	float pList = 1.0 / float(nLights);
+	if (claudeAreaPick > 0.5) {
+		int iHit = 0;
+		for (int i = 0; i < AREA_CAP; i++) {
+			if (i >= nLights)
+				break;
+			if (all(lessThan(abs(areaEmitter(i).xyz - cellHit), vec3(CELL_MATCH_EPS)))) {
+				iHit = i;
+				break;
+			}
+		}
+		pList = areaPickProb(iHit, x, nLights);
+		if (pList <= 0.0)
+			return 0.0;
+	}
 	int k = 0;
 	for (int f = 0; f < 6; f++) {
 		if (faceCandidate(cellHit, mask, f, x))
@@ -2292,8 +2452,9 @@ float neePdfSa(vec3 cellHit, vec3 nHit, vec3 x, float dist, float cosY,
 	}
 	if (k == 0)
 		return 0.0; // unreachable: the hit face itself passed the test
-	// p_A = 1/(N*k) over unit-square faces, converted to solid angle
-	return (dist * dist) / (float(nLights) * float(k) * cosY);
+	// p_A = pList/k over unit-square faces (pList = 1/N when uniform),
+	// converted to solid angle
+	return (dist * dist) * pList * areaCall(x, nLights) / (float(k) * cosY);
 }
 
 // One light sample at vertex (x, nx) with reflectance rho. Returns the
@@ -2346,11 +2507,41 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 {
 	g_neeDiag = vec4(0.0);
 	g_neeDiagK = 0.0;
-	// uniform over the list. Not importance-weighted by distance or
-	// power: p_A must be reproducible by neePdfSa() from the hit alone,
-	// and 1/(N*k) is.
+	float pCall = areaCall(x, nLights);
+	if (pCall < 1.0 && rnd1() >= pCall)
+		return vec3(0.0); // not this time (claude_area_skip); priced in p_l
+	// uniform over the list (claude_area_pick 0), or by each light's
+	// physical bound (1). Either way p_A is reproducible by neePdfSa()
+	// from the hit alone: 1/(N*k), or bound_i/sum/k from the same x.
 	float us = rnd1();
 	int li = min(int(float(nLights) * us), nLights - 1);
+	float pList = 1.0 / float(nLights);
+	if (claudeAreaPick > 0.5) {
+		// by physical bound: walk the CDF with the same draw
+		float wsum = 0.0;
+		int kk;
+		for (int j = 0; j < AREA_CAP; j++) {
+			if (j >= nLights)
+				break;
+			wsum += areaW(j, x, visBlock(x), kk);
+		}
+		if (wsum <= 0.0)
+			return vec3(0.0);
+		float t = us * wsum, acc = 0.0;
+		li = -1;
+		for (int j = 0; j < AREA_CAP; j++) {
+			if (j >= nLights)
+				break;
+			float w = areaW(j, x, visBlock(x), kk);
+			if (li < 0 && w > 0.0 && t < acc + w) {
+				li = j;
+				pList = w / wsum;
+			}
+			acc += w;
+		}
+		if (li < 0)
+			return vec3(0.0);
+	}
 	vec4 e = areaEmitter(li);
 	vec3 c = e.xyz;
 	int mask = int(e.w + 0.5);
@@ -2409,11 +2600,15 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	vec4 shpal;
 	float shidx;
 	vec3 shfar;
+	if (claudeAreaPick > 1.5)
+		visDeposit(visBlock(x), li, 0);   // a try
 	if (!marchAll(x, wi, curMed, shp, shn, shalb, shle, sht, shcell,
 			shpal, shidx, shfar))
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
 		return vec3(0.0); // occluded
+	if (claudeAreaPick > 1.5)
+		visDeposit(visBlock(x), li, 1);   // a hit
 
 	// THE LAW: one Le. shle came out of march(), which ran the same
 	// cellEmission() the eye ray runs — no second formula here, and no
@@ -2423,7 +2618,7 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 	// own. An early-out here would instead hide it, and would make
 	// neeDirect() decline a direction neePdfSa() still prices — the one
 	// asymmetry that actually loses energy.
-	float pdfL = dist2 / (float(nLights) * float(k) * cosY); // p_l, sa
+	float pdfL = dist2 * pList * pCall / (float(k) * cosY); // p_l, sa (pList = 1/N when uniform)
 	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;             // p_b, sa
 	float w = 1.0;
 	if (misOn > 0.5)
@@ -2445,8 +2640,38 @@ vec3 neeDirect(vec3 x, vec3 nx, vec3 rho, int nLights, float misOn,
 // is what gives a torch or a glowing block its halo in haze.
 vec3 neeDirectAir(vec3 x, vec3 dir, int nLights)
 {
+	float pCall = areaCall(x, nLights);
+	if (pCall < 1.0 && rnd1() >= pCall)
+		return vec3(0.0);
 	float us = rnd1();
 	int li = min(int(float(nLights) * us), nLights - 1);
+	float pList = 1.0 / float(nLights);
+	if (claudeAreaPick > 0.5) {
+		// the same pick as neeDirect(), so neePdfSa() prices it right
+		float wsum = 0.0;
+		int kk;
+		for (int j = 0; j < AREA_CAP; j++) {
+			if (j >= nLights)
+				break;
+			wsum += areaW(j, x, visBlock(x), kk);
+		}
+		if (wsum <= 0.0)
+			return vec3(0.0);
+		float t = us * wsum, acc = 0.0;
+		li = -1;
+		for (int j = 0; j < AREA_CAP; j++) {
+			if (j >= nLights)
+				break;
+			float w = areaW(j, x, visBlock(x), kk);
+			if (li < 0 && w > 0.0 && t < acc + w) {
+				li = j;
+				pList = w / wsum;
+			}
+			acc += w;
+		}
+		if (li < 0)
+			return vec3(0.0);
+	}
 	vec4 e = areaEmitter(li);
 	vec3 c = e.xyz;
 	int mask = int(e.w + 0.5);
@@ -2497,7 +2722,7 @@ vec3 neeDirectAir(vec3 x, vec3 dir, int nLights)
 		return vec3(0.0);
 	if (any(greaterThanEqual(abs(shcell - c), vec3(CELL_MATCH_EPS))))
 		return vec3(0.0);
-	float pdfL = dist2 / (float(nLights) * float(k) * cosY);
+	float pdfL = dist2 * pList * pCall / (float(k) * cosY);
 	float ph = hgPhase(dot(dir, wi), claudeAirG);
 	float w = pdfL / (pdfL + ph);
 	return w * ph * shle * airTr(dist) / pdfL;
@@ -3422,6 +3647,9 @@ void main(void)
 #endif
 	g_rngCtr = 0u;
 	g_skyCtr = 0u;
+	// TUNED: claude_guide_keep 0.25 (a quarter of paths teach the guide) |
+	// learn by: equal-time error sweep 1 / 0.5 / 0.25 / 0.125, doorway room
+	g_guideKeep = float(pcgHash(g_rngKey ^ 0x5bd1e995u) & 0xFFFFu) < claudeGuideKeep * 65536.0;
 
 	// sub-pixel jitter: free anti-aliasing through the running average.
 	// Off in views 1-5, which do not accumulate and would otherwise
