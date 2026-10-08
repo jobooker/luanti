@@ -5,6 +5,8 @@ every arm, interleaves arms, every dial spelled every arm."""
 import sys, time, json
 sys.path.insert(0, "util")
 import claude_lab as lab
+import claude_gpu_lock   # the GPU lock for this tool's whole life
+claude_gpu_lock.hold('util/claude_live_price.py')
 VIEWS = {"forest": (146.5, 8.5, 123.5, 270, -5), "torchroom": (241.7, 8.5, 231.7, 315, -12)}
 BASE = {"claude_nee": 1, "claude_bounces": 24, "claude_area_pick": 0, "claude_area_skip": 0,
         "claude_area_nee": 1, "claude_descend": 1, "claude_leaf_transmit": 1, "claude_far_levels": 3,
