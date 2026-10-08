@@ -33,7 +33,10 @@ PLAY = {"claude_nee": 1, "claude_bounces": 24, "claude_far_levels": 3, "claude_d
         "claude_descend": 1, "claude_model_far": 1, "claude_torch_nee": 1, "claude_pyramid": 1,
         # every dial an arm can change is spelled out, or it leaks from the arm before
         "claude_area_nee": 1, "claude_guide": 0, "claude_guide_deposit": 1,
-        "claude_guide_impl": 2, "claude_guide_keep": 0.25, "claude_area_pick": 0, "claude_area_skip": 0}
+        "claude_guide_impl": 2, "claude_guide_keep": 0.25, "claude_area_pick": 0, "claude_area_skip": 0,
+        # ladder stage 2 instruments (a dial missing here leaks between arms:
+        # claude_tree_dirs did, 2026-10-07)
+        "claude_view": 0, "claude_tree_variant": 0, "claude_tree_dirs": 0}
 ARMS = [("play", {}), ("play-again", {}), ("nee 0", {"claude_nee": 0}),
         ("bounces 2", {"claude_bounces": 2}), ("bounces 4", {"claude_bounces": 4}),
         ("far 0", {"claude_far_levels": 0}), ("denoise 0", {"claude_denoise": 0}),
@@ -68,6 +71,34 @@ if os.environ.get("PERF_ARMS") == "pick":
             ("+ skip", {"claude_area_pick": 2, "claude_area_skip": 1}), ("even-again", {})]
 if os.environ.get("PERF_ARMS") == "dnyoung":
     ARMS = [("young 0", {"claude_denoise_young": 0}), ("young 64", {"claude_denoise_young": 64}), ("young 0 again", {"claude_denoise_young": 0}), ("young 64 again", {"claude_denoise_young": 64})]
+if os.environ.get("PERF_ARMS") == "treespeed":
+    # ladder stage 2: what each walk costs, camera rays only (views 36-38)
+    ARMS = [("no walk", {"claude_view": 38}), ("today's walk", {"claude_view": 37}),
+            ("tree walk", {"claude_view": 36}), ("today's walk again", {"claude_view": 37}),
+            ("tree walk again", {"claude_view": 36}), ("no walk again", {"claude_view": 38})]
+if os.environ.get("PERF_ARMS") == "treeablate":
+    # what makes the tree walk's steps expensive (views 36-38, one walk only)
+    ARMS = [("no walk", {"claude_view": 38}), ("today's walk", {"claude_view": 37}),
+            ("tree, path arrays", {"claude_view": 36, "claude_tree_variant": 0}),
+            ("tree, from root", {"claude_view": 36, "claude_tree_variant": 1}),
+            ("tree, path arrays again", {"claude_view": 36, "claude_tree_variant": 0}),
+            ("tree, from root again", {"claude_view": 36, "claude_tree_variant": 1})]
+if os.environ.get("PERF_ARMS") == "treefast":
+    # the fast tree walk (variant 2) against today's walk and the first port
+    ARMS = [("no walk", {"claude_view": 38}), ("today's walk", {"claude_view": 37}),
+            ("tree, first port", {"claude_view": 36, "claude_tree_variant": 0}),
+            ("tree, fast", {"claude_view": 36, "claude_tree_variant": 2}),
+            ("today's walk again", {"claude_view": 37}),
+            ("tree, fast again", {"claude_view": 36, "claude_tree_variant": 2})]
+if os.environ.get("PERF_ARMS") == "treelong":
+    # camera rays and long random rays (claude_tree_dirs 1), each walk
+    ARMS = [("no walk", {"claude_view": 38}),
+            ("cam: today", {"claude_view": 37}), ("cam: tree", {"claude_view": 36, "claude_tree_variant": 2}),
+            ("long: today", {"claude_view": 37, "claude_tree_dirs": 1}),
+            ("long: tree", {"claude_view": 36, "claude_tree_variant": 2, "claude_tree_dirs": 1}),
+            ("long: today again", {"claude_view": 37, "claude_tree_dirs": 1}),
+            ("long: tree again", {"claude_view": 36, "claude_tree_variant": 2, "claude_tree_dirs": 1}),
+            ("cam: tree again", {"claude_view": 36, "claude_tree_variant": 2})]
 if os.environ.get("PERF_ARMS") == "split":
     ARMS = [("play", {}), ("split 0", {"claude_split": 0}), ("reproject 0", {"claude_reproject": 0}),
             ("split 0 + reproject 0", {"claude_split": 0, "claude_reproject": 0}), ("play-again", {})]

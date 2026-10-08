@@ -952,9 +952,14 @@ static GLuint g_tree_ssbo = 0;
 static bool g_tree_build_pending = false;
 // the gate's tally (binding 4): the shader counts, this reads it back
 static GLuint g_tree_count_ssbo = 0;
-static const int TREE_COUNT_N = 9 + 128 * 19;
-static void claudeTreeTally(const v3f &cam_local)
+static const int TREE_COUNT_N = 9 + 128 * 19 + 3;   // + steps, rays, node reads
+static void claudeTreeTally(const v3f &cam_local, bool every_frame)
 {
+	if (!every_frame && g_tree_count_ssbo && g_claude_frame_no % 30 != 0
+			&& g_claude_frame_no % 30 != 1) {
+		GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 4, g_tree_count_ssbo);
+		return;
+	}
 	std::vector<u32> c(TREE_COUNT_N, 0);
 	if (!g_tree_count_ssbo) {
 		GL.GenBuffers(1, &g_tree_count_ssbo);
@@ -965,6 +970,11 @@ static void claudeTreeTally(const v3f &cam_local)
 		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
 		GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, 0, c.size() * 4, c.data());
 		const u32 total = c[0] + c[1] + c[2] + c[3] + c[4] + c[5] + c[6];
+		const u32 srays = c[TREE_COUNT_N - 2];
+		if (srays > 0 && g_claude_frame_no % 30 == 0)
+			actionstream << "[claude_tree_steps] frame " << g_claude_frame_no << " rays " << srays
+					<< " steps per ray " << (double)c[TREE_COUNT_N - 3] / srays
+					<< " node reads per ray " << (double)c[TREE_COUNT_N - 1] / srays << std::endl;
 		if (total > 0 && g_claude_frame_no % 30 == 0) {
 			actionstream << "[claude_tree_gate] frame " << g_claude_frame_no << " rays " << total
 					<< " | none " << c[0] << " match " << c[1] << " cell " << c[2]
@@ -2290,6 +2300,11 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
 	float m_tree_plant = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tree_plant_pixel{"claudeTreePlant"};
+	// claude_tree_variant (2026-10-07): walk ablations for pricing
+	float m_tree_variant = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_tree_variant_pixel{"claudeTreeVariant"};
+	float m_tree_dirs = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_tree_dirs_pixel{"claudeTreeDirs"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
@@ -2394,6 +2409,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_denoise_young",
 		"claude_raw_frame",
 		"claude_tree_plant",
+		"claude_tree_variant",
+		"claude_tree_dirs",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2796,7 +2813,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 35.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 38.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3330,6 +3347,10 @@ public:
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_tree_plant")
 			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		if (name == "claude_tree_variant")
+			m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
+		if (name == "claude_tree_dirs")
+			m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3444,6 +3465,8 @@ public:
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
+		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3584,7 +3607,7 @@ public:
 			// view 35 (the stage 2 gate) keeps the tree in step with the
 			// grid: every new snapshot rebuilds it before it is walked
 			static u64 tree_snap_ms = 0;
-			if (m_view == 35.0f && g_claude_grid.last_snap_ms != tree_snap_ms) {
+			if ((m_view == 35.0f || m_view == 36.0f) && g_claude_grid.last_snap_ms != tree_snap_ms) {
 				tree_snap_ms = g_claude_grid.last_snap_ms;
 				g_tree_build_pending = true;
 			}
@@ -3594,13 +3617,15 @@ public:
 			}
 			if (g_tree_ssbo)
 				GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 3, g_tree_ssbo);
-			if (m_view == 35.0f) {
+			if (m_view >= 35.0f && m_view <= 37.0f) {
 				const ClaudeTraceGrid &G = g_claude_grid;
 				Camera *cam = m_client->getCamera();
 				claudeTreeTally(cam->getPosition() / BS
-						- v3f(G.origin.X, G.origin.Y, G.origin.Z));
+						- v3f(G.origin.X, G.origin.Y, G.origin.Z), m_view == 35.0f);
 			}
 			m_tree_plant_pixel.set(&m_tree_plant, services);
+			m_tree_variant_pixel.set(&m_tree_variant, services);
+			m_tree_dirs_pixel.set(&m_tree_dirs, services);
 			m_guide_deposit_pixel.set(&m_guide_deposit, services);
 			m_guide_keep_pixel.set(&m_guide_keep, services);
 			m_guide_impl_pixel.set(&m_guide_impl, services);

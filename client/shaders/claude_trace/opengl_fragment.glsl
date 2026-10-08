@@ -1584,6 +1584,8 @@ int treeF(int l) { return l == 6 ? 2 : 4; }
 int treeS(int l) { return l == 0 ? 1 : l == 1 ? 4 : l == 2 ? 16 : l == 3 ? 64 : l == 4 ? 256 : l == 5 ? 1024 : 2048; }
 int tnode[7];      // node index at each level: >= 0 a node, -2 full, -3 empty, -1 unknown
 ivec3 tcoord[7];   // its coordinates, in that level's cells
+int g_treeIters = 0;   // walk iterations, for the price views
+int g_treeLoads = 0;   // tree nodes read from memory, likewise
 
 // the node AT level L whose coordinates are c (level-L units)
 int treeNodeAt(int L, ivec3 c)
@@ -1627,13 +1629,43 @@ int treeNodeAt(int L, ivec3 c)
 	return node;
 }
 
+// ABLATION (claude_tree_variant 1, 2026-10-07): the same lookup with NO
+// path arrays, descending from the root every time. If this is faster
+// than the cached walk, the arrays (indexed at run time) are the cost.
+uniform float claudeTreeVariant;
+uniform float claudeTreeDirs;
+int treeNodeAtRoot(int L, ivec3 c)
+{
+	int node = 0;
+	for (int k = TREE_TOP; k > L; k--) {
+		if (node < 0)
+			return node;
+		ivec3 childc = (c * treeS(L)) / treeS(k - 1);
+		int f = treeF(k);
+		ivec3 local = childc - (childc / f) * f;
+		int bit = (local.z * f + local.y) * f + local.x;
+		uint lo = claudeTree[3 * node], hi = claudeTree[3 * node + 1];
+		uint ch = claudeTree[3 * node + 2];
+		bool set = bit < 32 ? ((lo >> uint(bit)) & 1u) != 0u
+				: ((hi >> uint(bit - 32)) & 1u) != 0u;
+		if (!set)
+			return -3;
+		if (ch == TREE_FULL)
+			return -2;
+		int cnt = bit < 32 ? bitCount(lo & ((1u << uint(bit)) - 1u))
+				: bitCount(lo) + bitCount(hi & ((1u << uint(bit - 32)) - 1u));
+		node = int(ch) + cnt;
+	}
+	return node;
+}
+
 // is the level-L cell c occupied (anything solid under it)?
 bool treeOcc(int L, ivec3 c)
 {
 	if (L >= TREE_TOP)
 		return (claudeTree[0] | claudeTree[1]) != 0u;
 	int f = treeF(L + 1);
-	int pn = treeNodeAt(L + 1, c / f);
+	int pn = claudeTreeVariant > 0.5 ? treeNodeAtRoot(L + 1, c / f) : treeNodeAt(L + 1, c / f);
 	if (pn == -3)
 		return false;
 	if (pn == -2)
@@ -1670,6 +1702,7 @@ bool treeWalk(vec3 ro, vec3 rd, out ivec3 hitB, out int hitAxis, out float hitT)
 	vec3 side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
 	hitB = ivec3(0); hitAxis = -1; hitT = 0.0;
 	for (int i = 0; i < 4096; i++) {
+		g_treeIters++;
 		if (started) {
 			for (int g = 0; g < 8 && L > 0 && treeOcc(L, c); g++) {
 				int f = treeF(L);
@@ -1716,6 +1749,147 @@ bool treeWalk(vec3 ro, vec3 rd, out ivec3 hitB, out int hitAxis, out float hitT)
 		if (c[a] < 0 || c[a] >= 2048 / treeS(L))
 			return false;
 		side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
+	}
+	return false;
+}
+
+// THE FAST TREE WALK (claude_tree_variant 2, 2026-10-07). The same cells in
+// the same order as treeWalk() (so the same exactness), organised the way
+// the published 64-tree walks are (dubiousconst282, 2024): the parent
+// node's 64-bit mask lives in registers and an ordinary step is ONE bit
+// test; the tree is read again only when the ray leaves the parent, from
+// the lowest ancestor that still contains it. Measured why: the first
+// port re-asked "is this occupied?" up to three times per step, each a
+// descent with divisions -- 7-14x the cost of today's walk per frame.
+int treeLg(int l) { return l == 6 ? 11 : 2 * l; }
+void treeLoad(int n, out uint lo, out uint hi, out uint ch)
+{
+	if (n == -2) {
+		lo = TREE_FULL; hi = TREE_FULL; ch = TREE_FULL;
+	} else {
+		g_treeLoads++;
+		lo = claudeTree[3 * n]; hi = claudeTree[3 * n + 1]; ch = claudeTree[3 * n + 2];
+	}
+}
+int treeBit(ivec3 c, int f)
+{
+	ivec3 lc = c & ivec3(f - 1);
+	return f == 4 ? (lc.z << 4) | (lc.y << 2) | lc.x : (lc.z << 2) | (lc.y << 1) | lc.x;
+}
+bool treeBitSet(uint lo, uint hi, int bit)
+{
+	return bit < 32 ? ((lo >> uint(bit)) & 1u) != 0u : ((hi >> uint(bit - 32)) & 1u) != 0u;
+}
+int treeChild(uint lo, uint hi, uint ch, int bit)
+{
+	if (ch == TREE_FULL)
+		return -2;
+	int cnt = bit < 32 ? bitCount(lo & ((1u << uint(bit)) - 1u))
+			: bitCount(lo) + bitCount(hi & ((1u << uint(bit - 32)) - 1u));
+	return int(ch) + cnt;
+}
+
+bool treeWalk2(vec3 ro, vec3 rd, out ivec3 hitB, out int hitAxis, out float hitT)
+{
+	vec3 stepDir = sign(rd);
+	vec3 delta0 = 1.0 / max(abs(rd), vec3(1e-8));
+	ivec3 up = ivec3(greaterThan(stepDir, vec3(0.0)));
+	int anc[7];          // node covering the ray's cell at each level (valid from r up)
+	anc[6] = 0;
+	int r = 6;           // lowest level whose anc[] is valid for the current cell
+	int L = 0;
+	ivec3 c = ivec3(floor(ro));
+	float t = 0.0;
+	int axis = -1;
+	uint pLo = 0u, pHi = 0u, pCh = 0u;   // the parent (level L+1) node, when r == L+1
+	vec3 side = tcross(vec3(c + up), ro, stepDir, delta0);
+	hitB = ivec3(0); hitAxis = -1; hitT = 0.0;
+	for (int i = 0; i < 4096; i++) {
+		g_treeIters++;
+		if (i > 0) {
+			// the ray left its parent: re-find the chain from the lowest
+			// ancestor that still holds it; stop at the first empty cell
+			// (the treeWalk() climb, found from above)
+			if (r > L + 1) {
+				bool climbed = false;
+				for (int k = r; k > L + 1; k--) {
+					uint lo, hi, ch;
+					treeLoad(anc[k], lo, hi, ch);
+					ivec3 cc = c >> (treeLg(k - 1) - treeLg(L));
+					int bit = treeBit(cc, k == 6 ? 2 : 4);
+					if (!treeBitSet(lo, hi, bit)) {
+						L = k - 1;
+						c = cc;
+						pLo = lo; pHi = hi; pCh = ch;
+						r = k;
+						side = tcross(vec3((c + up) << treeLg(L)), ro, stepDir, delta0);
+						climbed = true;
+						break;
+					}
+					anc[k - 1] = treeChild(lo, hi, ch, bit);
+				}
+				if (!climbed) {
+					treeLoad(anc[L + 1], pLo, pHi, pCh);
+					r = L + 1;
+				}
+			}
+			// descend while the cell is occupied (inner planes crossed,
+			// counted with tcross and the tie rule, exactly as treeWalk)
+			for (int g = 0; g < 8 && L > 0; g++) {
+				int f = L == 6 ? 2 : 4;
+				int pf = L + 1 == 6 ? 2 : 4;
+				int bit = treeBit(c, pf);
+				if (!treeBitSet(pLo, pHi, bit))
+					break;
+				int child = treeChild(pLo, pHi, pCh, bit);
+				anc[L] = child;
+				L -= 1;
+				float cs = float(1 << treeLg(L));
+				ivec3 k = ivec3(0);
+				for (int ax = 0; ax < 3; ax++) {
+					float lo = float(c[ax] * f) * cs;
+					if (stepDir[ax] == 0.0) {
+						k[ax] = clamp(int(floor((ro[ax] - lo) / cs)), 0, f - 1);
+						continue;
+					}
+					int n = 0;
+					for (int j = 1; j < 4; j++) {
+						if (j >= f)
+							break;
+						int jj = stepDir[ax] > 0.0 ? j : f - j;
+						float tm = (lo + float(jj) * cs - ro[ax]) * stepDir[ax] * delta0[ax];
+						if (tm < t || (tm == t && ax > axis))
+							n++;
+						else
+							break;
+					}
+					k[ax] = stepDir[ax] > 0.0 ? n : f - 1 - n;
+				}
+				c = c * f + k;
+				treeLoad(child, pLo, pHi, pCh);
+				r = L + 1;
+				side = tcross(vec3((c + up) << treeLg(L)), ro, stepDir, delta0);
+			}
+			if (L == 0 && treeBitSet(pLo, pHi, treeBit(c, 4))) {
+				hitB = c; hitAxis = axis; hitT = t;
+				return true;
+			}
+		}
+		int a = treeTie(side);
+		t = side[a];
+		axis = a;
+		int old = c[a];
+		c[a] += int(stepDir[a]);
+		if (c[a] < 0 || c[a] >= (2048 >> treeLg(L)))
+			return false;
+		// only the stepped axis's next plane moved; tcross is per
+		// component, so this is the same float as recomputing all three
+		side[a] = (float((c[a] + up[a]) << treeLg(L)) - ro[a]) * stepDir[a] * delta0[a];
+		// lowest level whose cell still holds both the old and new cell
+		int m = L + 1;
+		while (m < 6 && (old >> (treeLg(m) - treeLg(L))) != (c[a] >> (treeLg(m) - treeLg(L))))
+			m++;
+		r = max(r, m);
 	}
 	return false;
 }
@@ -3831,7 +4005,7 @@ void main(void)
 	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
 	// and want the free anti-aliasing (and want it identically, so the
 	// three instrument views can be divided pixel by pixel).
-	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || view == 33 || view == 34 || view == 35)
+	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || (view >= 33 && view <= 38))
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -3892,6 +4066,51 @@ void main(void)
 	float prevPdfB = 0.0;
 	bool misArmed = false;
 
+	// THE PRICE OF EACH WALK (2026-10-07): one camera ray per pixel through
+	// ONE walk only, BEFORE the path loop (first try sat after it and
+	// timed a whole frame), so the trace pass time is that walk's time. 36 = the
+	// tree, 37 = today's walk, 38 = no walk (the pass's fixed cost).
+	if (view == 36 || view == 37 || view == 38) {
+		float tt = -1.0;
+		if (claudeTreeDirs > 0.5) {
+			// a fixed random direction per pixel, the same for both walks:
+			// long rays (sky, sun, outdoor bounces), the tree's home ground
+			uvec2 q = uvec2(gl_FragCoord.xy);
+			uint h1 = (q.x * 1973u + q.y * 9277u + 26699u) | 1u;
+			h1 ^= h1 >> 16; h1 *= 0x7feb352du; h1 ^= h1 >> 15; h1 *= 0x846ca68bu; h1 ^= h1 >> 16;
+			uint h2 = h1 * 0x9e3779b9u + 0x632be5abu;
+			h2 ^= h2 >> 16; h2 *= 0x7feb352du; h2 ^= h2 >> 15; h2 *= 0x846ca68bu; h2 ^= h2 >> 16;
+			float zz = 1.0 - 2.0 * (float(h1 >> 8) / 16777216.0);
+			float ph = 6.2831853 * (float(h2 >> 8) / 16777216.0);
+			float rr = sqrt(max(0.0, 1.0 - zz * zz));
+			rd = vec3(rr * cos(ph), zz, rr * sin(ph));
+		}
+		if (view == 37) {
+			vec3 a1, a2, a3, a4, a5;
+			float tM;
+			if (march(ro, rd, a1, a2, a3, a4, tM, a5))
+				tt = tM;
+		}
+#ifdef CLAUDE_TREE_OK
+		if (view == 36) {
+			ivec3 hb;
+			int ha;
+			float tb;
+			if (claudeTreeVariant > 1.5 ? treeWalk2(ro * 16.0, rd, hb, ha, tb) : treeWalk(ro * 16.0, rd, hb, ha, tb))
+				tt = tb / 16.0;
+		}
+#endif
+#ifdef CLAUDE_TREE_OK
+		// steps per ray, summed on the GPU (slots after the gate's records)
+		if (view != 38) {
+			atomicAdd(claudeTreeCount[2441], uint(view == 36 ? float(g_treeIters) : g_steps));
+			atomicAdd(claudeTreeCount[2442], 1u);
+			atomicAdd(claudeTreeCount[2443], uint(g_treeLoads));
+		}
+#endif
+		gl_FragColor = vec4(vec3(tt < 0.0 ? 0.0 : 1.0 / (1.0 + tt)), 1.0);
+		return;
+	}
 	// --- INSTRUMENT: claude_view 7 / 8, THE SUB-VOXEL SLIVER ----------
 	// Bright specks inside the cabin's solid walls, 2026-08-17. There
 	// were three ways that can happen and they need separating BEFORE
@@ -4944,7 +5163,7 @@ void main(void)
 		int ha;
 		float tb;
 		vec3 roT = ro * 16.0 + (claudeTreePlant > 0.5 ? vec3(1.0 / 64.0, 0.0, 0.0) : vec3(0.0));
-		bool ht = treeWalk(roT, rd, hb, ha, tb);
+		bool ht = claudeTreeVariant > 1.5 ? treeWalk2(roT, rd, hb, ha, tb) : treeWalk(roT, rd, hb, ha, tb);
 		int vi;
 		vec3 cellT = floor(vec3(hb) / 16.0);
 		if (!hm && !ht) {
