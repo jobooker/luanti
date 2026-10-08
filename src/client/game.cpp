@@ -939,6 +939,249 @@ static void claudeVisFinalize()
 	GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
 	GL.UseProgram(prev);
 }
+// THE GENERAL LADDER'S TREE (ladder-plan stage 2, 2026-10-07). Built on
+// demand (pseudo-key claude_tree_build) from the SAME textures the tracer
+// walks, read back from the GPU, so the tree and march() cannot disagree
+// about what is solid -- only about how they walk. Levels in base units
+// (1/16 m): 1, 4, 16 (1 m), 64, 256, 1024, 2048; factor 4 everywhere but
+// the top (2). A node is 3 uints: child mask lo, hi, first child (children
+// are contiguous, in bit order, bit = (z*f + y)*f + x); a node whose first
+// child is FULL is solid all the way down. Stage 2 is the gate only: the
+// tree is NOT rebuilt when the grid moves, so the check runs pinned.
+static GLuint g_tree_ssbo = 0;
+static bool g_tree_build_pending = false;
+// the gate's tally (binding 4): the shader counts, this reads it back
+static GLuint g_tree_count_ssbo = 0;
+static const int TREE_COUNT_N = 9 + 128 * 19;
+static void claudeTreeTally(const v3f &cam_local)
+{
+	std::vector<u32> c(TREE_COUNT_N, 0);
+	if (!g_tree_count_ssbo) {
+		GL.GenBuffers(1, &g_tree_count_ssbo);
+		GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_tree_count_ssbo);
+		GL.BufferData(GL.SHADER_STORAGE_BUFFER, c.size() * 4, c.data(), GL.DYNAMIC_DRAW);
+	} else {
+		GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_tree_count_ssbo);
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, 0, c.size() * 4, c.data());
+		const u32 total = c[0] + c[1] + c[2] + c[3] + c[4] + c[5] + c[6];
+		if (total > 0 && g_claude_frame_no % 30 == 0) {
+			actionstream << "[claude_tree_gate] frame " << g_claude_frame_no << " rays " << total
+					<< " | none " << c[0] << " match " << c[1] << " cell " << c[2]
+					<< " face " << c[3] << " dist " << c[4] << " march-only " << c[5]
+					<< " tree-only " << c[6] << " | cam " << cam_local.X << " "
+					<< cam_local.Y << " " << cam_local.Z << std::endl;
+			for (u32 k = 0; k < std::min<u32>(c[8], 128); k++) {
+				const u32 *r = &c[9 + 19 * k];
+				float f[4];
+				memcpy(&f[0], &r[7], 4);
+				memcpy(&f[1], &r[12], 4);
+				float d[3], o[3];
+				memcpy(d, &r[13], 12);
+				memcpy(o, &r[16], 12);
+				actionstream << "[claude_tree_gate]   px " << r[0] << "," << r[1]
+						<< " verdict " << r[2] << " march cell " << (s32)r[3] << ","
+						<< (s32)r[4] << "," << (s32)r[5] << " axis " << r[6] << " t "
+						<< f[0] << " | tree piece " << r[8] << "," << r[9] << ","
+						<< r[10] << " axis " << r[11] << " t " << f[1] << " | rd "
+						<< d[0] << " " << d[1] << " " << d[2] << " | ro " << o[0] << " "
+						<< o[1] << " " << o[2] << " | bits " << std::hex << r[13] << " "
+						<< r[14] << " " << r[15] << " " << r[16] << " " << r[17] << " "
+						<< r[18] << std::dec << std::endl;
+			}
+		}
+		std::fill(c.begin(), c.end(), 0);
+		GL.BufferSubData(GL.SHADER_STORAGE_BUFFER, 0, c.size() * 4, c.data());
+	}
+	GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 4, g_tree_count_ssbo);
+}
+static bool claudeUseR8();
+static void claudeTreeBuild(bool descend, bool model_far)
+{
+	const ClaudeTraceGrid &V = g_claude_grid;
+	if (!V.tex) {
+		warningstream << "[claude_tree] no trace grid yet" << std::endl;
+		return;
+	}
+	const u64 t0 = porting::getTimeMs();
+	GLint prev_active = GL.TEXTURE0;
+	GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active);
+	GL.ActiveTexture(GL.TEXTURE0 + 30);
+	auto get3d = [&](u32 tex, size_t n, GLenum fmt) {
+		std::vector<u8> b;
+		if (!tex)
+			return b;
+		b.resize(n);
+		GL.BindTexture(GL.TEXTURE_3D, tex);
+		GL.GetTexImage(GL.TEXTURE_3D, 0, fmt, GL.UNSIGNED_BYTE, b.data());
+		return b;
+	};
+	const GLenum one = claudeUseR8() ? GL.RED : GL_LUMINANCE;
+	const std::vector<u8> grid = get3d(V.tex, (size_t)128 * 128 * 128 * 4, GL.RGBA);
+	const std::vector<u8> sub = get3d(V.subvox_tex, (size_t)64 * 512 * 512, one);
+	const std::vector<u8> mids = get3d(V.model_ids_tex, (size_t)128 * 128 * 128, one);
+	const std::vector<u8> atlas = get3d(V.model_atlas_tex, (size_t)16 * 16 * 2048, one);
+	GL.BindTexture(GL.TEXTURE_3D, 0);
+	std::vector<float> pal((size_t)256 * 2 * 4, 0.f);
+	if (V.matpal_tex) {
+		GL.BindTexture(GL.TEXTURE_2D, V.matpal_tex);
+		GL.GetTexImage(GL.TEXTURE_2D, 0, GL.RGBA, GL.FLOAT, pal.data());
+		GL.BindTexture(GL.TEXTURE_2D, 0);
+	}
+	GL.ActiveTexture(prev_active);
+
+	auto at1 = [](int x, int y, int z) { return ((size_t)z * 128 + y) * 128 + x; };
+	auto inRing = [](int x, int y, int z) {
+		return x >= 48 && y >= 48 && z >= 48 && x < 80 && y < 80 && z < 80;
+	};
+	// the shader's fineSolid(), byte for byte
+	auto fineBit = [&](int cx, int cy, int cz, int sx, int sy, int sz) -> bool {
+		if (inRing(cx, cy, cz)) {
+			if (sub.empty())
+				return false;
+			size_t tx = (cx - 48) * 2 + sx / 8, ty = (cy - 48) * 16 + sy,
+					tz = (cz - 48) * 16 + sz;
+			return (sub[(tz * 512 + ty) * 64 + tx] >> (sx % 8)) & 1;
+		}
+		if (mids.empty() || atlas.empty())
+			return false;
+		int mid = mids[at1(cx, cy, cz)];
+		int m = mid / 4 - 1, rot = mid % 4;
+		long layer = (long)(m * 4 + rot) * 16 + sz;
+		if (layer < 0 || layer >= 2048)
+			return false;
+		return atlas[((size_t)layer * 16 + sy) * 16 + sx] > 0;
+	};
+
+	// level 2 (1 m): 0 empty, 1 solid, 2 fine (walked at 1/16 m), the
+	// shader's rule: march stops at any material other than air; a fine
+	// material is walked at 1/16 m where fineAt() says it has bits.
+	std::vector<u8> cls((size_t)128 * 128 * 128, 0);
+	std::unordered_map<u32, u32> fine_slot;
+	std::vector<u64> fine_masks;   // 64 per fine cell: one per 1/4 m piece
+	size_t n_full = 0, n_fine = 0;
+	for (int z = 0; z < 128; z++)
+	for (int y = 0; y < 128; y++)
+	for (int x = 0; x < 128; x++) {
+		const size_t i = at1(x, y, z);
+		const int idx = grid[i * 4 + 3];
+		if (!idx)
+			continue;
+		const bool fine = descend && pal[(size_t)idx * 4 + 1] > 0.5f
+				&& (inRing(x, y, z) || (model_far && !mids.empty() && mids[i] > 3));
+		if (!fine) {
+			cls[i] = 1;
+			n_full++;
+			continue;
+		}
+		u64 m64[64];
+		bool any = false;
+		for (int q = 0; q < 64; q++) {
+			const int qx = q % 4, qy = (q / 4) % 4, qz = q / 16;
+			u64 m = 0;
+			for (int b = 0; b < 64; b++) {
+				const int px = b % 4, py = (b / 4) % 4, pz = b / 16;
+				if (fineBit(x, y, z, qx * 4 + px, qy * 4 + py, qz * 4 + pz))
+					m |= (u64)1 << b;
+			}
+			m64[q] = m;
+			any |= m != 0;
+		}
+		if (!any)
+			continue;
+		cls[i] = 2;
+		n_fine++;
+		fine_slot[(u32)i] = (u32)(fine_masks.size() / 64);
+		fine_masks.insert(fine_masks.end(), m64, m64 + 64);
+	}
+
+	// occupancy and all-solid, per level, 1 m and up
+	const int F[7] = {1, 4, 4, 4, 4, 4, 2};
+	const int dim[7] = {2048, 512, 128, 32, 8, 2, 1};
+	std::vector<u8> occ[7], full[7];
+	occ[2].resize(cls.size());
+	full[2].resize(cls.size());
+	for (size_t i = 0; i < cls.size(); i++) {
+		occ[2][i] = cls[i] != 0;
+		full[2][i] = cls[i] == 1;
+	}
+	auto atL = [&](int l, int x, int y, int z) {
+		return ((size_t)z * dim[l] + y) * dim[l] + x;
+	};
+	for (int l = 3; l <= 6; l++) {
+		const int n = dim[l], f = F[l];
+		occ[l].assign((size_t)n * n * n, 0);
+		full[l].assign((size_t)n * n * n, 0);
+		for (int z = 0; z < n; z++)
+		for (int y = 0; y < n; y++)
+		for (int x = 0; x < n; x++) {
+			bool o = false, a = true;
+			for (int k = 0; k < f * f * f; k++) {
+				const size_t c = atL(l - 1, x * f + k % f, y * f + (k / f) % f, z * f + k / (f * f));
+				o |= occ[l - 1][c] != 0;
+				a &= full[l - 1][c] != 0;
+			}
+			occ[l][atL(l, x, y, z)] = o;
+			full[l][atL(l, x, y, z)] = o && a;
+		}
+	}
+
+	// breadth first: node i is item i
+	struct Item { int l, x, y, z; bool full; };
+	std::vector<Item> items{{6, 0, 0, 0, full[6][0] != 0}};
+	std::vector<u32> nodes;
+	const u32 FULL = 0xFFFFFFFFu;
+	for (size_t i = 0; i < items.size(); i++) {
+		const Item it = items[i];
+		const int f = F[it.l], nb = f * f * f;
+		if (it.full) {
+			nodes.push_back(nb >= 32 ? FULL : ((1u << nb) - 1u));
+			nodes.push_back(nb >= 64 ? FULL : nb > 32 ? ((1u << (nb - 32)) - 1u) : 0u);
+			nodes.push_back(FULL);
+			continue;
+		}
+		u64 mask = 0;
+		const u32 base = (u32)items.size();
+		if (it.l == 1) {
+			const int cx = it.x / 4, cy = it.y / 4, cz = it.z / 4;
+			const int q = ((it.z % 4) * 4 + it.y % 4) * 4 + it.x % 4;
+			mask = fine_masks[(size_t)fine_slot.at((u32)at1(cx, cy, cz)) * 64 + q];
+		} else {
+			for (int b = 0; b < nb; b++) {
+				const int cx = it.x * f + b % f, cy = it.y * f + (b / f) % f,
+						cz = it.z * f + b / (f * f);
+				bool o, a;
+				if (it.l - 1 >= 2) {
+					o = occ[it.l - 1][atL(it.l - 1, cx, cy, cz)] != 0;
+					a = full[it.l - 1][atL(it.l - 1, cx, cy, cz)] != 0;
+				} else {   // level-1 children of a fine 1 m cell
+					const u64 m = fine_masks[(size_t)fine_slot.at((u32)at1(it.x, it.y, it.z)) * 64 + b];
+					o = m != 0;
+					a = m == ~(u64)0;
+				}
+				if (!o)
+					continue;
+				mask |= (u64)1 << b;
+				items.push_back({it.l - 1, cx, cy, cz, a});
+			}
+		}
+		nodes.push_back((u32)(mask & 0xFFFFFFFFu));
+		nodes.push_back((u32)(mask >> 32));
+		nodes.push_back(it.l == 1 ? 0u : base);
+	}
+
+	if (!g_tree_ssbo)
+		GL.GenBuffers(1, &g_tree_ssbo);
+	GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_tree_ssbo);
+	GL.BufferData(GL.SHADER_STORAGE_BUFFER, nodes.size() * 4, nodes.data(), GL.STATIC_DRAW);
+	GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+	actionstream << "[claude_tree] built: " << nodes.size() / 3 << " nodes ("
+			<< nodes.size() * 4 / 1024 << " KiB), 1 m cells solid " << n_full
+			<< " fine " << n_fine << ", descend " << descend << " model_far "
+			<< model_far << ", " << (porting::getTimeMs() - t0) << " ms" << std::endl;
+}
+
 static u32 g_vis_frame = ~0u;
 static bool g_vis_list_changed = false;
 static void claudeVisBind()
@@ -2044,6 +2287,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
 	float m_raw_frame = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_raw_frame_pixel{"claudeRawFrame"};
+	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
+	float m_tree_plant = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_tree_plant_pixel{"claudeTreePlant"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
@@ -2147,6 +2393,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_guide_alpha",
 		"claude_denoise_young",
 		"claude_raw_frame",
+		"claude_tree_plant",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2549,7 +2796,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 34.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 35.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3081,6 +3328,8 @@ public:
 			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
+		if (name == "claude_tree_plant")
+			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3194,6 +3443,7 @@ public:
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
+		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3331,6 +3581,26 @@ public:
 			m_area_skip_pixel.set(&m_area_skip, services);
 			if (m_area_pick > 1.5f)
 				claudeVisBind();
+			// view 35 (the stage 2 gate) keeps the tree in step with the
+			// grid: every new snapshot rebuilds it before it is walked
+			static u64 tree_snap_ms = 0;
+			if (m_view == 35.0f && g_claude_grid.last_snap_ms != tree_snap_ms) {
+				tree_snap_ms = g_claude_grid.last_snap_ms;
+				g_tree_build_pending = true;
+			}
+			if (g_tree_build_pending) {
+				g_tree_build_pending = false;
+				claudeTreeBuild(m_descend > 0.5f, m_model_far > 0.5f);
+			}
+			if (g_tree_ssbo)
+				GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 3, g_tree_ssbo);
+			if (m_view == 35.0f) {
+				const ClaudeTraceGrid &G = g_claude_grid;
+				Camera *cam = m_client->getCamera();
+				claudeTreeTally(cam->getPosition() / BS
+						- v3f(G.origin.X, G.origin.Y, G.origin.Z));
+			}
+			m_tree_plant_pixel.set(&m_tree_plant, services);
 			m_guide_deposit_pixel.set(&m_guide_deposit, services);
 			m_guide_keep_pixel.set(&m_guide_keep, services);
 			m_guide_impl_pixel.set(&m_guide_impl, services);
@@ -6657,6 +6927,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// read back from its own textures, plus the camera as the shader
 		// receives it, so a tree built offline can be checked against the
 		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_tree_build") {
+			g_tree_build_pending = true;   // built inside the next frame
+			continue;
+		}
 		if (name == "claude_export_trace") {
 			const std::string dir = patch.get(name);
 			fs::CreateAllDirs(dir);

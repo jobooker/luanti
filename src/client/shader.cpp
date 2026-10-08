@@ -855,6 +855,17 @@ void ShaderSource::generateShader(ShaderInfo &shaderinfo)
 			fragment_header += "#ifdef GL_ARB_shader_image_load_store\n"
 				"#extension GL_ARB_shader_image_load_store : enable\n"
 				"#endif\n"
+				// the general ladder's tree (2026-10-07): a storage buffer,
+				// bitCount() over child masks, and a fixed binding number
+				"#ifdef GL_ARB_shader_storage_buffer_object\n"
+				"#extension GL_ARB_shader_storage_buffer_object : enable\n"
+				"#endif\n"
+				"#ifdef GL_ARB_gpu_shader5\n"
+				"#extension GL_ARB_gpu_shader5 : enable\n"
+				"#endif\n"
+				"#ifdef GL_ARB_shading_language_420pack\n"
+				"#extension GL_ARB_shading_language_420pack : enable\n"
+				"#endif\n"
 				"#define VARYING_ in\n"
 				"#define gl_FragColor outFragColor\n"
 				"#ifdef GL_ARB_explicit_attrib_location\n"

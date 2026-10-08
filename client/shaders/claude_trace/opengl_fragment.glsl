@@ -554,6 +554,21 @@ uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
 uniform float claudeGuideImpl;    // claude_guide_impl: 1 = v1 (walk, 3 atomics, every path writes), 2 = v2 (alias, bin only, claude_guide_keep)
 uniform float claudeGuideKeep;    // claude_guide_keep: share of paths that write to the tables
 uniform float claudeGuideDeposit; // claude_guide_deposit: 0 = the guide reads its tables but writes nothing (price instrument)
+#if defined(GL_ARB_shader_storage_buffer_object) && defined(GL_ARB_gpu_shader5) && defined(GL_ARB_shading_language_420pack)
+// THE GENERAL LADDER'S TREE (ladder-plan stage 2, 2026-10-07): 3 uints per
+// node (child mask lo, hi, first child or FULL), root at 0. Built by
+// game.cpp claudeTreeBuild() from the tracer's own textures.
+layout(std430, binding = 3) readonly buffer ClaudeTreeBuf { uint claudeTree[]; };
+// the gate's tally, counted HERE and not from a screenshot (stage 1b's
+// lesson: the display pass blends neighbours, so a picture of verdicts is
+// not the verdicts). [0..6] one count per verdict, [8] disagreements seen,
+// [9 + 19 k ..] the first 128 of them in full. Cleared by game.cpp per frame.
+layout(std430, binding = 4) buffer ClaudeTreeCountBuf { uint claudeTreeCount[]; };
+#define CLAUDE_TREE_OK 1
+#endif
+// planted defect for the gate (claude_tree_plant 1): the tree walk starts
+// 1/64 of a base piece off, so the tally MUST show disagreements
+uniform float claudeTreePlant;
 uniform float claudeRawFrame;   // claude_raw_frame: 1 = no history, every frame shows only its own rays (the layered comparison)
 uniform float claudeBoost;      // claude_boost: 1 = extra-sample passes give young pixels more paths
 uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
@@ -1551,6 +1566,160 @@ vec3 tcross(vec3 plane, vec3 ro, vec3 stepDir, vec3 delta0)
 {
 	return (plane - ro) * stepDir * delta0 + (vec3(1.0) - abs(stepDir)) * 1e30;
 }
+
+
+// =====================================================================
+// THE TREE WALK (ladder-plan stage 2; util/claude_tree_equiv.py is its
+// float32 proof, exact at any branching factor). Levels in BASE units
+// (1/16 m): 1, 4, 16 (1 m), 64, 256, 1024, 2048 (the 128 m grid, factor 2
+// at the top). A level-l node covers TREE_F[l]^3 children of level l-1;
+// level 0 has no nodes, its occupancy is the level-1 node's mask bits.
+// The walk keeps the node it last used at every level (tnode / tcoord), so
+// a step inside the same parent never searches from the root.
+// =====================================================================
+#ifdef CLAUDE_TREE_OK
+const int TREE_TOP = 6;
+const uint TREE_FULL = 0xFFFFFFFFu;
+int treeF(int l) { return l == 6 ? 2 : 4; }
+int treeS(int l) { return l == 0 ? 1 : l == 1 ? 4 : l == 2 ? 16 : l == 3 ? 64 : l == 4 ? 256 : l == 5 ? 1024 : 2048; }
+int tnode[7];      // node index at each level: >= 0 a node, -2 full, -3 empty, -1 unknown
+ivec3 tcoord[7];   // its coordinates, in that level's cells
+
+// the node AT level L whose coordinates are c (level-L units)
+int treeNodeAt(int L, ivec3 c)
+{
+	int l = L;
+	for (; l < TREE_TOP; l++) {
+		ivec3 al = (c * treeS(L)) / treeS(l);
+		if (tnode[l] != -1 && all(equal(tcoord[l], al)))
+			break;
+	}
+	int node = tnode[l];
+	for (int k = l; k > L; k--) {
+		ivec3 childc = (c * treeS(L)) / treeS(k - 1);
+		int nn;
+		if (node == -3)
+			nn = -3;
+		else if (node == -2)
+			nn = -2;
+		else {
+			int f = treeF(k);
+			ivec3 local = childc - (childc / f) * f;
+			int bit = (local.z * f + local.y) * f + local.x;
+			uint lo = claudeTree[3 * node], hi = claudeTree[3 * node + 1];
+			uint ch = claudeTree[3 * node + 2];
+			bool set = bit < 32 ? ((lo >> uint(bit)) & 1u) != 0u
+					: ((hi >> uint(bit - 32)) & 1u) != 0u;
+			if (!set)
+				nn = -3;
+			else if (ch == TREE_FULL)
+				nn = -2;
+			else {
+				int cnt = bit < 32 ? bitCount(lo & ((1u << uint(bit)) - 1u))
+						: bitCount(lo) + bitCount(hi & ((1u << uint(bit - 32)) - 1u));
+				nn = int(ch) + cnt;
+			}
+		}
+		tnode[k - 1] = nn;
+		tcoord[k - 1] = childc;
+		node = nn;
+	}
+	return node;
+}
+
+// is the level-L cell c occupied (anything solid under it)?
+bool treeOcc(int L, ivec3 c)
+{
+	if (L >= TREE_TOP)
+		return (claudeTree[0] | claudeTree[1]) != 0u;
+	int f = treeF(L + 1);
+	int pn = treeNodeAt(L + 1, c / f);
+	if (pn == -3)
+		return false;
+	if (pn == -2)
+		return true;
+	ivec3 local = c - (c / f) * f;
+	int bit = (local.z * f + local.y) * f + local.x;
+	uint w = bit < 32 ? claudeTree[3 * pn] : claudeTree[3 * pn + 1];
+	return ((w >> uint(bit < 32 ? bit : bit - 32)) & 1u) != 0u;
+}
+
+int treeTie(vec3 side)
+{
+	if (side.x < side.y && side.x < side.z)
+		return 0;
+	if (side.y < side.z)
+		return 1;
+	return 2;
+}
+
+// first solid base piece along the ray: ro in BASE units; t in base units
+bool treeWalk(vec3 ro, vec3 rd, out ivec3 hitB, out int hitAxis, out float hitT)
+{
+	for (int l = 0; l < TREE_TOP; l++)
+		tnode[l] = -1;
+	tnode[TREE_TOP] = 0;
+	tcoord[TREE_TOP] = ivec3(0);
+	vec3 stepDir = sign(rd);
+	vec3 delta0 = 1.0 / max(abs(rd), vec3(1e-8));
+	int L = 0;
+	ivec3 c = ivec3(floor(ro));
+	float t = 0.0;
+	int axis = -1;
+	bool started = false;
+	vec3 side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
+	hitB = ivec3(0); hitAxis = -1; hitT = 0.0;
+	for (int i = 0; i < 4096; i++) {
+		if (started) {
+			for (int g = 0; g < 8 && L > 0 && treeOcc(L, c); g++) {
+				int f = treeF(L);
+				L -= 1;
+				int cs = treeS(L);
+				ivec3 k = ivec3(0);
+				for (int ax = 0; ax < 3; ax++) {
+					int lo = c[ax] * f;
+					if (stepDir[ax] == 0.0) {
+						k[ax] = clamp(int(floor((ro[ax] - float(lo * cs)) / float(cs))), 0, f - 1);
+						continue;
+					}
+					int n = 0;
+					for (int j = 1; j < 4; j++) {
+						if (j >= f)
+							break;
+						int jj = stepDir[ax] > 0.0 ? j : f - j;
+						float tm = (float((lo + jj) * cs) - ro[ax]) * stepDir[ax] * delta0[ax];
+						if (tm < t || (tm == t && ax > axis))
+							n++;
+						else
+							break;
+					}
+					k[ax] = stepDir[ax] > 0.0 ? n : f - 1 - n;
+				}
+				c = c * f + k;
+				side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
+			}
+			if (L == 0 && treeOcc(0, c)) {
+				hitB = c; hitAxis = axis; hitT = t;
+				return true;
+			}
+			for (int g = 0; g < 8 && L < TREE_TOP && !treeOcc(L + 1, c / treeF(L + 1)); g++) {
+				c = c / treeF(L + 1);
+				L += 1;
+				side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
+			}
+		}
+		started = true;
+		int a = treeTie(side);
+		t = side[a];
+		axis = a;
+		c[a] += int(stepDir[a]);
+		if (c[a] < 0 || c[a] >= 2048 / treeS(L))
+			return false;
+		side = tcross(vec3((c + ivec3(greaterThan(stepDir, vec3(0.0)))) * treeS(L)), ro, stepDir, delta0);
+	}
+	return false;
+}
+#endif
 
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
@@ -3662,7 +3831,7 @@ void main(void)
 	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
 	// and want the free anti-aliasing (and want it identically, so the
 	// three instrument views can be divided pixel by pixel).
-	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || view == 33 || view == 34)
+	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || view == 33 || view == 34 || view == 35)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -4758,6 +4927,77 @@ void main(void)
 	//   view 33: the 1 m cell and face, coded as view 22 (255 = none)
 	//   view 34: the 1/16 piece inside that cell: R = sx*16 + sy, G = sz,
 	//            B = 1 where a hit exists
+	// LADDER PLAN STAGE 2 GATE (2026-10-07): today's walk and the tree walk
+	// on the same camera ray, in the same shader, one colour per verdict:
+	// green = same cell, face and distance; red = different 1 m cell;
+	// yellow = same cell, different face; blue = same cell and face,
+	// distance differs; magenta = only today's walk hit; cyan = only the
+	// tree hit; black = neither (sky, far field).
+	if (view == 35) {
+		vec3 verdict = vec3(1.0, 1.0, 1.0);   // white: tree unavailable
+#ifdef CLAUDE_TREE_OK
+		vec3 hpM, nM, albM, leM, cellM;
+		float tM;
+		bool hm = march(ro, rd, hpM, nM, albM, leM, tM, cellM);
+		hm = hm && all(greaterThanEqual(cellM, vec3(0.0))) && all(lessThan(cellM, vec3(GRID_S)));
+		ivec3 hb;
+		int ha;
+		float tb;
+		vec3 roT = ro * 16.0 + (claudeTreePlant > 0.5 ? vec3(1.0 / 64.0, 0.0, 0.0) : vec3(0.0));
+		bool ht = treeWalk(roT, rd, hb, ha, tb);
+		int vi;
+		vec3 cellT = floor(vec3(hb) / 16.0);
+		if (!hm && !ht) {
+			verdict = vec3(0.0); vi = 0;
+		} else if (hm && !ht) {
+			verdict = vec3(1.0, 0.0, 1.0); vi = 5;
+		} else if (!hm && ht) {
+			verdict = vec3(0.0, 1.0, 1.0); vi = 6;
+		} else {
+			vec3 nT = vec3(0.0);
+			if (ha >= 0)
+				nT[ha] = -sign(rd[ha]);
+			if (any(notEqual(cellT, floor(cellM)))) {
+				verdict = vec3(1.0, 0.0, 0.0); vi = 2;
+			} else if (any(greaterThan(abs(nT - nM), vec3(0.5)))) {
+				verdict = vec3(1.0, 1.0, 0.0); vi = 3;
+			} else if (abs(tb / 16.0 - tM) > 2e-3) {
+				verdict = vec3(0.0, 0.0, 1.0); vi = 4;
+			} else {
+				verdict = vec3(0.0, 1.0, 0.0); vi = 1;
+			}
+		}
+		atomicAdd(claudeTreeCount[vi], 1u);
+		if (vi >= 2) {
+			uint k = atomicAdd(claudeTreeCount[8], 1u);
+			if (k < 128u) {
+				uint b = 9u + 19u * k;
+				int aM = abs(nM.x) > 0.5 ? 0 : abs(nM.y) > 0.5 ? 1 : 2;
+				claudeTreeCount[b + 0u] = uint(gl_FragCoord.x);
+				claudeTreeCount[b + 1u] = uint(gl_FragCoord.y);
+				claudeTreeCount[b + 2u] = uint(vi);
+				claudeTreeCount[b + 3u] = uint(hm ? cellM.x : -1.0);
+				claudeTreeCount[b + 4u] = uint(hm ? cellM.y : -1.0);
+				claudeTreeCount[b + 5u] = uint(hm ? cellM.z : -1.0);
+				claudeTreeCount[b + 6u] = uint(hm ? aM : 9);
+				claudeTreeCount[b + 7u] = floatBitsToUint(hm ? tM : -1.0);
+				claudeTreeCount[b + 8u] = uint(hb.x);
+				claudeTreeCount[b + 9u] = uint(hb.y);
+				claudeTreeCount[b + 10u] = uint(hb.z);
+				claudeTreeCount[b + 11u] = uint(ht ? ha : 9);
+				claudeTreeCount[b + 12u] = floatBitsToUint(ht ? tb / 16.0 : -1.0);
+				claudeTreeCount[b + 13u] = floatBitsToUint(rd.x);
+				claudeTreeCount[b + 14u] = floatBitsToUint(rd.y);
+				claudeTreeCount[b + 15u] = floatBitsToUint(rd.z);
+				claudeTreeCount[b + 16u] = floatBitsToUint(ro.x);
+				claudeTreeCount[b + 17u] = floatBitsToUint(ro.y);
+				claudeTreeCount[b + 18u] = floatBitsToUint(ro.z);
+			}
+		}
+#endif
+		gl_FragColor = vec4(verdict, 1.0);
+		return;
+	}
 	if (view == 33 || view == 34) {
 		vec3 code = vec3(255.0);
 		vec3 sub = vec3(0.0);
