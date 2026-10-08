@@ -914,9 +914,30 @@ FURNACE_PATCH = None
 # off-centre where the fence subtends more. If this ever proves flaky,
 # the honest fix is a third clean run and a re-derivation, not a wider
 # number.
-# PNG-era pin, kept for the record (2026-10-08): {"050": 0.9881} +/- 0.0006.
-SKYFURNACE_PINNED = {"050": None}
-SKYFURNACE_TOL = {"050": None}
+# THE PNG-ERA PIN ABOVE WAS THE INSTRUMENT (2026-10-08), kept for the record:
+#   SKYFURNACE_PINNED = {"050": 0.9881}; SKYFURNACE_TOL = {"050": 0.0006}
+# The 8-bit inversion (aces_inverse(byte ** 2.2)) read this pad 1.2 % low
+# and moved with noise; the fence is not "the 1.19 %" (with the fence
+# removed the PNG still read 0.9881, the linear buffer 0.99979).
+#
+# RE-DERIVED 2026-10-08 IN LINEAR RADIANCE (claude_accum_dump at the
+# shutter, 501 frames), fence in place as deployed, three consecutive runs
+# at bf534dc9f (20261008-232357, -233020, -233442):
+#   skyfurnace-050       R/G/B 0.99212 0.99186 0.99166 (all three runs)
+#   skyfurnace-050-nee1  R/G/B 0.99213 0.99188 0.99168, then 0.99214 0.99188 0.99168 (x2)
+#   PNG, same frames     R/G/B 0.98807 0.98807 0.98807
+#   standard error of the patch mean 0.00002 per channel
+# PER CHANNEL now: the channels differ by 0.00046, more than 20 standard
+# errors, so it is real -- the fence and the gallery buildings bounce back
+# coloured light (the PNG's 8-bit steps could not see it). The 0.8 % below
+# 1.0 is the fence: without it the same pad read 0.99979.
+# Tolerance: 3 x the larger of the run-to-run spread (0.00002) and the
+# patch's standard error (0.00002), floored at 3 x the printed resolution
+# (0.00001). The standard error enters because captures repeat exactly
+# (rng 2), so run-to-run spread is zero by construction and says nothing
+# about how far a correct change of the random sequence moves the mean.
+SKYFURNACE_PINNED = {"050": {"R": 0.99212, "G": 0.99186, "B": 0.99166}}
+SKYFURNACE_TOL = {"050": 0.00006}
 
 # MEASUREMENT EXPOSURE for every furnace arm (2026-10-05). At exposure 1
 # furnace-073's patch was 98.7 % byte 255 (the clip, read back as 7.22)
@@ -942,8 +963,20 @@ SKYFURNACE_TOL = {"050": None}
 # PNG-era pins, kept for the record (2026-10-08):
 #   FURNACE_PINNED = {"050": 0.998, "073": 0.999}
 #   FURNACE_TOL = {"050": 0.003, "073": 0.003}
-FURNACE_PINNED = {"050": None, "073": None}
-FURNACE_TOL = {"050": None, "073": None}
+#
+# RE-DERIVED 2026-10-08 IN LINEAR RADIANCE (claude_accum_dump at the
+# shutter: 501 frames, 4001 for -air), three consecutive runs at bf534dc9f
+# (20261008-232357, -233020, -233442), identical in all three:
+#   furnace-050      0.99994  (PNG of the same frames 0.99842-0.99843)  SE 0.00009
+#   furnace-050-air  0.99985  (PNG 0.99809-0.99810)                     SE 0.00008
+#   furnace-073      0.99933  (PNG 0.99874-0.99875)                     SE 0.00025
+# The renderer is energy-exact within its noise in both rooms; furnace-073's
+# 0.07 % is 2.7 standard errors, and the 24-bounce cap alone takes 0.73^25
+# = 0.04 % off a rho = 0.73 room. Tolerance: 3 x the larger of run-to-run
+# spread (0) and the patch's standard error, as for the sky furnace.
+# furnace-050-air shares the 050 pin and sits 1 standard error from it.
+FURNACE_PINNED = {"050": 0.99994, "073": 0.99933}
+FURNACE_TOL = {"050": 0.00027, "073": 0.00075}
 # Legacy name kept so old run.json rows still parse.
 FURNACE_RATIO_TOL = 0.15
 
@@ -953,6 +986,16 @@ FURNACE_RATIO_TOL = 0.15
 # and it is deliberately tight enough to fail the estimator arm: nee 1
 # reads +2% to +9% by region and is RED today BY DESIGN. That red is
 # roadmap step 1a's gate.
+#
+# LINEAR SINCE 2026-10-08: the region means come from the linear dump of
+# this capture and of the golden's (the golden must be a run that has
+# them). The tolerance is unchanged: it is a statement about the photo
+# arm's noise at CI depth, which the readback does not change. Measured
+# on the same frames (run 20261008-233442), linear vs PNG worst deviation:
+# cornell vs the 2026-10-06 golden 1.00002 (PNG); cornell-nee1 vs this
+# run's cornell 1.00388 linear, 1.00370 PNG (ceiling_flanks). Region means
+# read 0.03-0.09 % higher in linear than through the inverted display
+# curve; in a ratio against a golden read the same way that cancels.
 CORNELL_RATIO_TOL = 0.010
 # the PNG ratio's tolerance, used only while the golden has no linear dump
 CORNELL_RATIO_TOL_PNG = 0.010
@@ -2485,6 +2528,17 @@ def parse_cornell(t):
     return out
 
 
+def _pinned_verdict(r, pin, tol):
+    """PASS iff every channel's ratio is within tol of its pin; pin is one
+    number for all channels or a per-channel {"R", "G", "B"} dict."""
+    pins = pin if isinstance(pin, dict) else {c: pin for c in r}
+    dev = {c: r[c] - pins[c] for c in r}
+    worst = max(dev, key=lambda c: abs(dev[c]))
+    ok = all(abs(d) <= tol for d in dev.values())
+    return ("PASS" if ok else "FAIL"), "linear ratio %s %.5f (pinned %.5f +/- %.5f)" % (
+        worst, r[worst], pins[worst], tol)
+
+
 def furnace_verdict(ref, variant):
     """PASS/FAIL against the room's own pinned ratio, not a blanket 15%."""
     if not ref or ref.get("returncode") != 0:
@@ -2499,10 +2553,7 @@ def furnace_verdict(ref, variant):
     if pin is None or tol is None:
         return "-", ("no pin derived yet; measured %s"
                      % {k: round(v, 5) for k, v in sorted(r.items())})
-    worst = max(r.values(), key=lambda v: abs(v - pin))
-    ok = all(abs(v - pin) <= tol for v in r.values())
-    return ("PASS" if ok else "FAIL"), "linear ratio %.5f (pinned %.5f +/- %.5f)" % (
-        worst, pin, tol)
+    return _pinned_verdict(r, pin, tol)
 
 
 def skyfurnace_verdict(ref, variant):
@@ -2527,10 +2578,7 @@ def skyfurnace_verdict(ref, variant):
         # honest verdict -- a referee that cannot speak is not a pass.
         return "-", ("no pin derived yet; measured %s"
                      % {k: round(v, 5) for k, v in sorted(r.items())})
-    worst = max(r.values(), key=lambda v: abs(v - pin))
-    ok = all(abs(v - pin) <= tol for v in r.values())
-    return ("PASS" if ok else "FAIL"), "linear ratio %.5f (pinned %.5f +/- %.5f)" % (
-        worst, pin, tol)
+    return _pinned_verdict(r, pin, tol)
 
 
 def cornell_verdict(ref):
