@@ -2213,13 +2213,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_brick_ids_sampler_pixel{"claudeBrickIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_brick_pool_sampler_pixel{"claudeBrickPool"};
 	// claude_bricks: 1 = the walk reads its 1/16 m shapes from the pool
-	float m_bricks = 0.0f;
+	float m_bricks = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_bricks_pixel{"claudeBricks"};
 	// claude_bricks_far (B3): node-box shapes past the ring walked too
-	float m_bricks_far = 0.0f;
+	float m_bricks_far = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_bricks_far_pixel{"claudeBricksFar"};
 	// claude_walk_exact (2026-10-07): every crossing from tcross()
-	float m_walk_exact = 0.0f;
+	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
@@ -3384,11 +3384,11 @@ public:
 		if (name == "claude_tree_dirs")
 			m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		if (name == "claude_bricks")
-			m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
+			m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
 		if (name == "claude_bricks_far")
-			m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
+			m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		if (name == "claude_walk_exact")
-			m_walk_exact = readAir("claude_walk_exact", 0.0f, 1.0f);
+			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3505,9 +3505,9 @@ public:
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
-		m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
-		m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
-		m_walk_exact = readAir("claude_walk_exact", 0.0f, 1.0f);
+		m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
+		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
+		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);

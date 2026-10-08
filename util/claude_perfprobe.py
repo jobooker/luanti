@@ -36,7 +36,7 @@ PLAY = {"claude_nee": 1, "claude_bounces": 24, "claude_far_levels": 3, "claude_d
         "claude_guide_impl": 2, "claude_guide_keep": 0.25, "claude_area_pick": 0, "claude_area_skip": 0,
         # ladder stage 2 instruments (a dial missing here leaks between arms:
         # claude_tree_dirs did, 2026-10-07)
-        "claude_view": 0, "claude_tree_variant": 0, "claude_tree_dirs": 0, "claude_bricks": 0, "claude_bricks_far": 0, "claude_walk_exact": 0}
+        "claude_view": 0, "claude_tree_variant": 0, "claude_tree_dirs": 0, "claude_bricks": 1, "claude_bricks_far": 1, "claude_walk_exact": 1}
 ARMS = [("play", {}), ("play-again", {}), ("nee 0", {"claude_nee": 0}),
         ("bounces 2", {"claude_bounces": 2}), ("bounces 4", {"claude_bounces": 4}),
         ("far 0", {"claude_far_levels": 0}), ("denoise 0", {"claude_denoise": 0}),
