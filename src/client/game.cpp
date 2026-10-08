@@ -320,6 +320,20 @@ struct ClaudeTraceGrid
 	std::vector<u16> nbox_all;
 	std::vector<std::array<u8, 512>> nbox_masks; // 1-based via nbox_ids
 	std::unordered_map<u32, u16> nbox_of;        // shape cache
+	// SURFACE RELIEF (claude_relief, 2026-10-08; John: "the bark textures
+	// ... look fake. And the ground has no texture"). A log or a dirt/grass
+	// block gets grooves carved into its EXPOSED faces where its own face
+	// tile is dark, so the groove is real geometry the tracer shadows. Built
+	// once per content (the per-face depth maps, from the tiles as drawn)
+	// and once per (content, exposed faces) shape, into the SAME nbox_masks
+	// pool the node-box shapes use; a cell only stores the shape id in
+	// nbox_all. The cell's material stays a plain solid, so its hits keep
+	// their per-texel colour (claudeTexel) exactly like a B3 stair.
+	int relief_depth = 0;                        // dial the grid was built under
+	std::vector<std::array<u8, 768>> relief_maps; // 1-based: depth per texel, top/bottom/side
+	std::unordered_map<content_t, u16> relief_base_of; // content -> map id, 0 = none
+	std::unordered_map<u32, u16> relief_shape_of;      // (map id << 6 | exposed) -> nbox id
+	u32 relief_cells = 0;                        // cells carved in the last full walk
 	std::unordered_map<content_t, u8> palette;
 	std::vector<u8> atlas; // BGRA
 	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
@@ -1997,13 +2011,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_gray_pixel{"grayWorld"};
 	CachedPixelShaderSetting<float, 1, false> m_pure_pixel{"purePhoto"};
 	CachedPixelShaderSetting<float, 1, false> m_bevel_pixel{"bevelStrength"};
-	CachedPixelShaderSetting<float, 1, false> m_relief_pixel{"reliefStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_parallax_pixel{"parallaxStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_jitter_pixel{"jitterStrength"};
 	CachedPixelShaderSetting<float, 1, false> m_skybounce_pixel{"skyBounce"};
 	CachedPixelShaderSetting<float, 1, false> m_sunangle_pixel{"sunAngle"};
 	CachedPixelShaderSetting<float, 1, false> m_nightsky_pixel{"nightSkyGain"};
-	float m_texture_amount, m_gray, m_bevel, m_relief, m_parallax, m_jitter;
+	float m_texture_amount, m_gray, m_bevel, m_parallax, m_jitter;
 	float m_pure = 0.0f;
 	float m_skybounce, m_sunangle, m_nightsky, m_moongain;
 	float m_bounce2 = 0.0f;
@@ -2392,7 +2405,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_gray",
 		"claude_pure",
 		"claude_bevel",
-		"claude_relief",
 		"claude_parallax",
 		"claude_jitter",
 		"claude_skybounce",
@@ -2563,13 +2575,6 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		if (!g_settings->exists("claude_bevel"))
 			return 0.35f;
 		return g_settings->getFloat("claude_bevel", 0.0f, 1.0f);
-	}
-
-	static float readRelief()
-	{
-		if (!g_settings->exists("claude_relief"))
-			return 0.0f;
-		return g_settings->getFloat("claude_relief", 0.0f, 1.0f);
 	}
 
 	static float readParallax()
@@ -3279,8 +3284,6 @@ public:
 			m_pure = readPure();
 		if (name == "claude_bevel")
 			m_bevel = readBevel();
-		if (name == "claude_relief")
-			m_relief = readRelief();
 		if (name == "claude_parallax")
 			m_parallax = readParallax();
 		if (name == "claude_jitter")
@@ -3458,7 +3461,6 @@ public:
 		m_gray = readGray();
 		m_pure = readPure();
 		m_bevel = readBevel();
-		m_relief = readRelief();
 		m_parallax = readParallax();
 		m_jitter = readJitter();
 		m_skybounce = readSkyBounce();
@@ -3997,7 +3999,6 @@ public:
 				m_gray_pixel.set(&m_gray, services);
 				m_pure_pixel.set(&m_pure, services);
 				m_bevel_pixel.set(&m_bevel, services);
-				m_relief_pixel.set(&m_relief, services);
 				m_parallax_pixel.set(&m_parallax, services);
 				m_jitter_pixel.set(&m_jitter, services);
 				m_skybounce_pixel.set(&m_skybounce, services);
@@ -4461,45 +4462,61 @@ int claudeWarnRenamedSettings(const Settings *src, const char *source)
 // multiplies the cell's own colour by it, so a cell's mean stays what the
 // grid says, its biome tint still comes from the grid, and only the
 // pattern is added. Emission does not read it.
-static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
-		video::SColor ref, video::SColor tint)
+// One face tile AS LUANTI DRAWS IT (face 0 top, 1 bottom, 2 side), 16x16
+// sRGB bytes as doubles: the base tile times its own colour or the node's
+// tint, the overlay composited over it. `ref` fills a face with no tile.
+// Shared by the atlas (which stores it as a ratio to the cell colour) and
+// the relief bake (which reads its brightness), so the groove a ray finds
+// is under the texel the same ray is coloured by.
+static bool claudeFaceTileRGB(Client *client, const ContentFeatures &f,
+		int face, video::SColor ref, video::SColor tint, double out[256][3])
 {
-	u32 *dst = (u32 *)g_claude_grid.atlas.data();
-	auto load = [&](const TileDef &td, u32 *out) -> bool {
+	auto load = [&](const TileDef &td, u32 *px) -> bool {
 		if (td.name.empty())
 			return false;
 		video::IImage *img = client->tsrc()->claudeGetImage(td.name);
 		if (!img)
 			return false;
-		img->copyToScaling(out, 16, 16, video::ECF_A8R8G8B8);
+		img->copyToScaling(px, 16, 16, video::ECF_A8R8G8B8);
 		img->drop();
 		return true;
 	};
-	const int src_face[3] = {0, 1, 2};
+	const TileDef &bt = f.tiledef[face];
+	const TileDef &ot = f.tiledef_overlay[face];
+	u32 base[256], over[256];
+	bool hb = load(bt, base), ho = load(ot, over);
+	video::SColor bm = bt.has_color ? bt.color : tint;
+	video::SColor om = ot.has_color ? ot.color : tint;
+	for (int k = 0; k < 256; k++) {
+		double *c = out[k];
+		c[0] = ref.getRed(); c[1] = ref.getGreen(); c[2] = ref.getBlue();
+		if (hb) {
+			c[0] = ((base[k] >> 16) & 0xFF) * bm.getRed() / 255.0;
+			c[1] = ((base[k] >> 8) & 0xFF) * bm.getGreen() / 255.0;
+			c[2] = (base[k] & 0xFF) * bm.getBlue() / 255.0;
+		}
+		if (ho) {
+			double a = ((over[k] >> 24) & 0xFF) / 255.0;
+			double o[3] = {((over[k] >> 16) & 0xFF) * om.getRed() / 255.0,
+					((over[k] >> 8) & 0xFF) * om.getGreen() / 255.0,
+					(over[k] & 0xFF) * om.getBlue() / 255.0};
+			for (int ch = 0; ch < 3; ch++)
+				c[ch] = c[ch] * (1.0 - a) + o[ch] * a;
+		}
+	}
+	return hb || ho;
+}
+
+static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
+		video::SColor ref, video::SColor tint)
+{
+	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	for (int face = 0; face < 3; face++) {
-		const TileDef &bt = f.tiledef[src_face[face]];
-		const TileDef &ot = f.tiledef_overlay[src_face[face]];
-		u32 base[256], over[256];
-		bool hb = load(bt, base), ho = load(ot, over);
-		video::SColor bm = bt.has_color ? bt.color : tint;
-		video::SColor om = ot.has_color ? ot.color : tint;
+		double rgb[256][3];
+		claudeFaceTileRGB(client, f, face, ref, tint, rgb);
 		int ax = (mid % 16) * 16, ay = face * 256 + (mid / 16) * 16;
 		for (int k = 0; k < 256; k++) {
-			double c[3] = {(double)ref.getRed(), (double)ref.getGreen(),
-					(double)ref.getBlue()};   // no tile: ratio 1
-			if (hb) {
-				c[0] = ((base[k] >> 16) & 0xFF) * bm.getRed() / 255.0;
-				c[1] = ((base[k] >> 8) & 0xFF) * bm.getGreen() / 255.0;
-				c[2] = (base[k] & 0xFF) * bm.getBlue() / 255.0;
-			}
-			if (ho) {
-				double a = ((over[k] >> 24) & 0xFF) / 255.0;
-				double o[3] = {((over[k] >> 16) & 0xFF) * om.getRed() / 255.0,
-						((over[k] >> 8) & 0xFF) * om.getGreen() / 255.0,
-						(over[k] & 0xFF) * om.getBlue() / 255.0};
-				for (int ch = 0; ch < 3; ch++)
-					c[ch] = c[ch] * (1.0 - a) + o[ch] * a;
-			}
+			const double *c = rgb[k];
 			double r[3] = {(double)ref.getRed(), (double)ref.getGreen(),
 					(double)ref.getBlue()};
 			u32 px = 0xFF000000u;
@@ -5064,6 +5081,193 @@ static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, Map &map,
 	return id;
 }
 
+// ---- SURFACE RELIEF (claude_relief, 2026-10-08) ----------------------
+// claude_relief: the deepest groove, in 1/16 m (0 = off, the default; 4
+// at most). Read at every walk; a change forces a full re-walk (see
+// geom_moved), because every carved cell's shape id changes with it.
+static int claudeReliefDepth()
+{
+	if (!g_settings->exists("claude_relief"))
+		return 0;
+	return (int)std::lround(g_settings->getFloat("claude_relief", 0.0f, 4.0f));
+}
+
+// Which nodes are carved: logs and soil, by the game's own groups, and only
+// plain opaque cubes.
+// TUNED: the set of carved nodes (groups tree, dirt) | learn by: John's eye
+// on the side-by-sides, material by material
+static bool claudeReliefCandidate(const ContentFeatures &f)
+{
+	return f.drawtype == NDT_NORMAL && f.light_source == 0 && !f.isLiquid()
+			&& (f.getGroup("tree") > 0 || f.getGroup("dirt") > 0);
+}
+
+// One content's groove depths: per face tile (0 top, 1 bottom, 2 side, the
+// three tiles the atlas holds and faceTileRatio() colours by), a depth per
+// texel. Dark texels sink, by RANK within the tile, so a texture pack's
+// overall brightness does not change how much is carved. Memoised per
+// content; 0 = nothing to carve.
+static u16 claudeReliefMapId(Client *client, content_t c,
+		const ContentFeatures &f, video::SColor col, video::SColor tint)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	auto it = V.relief_base_of.find(c);
+	if (it != V.relief_base_of.end())
+		return it->second;
+	// TUNED: the darkest 35% of a tile's texels sink | learn by: the groove
+	// share John picks from side-by-sides, or authored height maps (LabPBR
+	// packs) as the known answer to fit brightness->height against
+	const double CARVE_FRAC = 0.35;
+	// TUNED: a tile whose luminance spread is under 6 sRGB levels is flat and
+	// is not carved | learn by: the same, on tiles John calls smooth
+	const double FLAT_STD = 6.0;
+	const int D = V.relief_depth;
+	std::array<u8, 768> m{};
+	bool any = false;
+	for (int face = 0; face < 3; face++) {
+		double rgb[256][3];
+		if (!claudeFaceTileRGB(client, f, face, col, tint, rgb))
+			continue;
+		double lum[256], mean = 0.0, var = 0.0;
+		for (int k = 0; k < 256; k++) {
+			lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1]
+					+ 0.0722 * rgb[k][2];
+			mean += lum[k] / 256.0;
+		}
+		for (int k = 0; k < 256; k++)
+			var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
+		if (std::sqrt(var) < FLAT_STD)
+			continue;
+		for (int k = 0; k < 256; k++) {
+			// the share of the tile at least this dark. Ties count whole:
+			// a 4-level tile (grass) carves a whole level or none of it,
+			// so no more than CARVE_FRAC of a tile ever sinks
+			int atmost = 0;
+			for (int j = 0; j < 256; j++)
+				atmost += lum[j] <= lum[k];
+			double p = atmost / 256.0;
+			if (p > CARVE_FRAC)
+				continue;
+			int d = 1 + (int)(D * (CARVE_FRAC - p) / CARVE_FRAC);
+			m[face * 256 + k] = (u8)std::min(d, D);
+			any = true;
+		}
+	}
+	u16 id = 0;
+	if (any) {
+		V.relief_maps.push_back(m);
+		id = (u16)V.relief_maps.size();
+	}
+	V.relief_base_of[c] = id;
+	return id;
+}
+
+// Which faces of the node at wp are open (bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z,
+// 5 -Z). A face against another plain opaque cube is closed and is not
+// carved, so a buried dirt block stays a plain cube and a trunk's grooves
+// run on across the seam to the next log. An unloaded neighbour counts as
+// closed: when it arrives, the incremental path's one-node halo re-walks
+// this cell.
+static u8 claudeReliefExposed(Map &map, const NodeDefManager *ndef, v3s16 wp)
+{
+	static const v3s16 dirs[6] = {v3s16(1, 0, 0), v3s16(-1, 0, 0),
+			v3s16(0, 1, 0), v3s16(0, -1, 0), v3s16(0, 0, 1), v3s16(0, 0, -1)};
+	u8 ex = 0;
+	for (int k = 0; k < 6; k++) {
+		content_t nc = map.getNode(wp + dirs[k]).getContent();
+		if (nc == CONTENT_IGNORE)
+			continue;
+		if (nc == CONTENT_AIR) {
+			ex |= (u8)(1 << k);
+			continue;
+		}
+		const ContentFeatures &nf = ndef->get(nc);
+		if (nf.drawtype != NDT_NORMAL || nf.isLiquid())
+			ex |= (u8)(1 << k);
+	}
+	return ex;
+}
+
+// (depth map, open faces) -> a 16^3 shape in the shared node-box pool.
+// Texel <-> voxel mapping is faceTileRatio()'s, so the colour a ray gets
+// is the texel the groove was carved from.
+//
+// THE BAKE FLOOR (util/claude_models.py enforce_opaque, proven 2026-08-17):
+// an air voxel must lie within D of EXACTLY ONE open face. Each face's air
+// is then its own box, open only through that face, so no straight ray can
+// cross the node. Closed faces do not count, which is what lets grooves
+// reach the edge where the neighbour is the same kind of cube; between two
+// OPEN faces (a trunk's vertical corner) a D-wide rim stays solid.
+static u16 claudeReliefShapeId(u16 mapid, u8 exposed)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	u32 key = ((u32)mapid << 6) | exposed;
+	auto it = V.relief_shape_of.find(key);
+	if (it != V.relief_shape_of.end())
+		return it->second;
+	u16 id = 0;
+	if (V.nbox_masks.size() < ClaudeTraceGrid::NBOX_CAP) {
+		const std::array<u8, 768> &m = V.relief_maps[mapid - 1];
+		const int D = V.relief_depth;
+		static bool air[16][16][16]; // [z][y][x]
+		memset(air, 0, sizeof(air));
+		for (int k = 0; k < 6; k++) {
+			if (!(exposed & (1 << k)))
+				continue;
+			for (int a = 0; a < 16; a++)
+			for (int b = 0; b < 16; b++) {
+				// (a, b) = the two in-plane voxel coords; tx, ty = texel
+				int tile, tx, ty;
+				switch (k) {
+				case 0: tile = 2; tx = 15 - b; ty = 15 - a; break; // +X: y=a, z=b
+				case 1: tile = 2; tx = b; ty = 15 - a; break;      // -X
+				case 2: tile = 0; tx = a; ty = b; break;           // +Y: x=a, z=b
+				case 3: tile = 1; tx = a; ty = b; break;           // -Y
+				case 4: tile = 2; tx = a; ty = 15 - b; break;      // +Z: x=a, y=b
+				default: tile = 2; tx = 15 - a; ty = 15 - b; break; // -Z
+				}
+				int d = m[tile * 256 + ty * 16 + tx];
+				for (int dd = 0; dd < d; dd++) {
+					int x, y, z;
+					switch (k) {
+					case 0: x = 15 - dd; y = a; z = b; break;
+					case 1: x = dd; y = a; z = b; break;
+					case 2: x = a; y = 15 - dd; z = b; break;
+					case 3: x = a; y = dd; z = b; break;
+					case 4: x = a; y = b; z = 15 - dd; break;
+					default: x = a; y = b; z = dd; break;
+					}
+					air[z][y][x] = true;
+				}
+			}
+		}
+		std::array<u8, 512> mask{};
+		int bits = 0;
+		for (int z = 0; z < 16; z++)
+		for (int y = 0; y < 16; y++)
+		for (int x = 0; x < 16; x++) {
+			bool a = air[z][y][x];
+			if (a) {
+				const int dist[6] = {15 - x, x, 15 - y, y, 15 - z, z};
+				int n = 0;
+				for (int k = 0; k < 6; k++)
+					n += (exposed & (1 << k)) && dist[k] < D;
+				a = n == 1;
+			}
+			if (!a) {
+				mask[(z * 16 + y) * 2 + x / 8] |= (u8)(1 << (x % 8));
+				bits++;
+			}
+		}
+		if (bits < 4096) {
+			V.nbox_masks.push_back(mask);
+			id = (u16)V.nbox_masks.size();
+		}
+	}
+	V.relief_shape_of[key] = id;
+	return id;
+}
+
 static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		Map &map, v3s16 origin, int b)
 {
@@ -5334,7 +5538,12 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// small-emitter law; honest until the NEE+MIS area block).
 		// Sub-cube point lights (torch/lantern/campfire, class 165)
 		// keep their existing nub+NEE treatment.
-		if (!g_claude_grid.model_of.empty()
+		// RELIEF BEATS A TEXTURE-BAKED CUBE MODEL for the nodes it carves
+		// (claude_relief > 0): log_oak_baked is the older bake of the same
+		// idea, from the tile files, in one colour per cell.
+		bool relief_node = V.relief_depth > 0 && plain_solid
+				&& claudeReliefCandidate(f);
+		if (!g_claude_grid.model_of.empty() && !relief_node
 				&& (plain_solid || leaves_model || (f.light_source > 0
 					&& f.drawtype == NDT_NORMAL))) {
 			auto mit = g_claude_grid.model_of.find(c);
@@ -5380,6 +5589,23 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 				nbid = sid;
 				mat.fine = 1;            // "this cell has sub-voxel bits"
 				V.nbox_ids[nbring] = nbid;
+			}
+		}
+		// SURFACE RELIEF: the shape goes in nbox_all only (the piece ids
+		// read it everywhere, the ring's own state is untouched) and the
+		// material stays a plain solid, so the hit keeps its texel colour.
+		if (relief_node && V.modelids[i] == 0 && nbid == 0
+				&& !V.nbox_all.empty() && V.nbox_all[i] == 0) {
+			video::SColor rtint(255, 255, 255, 255);
+			if (f.visuals)
+				f.visuals->getColor(n.getParam2(), &rtint);
+			u16 rm = claudeReliefMapId(client, c, f, col, rtint);
+			u8 ex = rm ? claudeReliefExposed(map, ndef,
+					origin + v3s16(x, y, z)) : 0;
+			u16 sid = ex ? claudeReliefShapeId(rm, ex) : 0;
+			if (sid) {
+				V.nbox_all[i] = sid;
+				V.relief_cells++;
 			}
 		}
 		u8 midx = claudeMatIndex(mat);
@@ -5709,6 +5935,10 @@ static void claudeTraceGridBakeBricks(int x0, int y0, int z0, int w, int h, int 
 				id = ClaudeTraceGrid::BRICK_MODEL0 + ((mtag >> 2) - 1) * 4 + (mtag & 3);
 			else if (bakes && !V.nbox_ids.empty() && V.nbox_ids[ring])
 				id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_ids[ring];
+			else if (bakes && !V.nbox_all.empty() && V.nbox_all[vi])
+				// only a relief cell gets here: a node-box cell in the
+				// ring has the same id in nbox_ids, caught above
+				id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_all[vi];
 			else
 				id = bakes ? ClaudeTraceGrid::BRICK_FULL : ClaudeTraceGrid::BRICK_ZERO;
 		} else if (tag >> 2) {
@@ -6358,6 +6588,19 @@ static void claudeTraceGridSnapshot(Client *client)
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	claudeLoadModels(ndef);
 	V.nodebox_on = claudeNodeBoxEnabled();
+	{
+		int rd = claudeReliefDepth();
+		if (rd != V.relief_depth) {
+			// depths are baked into the maps and shapes: start them over
+			// (the old shapes stay in nbox_masks, unreferenced, until the
+			// session ends; at most a few dozen per dial move)
+			V.relief_maps.clear();
+			V.relief_base_of.clear();
+			V.relief_shape_of.clear();
+		}
+		V.relief_depth = rd;
+		V.relief_cells = 0;
+	}
 	// RGBA per cell: rgb = the node type's average color (same one the
 	// minimap uses), alpha = occupancy class: 0 air, 128 water (so later
 	// reflection rays can recognize it), 255 solid.
@@ -6440,6 +6683,9 @@ static void claudeTraceGridSnapshot(Client *client)
 			<< " nodebox=" << (V.nodebox_on ? 1 : 0)
 			<< " nbox_shapes=" << V.nbox_masks.size()
 			<< "/" << V.nbox_of.size()
+			<< " relief=" << V.relief_depth
+			<< " relief_cells=" << V.relief_cells
+			<< " relief_shapes=" << V.relief_shape_of.size()
 			<< std::endl;
 }
 
@@ -6825,6 +7071,9 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"moon_phase\": " << g_claude_grid.units_moon_phase
 			<< ", \"point_emitters\": " << g_claude_grid.emitter_count
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
+			<< ", \"claude_relief\": " << g_claude_grid.relief_depth
+			<< ", \"relief_cells\": " << g_claude_grid.relief_cells
+			<< ", \"relief_shapes\": " << g_claude_grid.relief_shape_of.size()
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
 			<< ", \"sun_chroma\": [" << g_claude_grid.sun_chroma.X << ","
@@ -7415,10 +7664,11 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 		// be re-run.
 		bool geom_moved = consumer_on && g_claude_grid.valid
 				&& (claudeModelsEnabled() != g_claude_grid.models_on
-					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on);
+					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on
+					|| claudeReliefDepth() != g_claude_grid.relief_depth);
 		if (geom_moved) {
 			actionstream << "[claude_grid] geometry dial changed"
-					" (claude_models/claude_nodebox); full re-walk"
+					" (claude_models/claude_nodebox/claude_relief); full re-walk"
 					<< std::endl;
 			claudeTraceGridSnapshot(client);
 		} else if (follow && !g_claude_grid.valid && consumer_on) {
