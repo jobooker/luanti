@@ -1938,6 +1938,53 @@ bool treeWalk2(vec3 ro, vec3 rd, out ivec3 hitB, out int hitAxis, out float hitT
 }
 #endif
 
+// THE EXACT FINE WALK (claude_walk_exact 1, 2026-10-07). The ladder
+// stage 2 gate found today's walk wrong on 75 forest camera rays that the
+// tree walk gets right (float64 referee): it re-derived positions where
+// the tree uses the ONE formula. 64 came from the fine-entry pull
+// (SUBV - 1/512), the rest from running sums. With this dial every crossing
+// time comes from tcross() and the entry piece is found by counting the
+// piece planes already crossed at the entry time, with the walk's own tie
+// rule (z > y > x) -- the tree walk's descent, at factor 16. Planes are
+// cell + k/16, exact in float, so t is the tree's t / 16 exactly.
+uniform float claudeWalkExact;
+bool fineCrossed(float tm, float t, int ax, int axis)
+{
+	return tm < t || (tm == t && ax > axis);
+}
+// One axis of the entry piece. The rounded position is off by at most one
+// piece (its error is float-sized against 1/16 m), so one check each way.
+float fineEntryAxis(float hiA, float k, float roA, float sA, float dA,
+		float t, int ax, int axis)
+{
+	if (ax == axis)
+		return sA > 0.0 ? 0.0 : SUBV - 1.0;
+	if (sA == 0.0)
+		return k;
+	k = clamp(k, 0.0, SUBV - 1.0);
+	float tLo = (hiA + k * RUNG_FINE - roA) * sA * dA;
+	float tHi = (hiA + (k + 1.0) * RUNG_FINE - roA) * sA * dA;
+	if (sA > 0.0) {
+		if (k > 0.0 && !fineCrossed(tLo, t, ax, axis))
+			k -= 1.0;
+		else if (k < SUBV - 1.0 && fineCrossed(tHi, t, ax, axis))
+			k += 1.0;
+	} else {
+		if (k < SUBV - 1.0 && !fineCrossed(tHi, t, ax, axis))
+			k += 1.0;
+		else if (k > 0.0 && fineCrossed(tLo, t, ax, axis))
+			k -= 1.0;
+	}
+	return k;
+}
+vec3 fineEntryExact(vec3 hi, vec3 su, vec3 ro, vec3 stepDir, vec3 delta0,
+		float t, int axis)
+{
+	return vec3(fineEntryAxis(hi.x, su.x, ro.x, stepDir.x, delta0.x, t, 0, axis),
+			fineEntryAxis(hi.y, su.y, ro.y, stepDir.y, delta0.y, t, 1, axis),
+			fineEntryAxis(hi.z, su.z, ro.z, stepDir.z, delta0.z, t, 2, axis));
+}
+
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
 		out vec4 palOut, out float idxOut, out vec3 hpFar)
@@ -1967,6 +2014,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 	// ci in units of that size; L = 0 is the plain 1 m walk
 	int L = 0;
 	vec3 delta0 = 1.0 / max(abs(rd), vec3(DDA_MIN_ABS));
+	vec3 walkUp = step(0.0, stepDir);   // claude_walk_exact: the far plane's offset
+	vec3 walkSd = stepDir * delta0;     // ... and its slope (exact: a sign flip)
 
 	// THE STARTING CELL, and it is tested for exactly one thing. The
 	// loop below never tests the cell the ray starts in, which is what
@@ -2031,6 +2080,9 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			ci = floor(pu);
 			delta *= RUNG_FINE;
 			sideDist = (stepDir * (ci - pu) + stepDir * 0.5 + 0.5) * delta;
+			if (claudeWalkExact > 0.5)
+				sideDist = tcross(cellHi + (ci + step(0.0, stepDir)) * RUNG_FINE,
+						ro, stepDir, delta0);
 			lim = SUBV;
 		}
 	}
@@ -2043,15 +2095,26 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// then test what was entered: the cell the ray starts in is
 		// never tested, which is what keeps a bounce ray off its own
 		// surface.
+		// claude_walk_exact: the stepped axis's next plane from the one
+		// formula, (plane - ro) * (stepDir * delta0), the same float as
+		// tcross(); planes are cell + k/16, exact. Else the running sum.
+		bool exactStep = claudeWalkExact > 0.5 && L == 0;
+		bool fineRung = lim < GRID_S;
 		if (sideDist.x < sideDist.y && sideDist.x < sideDist.z) {
-			t = sideDist.x; sideDist.x += delta.x;
+			t = sideDist.x;
 			ci.x += stepDir.x; axis = 0;
+			sideDist.x = exactStep ? ((fineRung ? cellHi.x + (ci.x + walkUp.x) * RUNG_FINE
+					: ci.x + walkUp.x) - ro.x) * walkSd.x : sideDist.x + delta.x;
 		} else if (sideDist.y < sideDist.z) {
-			t = sideDist.y; sideDist.y += delta.y;
+			t = sideDist.y;
 			ci.y += stepDir.y; axis = 1;
+			sideDist.y = exactStep ? ((fineRung ? cellHi.y + (ci.y + walkUp.y) * RUNG_FINE
+					: ci.y + walkUp.y) - ro.y) * walkSd.y : sideDist.y + delta.y;
 		} else {
-			t = sideDist.z; sideDist.z += delta.z;
+			t = sideDist.z;
 			ci.z += stepDir.z; axis = 2;
+			sideDist.z = exactStep ? ((fineRung ? cellHi.z + (ci.z + walkUp.z) * RUNG_FINE
+					: ci.z + walkUp.z) - ro.z) * walkSd.z : sideDist.z + delta.z;
 		}
 
 		if (L > 0)
@@ -2153,6 +2216,8 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			lim = GRID_S;
 			vec3 pl = ro + rd * t - cellHi;
 			sideDist = t + (stepDir * (-pl) + stepDir * 0.5 + 0.5) * delta;
+			if (claudeWalkExact > 0.5)
+				sideDist = tcross(ci + step(0.0, stepDir), ro, stepDir, delta0);
 			escaped = any(lessThan(ci, vec3(0.0)))
 					|| any(greaterThanEqual(ci, vec3(GRID_S)));
 		}
@@ -2309,6 +2374,9 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 			vec3 pu = clamp((ro + rd * t - hi) * SUBV, vec3(0.0),
 					vec3(SUBV - 1.0 / 512.0));
 			vec3 su = floor(pu);
+			// (> 1.5: an ablation step while pricing, 2026-10-08; 2 = all)
+			if (claudeWalkExact > 0.5)
+				su = fineEntryExact(hi, su, ro, stepDir, delta0, t, axis);
 			// the entry sub-voxel's material, by the same rule the fine
 			// rung uses: the cell's own where the mask is set, AIR where
 			// it is not
@@ -2322,6 +2390,9 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 				delta *= RUNG_FINE;
 				sideDist = t + (stepDir * (su - pu)
 						+ stepDir * 0.5 + 0.5) * delta;
+				if (claudeWalkExact > 0.5)
+					sideDist = tcross(hi + (su + step(0.0, stepDir)) * RUNG_FINE,
+							ro, stepDir, delta0);
 				ci = su;
 				lim = SUBV;
 				continue;

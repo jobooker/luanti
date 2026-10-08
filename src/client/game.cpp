@@ -2218,6 +2218,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_bricks_far (B3): node-box shapes past the ring walked too
 	float m_bricks_far = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bricks_far_pixel{"claudeBricksFar"};
+	// claude_walk_exact (2026-10-07): every crossing from tcross()
+	float m_walk_exact = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
@@ -2439,6 +2442,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_tree_dirs",
 		"claude_bricks",
 		"claude_bricks_far",
+		"claude_walk_exact",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -3383,6 +3387,8 @@ public:
 			m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
 		if (name == "claude_bricks_far")
 			m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
+		if (name == "claude_walk_exact")
+			m_walk_exact = readAir("claude_walk_exact", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3501,6 +3507,7 @@ public:
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
 		m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
+		m_walk_exact = readAir("claude_walk_exact", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3828,6 +3835,7 @@ public:
 				m_brick_pool_sampler_pixel.set(&bpool, services);
 				m_bricks_pixel.set(&m_bricks, services);
 				m_bricks_far_pixel.set(&m_bricks_far, services);
+				m_walk_exact_pixel.set(&m_walk_exact, services);
 				SamplerLayer_t mtpal = 20, mtprobe = 21;
 				m_matpal_sampler_pixel.set(&mtpal, services);
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
