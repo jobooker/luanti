@@ -1344,6 +1344,7 @@ static void claudeGuideBind()
 	GL.BindImageTexture(2, g_guide_alias, 0, 0, 0, GL.READ_ONLY, GL.R32UI);
 }
 static std::string g_claude_shutter_token;
+static std::string g_claude_dump_at_shutter;   // claude_accum_dump_shutter
 static float g_claude_shutter_fired = -1.0f;
 static std::string g_claude_shutter_fired_token;
 
@@ -7288,6 +7289,16 @@ static bool claudeApplyPatchFile(const std::string &path,
 			g_claude_accum_dump = patch.get(name);   // read back after the next frame
 			continue;
 		}
+		// THE LINEAR READING AT A FIXED DEPTH (2026-10-08): armed here, the
+		// accumulation dump is requested by the shutter itself when it fires,
+		// so it is read back in the very next frame and holds exactly
+		// shutter_frames + 1 frames. Requested after the PNG on the 1 Hz poll
+		// instead, it landed 200-400 frames later, a depth that moved with
+		// timing, so two runs of one build read different linear numbers.
+		if (name == "claude_accum_dump_shutter") {
+			g_claude_dump_at_shutter = patch.get(name);
+			continue;
+		}
 		if (name == "claude_brick_check") {
 			claudeBrickCheck();
 			continue;
@@ -7377,6 +7388,7 @@ static bool claudeApplyPatchFile(const std::string &path,
 						<< n << " (" << v << ")" << std::endl;
 			} else {
 				g_claude_shutter_at = 0.0f;
+				g_claude_dump_at_shutter.clear();
 				actionstream << "[claude_settings_patch] shutter disarmed ("
 						<< v << ")" << std::endl;
 			}
@@ -11052,6 +11064,12 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 		actionstream << "[claude_settings_patch] shutter fired at still_frames="
 				<< g_claude_shutter_fired << " ("
 				<< g_claude_shutter_fired_token << ")" << std::endl;
+		if (!g_claude_dump_at_shutter.empty()) {
+			g_claude_accum_dump = g_claude_dump_at_shutter;   // the next frame: N + 1
+			g_claude_dump_at_shutter.clear();
+			actionstream << "[claude_accum_dump] armed by the shutter: next frame, "
+					<< (g_claude_shutter_fired + 1.0f) << " frames" << std::endl;
+		}
 	}
 	if (g_claude_screenshot_pending) {
 		g_claude_screenshot_pending = false;

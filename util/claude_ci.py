@@ -2128,10 +2128,22 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     tl.mark("await_grid")
     before = lab.newest_shot()
     shutter_tok = "%d:%s" % (settle, marker)
+    # THE LINEAR READING (2026-10-08): for the LINEAR_REFEREES arms the
+    # shutter itself requests the accumulation dump, read back in the next
+    # frame -- a fixed depth of shutter + 1 frames (see accum_dump).
+    linear = None
+    if (shot.get("referee") or (None,))[0] in LINEAR_REFEREES:
+        linear = os.path.join(rundir, name)
+        for ext in (".f32", ".json"):
+            if os.path.exists(linear + ext):
+                os.remove(linear + ext)
     with open(lab.PATCH, "w") as f:
+        if linear:
+            f.write("claude_accum_dump_shutter = %s\n" % linear)
         f.write("claude_shutter = %s\n" % shutter_tok)
     info["settle"] = await_shutter(settle, shutter_tok, before)
     png = info["settle"].pop("png")
+    by_shutter = png is not None   # False: the ceiling path below shoots instead
     tl.mark("settle")
 
     # still_frames BEFORE waiting on the ~3 MB PNG write (measured.md
@@ -2195,12 +2207,13 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
 
     dst = os.path.join(rundir, name + ".png")
     shutil.copy2(png, dst)
-    # THE LINEAR READING (2026-10-08). The energy referees (furnace, sky
-    # furnace, Cornell) read the accumulated float radiance, not the 8-bit
-    # picture: see LINEAR_REFEREES. Asked for here, straight after the
-    # shutter, while the camera still stands where it shot.
-    if (shot.get("referee") or (None,))[0] in LINEAR_REFEREES:
-        info["linear"] = accum_dump(os.path.join(rundir, name), settle)
+    # THE LINEAR READING (2026-10-08), armed with the shutter above: the
+    # energy referees (furnace, sky furnace, Cornell) read the accumulated
+    # float radiance, not the 8-bit picture. See LINEAR_REFEREES.
+    if linear:
+        info["linear"] = accum_dump(
+                linear, settle,
+                fired=info["settle"].get("still_frames") if by_shutter else None)
         tl.mark("linear_dump")
     rec = os.path.splitext(png)[0] + ".capture.json"
     cap = {}
@@ -2240,36 +2253,44 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     return dst, info
 
 
-def accum_dump(prefix, settle, timeout=ACCUM_DUMP_TIMEOUT):
-    """Ask the client for the linear accumulated radiance of its next frame
-    (claude_accum_dump -> <prefix>.f32 + <prefix>.json) and prove it is the
-    shot's average: the accumulation must still hold at least `settle`
-    frames after the dump arrived (a reset between the shutter and the
-    dump would make it a picture of a few frames, not of the shot)."""
-    for ext in (".f32", ".json"):
-        if os.path.exists(prefix + ext):
-            os.remove(prefix + ext)
-    with open(lab.PATCH, "w") as f:
-        f.write("claude_accum_dump = %s\n" % prefix)
+def accum_dump(prefix, settle, fired=None, timeout=ACCUM_DUMP_TIMEOUT):
+    """Collect the linear accumulated radiance (<prefix>.f32 + .json) for a
+    capture whose shutter armed it (claude_accum_dump_shutter): the client
+    reads it back in the frame after the shutter's, so it holds exactly
+    fired + 1 frames.
+
+    WHY ARMED BY THE SHUTTER, MEASURED (2026-10-08, first run of this): the
+    dump requested on the 1 Hz patch poll after the PNG arrived held 609 to
+    4,315 frames for arms shot at 500 and 4,000 -- 200-400 frames late, by
+    an amount that moves with timing, so two runs of one build would read
+    different linear numbers. If the shutter did not fire (the harness's
+    ceiling path), the dump is requested now and the depth recorded, and
+    the reading is marked not fixed-depth."""
     t0 = time.time()
+    out = {"prefix": os.path.basename(prefix)}
+    if fired is None:
+        with open(lab.PATCH, "w") as f:
+            f.write("claude_accum_dump = %s\n" % prefix)
+        out["fixed_depth"] = False
+    else:
+        out["fixed_depth"] = True
+        out["frames"] = fired + 1
     while time.time() - t0 < timeout and not os.path.exists(prefix + ".json"):
-        time.sleep(0.1)
-    out = {"prefix": os.path.basename(prefix), "s": round(time.time() - t0, 2)}
+        time.sleep(0.05)
+    out["s"] = round(time.time() - t0, 2)
     if not os.path.exists(prefix + ".json"):
         out.update(ok=False, error="no dump within %.0f s" % timeout)
         return out
-    # the .f32 is written before the .json; and read a stats record
-    # written AFTER the dump (the file is rewritten about once a second)
-    mt0, t1 = os.path.getmtime(lab.STATS), time.time()
-    while time.time() - t1 < 2.5 and os.path.getmtime(lab.STATS) == mt0:
-        time.sleep(0.1)
-    st = lab.read_stats() or {}
-    sf = st.get("still_frames")
-    out["still_frames_after"] = sf
-    out["ok"] = sf is not None and sf >= settle
-    if not out["ok"]:
-        out["error"] = ("accumulation holds %s frames after the dump, the "
-                        "shot asked for %d: reset in between" % (sf, settle))
+    time.sleep(0.1)   # the .f32 is written before the .json
+    if fired is None:
+        sf = (lab.read_stats() or {}).get("still_frames")
+        out["frames_at_least"] = sf
+        out["ok"] = sf is not None and sf >= settle
+        if not out["ok"]:
+            out["error"] = ("accumulation holds %s frames after the dump, the "
+                            "shot asked for %d: reset in between" % (sf, settle))
+        return out
+    out["ok"] = True
     return out
 
 
