@@ -25,6 +25,7 @@ cp -r "$MAIN/mods/claude_bridge/init.lua" "$MAIN/mods/claude_bridge/mod.conf" \
 cp "$MAIN/minetest.conf" "$WT/minetest.conf"
 BT=$(grep "^CMAKE_BUILD_TYPE:" "$MAIN/build/CMakeCache.txt" | cut -d= -f2)
 GEN=$(grep "^CMAKE_GENERATOR:" "$MAIN/build/CMakeCache.txt" | cut -d= -f2)
-cmake -S "$WT" -B "$WT/build" -G "$GEN" -DCMAKE_BUILD_TYPE="$BT" -DRUN_IN_PLACE=TRUE \
+cmake -S "$WT" -B "$WT/build" -G "$GEN" -DCMAKE_BUILD_TYPE="$BT" -DRUN_IN_PLACE=TRUE -DBUILD_SERVER=TRUE \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache > "$WT/build-configure.log"
+# the test seat runs ./bin/luantiserver too (the first relief run found it missing, 2026-10-08)
 echo "worktree $WT on branch $NAME (build type $BT); build: cmake --build $WT/build -j16"
