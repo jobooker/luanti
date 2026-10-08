@@ -49,7 +49,7 @@ def start_seat():
         subprocess.Popen(cmd, cwd=ci.REPO,
                          stdout=open("/tmp/claude_denoise_price.%s.log" % tag, "wb"),
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True, env=ci.seat_env())
         time.sleep(wait)
     if not ci.wait_for_client():
         sys.exit("client never became ready")
