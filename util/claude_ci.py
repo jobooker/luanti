@@ -1219,6 +1219,14 @@ def stop_seat():
     return False
 
 
+def seat_env():
+    """The game's environment. SDL asks the desktop to keep the screen on
+    while a window is open ("Playing a game"), and the headless client still
+    reaches KDE through the session bus, so John's monitor never turned off
+    (2026-10-08). The test game has no reason to hold the screen on."""
+    return dict(os.environ, SDL_VIDEO_ALLOW_SCREENSAVER="1")
+
+
 def start_seat(rundir, headless=False):
     import claude_gpu_lock   # one game on the GPU at a time, across worktrees
     claude_gpu_lock.hold("start_seat")
@@ -1229,7 +1237,7 @@ def start_seat(rundir, headless=False):
         logs[tag] = open(os.path.join(rundir, tag + ".log"), "wb")
         subprocess.Popen(cmd, cwd=REPO, stdout=logs[tag],
                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                         start_new_session=True)
+                         start_new_session=True, env=seat_env())
         time.sleep(wait)
 
 
