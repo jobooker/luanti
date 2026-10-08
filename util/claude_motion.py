@@ -64,7 +64,11 @@ def main():
     dials = dict(ci.CANONICAL_DIALS) if not args.play else {
         k: ci.CANONICAL_DIALS[k] for k in ("claude_input_lock", "claude_show_hud",
                                            "claude_show_chat", "claude_stats",
-                                           "recent_chat_messages", "node_highlighting")
+                                           "recent_chat_messages", "node_highlighting",
+                                           # a debug view set by an earlier capture (the
+                                           # playtest's face-ID pass) must not leak into
+                                           # the next scenario: it did, 2026-10-08
+                                           "claude_view")
         if k in ci.CANONICAL_DIALS}
     for kv in args.dial:
         k, _, v = kv.partition("=")
