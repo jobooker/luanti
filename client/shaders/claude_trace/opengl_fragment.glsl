@@ -1530,12 +1530,42 @@ vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 // Ring cells: the ring's bits (as always). Elsewhere: a model cell's
 // atlas voxels, when claude_model_far is on.
 uniform float claudeModelFar;
+// THE PIECE POOL (ladder B2, DECISIONS 0x, 2026-10-07; claude_bricks 1):
+// a piece id per 1 m block (unit 22, RG8: 0 none, 1 solid, 2 empty, then
+// shapes) and every distinct 16^3 shape once (unit 23, the ring's byte
+// layout, 64 shapes per 16-deep slab). Same decisions as the ring and the
+// atlas (game.cpp claudeTraceGridBakeBricks), so the walk must not change
+// by one pixel: claude_view 39 checks exactly that.
+uniform sampler3D claudeBrickIds;
+uniform sampler3D claudeBrickPool;
+uniform float claudeBricks;
+bool g_bricksOff = false;   // view 39 walks once with, once without
+float brickId(vec3 cell)
+{
+	vec2 v = texture3D(claudeBrickIds, (cell + 0.5) / GRID_S).rg;
+	return floor(v.r * 255.0 + 0.5) + 256.0 * floor(v.g * 255.0 + 0.5);
+}
+bool brickSolid(float id, vec3 sv)
+{
+	if (claudeTreePlant > 0.5)   // the gate's planted defect: shapes mirrored
+		sv.x = 15.0 - sv.x;
+	vec3 texel = vec3(mod(id, 64.0) * 2.0 + floor(sv.x / 8.0), sv.y,
+			floor(id / 64.0) * 16.0 + sv.z);
+	float raw = texture3D(claudeBrickPool,
+			(texel + 0.5) / vec3(128.0, 16.0, 1104.0)).r;
+	float byte = floor(raw * 255.0 + 0.5);
+	return mod(floor(byte / exp2(mod(sv.x, 8.0))), 2.0) >= 0.5;
+}
 bool fineAt(vec3 cell)
 {
+	if (claudeBricks > 0.5 && !g_bricksOff)
+		return brickId(cell) > 0.5 && (inSubvoxRing(cell) || claudeModelFar > 0.5);
 	return inSubvoxRing(cell) || (claudeModelFar > 0.5 && modelCell(cell));
 }
 bool fineSolid(vec3 cell, vec3 sv)
 {
+	if (claudeBricks > 0.5 && !g_bricksOff)
+		return brickSolid(brickId(cell), sv);
 	return inSubvoxRing(cell) ? subvoxSolid(cell - vec3(SUBV_R0), sv)
 			: modelVoxelSolid(cell, sv);
 }
@@ -4005,7 +4035,7 @@ void main(void)
 	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
 	// and want the free anti-aliasing (and want it identically, so the
 	// three instrument views can be divided pixel by pixel).
-	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || (view >= 33 && view <= 38))
+	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || (view >= 33 && view <= 39))
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -5152,6 +5182,37 @@ void main(void)
 	// yellow = same cell, different face; blue = same cell and face,
 	// distance differs; magenta = only today's walk hit; cyan = only the
 	// tree hit; black = neither (sky, far field).
+	// LADDER B2 GATE (claude_view 39, run with claude_bricks 1): today's
+	// walk on the same camera ray twice, reading its 1/16 m shapes from
+	// the ring and atlas, then from the pool. Counted on the GPU like 35.
+	if (view == 39) {
+		vec3 hpA, nA, albA, leA, cellA, hpB, nB, albB, leB, cellB;
+		float tA, tB;
+		g_bricksOff = true;
+		bool hA = march(ro, rd, hpA, nA, albA, leA, tA, cellA);
+		g_bricksOff = false;
+		bool hB = march(ro, rd, hpB, nB, albB, leB, tB, cellB);
+		int vi;
+		vec3 verdict;
+		if (!hA && !hB) {
+			vi = 0; verdict = vec3(0.0);
+		} else if (hA != hB) {
+			vi = hA ? 5 : 6; verdict = hA ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
+		} else if (any(notEqual(cellA, cellB))) {
+			vi = 2; verdict = vec3(1.0, 0.0, 0.0);
+		} else if (any(notEqual(nA, nB))) {
+			vi = 3; verdict = vec3(1.0, 1.0, 0.0);
+		} else if (tA != tB) {
+			vi = 4; verdict = vec3(0.0, 0.0, 1.0);
+		} else {
+			vi = 1; verdict = vec3(0.0, 1.0, 0.0);
+		}
+#ifdef CLAUDE_TREE_OK
+		atomicAdd(claudeTreeCount[vi], 1u);
+#endif
+		gl_FragColor = vec4(verdict, 1.0);
+		return;
+	}
 	if (view == 35) {
 		vec3 verdict = vec3(1.0, 1.0, 1.0);   // white: tree unavailable
 #ifdef CLAUDE_TREE_OK

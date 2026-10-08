@@ -298,6 +298,18 @@ struct ClaudeTraceGrid
 	// node stays an honest 1 m cube, exactly as it is today.
 	static constexpr int NBOX_R0 = 48, NBOX_R1 = 80;
 	static constexpr int NBOX_RING = NBOX_R1 - NBOX_R0;
+	// THE PIECE POOL (ladder B1, DECISIONS 0x, 2026-10-07): every distinct
+	// 16^3 shape once (the node-box shapes and the model rotations are
+	// already deduplicated above; the ring only copied them per cell), and
+	// a piece id per 1 m block over the WHOLE grid. Ids: 0 none, 1 solid,
+	// 2 empty, 2 + n node-box shape n, BRICK_MODEL0 + model*4 + rotation.
+	// Pool texture R8 128 x 16 x 1104: 64 shapes per 16-deep slab, shape
+	// id at x (id % 64) * 2, z (id / 64) * 16, the ring's byte layout.
+	static constexpr int BRICK_FULL = 1, BRICK_ZERO = 2, BRICK_NBOX0 = 2,
+			BRICK_MODEL0 = 4099, BRICK_CAP = 4355, BRICK_POOL_D = 1104;
+	std::vector<u8> brick_ids;            // RG8 per cell (id lo, hi)
+	u32 brick_ids_tex = 0, brick_pool_tex = 0;
+	size_t brick_pool_nbox = (size_t)-1, brick_pool_models = (size_t)-1;
 	static constexpr size_t NBOX_CAP = 4096; // distinct shapes; 2 MB
 	bool nodebox_on = true;
 	std::vector<u16> nbox_ids;                   // RING^3, 0 = none
@@ -2192,6 +2204,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// running frame counter offset by 2^23, so motion still decorrelates.
 	CachedPixelShaderSetting<float, 1, false> m_rng_frame_pixel{"claudeRngFrame"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_subvox_sampler_pixel{"claudeSubvoxTex"};
+	// the piece pool (ladder B1/B2, 2026-10-07): ids on unit 22, shapes on 23
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_brick_ids_sampler_pixel{"claudeBrickIds"};
+	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_brick_pool_sampler_pixel{"claudeBrickPool"};
+	// claude_bricks: 1 = the walk reads its 1/16 m shapes from the pool
+	float m_bricks = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bricks_pixel{"claudeBricks"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
@@ -2411,6 +2429,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_tree_plant",
 		"claude_tree_variant",
 		"claude_tree_dirs",
+		"claude_bricks",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2813,7 +2832,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 38.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 39.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3351,6 +3370,8 @@ public:
 			m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		if (name == "claude_tree_dirs")
 			m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
+		if (name == "claude_bricks")
+			m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3467,6 +3488,7 @@ public:
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
+		m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3617,11 +3639,11 @@ public:
 			}
 			if (g_tree_ssbo)
 				GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 3, g_tree_ssbo);
-			if (m_view >= 35.0f && m_view <= 37.0f) {
+			if ((m_view >= 35.0f && m_view <= 37.0f) || m_view == 39.0f) {
 				const ClaudeTraceGrid &G = g_claude_grid;
 				Camera *cam = m_client->getCamera();
 				claudeTreeTally(cam->getPosition() / BS
-						- v3f(G.origin.X, G.origin.Y, G.origin.Z), m_view == 35.0f);
+						- v3f(G.origin.X, G.origin.Y, G.origin.Z), m_view == 35.0f || m_view == 39.0f);
 			}
 			m_tree_plant_pixel.set(&m_tree_plant, services);
 			m_tree_variant_pixel.set(&m_tree_variant, services);
@@ -3758,6 +3780,12 @@ public:
 					GL.BindTexture(GL.TEXTURE_2D,
 							g_claude_grid.model_pal_tex);
 				}
+				if (g_claude_grid.brick_ids_tex && g_claude_grid.brick_pool_tex) {
+					GL.ActiveTexture(GL.TEXTURE0 + 22);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.brick_ids_tex);
+					GL.ActiveTexture(GL.TEXTURE0 + 23);
+					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.brick_pool_tex);
+				}
 				if (g_claude_grid.cascades_tex) {
 					GL.ActiveTexture(GL.TEXTURE8);
 					GL.BindTexture(GL.TEXTURE_3D, g_claude_grid.cascades_tex);
@@ -3783,6 +3811,10 @@ public:
 				m_modelids_sampler_pixel.set(&midl, services);
 				m_modelatlas_sampler_pixel.set(&matl, services);
 				m_modelpal_sampler_pixel.set(&mpal, services);
+				SamplerLayer_t bids = 22, bpool = 23;
+				m_brick_ids_sampler_pixel.set(&bids, services);
+				m_brick_pool_sampler_pixel.set(&bpool, services);
+				m_bricks_pixel.set(&m_bricks, services);
 				SamplerLayer_t mtpal = 20, mtprobe = 21;
 				m_matpal_sampler_pixel.set(&mtpal, services);
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
@@ -5614,6 +5646,167 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 	}
 }
 
+
+// THE PIECE IDS (ladder B1). The same decision claudeTraceGridBakeSubvox
+// makes, in the same order, for every cell rather than only the ring:
+// inside the ring a model, else a node-box shape, else solid or empty
+// fill; outside it a model cell's shape (what claude_model_far walks).
+static void claudeTraceGridBakeBricks(int x0, int y0, int z0, int w, int h, int d)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	if (V.brick_ids.empty())
+		V.brick_ids.assign((size_t)S * S * S * 2, 0);
+	for (int vz = z0; vz < z0 + d; vz++)
+	for (int vy = y0; vy < y0 + h; vy++)
+	for (int vx = x0; vx < x0 + w; vx++) {
+		size_t vi = (size_t)(vz * S + vy) * S + vx;
+		u8 a = V.occ[vi * 4 + 3];
+		bool bakes = claudeMatBakesBits(a);
+		u8 tag = V.modelids.empty() ? 0 : V.modelids[vi];
+		int ring = claudeNBoxRing(vx, vy, vz);
+		int id = 0;
+		if (ring >= 0) {
+			u8 mtag = bakes ? tag : 0;
+			if (mtag >> 2)
+				id = ClaudeTraceGrid::BRICK_MODEL0 + ((mtag >> 2) - 1) * 4 + (mtag & 3);
+			else if (bakes && !V.nbox_ids.empty() && V.nbox_ids[ring])
+				id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_ids[ring];
+			else
+				id = bakes ? ClaudeTraceGrid::BRICK_FULL : ClaudeTraceGrid::BRICK_ZERO;
+		} else if (tag >> 2) {
+			id = ClaudeTraceGrid::BRICK_MODEL0 + ((tag >> 2) - 1) * 4 + (tag & 3);
+		}
+		if (id >= ClaudeTraceGrid::BRICK_CAP)
+			id = 0;
+		V.brick_ids[vi * 2] = (u8)(id & 0xFF);
+		V.brick_ids[vi * 2 + 1] = (u8)(id >> 8);
+	}
+}
+
+// One shape's 512 bytes, from the shared caches (nullptr: none).
+static const u8 *claudeBrickMask(int id)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	if (id >= ClaudeTraceGrid::BRICK_MODEL0) {
+		int m = (id - ClaudeTraceGrid::BRICK_MODEL0) / 4, r = (id - ClaudeTraceGrid::BRICK_MODEL0) % 4;
+		if (m < (int)V.models.size() && V.models[m][r].size() == 512)
+			return V.models[m][r].data();
+		return nullptr;
+	}
+	if (id > ClaudeTraceGrid::BRICK_NBOX0) {
+		size_t n = id - ClaudeTraceGrid::BRICK_NBOX0;
+		return n <= V.nbox_masks.size() ? V.nbox_masks[n - 1].data() : nullptr;
+	}
+	return nullptr;
+}
+static bool claudeBrickBit(int id, int sx, int sy, int sz)
+{
+	if (id == ClaudeTraceGrid::BRICK_FULL)
+		return true;
+	const u8 *mm = claudeBrickMask(id);
+	return mm && ((mm[(sz * 16 + sy) * 2 + sx / 8] >> (sx % 8)) & 1);
+}
+
+static void claudeTraceGridTexParams3D();
+// The pool texture (unit 23), re-uploaded whole when a shape was added.
+static void claudeBrickPoolUpload()
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	if (V.brick_pool_tex && V.brick_pool_nbox == V.nbox_masks.size()
+			&& V.brick_pool_models == V.models.size())
+		return;
+	V.brick_pool_nbox = V.nbox_masks.size();
+	V.brick_pool_models = V.models.size();
+	const int D = ClaudeTraceGrid::BRICK_POOL_D;
+	std::vector<u8> pool((size_t)128 * 16 * D, 0);
+	for (int id = 1; id < ClaudeTraceGrid::BRICK_CAP; id++) {
+		const u8 *mm = claudeBrickMask(id);
+		if (id != ClaudeTraceGrid::BRICK_FULL && !mm)
+			continue;
+		int x0 = (id % 64) * 2, z0 = (id / 64) * 16;
+		for (int sz = 0; sz < 16; sz++)
+		for (int sy = 0; sy < 16; sy++)
+		for (int b = 0; b < 2; b++)
+			pool[((size_t)(z0 + sz) * 16 + sy) * 128 + x0 + b] =
+					mm ? mm[(sz * 16 + sy) * 2 + b] : 0xFF;
+	}
+	bool fresh = !V.brick_pool_tex;
+	if (fresh)
+		GL.GenTextures(1, &V.brick_pool_tex);
+	GL.ActiveTexture(GL.TEXTURE0 + 23);
+	GL.BindTexture(GL.TEXTURE_3D, V.brick_pool_tex);
+	if (fresh)
+		claudeTraceGridTexParams3D();
+	GL.TexImage3D(GL.TEXTURE_3D, 0, GL.R8, 128, 16, D, 0, GL.RED,
+			GL.UNSIGNED_BYTE, pool.data());
+}
+
+// THE B1 GATE (pseudo-key claude_brick_check): for every block with a
+// piece id, all 4096 of the pool's bits against what the walk reads
+// today -- the ring's bits inside the ring, the model ATLAS outside it
+// (claude_model_far reads the atlas, built from model_vox, while the pool
+// takes model shapes from the masks: this is where those two would part).
+static void claudeBrickCheck()
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	const int R0 = ClaudeTraceGrid::NBOX_R0;
+	size_t cells = 0, bad_cells = 0, bad_bits = 0, ring_cells = 0, far_cells = 0;
+	std::set<int> ids;
+	for (int z = 0; z < S; z++)
+	for (int y = 0; y < S; y++)
+	for (int x = 0; x < S; x++) {
+		size_t vi = (size_t)(z * S + y) * S + x;
+		int id = V.brick_ids[vi * 2] | (V.brick_ids[vi * 2 + 1] << 8);
+		bool ring = claudeNBoxRing(x, y, z) >= 0;
+		u8 tag = V.modelids.empty() ? 0 : V.modelids[vi];
+		if (!id) {
+			// none: today's walk must have no fine data here either
+			if (ring || (tag >> 2)) {
+				bad_cells++;
+				if (bad_cells <= 4)
+					warningstream << "[claude_bricks] cell " << x << "," << y << "," << z
+							<< " has no piece id but today's walk has fine data" << std::endl;
+			}
+			continue;
+		}
+		cells++;
+		ids.insert(id);
+		(ring ? ring_cells : far_cells)++;
+		size_t bad = 0;
+		for (int sz = 0; sz < 16; sz++)
+		for (int sy = 0; sy < 16; sy++)
+		for (int sx = 0; sx < 16; sx++) {
+			bool today;
+			if (ring) {
+				size_t row = ((size_t)((z - R0) * 16 + sz) * 512 + ((y - R0) * 16 + sy)) * 64
+						+ (size_t)(x - R0) * 2 + sx / 8;
+				today = (V.subvox[row] >> (sx % 8)) & 1;
+			} else {
+				int m = (tag >> 2) - 1, r = tag & 3;
+				today = m < (int)V.model_vox.size() && m < 32
+						&& V.model_vox[m][r][(size_t)(sz * 16 + sy) * 16 + sx] > 0;
+			}
+			if (today != claudeBrickBit(id, sx, sy, sz))
+				bad++;
+		}
+		if (bad) {
+			bad_cells++;
+			bad_bits += bad;
+			if (bad_cells <= 4)
+				warningstream << "[claude_bricks] cell " << x << "," << y << "," << z << " id "
+						<< id << (ring ? " (ring)" : " (model, past the ring)") << ": " << bad
+						<< " of 4096 bits differ" << std::endl;
+		}
+	}
+	actionstream << "[claude_bricks] check: " << cells << " blocks with pieces (" << ring_cells
+			<< " in the ring, " << far_cells << " past it), " << ids.size()
+			<< " distinct shapes in use, pool " << V.nbox_masks.size() << " node-box + "
+			<< V.models.size() * 4 << " model shapes | blocks that differ " << bad_cells
+			<< ", bits " << bad_bits << std::endl;
+}
+
 // OCCUPANCY MIP PYRAMID on unit 11 (Teardown's accelerator, ADR-0007
 // overnight 2026-08-12): the old 32^3 brick map is level 2 of a 128^3 R8
 // texture with real GL mips 0..5 (any-content, max-reduced). Shaders
@@ -5940,6 +6133,21 @@ static void claudeTraceGridUploadFull()
 				claudeUseR8() ? GL.RED : GL_LUMINANCE,
 				GL.UNSIGNED_BYTE, V.modelids.data());
 		claudeTraceGridUploadModelTex();
+		if (claudeUseR8() && !V.brick_ids.empty()) {
+			bool fresh_b = !V.brick_ids_tex;
+			if (fresh_b)
+				GL.GenTextures(1, &V.brick_ids_tex);
+			GL.ActiveTexture(GL.TEXTURE0 + 22);
+			GL.BindTexture(GL.TEXTURE_3D, V.brick_ids_tex);
+			if (fresh_b) {
+				claudeTraceGridTexParams3D();
+				GL.TexImage3D(GL.TEXTURE_3D, 0, GL.RG8, S, S, S, 0, GL.RG,
+						GL.UNSIGNED_BYTE, nullptr);
+			}
+			GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, 0, S, S, S, GL.RG,
+					GL.UNSIGNED_BYTE, V.brick_ids.data());
+			claudeBrickPoolUpload();
+		}
 	}
 	{
 		if (!V.coarse_tex)
@@ -6051,6 +6259,14 @@ static bool claudeTraceGridUploadBox(int x0, int y0, int z0, int w, int h, int d
 					fmt, GL.UNSIGNED_BYTE, staging.data());
 		}
 	}
+	if (claudeUseR8() && V.brick_ids_tex && !V.brick_ids.empty()) {
+		claudePackBox(V.brick_ids.data(), S, S, 2, x0, y0, z0, w, h, d, staging);
+		GL.ActiveTexture(GL.TEXTURE0 + 22);
+		GL.BindTexture(GL.TEXTURE_3D, V.brick_ids_tex);
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, x0, y0, z0, w, h, d, GL.RG,
+				GL.UNSIGNED_BYTE, staging.data());
+		claudeBrickPoolUpload();
+	}
 	claudeTraceGridUploadModelTex();
 	claudeTraceGridUploadAtlas();
 	GL.ActiveTexture(prev_active_unit);
@@ -6139,6 +6355,7 @@ static void claudeTraceGridSnapshot(Client *client)
 	V.content_hash = hash;
 	u64 tbake = porting::getTimeUs();
 	claudeTraceGridBakeSubvox(0, 0, 0, S, S, S);
+	claudeTraceGridBakeBricks(0, 0, 0, S, S, S);
 	claudeTraceGridBakePyramid(0, 0, 0, S, S, S);
 	u64 bake_us = porting::getTimeUs() - tbake;
 	u64 tgl = porting::getTimeUs();
@@ -6289,6 +6506,7 @@ static bool claudeTraceGridIncremental(Client *client)
 	V.content_hash = hash;
 	u64 tbake = porting::getTimeUs();
 	claudeTraceGridBakeSubvox(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
+	claudeTraceGridBakeBricks(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
 	claudeTraceGridBakePyramid(cx0, cy0, cz0, cx1 - cx0, cy1 - cy0, cz1 - cz0);
 	u64 bake_us = porting::getTimeUs() - tbake;
 	u64 tgl = porting::getTimeUs();
@@ -6952,6 +7170,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// read back from its own textures, plus the camera as the shader
 		// receives it, so a tree built offline can be checked against the
 		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_brick_check") {
+			claudeBrickCheck();
+			continue;
+		}
 		if (name == "claude_tree_build") {
 			g_tree_build_pending = true;   // built inside the next frame
 			continue;
