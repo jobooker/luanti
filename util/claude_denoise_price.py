@@ -40,6 +40,8 @@ REF_FRAMES = 4000
 
 
 def start_seat():
+    import claude_gpu_lock   # one game on the GPU at a time, across worktrees
+    claude_gpu_lock.hold("start_seat")
     ci.stop_seat()
     ci.pin_conf()
     for tag, cmd, wait in (("server", ci.SERVER_CMD, ci.SEAT_BOOT_WAIT),

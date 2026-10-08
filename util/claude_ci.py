@@ -1200,6 +1200,8 @@ def stop_seat():
 
 
 def start_seat(rundir, headless=False):
+    import claude_gpu_lock   # one game on the GPU at a time, across worktrees
+    claude_gpu_lock.hold("start_seat")
     logs = {}
     client = (HEADLESS_WRAP + CLIENT_CMD) if headless else CLIENT_CMD
     for tag, cmd, wait in (("server", SERVER_CMD, SEAT_BOOT_WAIT),

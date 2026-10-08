@@ -184,6 +184,40 @@ def cmd_run(scenes):
     subprocess.run([JUDGE_PY, os.path.abspath(__file__), "score", run], check=True)
 
 
+def cmd_try(scene, variants):
+    """the honest renderer plus one change per variant, at equal time against
+    the scene's truth; logged to experiments.jsonl, not to the history.
+    Every variant spells every dial any variant sets (unset ones revert to
+    the honest renderer's value), so nothing leaks from one to the next."""
+    tm = truth_meta(scene)
+    seat()
+    keys = sorted({k for v in variants.values() for k in v})
+    base = dict(CONTENDERS["honest"])
+    defaults = {"claude_guide": 0, "claude_guide_impl": 2, "claude_area_pick": 0, "claude_area_skip": 0,
+                "claude_torch_nee": 1, "claude_area_nee": 1, "claude_boost": 0, "claude_bounces": 24}
+    run = os.path.join(OUT, "tries", time.strftime("%Y%m%d-%H%M%S") + "-" + scene)
+    os.makedirs(run, exist_ok=True)
+    shots = {"sha": git_sha(), "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "shots": [],
+             "try": True, "variants": variants}
+    for vn, over in [("honest", {})] + list(variants.items()):
+        d = dict(base, **{k: base.get(k, defaults.get(k, 0)) for k in keys})
+        d.update(over)
+        d.update(DISPLAY, claude_exposure=tm["exposure"])
+        st = stats_of(shoot(scene, d, 64, "price-%s-%s" % (scene, vn.replace(" ", "_"))))
+        ms = st.get("busy_ms") or st.get("frame_ms_avg")
+        for bn, budget in BUDGETS_MS.items():
+            n = max(1, int(math.floor(budget / ms)))
+            png = shoot(scene, d, n, "%s-%s-%d" % (scene, vn.replace(" ", "_"), n))
+            s2 = stats_of(png)
+            same = s2.get("area_emitters") == tm["scene_id"].get("area_emitters")
+            shots["shots"].append({"scene": scene, "contender": vn, "budget": bn, "frame_ms": ms,
+                                   "frames": n, "png": png, "same_scene": same, "dials": over})
+            print("%-10s %-26s %-11s %6.2f ms/frame -> %5d frames%s" % (scene, vn, bn, ms, n,
+                  "" if same else "  SCENE DIFFERS"), flush=True)
+    json.dump(shots, open(os.path.join(run, "shots.json"), "w"), indent=1)
+    subprocess.run([JUDGE_PY, os.path.abspath(__file__), "score", run], check=True)
+
+
 def cmd_score(run):
     sys.path.insert(0, HERE)
     import claude_judge as J
@@ -202,10 +236,15 @@ def cmd_score(run):
         rmse = float(np.sqrt(((a - b) ** 2).mean()))
         s.update(flip=m["flip"], jod=m["jod"], brightness=m["brightness"], rmse=rmse)
         rows.append(s)
-        print("%-10s %-9s %-11s RMSE %.4f  FLIP %.4f  JOD %5.2f  bright %.4f  (%d frames)%s" % (
+        print("%-10s %-26s %-11s RMSE %.4f  FLIP %.4f  JOD %5.2f  bright %.4f  (%d frames)%s" % (
             s["scene"], s["contender"], s["budget"], rmse, m["flip"], m["jod"], m["brightness"], s["frames"],
             "" if s.get("same_scene", True) else "  SCENE DIFFERS"), flush=True)
     rec = {"utc": shots["utc"], "sha": shots["sha"], "run": os.path.basename(run), "rows": rows}
+    if shots.get("try"):
+        rec["variants"] = shots["variants"]
+        with open(os.path.join(OUT, "experiments.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        return
     # rescoring a run replaces its line rather than adding a second one
     hp = os.path.join(OUT, "history.jsonl")
     old = [l for l in open(hp)] if os.path.exists(hp) else []
@@ -336,5 +375,7 @@ if __name__ == "__main__":
         cmd_score(sys.argv[2])
     elif what == "check":
         cmd_check(rest)
+    elif what == "try":
+        cmd_try(sys.argv[2], json.loads(sys.argv[3]))
     else:
         print(__doc__)
