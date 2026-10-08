@@ -525,8 +525,22 @@ SKY_UNIFORM_L = 1.0
 # reports the depth it ran at.
 SEALED_SETTLE = 2000
 
-# measurement exposure for the furnace arms -- see FURNACE_PINNED
+# measurement exposure for the furnace arms -- see FURNACE_PINNED. Since
+# 2026-10-08 the furnace verdict reads the linear dump, where exposure
+# does not enter; it still sets the PNG, which is read for comparison.
 FURNACE_EXPOSURE = 0.1
+# THE REFEREES THAT READ LINEAR RADIANCE (2026-10-08). They used to invert
+# an ASSUMED display curve on the 8-bit PNG (aces_inverse(byte ** 2.2)):
+# on the sky furnace that read 1.2 % low and moved with image noise (a
+# noisier but equally correct sampler read 0.9947 against 0.9881), while
+# the accumulated float radiance read 0.99979 of the analytic answer
+# (spec/measured.md 2026-10-08). capture() now asks the client for that
+# buffer (claude_accum_dump, util/claude_linear.py) after the shutter,
+# into <rundir>/<arm>.f32 + .json, and these referees judge it. The PNG
+# reading of the same box is still made and recorded beside it
+# (ratio_png / region_ratios_png), never judged.
+LINEAR_REFEREES = ("furnace", "skyfurnace", "cornell")
+ACCUM_DUMP_TIMEOUT = 15.0
 # A CAMERA EXPOSURE PER ARM THAT SEES SKY OR FLAMES (2026-10-05, real light
 # units). MEASURED, not chosen: each is the factor claude_exposure (the
 # auto-exposure law) settled on at that vantage after 600 frames, read back
@@ -900,8 +914,9 @@ FURNACE_PATCH = None
 # off-centre where the fence subtends more. If this ever proves flaky,
 # the honest fix is a third clean run and a re-derivation, not a wider
 # number.
-SKYFURNACE_PINNED = {"050": 0.9881}
-SKYFURNACE_TOL = {"050": 0.0006}
+# PNG-era pin, kept for the record (2026-10-08): {"050": 0.9881} +/- 0.0006.
+SKYFURNACE_PINNED = {"050": None}
+SKYFURNACE_TOL = {"050": None}
 
 # MEASUREMENT EXPOSURE for every furnace arm (2026-10-05). At exposure 1
 # furnace-073's patch was 98.7 % byte 255 (the clip, read back as 7.22)
@@ -924,8 +939,11 @@ SKYFURNACE_TOL = {"050": 0.0006}
 # patch at byte 255). The renderer has been energy-exact to ~0.2 % in both
 # rooms; the instrument could not see it. At exposure 0.25 the same build
 # read 1.001 / 1.000 / 0.998 -- the residual is read-back resolution.
-FURNACE_PINNED = {"050": 0.998, "073": 0.999}
-FURNACE_TOL = {"050": 0.003, "073": 0.003}
+# PNG-era pins, kept for the record (2026-10-08):
+#   FURNACE_PINNED = {"050": 0.998, "073": 0.999}
+#   FURNACE_TOL = {"050": 0.003, "073": 0.003}
+FURNACE_PINNED = {"050": None, "073": None}
+FURNACE_TOL = {"050": None, "073": None}
 # Legacy name kept so old run.json rows still parse.
 FURNACE_RATIO_TOL = 0.15
 
@@ -936,6 +954,8 @@ FURNACE_RATIO_TOL = 0.15
 # reads +2% to +9% by region and is RED today BY DESIGN. That red is
 # roadmap step 1a's gate.
 CORNELL_RATIO_TOL = 0.010
+# the PNG ratio's tolerance, used only while the golden has no linear dump
+CORNELL_RATIO_TOL_PNG = 0.010
 # still_frames at the shutter below which a capture is not a measurement.
 CONVERGED_MIN = 100
 
@@ -2175,6 +2195,13 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
 
     dst = os.path.join(rundir, name + ".png")
     shutil.copy2(png, dst)
+    # THE LINEAR READING (2026-10-08). The energy referees (furnace, sky
+    # furnace, Cornell) read the accumulated float radiance, not the 8-bit
+    # picture: see LINEAR_REFEREES. Asked for here, straight after the
+    # shutter, while the camera still stands where it shot.
+    if (shot.get("referee") or (None,))[0] in LINEAR_REFEREES:
+        info["linear"] = accum_dump(os.path.join(rundir, name), settle)
+        tl.mark("linear_dump")
     rec = os.path.splitext(png)[0] + ".capture.json"
     cap = {}
     if os.path.exists(rec):
@@ -2211,6 +2238,39 @@ def capture(shot, vantage, park, dials, rundir, settle, vantage_name=None):
     tl.mark("room_hash")
     info["timeline"] = tl.done()
     return dst, info
+
+
+def accum_dump(prefix, settle, timeout=ACCUM_DUMP_TIMEOUT):
+    """Ask the client for the linear accumulated radiance of its next frame
+    (claude_accum_dump -> <prefix>.f32 + <prefix>.json) and prove it is the
+    shot's average: the accumulation must still hold at least `settle`
+    frames after the dump arrived (a reset between the shutter and the
+    dump would make it a picture of a few frames, not of the shot)."""
+    for ext in (".f32", ".json"):
+        if os.path.exists(prefix + ext):
+            os.remove(prefix + ext)
+    with open(lab.PATCH, "w") as f:
+        f.write("claude_accum_dump = %s\n" % prefix)
+    t0 = time.time()
+    while time.time() - t0 < timeout and not os.path.exists(prefix + ".json"):
+        time.sleep(0.1)
+    out = {"prefix": os.path.basename(prefix), "s": round(time.time() - t0, 2)}
+    if not os.path.exists(prefix + ".json"):
+        out.update(ok=False, error="no dump within %.0f s" % timeout)
+        return out
+    # the .f32 is written before the .json; and read a stats record
+    # written AFTER the dump (the file is rewritten about once a second)
+    mt0, t1 = os.path.getmtime(lab.STATS), time.time()
+    while time.time() - t1 < 2.5 and os.path.getmtime(lab.STATS) == mt0:
+        time.sleep(0.1)
+    st = lab.read_stats() or {}
+    sf = st.get("still_frames")
+    out["still_frames_after"] = sf
+    out["ok"] = sf is not None and sf >= settle
+    if not out["ok"]:
+        out["error"] = ("accumulation holds %s frames after the dump, the "
+                        "shot asked for %d: reset in between" % (sf, settle))
+    return out
 
 
 def park_for(vantage_name, vantages):
@@ -2263,18 +2323,31 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
         # dial is pushed from, so the referee cannot be judging a
         # different sky from the one the capture was taken under
         cmd += ["--lsky", str(SKY_UNIFORM_L)]
+    # the linear dump capture() wrote beside the PNG (LINEAR_REFEREES)
+    linear = os.path.join(rundir, name)
+    if kind in LINEAR_REFEREES and os.path.exists(linear + ".json"):
+        cmd += ["--linear", linear]
+    else:
+        linear = None
     use_golden = golden_png if not golden_refused else None
+    golden_linear = None
     if kind == "cornell":
         cmd += ["--regions"]
         if use_golden:
             cmd += ["--ratio", use_golden]
+            # the golden's own linear dump, when the golden run has one
+            gl = os.path.splitext(use_golden)[0]
+            if linear and os.path.exists(gl + ".json"):
+                golden_linear = gl
+                cmd += ["--ratio-linear", gl]
     r = sh(cmd)
     text = (r.stdout or "") + (r.stderr or "")
     with open(os.path.join(rundir, name + ".referee.txt"), "w") as f:
         f.write("$ %s\n\n%s\n[exit %d]\n" % (" ".join(cmd), text, r.returncode))
     out = {"kind": kind, "arg": arg, "returncode": r.returncode,
            "txt": name + ".referee.txt", "stdout": text,
-           "golden_png": use_golden, "golden_refused": golden_refused}
+           "golden_png": use_golden, "golden_refused": golden_refused,
+           "linear": linear is not None, "golden_linear": golden_linear}
     if kind == "furnace":
         out.update(parse_furnace(text))
     elif kind == "skyfurnace":
@@ -2283,6 +2356,20 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
         out.update(parse_sealed(text))
     else:
         out.update(parse_cornell(text))
+    return out
+
+
+def _parse_linear_extras(t, out):
+    """The lines a --linear referee adds: the PNG reading of the same box
+    (for comparison only) and the standard error of the linear mean."""
+    m = re.search(r"^png reading of the same patch: ratio (.+)$", t, re.M)
+    if m:
+        out["ratio_png"] = {c: float(v) for c, v in
+                            re.findall(r"([RGB]) ([-\d.]+)", m.group(1))}
+    m = re.search(r"^ratio standard error \(pixels independent\): (.+)$", t, re.M)
+    if m:
+        out["ratio_se"] = {c: float(v) for c, v in
+                           re.findall(r"([RGB]) ([-\d.]+)", m.group(1))}
     return out
 
 
@@ -2296,7 +2383,7 @@ def parse_furnace(t):
     m = re.search(r"clipped\s+([-\d.]+)%", t)
     if m:
         out["clipped_pct"] = float(m.group(1))
-    return out
+    return _parse_linear_extras(t, out)
 
 
 def parse_skyfurnace(t):
@@ -2311,7 +2398,7 @@ def parse_skyfurnace(t):
     m = re.search(r"clipped\s+([-\d.]+)%", t)
     if m:
         out["clipped_pct"] = float(m.group(1))
-    return out
+    return _parse_linear_extras(t, out)
 
 
 def parse_sealed(t):
@@ -2359,6 +2446,13 @@ def parse_cornell(t):
     if ratios:
         out["region_ratios"] = ratios
         out["region_worst"] = max(abs(v - 1.0) for v in ratios.values())
+    # with --ratio-linear the ratios above are linear/linear and the PNG
+    # ones follow as 'pngratio' lines, recorded for comparison only
+    png = {}
+    for name, val in re.findall(r"^pngratio (\S+)\s+([-\d.]+)\s+\(this", t, re.M):
+        png[name] = float(val)
+    if png:
+        out["region_ratios_png"] = png
     return out
 
 
@@ -2366,13 +2460,19 @@ def furnace_verdict(ref, variant):
     """PASS/FAIL against the room's own pinned ratio, not a blanket 15%."""
     if not ref or ref.get("returncode") != 0:
         return "-", "referee could not speak"
+    if not ref.get("linear"):
+        # the pins below are LINEAR pins; a PNG reading is not comparable
+        return "-", "no linear dump for this capture (see capture.linear)"
     r = ref.get("ratio_analytic") or {}
     if len(r) != 3:
         return "-", "unparsed"
     pin, tol = FURNACE_PINNED[variant], FURNACE_TOL[variant]
+    if pin is None or tol is None:
+        return "-", ("no pin derived yet; measured %s"
+                     % {k: round(v, 5) for k, v in sorted(r.items())})
     worst = max(r.values(), key=lambda v: abs(v - pin))
     ok = all(abs(v - pin) <= tol for v in r.values())
-    return ("PASS" if ok else "FAIL"), "ratio %.3f (pinned %.3f +/- %.3f)" % (
+    return ("PASS" if ok else "FAIL"), "linear ratio %.5f (pinned %.5f +/- %.5f)" % (
         worst, pin, tol)
 
 
@@ -2385,6 +2485,8 @@ def skyfurnace_verdict(ref, variant):
     blanket percentage of the ideal."""
     if not ref or ref.get("returncode") != 0:
         return "-", "referee could not speak"
+    if not ref.get("linear"):
+        return "-", "no linear dump for this capture (see capture.linear)"
     r = ref.get("ratio_analytic") or {}
     if len(r) != 3:
         return "-", "unparsed"
@@ -2395,10 +2497,10 @@ def skyfurnace_verdict(ref, variant):
         # nothing to compare against yet. '-' counts as RED, which is the
         # honest verdict -- a referee that cannot speak is not a pass.
         return "-", ("no pin derived yet; measured %s"
-                     % {k: round(v, 4) for k, v in sorted(r.items())})
+                     % {k: round(v, 5) for k, v in sorted(r.items())})
     worst = max(r.values(), key=lambda v: abs(v - pin))
     ok = all(abs(v - pin) <= tol for v in r.values())
-    return ("PASS" if ok else "FAIL"), "ratio %.4f (pinned %.4f +/- %.4f)" % (
+    return ("PASS" if ok else "FAIL"), "linear ratio %.5f (pinned %.5f +/- %.5f)" % (
         worst, pin, tol)
 
 
@@ -2415,9 +2517,16 @@ def cornell_verdict(ref):
         return "-", "no golden pinned (region ratios unmeasurable)"
     worst_name = max(ratios, key=lambda k: abs(ratios[k] - 1.0))
     worst = ratios[worst_name]
-    ok = abs(worst - 1.0) <= CORNELL_RATIO_TOL
-    return ("PASS" if ok else "FAIL"), "%s %.4f (tol %.3f)" % (
-        worst_name, worst, CORNELL_RATIO_TOL)
+    if ref.get("linear") and ref.get("golden_linear"):
+        tol, how = CORNELL_RATIO_TOL, "linear"
+    else:
+        # The golden run predates linear dumps (or this capture has none):
+        # the PNG ratio, under its own tolerance, SAYING so. Re-pin a
+        # golden from a run with dumps to judge in linear radiance.
+        tol, how = CORNELL_RATIO_TOL_PNG, "PNG (no linear golden: re-pin)"
+    ok = abs(worst - 1.0) <= tol
+    return ("PASS" if ok else "FAIL"), "%s %s %.5f (tol %.4f)" % (
+        how, worst_name, worst, tol)
 
 
 def sealed_verdict(ref):
