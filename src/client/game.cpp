@@ -6722,6 +6722,68 @@ static void claudeUpdateAccum(Client *client)
 // claude_stats: when enabled, write rolling frame statistics to
 // <path_user>/claude_stats.json once per second so external tooling can
 // measure performance without reading the debug overlay off a screenshot.
+// SCENE IDENTITY INSTRUMENT (2026-10-08, the torch room's 9-vs-11 lights).
+// How many of the client's map blocks the grid's 128^3 box covers, and a
+// hash of WHICH ones, refreshed once a second by Game::run; plus a hash of
+// the area-emitter list in world coordinates, logged in full on change.
+// Together they say whether a scene differs because blocks had not arrived,
+// because the grid's box sat elsewhere, or because the world differs.
+static int g_scene_blocks_have = 0, g_scene_blocks_want = 0;
+static u64 g_scene_blocks_hash = 0;
+static void claudeSceneBlocksCount(Client *client)
+{
+	static u64 last_ms = 0;
+	const u64 now = porting::getTimeMs();
+	if (now - last_ms < 1000 || !g_claude_grid.valid)
+		return;
+	last_ms = now;
+	constexpr int S = ClaudeTraceGrid::SIZE;
+	const v3s16 o = g_claude_grid.origin;
+	const v3s16 b0 = getNodeBlockPos(o), b1 = getNodeBlockPos(o + v3s16(S - 1, S - 1, S - 1));
+	Map &map = client->getEnv().getMap();
+	int have = 0, want = 0;
+	u64 h = 14695981039346656037ULL;
+	for (s16 z = b0.Z; z <= b1.Z; z++)
+	for (s16 y = b0.Y; y <= b1.Y; y++)
+	for (s16 x = b0.X; x <= b1.X; x++) {
+		want++;
+		if (map.getBlockNoCreateNoEx(v3s16(x, y, z))) {
+			have++;
+			u64 k = ((u64)(u16)x << 32) | ((u64)(u16)y << 16) | (u64)(u16)z;
+			h ^= k * 0x9E3779B97F4A7C15ULL;   // order-independent
+		}
+	}
+	g_scene_blocks_have = have;
+	g_scene_blocks_want = want;
+	g_scene_blocks_hash = h;
+}
+
+// the area-emitter list in WORLD coordinates, hashed in list order; the
+// full list goes to the log whenever the hash changes
+static u64 claudeAreaListHash()
+{
+	const ClaudeTraceGrid &V = g_claude_grid;
+	u64 h = 14695981039346656037ULL;
+	std::ostringstream os;
+	for (int e = 0; e < V.area_count; e++) {
+		int x = (int)V.area[e][0] + V.origin.X, y = (int)V.area[e][1] + V.origin.Y,
+			z = (int)V.area[e][2] + V.origin.Z, m = (int)V.area[e][3];
+		for (int v : {x, y, z, m}) {
+			h ^= (u64)(u32)v;
+			h *= 1099511628211ULL;
+		}
+		os << " (" << x << "," << y << "," << z << ")";
+	}
+	static u64 last = 0;
+	if (h != last) {
+		last = h;
+		actionstream << "[claude_scene] area list " << V.area_count << "/" << V.area_total
+				<< " origin=(" << V.origin.X << "," << V.origin.Y << "," << V.origin.Z
+				<< ") hash=" << std::hex << h << std::dec << ":" << os.str() << std::endl;
+	}
+	return h;
+}
+
 static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 {
 	if (!g_settings->exists("claude_stats")
@@ -6879,6 +6941,11 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< "," << g_claude_grid.casc[4].ms
 			<< "], \"summary_blocks\": " << claude_lod::summaryCount()
 			<< ", \"far_db_blocks\": " << claude_lod::farDbLoaded()
+			<< ", \"grid_origin\": [" << g_claude_grid.origin.X << "," << g_claude_grid.origin.Y
+					<< "," << g_claude_grid.origin.Z << "]"
+			<< ", \"grid_blocks\": [" << g_scene_blocks_have << "," << g_scene_blocks_want << "]"
+			<< ", \"grid_blocks_hash\": \"" << std::hex << g_scene_blocks_hash << std::dec << "\""
+			<< ", \"area_hash\": \"" << std::hex << claudeAreaListHash() << std::dec << "\""
 			<< ", \"summary_mb\": " << claude_lod::summaryBytes() / (1024 * 1024);
 	os << ", \"draw_ms\": " << (draw_total / frames / 1000.0f)
 			<< ", \"busy_ms\": " << (busy_total / frames / 1000.0f);
@@ -7571,6 +7638,7 @@ void Game::run()
 
 		pollSettingsPatch(dtime, client, m_game_ui.get());
 		claudeUpdateAccum(client);
+		claudeSceneBlocksCount(client);
 		claudeWriteStats(dtime, draw_times.busy_time, stats.drawtime);
 
 		const auto current_dynamic_info = ClientDynamicInfo::getCurrent();
