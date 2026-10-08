@@ -18,8 +18,15 @@ _held = None
 
 
 def hold(what=""):
+    """Take the lock for this process's whole life and hand it down: child
+    processes see CLAUDE_GPU_LOCK_HELD and do not try to take it again (an
+    flock is per open file, so a child taking it would wait for its own
+    parent). Call it at the top of every tool that drives the game, not only
+    where the game is started: a tool that starts the game in a short child
+    and keeps using it would otherwise release the lock mid-run (found
+    2026-10-08)."""
     global _held
-    if _held is not None:
+    if _held is not None or os.environ.get("CLAUDE_GPU_LOCK_HELD"):
         return
     f = open(LOCK, "a+")
     try:
@@ -32,5 +39,6 @@ def hold(what=""):
         print("[gpu-lock] waiting for: %s" % who, file=sys.stderr, flush=True)
         fcntl.flock(f, fcntl.LOCK_EX)
     _held = f
+    os.environ["CLAUDE_GPU_LOCK_HELD"] = str(os.getpid())   # children inherit it
     open(OWNER, "w").write("pid %d since %s in %s: %s\n" % (
         os.getpid(), time.strftime("%H:%M:%S"), os.getcwd(), what or " ".join(sys.argv)))

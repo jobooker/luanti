@@ -145,12 +145,16 @@ def capture(args):
                 f.write("%d %r %r %r %r %r\n" % k)
         fixed = ["--dial", "claude_auto_exposure=0"] + (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
-        rt = run(common + ["--name", name + "-rt"])
-        ref = run(common + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
+        # --rt-dial: on the real-time run only; the truth runs get it at 0
+        # (the truth must not see a display cache, e.g. claude_ledger)
+        rt_only = sum([["--dial", kv] for kv in (args.rt_dial or [])], [])
+        rt_off = sum([["--dial", kv.split("=")[0] + "=0"] for kv in (args.rt_dial or [])], [])
+        rt = run(common + rt_only + ["--name", name + "-rt"])
+        ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
         # face IDs at FULL resolution: the half-res dump blends with a linear
         # filter, which would invent codes at every edge; the scorer takes
         # every second pixel exactly instead
-        fid = run([c if c != "2" else "1" for c in common] + ["--name", name + "-faces",
+        fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
                   "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
         meta["scenarios"][name] = {"fps_at_start": fps, "exposure": expo, "frames": pk[-1][0] + 1,
                                    "realtime": rt[-1], "reference": ref[-1], "faces": fid[-1],
@@ -259,11 +263,17 @@ def score(run_dir):
 
 
 if __name__ == "__main__":
+    # the GPU lock for this tool's whole life (children inherit it): see util/claude_gpu_lock.py
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import claude_gpu_lock
+    claude_gpu_lock.hold('util/claude_playtest.py')
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--hold", type=int, default=256)
     ap.add_argument("--score")
     ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
+    ap.add_argument("--rt-dial", action="append",
+                    help="k=v on the real-time run only; the truth runs get k=0")
     a = ap.parse_args()
     if a.score:
         score(a.score)
