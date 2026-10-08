@@ -330,6 +330,8 @@ struct ClaudeTraceGrid
 	// nbox_all. The cell's material stays a plain solid, so its hits keep
 	// their per-texel colour (claudeTexel) exactly like a B3 stair.
 	int relief_depth = 0;                        // dial the grid was built under
+	bool relief_flat = false;                    // claude_relief_flat, likewise
+	float relief_frac = 0.35f;                   // claude_relief_frac, likewise
 	std::vector<std::array<u8, 768>> relief_maps; // 1-based: depth per texel, top/bottom/side
 	std::unordered_map<content_t, u16> relief_base_of; // content -> map id, 0 = none
 	std::unordered_map<u32, u16> relief_shape_of;      // (map id << 6 | exposed) -> nbox id
@@ -5092,6 +5094,24 @@ static int claudeReliefDepth()
 	return (int)std::lround(g_settings->getFloat("claude_relief", 0.0f, 4.0f));
 }
 
+// claude_relief_flat (an INSTRUMENT, default 0): 1 = the nodes relief
+// would carve drop their baked model (log_oak_baked) and stay plain,
+// per-texel-coloured cubes, uncarved. With claude_relief = N it is the
+// control arm that separates what the grooves add from what the texel
+// colour adds (the oak model is one colour per cell, the plain cube is not).
+static bool claudeReliefFlat()
+{
+	return g_settings->exists("claude_relief_flat")
+			&& g_settings->getFloat("claude_relief_flat", 0.0f, 1.0f) >= 0.5f;
+}
+
+static float claudeReliefFrac()
+{
+	if (!g_settings->exists("claude_relief_frac"))
+		return 0.35f;
+	return g_settings->getFloat("claude_relief_frac", 0.0f, 1.0f);
+}
+
 // Which nodes are carved: logs and soil, by the game's own groups, and only
 // plain opaque cubes.
 // TUNED: the set of carved nodes (groups tree, dirt) | learn by: John's eye
@@ -5114,10 +5134,11 @@ static u16 claudeReliefMapId(Client *client, content_t c,
 	auto it = V.relief_base_of.find(c);
 	if (it != V.relief_base_of.end())
 		return it->second;
-	// TUNED: the darkest 35% of a tile's texels sink | learn by: the groove
-	// share John picks from side-by-sides, or authored height maps (LabPBR
-	// packs) as the known answer to fit brightness->height against
-	const double CARVE_FRAC = 0.35;
+	// TUNED: the darkest 35% of a tile's texels sink (claude_relief_frac,
+	// default 0.35; near 0.65 the bright texels stand proud instead) |
+	// learn by: the groove share John picks from side-by-sides, or authored
+	// height maps (LabPBR packs) as the known answer to fit brightness->height
+	const double CARVE_FRAC = V.relief_frac;
 	// TUNED: a tile whose luminance spread is under 6 sRGB levels is flat and
 	// is not carved | learn by: the same, on tiles John calls smooth
 	const double FLAT_STD = 6.0;
@@ -5599,7 +5620,8 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 			video::SColor rtint(255, 255, 255, 255);
 			if (f.visuals)
 				f.visuals->getColor(n.getParam2(), &rtint);
-			u16 rm = claudeReliefMapId(client, c, f, col, rtint);
+			u16 rm = V.relief_flat ? 0
+					: claudeReliefMapId(client, c, f, col, rtint);
 			u8 ex = rm ? claudeReliefExposed(map, ndef,
 					origin + v3s16(x, y, z)) : 0;
 			u16 sid = ex ? claudeReliefShapeId(rm, ex) : 0;
@@ -6590,7 +6612,8 @@ static void claudeTraceGridSnapshot(Client *client)
 	V.nodebox_on = claudeNodeBoxEnabled();
 	{
 		int rd = claudeReliefDepth();
-		if (rd != V.relief_depth) {
+		float rf = claudeReliefFrac();
+		if (rd != V.relief_depth || rf != V.relief_frac) {
 			// depths are baked into the maps and shapes: start them over
 			// (the old shapes stay in nbox_masks, unreferenced, until the
 			// session ends; at most a few dozen per dial move)
@@ -6599,6 +6622,8 @@ static void claudeTraceGridSnapshot(Client *client)
 			V.relief_shape_of.clear();
 		}
 		V.relief_depth = rd;
+		V.relief_frac = rf;
+		V.relief_flat = claudeReliefFlat();
 		V.relief_cells = 0;
 	}
 	// RGBA per cell: rgb = the node type's average color (same one the
@@ -7072,6 +7097,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"point_emitters\": " << g_claude_grid.emitter_count
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_relief\": " << g_claude_grid.relief_depth
+			<< ", \"claude_relief_flat\": " << (g_claude_grid.relief_flat ? 1 : 0)
+			<< ", \"claude_relief_frac\": " << g_claude_grid.relief_frac
 			<< ", \"relief_cells\": " << g_claude_grid.relief_cells
 			<< ", \"relief_shapes\": " << g_claude_grid.relief_shape_of.size()
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
@@ -7665,7 +7692,9 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 		bool geom_moved = consumer_on && g_claude_grid.valid
 				&& (claudeModelsEnabled() != g_claude_grid.models_on
 					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on
-					|| claudeReliefDepth() != g_claude_grid.relief_depth);
+					|| claudeReliefDepth() != g_claude_grid.relief_depth
+					|| claudeReliefFlat() != g_claude_grid.relief_flat
+					|| claudeReliefFrac() != g_claude_grid.relief_frac);
 		if (geom_moved) {
 			actionstream << "[claude_grid] geometry dial changed"
 					" (claude_models/claude_nodebox/claude_relief); full re-walk"

@@ -29,45 +29,52 @@ def say(*a):
     log.write(s + "\n"); log.flush()
 
 
-def shoot(name, pos, yaw, pitch, t, depth):
+def shoot(name, pos, yaw, pitch, t, depth, extra=None, label=None):
+    """depth = claude_relief; extra = more dials (every arm spells every
+    relief dial, so nothing leaks from the arm before)."""
     global started
+    extra = dict({"claude_relief_flat": 0, "claude_relief_frac": 0.35}, **(extra or {}))
+    label = label or "d%d" % depth
     cmd = [sys.executable, "util/claude_shoot.py", "--play", "--pin",
            "--pos", *map(str, pos), "--yaw", str(yaw), "--pitch", str(pitch),
            "--time", str(t), "--frames", str(FRAMES),
-           "--name", "relief-%s-d%d" % (name, depth),
+           "--name", "relief-%s-%s" % (name, label),
            "--dial", "claude_nee=1", "--dial", "claude_relief=%d" % depth]
+    for k, v in extra.items():
+        cmd += ["--dial", "%s=%s" % (k, v)]
     if started:
         cmd.append("--skip-seat")
-    for attempt in range(4):
+    for attempt in range(3):
         r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True)
         last = (r.stdout.strip().splitlines() or [""])[-1]
         if last.endswith(".png") and os.path.exists(last):
             started = True
             st = lab.read_stats() or {}
-            say("%-14s d%d %s relief_cells=%s shapes=%s still=%s" % (
-                name, depth, last, st.get("relief_cells"), st.get("relief_shapes"),
+            say("%-14s %s %s relief_cells=%s shapes=%s still=%s" % (
+                name, label, last, st.get("relief_cells"), st.get("relief_shapes"),
                 st.get("still_frames")))
-            dst = os.path.join(OUT, "%s-d%d.png" % (name, depth))
+            dst = os.path.join(OUT, "%s-%s.png" % (name, label))
             Image.open(last).save(dst)
             return dst
-        say("shot %s d%d attempt %d failed: %s | %s" % (name, depth, attempt,
+        say("shot %s %s attempt %d failed: %s | %s" % (name, label, attempt,
             last, r.stderr.strip().splitlines()[-3:]))
         started = started or "REFUSED" in last
         time.sleep(20)
     raise SystemExit("two-miss: %s never shot" % name)
 
 
-def stitch(name, paths, crop=None):
+def stitch(name, paths, crop=None, labels=None):
     ims = [Image.open(p).convert("RGB") for p in paths]
     if crop:
         ims = [im.crop(crop) for im in ims]
     w, h = ims[0].size
     out = Image.new("RGB", (w * len(ims) + 8 * (len(ims) - 1), h + 40), "white")
     d = ImageDraw.Draw(out)
-    for k, (im, dep) in enumerate(zip(ims, DEPTHS)):
+    labels = labels or ["claude_relief = %d (%s)" % (
+        dep, "off, today" if dep == 0 else "grooves %d/16 m deep" % dep) for dep in DEPTHS]
+    for k, (im, lab_) in enumerate(zip(ims, labels)):
         out.paste(im, (k * (w + 8), 40))
-        d.text((k * (w + 8) + 10, 10), "claude_relief = %d (%s)" % (
-            dep, "off, today" if dep == 0 else "grooves %d/16 m deep" % dep), fill="black")
+        d.text((k * (w + 8) + 10, 10), lab_, fill="black")
     p = os.path.join(OUT, "%s-compare.png" % name)
     out.save(p)
     say("stitched", p)
@@ -104,6 +111,24 @@ def find_trunk(c):
 
 
 FOREST = (146.5, 8.5, 123.5)
+if os.environ.get("RELIEF_RUN") == "2":
+    # what the grooves add beyond the texel colour (flat control), and the
+    # two knobs: depth, and the share of the tile that sinks
+    ARMS = [("today", 0, {}, "today: relief 0 (oak = baked model, one colour per cell)"),
+            ("flat", 1, {"claude_relief_flat": 1}, "control: plain textured cube, no grooves"),
+            ("d1", 1, {}, "relief 1: darkest 35% sink 1/16 m"),
+            ("d2", 2, {}, "relief 2: darkest 35% sink up to 2/16 m"),
+            ("d1f65", 1, {"claude_relief_frac": 0.65}, "relief 1, frac 0.65: brightest 35% stand proud")]
+    VIEWS = [("trunk2", (151.5, 8.5, 132.5), 180, 8, 0.30, (760, 160, 1400, 1000)),
+             ("ground2-side", FOREST, 0, -28, 0.30, (480, 540, 1440, 1080)),
+             ("ground2-into-sun", FOREST, 270, -28, 0.30, (480, 540, 1440, 1080))]
+    for name, pos, yaw, pitch, t, crop in VIEWS:
+        ps = [shoot(name, pos, yaw, pitch, t, dep, ex, lab_) for lab_, dep, ex, _ in ARMS]
+        stitch(name, ps, labels=[a[3] for a in ARMS])
+        stitch(name + "-crop", ps, crop=crop, labels=[a[3] for a in ARMS])
+    say("done")
+    sys.exit(0)
+
 pairs = {}
 # 1. the wide forest view; this starts the game
 for t, tag in ((0.30, "forest-morning"), (0.5, "forest-noon")):
