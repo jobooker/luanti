@@ -76,4 +76,22 @@ private:
 	u32 frames = 0;
 };
 
+// THE LINEAR READBACK (claude_accum_dump, 2026-10-08): on request, the
+// latest accumulated radiance (float, before exposure and the display
+// curve) to <path>.f32 with <path>.json. The referees read the final 8-bit
+// picture and undo an assumed display curve; this reads what the tracer
+// actually averaged, for checks that must not depend on that inversion.
+extern std::string g_claude_accum_dump;
+class ClaudeAccumReadback : public TrivialRenderStep
+{
+public:
+	ClaudeAccumReadback(TextureBuffer *_buffer, u8 _index) :
+			buffer(_buffer), index(_index) {};
+	void run(PipelineContext &context) override;
+
+private:
+	TextureBuffer *buffer;
+	u8 index;
+};
+
 RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep, v2f scale, Client *client);

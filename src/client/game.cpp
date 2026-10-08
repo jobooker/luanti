@@ -2219,6 +2219,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_bricks_far = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_bricks_far_pixel{"claudeBricksFar"};
 	// claude_walk_exact (2026-10-07): every crossing from tcross()
+	// claude_bounce_uniform (2026-10-08): the scoreboard's control
+	float m_bounce_uniform = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bounce_uniform_pixel{"claudeBounceUniform"};
 	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
@@ -2443,6 +2446,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bricks",
 		"claude_bricks_far",
 		"claude_walk_exact",
+		"claude_bounce_uniform",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -3389,6 +3393,8 @@ public:
 			m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		if (name == "claude_walk_exact")
 			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
+		if (name == "claude_bounce_uniform")
+			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3508,6 +3514,7 @@ public:
 		m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
 		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
+		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3836,6 +3843,7 @@ public:
 				m_bricks_pixel.set(&m_bricks, services);
 				m_bricks_far_pixel.set(&m_bricks_far, services);
 				m_walk_exact_pixel.set(&m_walk_exact, services);
+				m_bounce_uniform_pixel.set(&m_bounce_uniform, services);
 				SamplerLayer_t mtpal = 20, mtprobe = 21;
 				m_matpal_sampler_pixel.set(&mtpal, services);
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
@@ -7209,6 +7217,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// read back from its own textures, plus the camera as the shader
 		// receives it, so a tree built offline can be checked against the
 		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_accum_dump") {
+			g_claude_accum_dump = patch.get(name);   // read back after the next frame
+			continue;
+		}
 		if (name == "claude_brick_check") {
 			claudeBrickCheck();
 			continue;

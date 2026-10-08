@@ -2605,8 +2605,28 @@ float guideFactorBin(int bin)
 	float g = g_guideT > 0.0 ? guideLoad(g_guideTab, bin) / g_guideT : 1.0 / 64.0;
 	return (1.0 - GUIDE_ALPHA) + 64.0 * GUIDE_ALPHA * g;
 }
+// THE CONTROL'S BOUNCES (claude_bounce_uniform 1, 2026-10-08, John: "a
+// real dumb baseline ... random rays in random directions"): uniform over
+// the hemisphere, pdf 1/(2 PI), instead of cosine-weighted. Written as a
+// factor on the cosine pdf exactly as the guide is, so the throughput
+// (tp /= factor) and every light sampler's MIS weight see the same density
+// and the estimate stays unbiased with light sampling on or off.
+uniform float claudeBounceUniform;
+vec3 g_bounceN = vec3(0.0, 1.0, 0.0);   // the vertex normal the factor is about
+vec3 uniformHemisphere(vec3 n, float u1, float u2)
+{
+	float z = u1;
+	float r = sqrt(max(0.0, 1.0 - z * z));
+	float phi = PI2 * u2;
+	vec3 t = abs(n.y) > 0.5 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	vec3 tx = normalize(cross(t, n));
+	vec3 ty = cross(n, tx);
+	return normalize(tx * (r * cos(phi)) + ty * (r * sin(phi)) + n * z);
+}
 float guideFactorDir(vec3 wi)
 {
+	if (g_guideTab < 0 && claudeBounceUniform > 0.5)
+		return 0.5 / max(abs(dot(wi, g_bounceN)), 1e-6);   // (1 / 2PI) / (cos / PI)
 	if (g_guideTab < 0)
 		return 1.0;
 	vec3 t1, t2;
@@ -5080,6 +5100,7 @@ void main(void)
 		// from them. The MIS arms below say so (areaArmed / coneArmed),
 		// so a BSDF ray from that vertex that does hit a lamp counts in
 		// full: no light is lost, it is only found the slow way.
+		g_bounceN = n;
 		if (!hitFar && nLights > 0) {
 			float r0cN = g_rays;
 			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
@@ -5164,6 +5185,10 @@ void main(void)
 				vec2 dd = vec2(dot(dir, t1), dot(dir, t2)) - vec2(0.6, -0.3);
 				g_guideTest = (1.0 + 50.0 * exp(-dot(dd, dd) / 0.02)) / gF;
 			}
+		} else if (claudeBounceUniform > 0.5) {
+			dir = uniformHemisphere(through ? -n : n, u1, u2);
+			gF = 0.5 / max(abs(dot(dir, n)), 1e-6);
+			tp /= gF;
 		} else
 			dir = cosineHemisphere(through ? -n : n, u1, u2);
 		if (through)

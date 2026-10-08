@@ -5,6 +5,8 @@
 // Copyright (C) 2020 appgurueu, Lars Mueller <appgurulars@gmx.de>
 
 #include "secondstage.h"
+#include <fstream>
+#include <cmath>
 #include "client/client.h"
 #include "client/shader.h"
 #include "settings.h"
@@ -473,12 +475,54 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	present->setRenderSource(buffer);
 
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
+	// after the swap, ACCUM_1 holds this frame's accumulated radiance
+	pipeline->addStep<ClaudeAccumReadback>(buffer, TEXTURE_ACCUM_1);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_DIRECT_1, TEXTURE_DIRECT_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_GBUF_1, TEXTURE_GBUF_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_MOM_1, TEXTURE_MOM_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_EXP_1, TEXTURE_EXP_2);
 
 	return present;
+}
+
+std::string g_claude_accum_dump;
+void ClaudeAccumReadback::run(PipelineContext &context)
+{
+	if (g_claude_accum_dump.empty())
+		return;
+	const std::string path = g_claude_accum_dump;
+	g_claude_accum_dump.clear();
+	video::ITexture *tex = buffer->getTexture(index);
+	if (!tex) {
+		warningstream << "[claude_accum_dump] no accumulation texture" << std::endl;
+		return;
+	}
+	const auto fmt = tex->getColorFormat();
+	const core::dimension2du sz = tex->getSize();
+	const void *px = tex->lock(video::ETLM_READ_ONLY);
+	if (!px)
+		return;
+	const size_t n = (size_t)sz.Width * sz.Height * 4;
+	std::vector<float> out(n);
+	if (fmt == video::ECF_A32B32G32R32F) {
+		memcpy(out.data(), px, n * 4);
+	} else if (fmt == video::ECF_A16B16G16R16F) {
+		const u16 *h = (const u16 *)px;
+		for (size_t i = 0; i < n; i++) {
+			u32 v = h[i], sgn = (v >> 15) & 1, e = (v >> 10) & 31, m = v & 1023;
+			float f = e == 0 ? std::ldexp((float)m, -24)
+					: e == 31 ? INFINITY : std::ldexp((float)(m | 1024), (int)e - 25);
+			out[i] = sgn ? -f : f;
+		}
+	}
+	tex->unlock();
+	std::ofstream o(path + ".f32", std::ios::binary);
+	o.write((const char *)out.data(), out.size() * 4);
+	std::ofstream j(path + ".json");
+	j << "{\"w\": " << sz.Width << ", \"h\": " << sz.Height << ", \"format\": \""
+			<< (fmt == video::ECF_A32B32G32R32F ? "rgba32f" : "rgba16f") << "\"}\n";
+	actionstream << "[claude_accum_dump] " << sz.Width << "x" << sz.Height << " -> " << path
+			<< ".f32" << std::endl;
 }
 
 float g_claude_auto_exposure[4] = {0.0f, 0.0f, 0.0f, 0.0f};
