@@ -1539,6 +1539,7 @@ uniform float claudeModelFar;
 uniform sampler3D claudeBrickIds;
 uniform sampler3D claudeBrickPool;
 uniform float claudeBricks;
+uniform float claudeBricksFar;   // B3: node-box shapes past the ring too
 bool g_bricksOff = false;   // view 39 walks once with, once without
 float brickId(vec3 cell)
 {
@@ -1559,8 +1560,20 @@ bool brickSolid(float id, vec3 sv)
 bool fineAt(vec3 cell)
 {
 	if (claudeBricks > 0.5 && !g_bricksOff)
-		return brickId(cell) > 0.5 && (inSubvoxRing(cell) || claudeModelFar > 0.5);
+		return brickId(cell) > 0.5 && (inSubvoxRing(cell) || claudeModelFar > 0.5
+				|| claudeBricksFar > 0.5);
 	return inSubvoxRing(cell) || (claudeModelFar > 0.5 && modelCell(cell));
+}
+// IS THIS BLOCK WALKED AT 1/16 m? Today: a fine material (the snapshot
+// marks ring node boxes and models fine) with bits to walk. B3 adds: any
+// block whose piece is a real shape (id > 2: not solid, not empty) -- a
+// stair past the ring keeps its plain material and gains its shape.
+bool fineHereAt(vec4 pal, vec3 cell)
+{
+	if (claudeBricks > 0.5 && claudeBricksFar > 0.5 && !g_bricksOff
+			&& brickId(cell) > 2.5)
+		return true;
+	return matFine(pal) && fineAt(cell);
 }
 bool fineSolid(vec3 cell, vec3 sv)
 {
@@ -2004,7 +2017,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// step's. Written into spec/roadmap.md instead.
 		idxOut = matIndex(s.a);
 		palOut = matPalIdx(idxOut);
-		if (matFine(palOut)) {
+		if (fineHereAt(palOut, cellHi)) {
 			// entry point in SUB-VOXEL units, clamped INSIDE the
 			// cell: the walk lands exactly on a cell plane and floor()
 			// of an exact boundary can fall either side of it. The
@@ -2224,8 +2237,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// arrival, kept live across a descent for the same reason `s` is:
 		// a fine hit takes its material from the cell that owns the mask.
 		pal = matPalIdx(idx);
-		bool fineHere = claudeDescend > 0.5 && matFine(pal)
-				&& fineAt(ci);
+		bool fineHere = claudeDescend > 0.5 && fineHereAt(pal, ci);
 		// GLASS SITS FLUSH AGAINST CARVED WOOD (2026-10-04, John: "glass
 		// sits flush"). A ray still IN a medium (curMed != 0, and only a
 		// transmissive material is ever a medium) that arrives at an
@@ -3733,7 +3745,7 @@ bool pointSolid(vec3 x)
 	if (s.a <= MAT_AIR_MAX)
 		return false;
 	vec4 pal = matPal(s.a);
-	if (!(matFine(pal) && fineAt(c)))
+	if (!fineHereAt(pal, c))
 		return true;
 	return fineSolid(c, floor((x - c) * SUBV));
 }

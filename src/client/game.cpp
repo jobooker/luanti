@@ -313,6 +313,11 @@ struct ClaudeTraceGrid
 	static constexpr size_t NBOX_CAP = 4096; // distinct shapes; 2 MB
 	bool nodebox_on = true;
 	std::vector<u16> nbox_ids;                   // RING^3, 0 = none
+	// ladder B3 (2026-10-07): the same shape id for EVERY block of the
+	// grid (128^3, 0 = none). The ring's own state (nbox_ids, mat.fine) is
+	// untouched; only the piece ids read this, so claude_bricks_far 0 is
+	// today's renderer exactly.
+	std::vector<u16> nbox_all;
 	std::vector<std::array<u8, 512>> nbox_masks; // 1-based via nbox_ids
 	std::unordered_map<u32, u16> nbox_of;        // shape cache
 	std::unordered_map<content_t, u8> palette;
@@ -2210,6 +2215,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_bricks: 1 = the walk reads its 1/16 m shapes from the pool
 	float m_bricks = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bricks_pixel{"claudeBricks"};
+	// claude_bricks_far (B3): node-box shapes past the ring walked too
+	float m_bricks_far = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_bricks_far_pixel{"claudeBricksFar"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelatlas_sampler_pixel{"claudeModelAtlas"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelpal_sampler_pixel{"claudeModelPal"};
@@ -2430,6 +2438,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_tree_variant",
 		"claude_tree_dirs",
 		"claude_bricks",
+		"claude_bricks_far",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -3372,6 +3381,8 @@ public:
 			m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		if (name == "claude_bricks")
 			m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
+		if (name == "claude_bricks_far")
+			m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3489,6 +3500,7 @@ public:
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_bricks = readAir("claude_bricks", 0.0f, 1.0f);
+		m_bricks_far = readAir("claude_bricks_far", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3815,6 +3827,7 @@ public:
 				m_brick_ids_sampler_pixel.set(&bids, services);
 				m_brick_pool_sampler_pixel.set(&bpool, services);
 				m_bricks_pixel.set(&m_bricks, services);
+				m_bricks_far_pixel.set(&m_bricks_far, services);
 				SamplerLayer_t mtpal = 20, mtprobe = 21;
 				m_matpal_sampler_pixel.set(&mtpal, services);
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
@@ -5080,6 +5093,8 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		int nbring = claudeNBoxRing(x, y, z);
 		if (nbring >= 0 && !V.nbox_ids.empty())
 			V.nbox_ids[nbring] = 0;
+		if (!V.nbox_all.empty())
+			V.nbox_all[i] = 0;
 		u16 nbid = 0;
 		MapNode n = map.getNode(origin + v3s16(x, y, z));
 		content_t c = n.getContent();
@@ -5336,13 +5351,17 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// transmissive cell. A ray still crosses it; it just crosses a
 		// metre of it. That is a coarser GEOMETRY rung, which §7 permits,
 		// rather than a different light law.
-		if (V.nodebox_on && nbring >= 0 && (plain_solid || glass_nodebox)
+		if (V.nodebox_on && (plain_solid || glass_nodebox)
 				&& V.modelids[i] == 0
 				&& f.drawtype == NDT_NODEBOX
 				&& claudeNodeBoxConvertible(f.node_box)) {
-			nbid = claudeNodeBoxMaskId(ndef, map, origin + v3s16(x, y, z),
+			// the shape for every block (B3); the ring's state only inside it
+			u16 sid = claudeNodeBoxMaskId(ndef, map, origin + v3s16(x, y, z),
 					n, c, f);
-			if (nbid) {
+			if (sid && !V.nbox_all.empty())
+				V.nbox_all[i] = sid;
+			if (sid && nbring >= 0) {
+				nbid = sid;
 				mat.fine = 1;            // "this cell has sub-voxel bits"
 				V.nbox_ids[nbring] = nbid;
 			}
@@ -5370,6 +5389,8 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// does not churn the upload path.
 		if (nbid)
 			hash = hash * 1099511628211ULL + (u64)nbid * 7919;
+		else if (!V.nbox_all.empty() && V.nbox_all[i])
+			hash = hash * 1099511628211ULL + (u64)V.nbox_all[i] * 7907;
 		else if (V.modelids[i])
 			hash = hash * 1099511628211ULL + (u64)V.modelids[i] * 31;
 		// material id (0 = untextured); palette + atlas grow on first sight
@@ -5676,6 +5697,9 @@ static void claudeTraceGridBakeBricks(int x0, int y0, int z0, int w, int h, int 
 				id = bakes ? ClaudeTraceGrid::BRICK_FULL : ClaudeTraceGrid::BRICK_ZERO;
 		} else if (tag >> 2) {
 			id = ClaudeTraceGrid::BRICK_MODEL0 + ((tag >> 2) - 1) * 4 + (tag & 3);
+		} else if (!V.nbox_all.empty() && V.nbox_all[vi]) {
+			// B3: a node-box shape past the ring (stairs, slabs, panes)
+			id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_all[vi];
 		}
 		if (id >= ClaudeTraceGrid::BRICK_CAP)
 			id = 0;
@@ -5752,7 +5776,7 @@ static void claudeBrickCheck()
 	ClaudeTraceGrid &V = g_claude_grid;
 	constexpr int S = ClaudeTraceGrid::SIZE;
 	const int R0 = ClaudeTraceGrid::NBOX_R0;
-	size_t cells = 0, bad_cells = 0, bad_bits = 0, ring_cells = 0, far_cells = 0;
+	size_t cells = 0, bad_cells = 0, bad_bits = 0, ring_cells = 0, far_cells = 0, new_cells = 0;
 	std::set<int> ids;
 	for (int z = 0; z < S; z++)
 	for (int y = 0; y < S; y++)
@@ -5769,6 +5793,11 @@ static void claudeBrickCheck()
 					warningstream << "[claude_bricks] cell " << x << "," << y << "," << z
 							<< " has no piece id but today's walk has fine data" << std::endl;
 			}
+			continue;
+		}
+		if (!ring && !(tag >> 2)) {
+			new_cells++;   // B3: a shape today's walk never had here
+			ids.insert(id);
 			continue;
 		}
 		cells++;
@@ -5801,7 +5830,8 @@ static void claudeBrickCheck()
 		}
 	}
 	actionstream << "[claude_bricks] check: " << cells << " blocks with pieces (" << ring_cells
-			<< " in the ring, " << far_cells << " past it), " << ids.size()
+			<< " in the ring, " << far_cells << " past it; " << new_cells
+			<< " node-box blocks past the ring, new in B3), " << ids.size()
 			<< " distinct shapes in use, pool " << V.nbox_masks.size() << " node-box + "
 			<< V.models.size() * 4 << " model shapes | blocks that differ " << bad_cells
 			<< ", bits " << bad_bits << std::endl;
@@ -6322,6 +6352,7 @@ static void claudeTraceGridSnapshot(Client *client)
 		V.nbox_ids.assign((size_t)ClaudeTraceGrid::NBOX_RING
 				* ClaudeTraceGrid::NBOX_RING
 				* ClaudeTraceGrid::NBOX_RING, 0);
+		V.nbox_all.assign((size_t)S * S * S, 0);
 		for (int lvl = 0; lvl <= 5; lvl++) {
 			int n = S >> lvl;
 			V.pyr[lvl].assign((size_t)n * n * n, 0);
