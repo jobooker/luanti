@@ -368,7 +368,8 @@ if __name__ == "__main__":
     # the GPU lock for this tool's whole life (children inherit it): see util/claude_gpu_lock.py
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import claude_gpu_lock
-    claude_gpu_lock.hold('util/claude_scoreboard.py')
+    if sys.argv[1:2] != ["score"]:   # scoring only reads files: no GPU lock
+        claude_gpu_lock.hold('util/claude_scoreboard.py')
     what = sys.argv[1] if len(sys.argv) > 1 else ""
     rest = sys.argv[2:] or list(SCENES)
     if what == "truth":
