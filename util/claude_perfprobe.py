@@ -66,6 +66,8 @@ if os.environ.get("PERF_ARMS") == "pick":
     # light lists: even / by bound / bound x visibility / + skipping
     ARMS = [("even", {}), ("bound", {"claude_area_pick": 1}), ("bound x visibility", {"claude_area_pick": 2}),
             ("+ skip", {"claude_area_pick": 2, "claude_area_skip": 1}), ("even-again", {})]
+if os.environ.get("PERF_ARMS") == "dnyoung":
+    ARMS = [("young 0", {"claude_denoise_young": 0}), ("young 64", {"claude_denoise_young": 64}), ("young 0 again", {"claude_denoise_young": 0}), ("young 64 again", {"claude_denoise_young": 64})]
 if os.environ.get("PERF_ARMS") == "split":
     ARMS = [("play", {}), ("split 0", {"claude_split": 0}), ("reproject 0", {"claude_reproject": 0}),
             ("split 0 + reproject 0", {"claude_split": 0, "claude_reproject": 0}), ("play-again", {})]

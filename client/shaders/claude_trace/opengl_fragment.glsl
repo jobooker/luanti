@@ -554,6 +554,7 @@ uniform float claudeTorchNee;   // claude_torch_nee: 1 = aim at flames
 uniform float claudeGuideImpl;    // claude_guide_impl: 1 = v1 (walk, 3 atomics, every path writes), 2 = v2 (alias, bin only, claude_guide_keep)
 uniform float claudeGuideKeep;    // claude_guide_keep: share of paths that write to the tables
 uniform float claudeGuideDeposit; // claude_guide_deposit: 0 = the guide reads its tables but writes nothing (price instrument)
+uniform float claudeRawFrame;   // claude_raw_frame: 1 = no history, every frame shows only its own rays (the layered comparison)
 uniform float claudeBoost;      // claude_boost: 1 = extra-sample passes give young pixels more paths
 uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
 #ifdef GL_ARB_shader_image_load_store
@@ -3661,7 +3662,7 @@ void main(void)
 	// silhouette; 0, 6 and the 9-11 instruments all accumulate radiance
 	// and want the free anti-aliasing (and want it identically, so the
 	// three instrument views can be divided pixel by pixel).
-	if ((view >= 1 && view <= 5) || view == 7 || view == 8)
+	if ((view >= 1 && view <= 5) || view == 7 || view == 8 || view == 33 || view == 34)
 		jit = vec2(0.0);
 
 	vec2 ndc = (uv + jit) * 2.0 - 1.0;
@@ -3690,6 +3691,7 @@ void main(void)
 	float curMed = 0.0;
 
 	float primaryT = DEPTH_MISS; // for the depth channel + view 4
+	vec3 primaryHp = vec3(0.0);  // views 33/34: the walk's own hit point (not ro + rd * t)
 	vec3 primaryN = vec3(0.0);   // view 1
 	vec3 primaryAlb = vec3(0.0); // view 2
 	bool primaryClear = false;   // the camera ray's first hit is glass/water
@@ -4331,6 +4333,7 @@ void main(void)
 		if (seg == 0) {
 			primaryHit = true;
 			primaryT = tHit;
+			primaryHp = hp;
 			primaryN = n;
 			primaryAlb = alb;
 			primaryLe = le;
@@ -4749,6 +4752,33 @@ void main(void)
 	//   view 23: the bounced light at that surface, demodulated:
 	//            (L - Ld) / albedo, accumulated like a photo (Ld holds all the
 	//            direct light at the first surface, its own glow included).
+	// LADDER PLAN STAGE 1b (2026-10-07): the camera ray's FIRST hit through
+	// the exact pixel centre (no jitter), to check a tree walk built offline
+	// against this walk pixel by pixel.
+	//   view 33: the 1 m cell and face, coded as view 22 (255 = none)
+	//   view 34: the 1/16 piece inside that cell: R = sx*16 + sy, G = sz,
+	//            B = 1 where a hit exists
+	if (view == 33 || view == 34) {
+		vec3 code = vec3(255.0);
+		vec3 sub = vec3(0.0);
+		if (primaryHit && primaryT < DEPTH_MISS * 0.5) {
+			// the walk's OWN hit point: ro + rd * primaryT put floor hits
+			// ~0.25 m inside the cell (2026-10-07), primaryT is not that
+			vec3 q = primaryHp - primaryN * 1e-3;
+			vec3 cc = floor(q);
+			if (all(greaterThanEqual(cc, vec3(0.0))) && all(lessThan(cc, vec3(GRID_S)))) {
+				vec3 an = abs(primaryN);
+				float ax = an.x > 0.5 ? 0.0 : (an.y > 0.5 ? 1.0 : 2.0);
+				float sg = (primaryN.x + primaryN.y + primaryN.z) > 0.0 ? 1.0 : 0.0;
+				float face = ax * 2.0 + sg;
+				code = cc + 128.0 * vec3(mod(face, 2.0), mod(floor(face / 2.0), 2.0), floor(face / 4.0));
+				vec3 sv = floor((q - cc) * SUBV);
+				sub = vec3(sv.x * 16.0 + sv.y, sv.z, 1.0);
+			}
+		}
+		gl_FragColor = vec4((view == 33 ? code : sub) / 255.0, 1.0);
+		return;
+	}
 	if (view == 22) {
 		vec3 code = vec3(255.0);
 		if (guideSet && !guideSky) {
@@ -4956,6 +4986,13 @@ void main(void)
 		}
 	}
 
+	// THE RAW LAYER (claude_raw_frame, 2026-10-07; John: "only what we
+	// actually collect"): this frame's rays and nothing remembered
+	if (claudeRawFrame > 0.5) {
+		prev = fresh;
+		a = 1.0;
+		nPix = 0.0;
+	}
 	gl_FragColor = vec4(mix(prev, fresh, a), tPack);
 #ifdef CLAUDE_SPLIT_OUT
 	vec3 freshD = max(Ld, vec3(0.0));

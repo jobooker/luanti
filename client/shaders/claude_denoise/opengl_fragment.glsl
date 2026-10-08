@@ -38,7 +38,10 @@
 uniform sampler2D src;
 uniform sampler2D gbuf;
 uniform sampler2D aux;
-uniform sampler2D direct;
+uniform sampler2D direct;   // pass 0 and 5; passes 1-4 get the MOMENTS in this slot (secondstage.cpp)
+// claude_denoise_young (2026-10-07): over how many effective samples the
+// brightness test fades in. 0 = always on (the filter as published).
+uniform float claudeDenoiseYoung;
 uniform float claudeDenoise;
 uniform float claudeSplitFrames;  // the direct/bounced split (moved here
 uniform float claudeStillFrames;  // from claude_present, 2026-10-05)
@@ -141,6 +144,28 @@ void main(void)
 		}
 		float sl = SIGMA_L * sqrt(max(vs / vw, 0.0)) + 1e-8;
 		float lp = dot(cp.rgb, LUMA);
+		// A YOUNG PIXEL'S WEIGHTS MUST NOT DEPEND ON BRIGHTNESS (2026-10-07).
+		// Its own value is one or a few samples, usually below the true mean
+		// (the light arrives as rare bright samples), so a brightness test
+		// keeps dark neighbours and drops bright ones and the average sinks:
+		// revealed walls at ~0.6 of truth, the frame 84% too dark just after a
+		// stop. A filter whose weights ignore the values is a plain average
+		// over the same voxel face and cannot darken anything. The test fades
+		// in with the history's effective sample count (1 / moments.g), so a
+		// converged shadow edge stays crisp.
+		// TUNED: claudeDenoiseYoung (8) | learn by: the indoor backing-up
+		// play test, brightness of revealed pixels vs grain, 4 / 8 / 16 / 32
+		float kappa = 1.0;
+		if (claudeDenoiseYoung > 0.5) {
+#if CLAUDE_DN_ITER == 5
+			// pass 5's 4th slot is the direct split: the raw sample count
+			float nEff = texture2D(direct, uv).a;
+#else
+			// passes 1-4: the moments, 1 / (the share one sample has)
+			float nEff = 1.0 / max(texture2D(direct, uv).g, 1e-4);
+#endif
+			kappa = clamp((nEff - 1.0) / claudeDenoiseYoung, 0.0, 1.0);
+		}
 		float h[5];
 		h[0] = 1.0 / 16.0; h[1] = 1.0 / 4.0; h[2] = 3.0 / 8.0;
 		h[3] = 1.0 / 4.0; h[4] = 1.0 / 16.0;
@@ -155,7 +180,7 @@ void main(void)
 				continue;
 			vec4 cq = texture2D(src, q);
 			float w = h[dx + 2] * h[dy + 2]
-					* exp(-abs(dot(cq.rgb, LUMA) - lp) / sl);
+					* exp(-kappa * abs(dot(cq.rgb, LUMA) - lp) / sl);
 			sum += cq.rgb * w;
 			wsum += w;
 			vsum += w * w * cq.a;

@@ -441,7 +441,7 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 				? std::vector<u8> { TEXTURE_ACCUM_2, TEXTURE_GBUF_2,
 						TEXTURE_MOM_2, TEXTURE_DIRECT_2 }
 				: std::vector<u8> { in, TEXTURE_GBUF_2, TEXTURE_ACCUM_2,
-						TEXTURE_DIRECT_2 };
+						it == 5 ? TEXTURE_DIRECT_2 : TEXTURE_MOM_2 };
 		PostProcessingStep *dn = pipeline->addStep<PostProcessingStep>(dn_id,
 				inputs);
 		dn->setRenderSource(buffer);

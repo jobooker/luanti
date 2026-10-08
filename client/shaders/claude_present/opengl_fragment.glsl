@@ -179,7 +179,7 @@ void main(void)
 	if ((claudeView > 0.5 && claudeView < 5.5)
 			|| (claudeView > 6.5 && claudeView < 8.5)
 			|| (claudeView > 18.5 && claudeView < 23.5)
-			|| (claudeView > 24.5 && claudeView < 32.5)) {
+			|| (claudeView > 24.5 && claudeView < 34.5)) {
 		// views 23, 25, 26 are radiance-like values: stored as x/(1+x),
 		// exactly invertible, so 8 bits keep a wide range
 		if ((claudeView > 22.5 && claudeView < 26.5) || (claudeView > 30.5 && claudeView < 31.5))

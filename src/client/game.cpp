@@ -2033,6 +2033,17 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_guide_alpha (2026-10-07): share of bounces drawn from the table
 	float m_guide_alpha = 0.5f;
 	CachedPixelShaderSetting<float, 1, false> m_guide_alpha_pixel{"claudeGuideAlpha"};
+	// claude_denoise_young (2026-10-07): effective samples over which the
+	// denoiser's brightness test fades in (0 = always on, as published).
+	// DEFAULT 64 (2026-10-07, measured): indoor backing up, frame below half
+	// its true brightness 12% -> 0%, too dark after the stop 84% -> 4%, video
+	// JOD 5.39 -> 7.16; no cost (13.7 vs 13.8 ms). Outdoors 8.58 -> 8.33 at
+	// unequal fps: recheck on the loop.
+	float m_denoise_young = 64.0f;
+	CachedPixelShaderSetting<float, 1, false> m_denoise_young_pixel{"claudeDenoiseYoung"};
+	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
+	float m_raw_frame = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_raw_frame_pixel{"claudeRawFrame"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_w_pixel{"claudeGuideW"};
 	CachedPixelShaderSetting<SamplerLayer_t> m_guide_r_pixel{"claudeGuideR"};
 	CachedPixelShaderSetting<float, 4, false> m_held_emitter_pixel{"claudeHeldEmitter"};
@@ -2134,6 +2145,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_guide_keep",
 		"claude_guide_impl",
 		"claude_guide_alpha",
+		"claude_denoise_young",
+		"claude_raw_frame",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -2536,7 +2549,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 32.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 34.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3064,6 +3077,10 @@ public:
 			m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		if (name == "claude_guide_alpha")
 			m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
+		if (name == "claude_denoise_young")
+			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		if (name == "claude_raw_frame")
+			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3175,6 +3192,8 @@ public:
 		m_guide_keep = readAir("claude_guide_keep", 0.25f, 1.0f);
 		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
+		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3316,6 +3335,8 @@ public:
 			m_guide_keep_pixel.set(&m_guide_keep, services);
 			m_guide_impl_pixel.set(&m_guide_impl, services);
 			m_guide_alpha_pixel.set(&m_guide_alpha, services);
+			m_denoise_young_pixel.set(&m_denoise_young, services);
+			m_raw_frame_pixel.set(&m_raw_frame, services);
 			{
 				// image units 0 (write) and 1 (read): separate from the
 				// texture units, so they alias nothing above
@@ -6630,6 +6651,62 @@ static bool claudeApplyPatchFile(const std::string &path,
 				actionstream << "[claude_settings_patch] guide table dumped to " << path
 						<< " (frame " << g_claude_frame_no << ", " << live.size() << " live tables)" << std::endl;
 			}
+			continue;
+		}
+		// LADDER PLAN STAGE 1b (2026-10-07): exactly what the tracer walks,
+		// read back from its own textures, plus the camera as the shader
+		// receives it, so a tree built offline can be checked against the
+		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_export_trace") {
+			const std::string dir = patch.get(name);
+			fs::CreateAllDirs(dir);
+			const ClaudeTraceGrid &V = g_claude_grid;
+			GLint prev_active = GL.TEXTURE0;
+			GL.GetIntegerv(GL.ACTIVE_TEXTURE, &prev_active);
+			GL.ActiveTexture(GL.TEXTURE0 + 30);
+			auto dump3d = [&](u32 tex, const char *file, int w, int h, int d, int comps,
+					GLenum fmt) {
+				if (!tex)
+					return;
+				std::vector<u8> buf((size_t)w * h * d * comps);
+				GL.BindTexture(GL.TEXTURE_3D, tex);
+				GL.GetTexImage(GL.TEXTURE_3D, 0, fmt, GL.UNSIGNED_BYTE, buf.data());
+				std::ofstream o(dir + DIR_DELIM + file, std::ios::binary);
+				o.write((const char *)buf.data(), buf.size());
+			};
+			const GLenum one = claudeUseR8() ? GL.RED : GL_LUMINANCE;
+			dump3d(V.tex, "grid.rgba", 128, 128, 128, 4, GL.RGBA);
+			dump3d(V.subvox_tex, "subvox.r8", 64, 512, 512, 1, one);
+			dump3d(V.model_ids_tex, "model_ids.r8", 128, 128, 128, 1, one);
+			dump3d(V.model_atlas_tex, "model_atlas.r8", 16, 16, 2048, 1, one);
+			GL.BindTexture(GL.TEXTURE_3D, 0);
+			if (V.matpal_tex) {
+				std::vector<float> pal((size_t)256 * 2 * 4);
+				GL.BindTexture(GL.TEXTURE_2D, V.matpal_tex);
+				GL.GetTexImage(GL.TEXTURE_2D, 0, GL.RGBA, GL.FLOAT, pal.data());
+				GL.BindTexture(GL.TEXTURE_2D, 0);
+				std::ofstream o(dir + DIR_DELIM + "matpal.f32", std::ios::binary);
+				o.write((const char *)pal.data(), pal.size() * 4);
+			}
+			GL.ActiveTexture(prev_active);
+			Camera *camera = client->getCamera();
+			v3f local = camera->getPosition() / BS - v3f(V.origin.X, V.origin.Y, V.origin.Z);
+			v3f fwd = camera->getDirection();
+			fwd.normalize();
+			v3f right = v3f(0.f, 1.f, 0.f).crossProduct(fwd);
+			right.normalize();
+			v3f up = fwd.crossProduct(right);
+			right *= std::tan(camera->getFovX() * 0.5f);
+			up *= std::tan(camera->getFovY() * 0.5f);
+			std::ofstream j(dir + DIR_DELIM + "camera.json");
+			j.precision(9);   // full float32: a 6-digit camera moved boundary hits
+			j << "{\"origin\": [" << V.origin.X << ", " << V.origin.Y << ", " << V.origin.Z
+					<< "], \"cam_pos\": [" << local.X << ", " << local.Y << ", " << local.Z
+					<< "], \"fwd\": [" << fwd.X << ", " << fwd.Y << ", " << fwd.Z
+					<< "], \"right\": [" << right.X << ", " << right.Y << ", " << right.Z
+					<< "], \"up\": [" << up.X << ", " << up.Y << ", " << up.Z
+					<< "], \"frame\": " << g_claude_frame_no << "}\n";
+			actionstream << "[claude_settings_patch] trace data exported to " << dir << std::endl;
 			continue;
 		}
 		if (name == "claude_reset_accum") {
