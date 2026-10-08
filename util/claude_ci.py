@@ -155,12 +155,15 @@ SETTLE_SECONDS_WAS = 60.0  # what SETTLE_FRAMES replaced, 2026-08-16
 # way to go red -- the shot is taken and the existing `-converged`
 # assertion (still_frames >= CONVERGED_MIN) judges it, exactly as before.
 SETTLE_MAX_S = 180.0
+# long shots (the scoreboard's truths) raise it per run; CI never sets it
+SETTLE_MAX_S = float(os.environ.get("CLAUDE_SETTLE_MAX_S", SETTLE_MAX_S))
 # ...except that firing the shutter one frame after a reset is the whole
 # defect being removed, so the ceiling does not apply until the
 # accumulator is at least this deep. Past SETTLE_HARD_MAX_S the shot is
 # taken regardless and the run says so.
 SETTLE_MIN_FRAMES = 300
 SETTLE_HARD_MAX_S = 300.0
+SETTLE_HARD_MAX_S = max(SETTLE_HARD_MAX_S, SETTLE_MAX_S + 120.0)
 SETTLE_POLL = 0.25
 # s between the two still_frames reads in freeze. 8.0 -> 3.0: the claim
 # is "still_frames is CLIMBING", still_frames climbs at 45-90 per second,

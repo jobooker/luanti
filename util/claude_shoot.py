@@ -37,6 +37,15 @@ def main():
     # reference-based judge reads as a big difference. Pinned, the pose is
     # the same float every frame of every shot.
     ap.add_argument("--pin", action="store_true")
+    # PLAY PHYSICS (2026-10-08, the scoreboard): push only the capture
+    # mechanics and leave the renderer at the game's own defaults, the
+    # physics as played (CI's photo state switches the air off, among
+    # others). --dial still overrides; a caller comparing arms must spell
+    # every dial any arm sets, because an unpushed key does not revert.
+    ap.add_argument("--play", action="store_true")
+    # the linear accumulated radiance, read BEFORE the pin is released (an
+    # unpinned camera can restart the accumulation)
+    ap.add_argument("--accum-dump", help="path prefix: write <p>.f32 + <p>.json")
     args = ap.parse_args()
     if not args.skip_seat:
         price.start_seat()
@@ -45,6 +54,15 @@ def main():
         print("REFUSED: time did not freeze: %r" % (fr,))
         return 2
     dials = dict(ci.CANONICAL_DIALS)
+    if args.play:
+        dials = {k: v for k, v in ci.CANONICAL_DIALS.items()
+                 if k in ("claude_input_lock", "claude_show_hud", "claude_show_chat",
+                          "claude_stats", "recent_chat_messages", "node_highlighting",
+                          "claude_grid_debug", "claude_grid_follow", "claude_rng", "claude_view",
+                          # the capture PROVES these were applied (ci.PROVEN_DIALS);
+                          # bounces 24 and sky_uniform 0 are the game defaults, and
+                          # a caller sets nee itself (the canonical 0 is photo mode)
+                          "claude_bounces", "claude_sky_uniform", "claude_nee")}
     for kv in args.dial:
         k, _, v = kv.partition("=")
         dials[k.strip()] = float(v)
@@ -94,6 +112,15 @@ def main():
     os.makedirs(rundir, exist_ok=True)
     png, cap = ci.capture({"name": args.name}, vant, vs["furnace-050"],
                           dials, rundir, args.frames, vantage_name=args.name)
+    if args.accum_dump:
+        with open(lab.PATCH, "w") as f:
+            f.write("claude_accum_dump = %s\n" % args.accum_dump)
+        t0 = time.time()
+        while time.time() - t0 < 15 and not os.path.exists(args.accum_dump + ".json"):
+            time.sleep(0.25)
+        if not os.path.exists(args.accum_dump + ".json"):
+            print("REFUSED: the linear dump did not arrive")
+            return 2
     if args.pin:
         with open(lab.PATCH, "w") as f:
             f.write("claude_path = 0\n")
