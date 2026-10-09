@@ -31,7 +31,11 @@ and a GIF: real time | reference, side by side.
 
 Pass/fail thresholds are John's (objectives): this reports numbers.
 
+An A/B is ONE run with several --arm: the arms share the path and the truth
+(rendered once), and each starts from the same settled, reset state.
+
   python3 util/claude_playtest.py [--only backup ...] [--hold 256]
+  python3 util/claude_playtest.py --arm off: --arm m5:claude_ledger=5
   ~/.venvs/judge/bin/python util/claude_playtest.py --score RUN_DIR
 """
 import argparse
@@ -112,7 +116,14 @@ def capture(args):
     run_dir = os.path.join(OUT, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(run_dir)
     keys = scrub_conf_like_look()
-    meta = {"deferred_to_game_defaults": keys, "scenarios": {}}
+    # --arm NAME:k=v,k=v (repeatable); --rt-dial alone is one arm named "rt"
+    arms = [(a.split(":", 1)[0], [kv for kv in a.split(":", 1)[1].split(",") if kv] if ":" in a else [])
+            for a in (args.arm or [])] or [("rt", list(args.rt_dial or []))]
+    if len({a for a, _ in arms}) != len(arms):
+        sys.exit("REFUSED: two arms share a name: %r" % [a for a, _ in arms])
+    arm_keys = sorted({kv.split("=")[0].strip() for _, kvs in arms for kv in kvs})
+    meta = {"deferred_to_game_defaults": keys, "scenarios": {},
+            "arms": {a: kvs for a, kvs in arms}, "dials_all_runs": args.dial or []}
     first = True
     for name, (start, moves) in SCENARIOS.items():
         if args.only and name not in args.only:
@@ -145,11 +156,28 @@ def capture(args):
                 f.write("%d %r %r %r %r %r\n" % k)
         fixed = ["--dial", "claude_auto_exposure=0"] + (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
-        # --rt-dial: on the real-time run only; the truth runs get it at 0
-        # (the truth must not see a display cache, e.g. claude_ledger)
-        rt_only = sum([["--dial", kv] for kv in (args.rt_dial or [])], [])
-        rt_off = sum([["--dial", kv.split("=")[0] + "=0"] for kv in (args.rt_dial or [])], [])
-        rt = run(common + rt_only + ["--name", name + "-rt"])
+        # ARMS (2026-10-09): every arm plays the SAME path and is scored against
+        # the SAME truth, rendered once per scenario. Before, each A/B arm was
+        # its own playtest: its own fps reading, so a slightly different path,
+        # and its own truth -- two truth renders (the bulk of the GPU time) for
+        # a comparison that was not quite one-variable. An arm's dials are on
+        # its real-time run only; the truth runs get every arm key at 0 (the
+        # truth must not see a display cache, e.g. claude_ledger).
+        rt_off = sum([["--dial", k + "=0"] for k in arm_keys], [])
+        rt = {}
+        for ai, (arm, kvs) in enumerate(arms):
+            arm_dials = sum([["--dial", kv] for kv in kvs], [])
+            # every arm starts the same way: parked at the start pose with its
+            # own dials, the light memory and history forgotten (a ledger kept
+            # from the last arm would already know the whole route), then 6 s
+            # to settle with its dials on
+            run(["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pin,
+                 "--nodump", "--frames", "120", "--name", name + "-park-" + arm] + extra + arm_dials)
+            lab.goto({"pos": [x, y, z], "yaw": yaw, "pitch": pitch})
+            open(lab.PATCH, "w").write("claude_path = %s\nclaude_reset_accum = %s-%d\n"
+                                       % (pin, arm, time.time_ns()))
+            time.sleep(6)
+            rt[arm] = run(common + arm_dials + ["--name", name + "-rt-" + arm])
         ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
         # face IDs at FULL resolution: the half-res dump blends with a linear
         # filter, which would invent codes at every edge; the scorer takes
@@ -157,8 +185,9 @@ def capture(args):
         fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
                   "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
         meta["scenarios"][name] = {"fps_at_start": fps, "exposure": expo, "frames": pk[-1][0] + 1,
-                                   "realtime": rt[-1], "reference": ref[-1], "faces": fid[-1],
-                                   "notes": [l for l in rt + ref + fid if "REFUSED" in l]}
+                                   "arms": {a: v[-1] for a, v in rt.items()},
+                                   "reference": ref[-1], "faces": fid[-1],
+                                   "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
     open(lab.PATCH, "w").write("claude_path = 0\nclaude_view = 0\n")
     lab.rpc("abm", on=True)
@@ -173,7 +202,6 @@ def score(run_dir):
     meta = json.load(open(os.path.join(run_dir, "meta.json")))
     report = {}
     for name, sc in meta["scenarios"].items():
-        T, rows = J.load_dump(sc["realtime"])
         R, _ = J.load_dump(sc["reference"])
         # AN INSTRUMENT MUST SEE SOMETHING (2026-10-07): a path that walks the
         # camera into a solid block records black in BOTH arms, and two black
@@ -184,81 +212,86 @@ def score(run_dir):
                   "path enters something solid" % (name, len(black), black[0]))
             continue
         Fc, _ = J.load_dump(sc["faces"])
-        n = min(len(T), len(R), len(Fc))
-        pace = J.pacing(rows)
-        jod = J.jod_video(T[:n], R[:n], max(pace.get("fps_mean", 30.0), 1.0), clip=min(60, n))
-        # the reveal curve: pixels whose face code no pixel had the frame before
-        codes = [(f[::2, ::2].astype(np.int32) * np.array([1, 256, 65536])).sum(2) for f in Fc[:n]]
-        sky = 255 + 255 * 256 + 255 * 65536
-        lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
-        lumR = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R[:n]]
-        born = np.full(codes[0].shape, -1)
-        ages = {}
-        for i in range(1, n):
-            new = ~np.isin(codes[i], codes[i - 1]) & (codes[i] != sky)
-            same = codes[i] == codes[i - 1]
-            born = np.where(new, i, np.where(same, born, -1))
-            age = np.where(born >= 0, i - born, -1)
-            for a in range(0, 31):
-                m = age == a
-                if m.sum() < 200:
-                    continue
-                t_, r_ = lumT[i][m].mean(), lumR[i][m].mean()
-                ages.setdefault(a, []).append((t_, r_, int(m.sum())))
-        curve = {a: float(sum(t for t, r, c in v) / max(sum(r for t, r, c in v), 1e-9))
-                 for a, v in sorted(ages.items())}
-        # DARK PATCHES (what John saw: "starts off all dark"): locally
-        # smoothed brightness, real time vs the truth at the same pose, and
-        # the share of the frame below 80 % / 50 % of the truth. The reveal
-        # curve above only catches faces that are NEW to the screen; backing
-        # up showed a dark band over ground that WAS on screen the frame
-        # before (its history lost while moving), which this sees.
-        def smooth(x, k=8):
-            h, w = x.shape
-            hh, ww = h // k, w // k
-            return x[:hh * k, :ww * k].reshape(hh, k, ww, k).mean((1, 3))
-        dark80, dark50 = [], []
-        for i in range(n):
-            st, sr = smooth(lumT[i]), smooth(lumR[i])
-            lit = sr > 1e-3
-            ratio = np.where(lit, st / np.maximum(sr, 1e-6), 1.0)
-            dark80.append(float(((ratio < 0.8) & lit).mean()))
-            dark50.append(float(((ratio < 0.5) & lit).mean()))
-        moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
-                  or rows[i]["yaw"] != rows[i - 1]["yaw"]]
-        # settling: per-frame JOD after the last move
-        last_move = max(i for i, r in enumerate(rows[:n]) if i > 0 and
-                        (r["pos"] != rows[i - 1]["pos"] or r["yaw"] != rows[i - 1]["yaw"])) \
-            if any(r["pos"] != rows[0]["pos"] or r["yaw"] != rows[0]["yaw"] for r in rows[:n]) else 0
-        settle = None
-        for i in range(last_move, n, max(1, (n - last_move) // 20)):
-            q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]), J.fit(R[i], J.display()["resolution"][::-1]))
-            if q >= 9.0:
-                settle = i - last_move
-                break
-        dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
-        after = list(range(last_move + 1, n))
-        report[name] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
-                            dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
-                            dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
-                            frames_to_jod9_after_stop=settle, frames=n,
-                            fps_at_start=sc["fps_at_start"])
-        print("%-12s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
-              % (name, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
-                 jod, settle))
-        print("             dark patches (share of frame below 80%% / 50%% of truth): moving %.3f / %.3f, first 10 frames after stop %.3f"
-              % (report[name]["dark80_moving"], report[name]["dark50_moving"], report[name]["dark80_after_stop"]))
-        print("             new-face reveal curve (catches only faces new to the screen): " +
-              " ".join("%d:%.2f" % (a, v) for a, v in list(curve.items())[:12]))
-        # the GIF: real time | reference
-        frames = []
-        for i in range(0, n, max(1, n // 60)):
-            a = Image.fromarray(T[i]).resize((480, 270))
-            b = Image.fromarray(R[i]).resize((480, 270))
-            c = Image.new("RGB", (960, 270)); c.paste(a, (0, 0)); c.paste(b, (480, 0))
-            frames.append(c)
-        frames[0].save(os.path.join(run_dir, name + ".gif"), save_all=True, append_images=frames[1:],
-                       duration=int(1000 / max(pace.get("fps_mean", 30), 1) * max(1, n // 60)), loop=0)
+        # every arm against the one truth (old runs: a single "realtime")
+        arms = sc.get("arms") or {"rt": sc["realtime"]}
+        for arm, rt_dir in arms.items():
+            key = name if len(arms) == 1 else name + "/" + arm
+            T, rows = J.load_dump(rt_dir)
+            n = min(len(T), len(R), len(Fc))
+            pace = J.pacing(rows)
+            jod = J.jod_video(T[:n], R[:n], max(pace.get("fps_mean", 30.0), 1.0), clip=min(60, n))
+            # the reveal curve: pixels whose face code no pixel had the frame before
+            codes = [(f[::2, ::2].astype(np.int32) * np.array([1, 256, 65536])).sum(2) for f in Fc[:n]]
+            sky = 255 + 255 * 256 + 255 * 65536
+            lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
+            lumR = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R[:n]]
+            born = np.full(codes[0].shape, -1)
+            ages = {}
+            for i in range(1, n):
+                new = ~np.isin(codes[i], codes[i - 1]) & (codes[i] != sky)
+                same = codes[i] == codes[i - 1]
+                born = np.where(new, i, np.where(same, born, -1))
+                age = np.where(born >= 0, i - born, -1)
+                for a in range(0, 31):
+                    m = age == a
+                    if m.sum() < 200:
+                        continue
+                    t_, r_ = lumT[i][m].mean(), lumR[i][m].mean()
+                    ages.setdefault(a, []).append((t_, r_, int(m.sum())))
+            curve = {a: float(sum(t for t, r, c in v) / max(sum(r for t, r, c in v), 1e-9))
+                     for a, v in sorted(ages.items())}
+            # DARK PATCHES (what John saw: "starts off all dark"): locally
+            # smoothed brightness, real time vs the truth at the same pose, and
+            # the share of the frame below 80 % / 50 % of the truth. The reveal
+            # curve above only catches faces that are NEW to the screen; backing
+            # up showed a dark band over ground that WAS on screen the frame
+            # before (its history lost while moving), which this sees.
+            def smooth(x, k=8):
+                h, w = x.shape
+                hh, ww = h // k, w // k
+                return x[:hh * k, :ww * k].reshape(hh, k, ww, k).mean((1, 3))
+            dark80, dark50 = [], []
+            for i in range(n):
+                st, sr = smooth(lumT[i]), smooth(lumR[i])
+                lit = sr > 1e-3
+                ratio = np.where(lit, st / np.maximum(sr, 1e-6), 1.0)
+                dark80.append(float(((ratio < 0.8) & lit).mean()))
+                dark50.append(float(((ratio < 0.5) & lit).mean()))
+            moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
+                      or rows[i]["yaw"] != rows[i - 1]["yaw"]]
+            # settling: per-frame JOD after the last move
+            last_move = max(i for i, r in enumerate(rows[:n]) if i > 0 and
+                            (r["pos"] != rows[i - 1]["pos"] or r["yaw"] != rows[i - 1]["yaw"])) \
+                if any(r["pos"] != rows[0]["pos"] or r["yaw"] != rows[0]["yaw"] for r in rows[:n]) else 0
+            settle = None
+            for i in range(last_move, n, max(1, (n - last_move) // 20)):
+                q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]), J.fit(R[i], J.display()["resolution"][::-1]))
+                if q >= 9.0:
+                    settle = i - last_move
+                    break
+            dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
+            after = list(range(last_move + 1, n))
+            report[key] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
+                                dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
+                                dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
+                                frames_to_jod9_after_stop=settle, frames=n,
+                                fps_at_start=sc["fps_at_start"])
+            print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
+                  % (key, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
+                     jod, settle))
+            print("             dark patches (share of frame below 80%% / 50%% of truth): moving %.3f / %.3f, first 10 frames after stop %.3f"
+                  % (report[key]["dark80_moving"], report[key]["dark50_moving"], report[key]["dark80_after_stop"]))
+            print("             new-face reveal curve (catches only faces new to the screen): " +
+                  " ".join("%d:%.2f" % (a, v) for a, v in list(curve.items())[:12]))
+            # the GIF: real time | reference
+            frames = []
+            for i in range(0, n, max(1, n // 60)):
+                a = Image.fromarray(T[i]).resize((480, 270))
+                b = Image.fromarray(R[i]).resize((480, 270))
+                c = Image.new("RGB", (960, 270)); c.paste(a, (0, 0)); c.paste(b, (480, 0))
+                frames.append(c)
+            frames[0].save(os.path.join(run_dir, key.replace("/", "-") + ".gif"), save_all=True, append_images=frames[1:],
+                           duration=int(1000 / max(pace.get("fps_mean", 30), 1) * max(1, n // 60)), loop=0)
     json.dump(report, open(os.path.join(run_dir, "report.json"), "w"), indent=1)
 
 
@@ -276,7 +309,12 @@ if __name__ == "__main__":
     ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
     ap.add_argument("--rt-dial", action="append",
                     help="k=v on the real-time run only; the truth runs get k=0")
+    ap.add_argument("--arm", action="append",
+                    help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
+                         "and scored against one truth (NAME: alone = the game as it is)")
     a = ap.parse_args()
+    if a.arm and a.rt_dial:
+        sys.exit("REFUSED: --arm and --rt-dial together (put the dials in the arms)")
     if "--score" in sys.argv:
         # an empty --score (a failed capture upstream) once fell through to a
         # full capture of every scenario, without the GPU lock (scoring skips
