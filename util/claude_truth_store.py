@@ -70,6 +70,8 @@ def find(spec_base, fps):
         sp.pop("keys", None)
         if sp != spec_base or not f or not all(os.path.isdir(man[x]) for x in ("reference", "faces")):
             continue
+        if not all(fl.get("seeds", 1) >= len(FLOOR_SEEDS) for fl in man["floor"]):
+            continue   # a floor from fewer seeds under-reads the noise
         err = abs(f / fps - 1.0)
         if err <= FPS_MATCH and (best is None or err < best[0]):
             best = (err, man)
