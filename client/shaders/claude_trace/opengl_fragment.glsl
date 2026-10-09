@@ -569,6 +569,21 @@ layout(std430, binding = 4) buffer ClaudeTreeCountBuf { uint claudeTreeCount[]; 
 // planted defect for the gate (claude_tree_plant 1): the tree walk starts
 // 1/64 of a base piece off, so the tally MUST show disagreements
 uniform float claudeTreePlant;
+#ifdef CLAUDE_TREE_OK
+// THE TRUTH LEDGER (claude_ledger, roadmap item 4, 2026-10-08): per 1/16 m
+// patch of a surface (world cell, face, two in-face and one depth piece
+// index), the light ARRIVING there, divided by the surface's colour so any
+// view can reuse it, summed from real rays only. Read at the camera's hit
+// for the display (claude_ledger 2), never fed back into paths, so no guess
+// is ever read back as a measurement. Two tables: last frame's (read) and
+// this frame's (written; game.cpp carries it forward each frame with the
+// staleness cap). Entry: key hi, key lo, R, G, B (float bits), count, frame.
+layout(std430, binding = 5) readonly buffer ClaudeLedgerR { uint claudeLedgerR[]; };
+layout(std430, binding = 6) buffer ClaudeLedgerW { uint claudeLedgerW[]; };
+#define CLAUDE_LEDGER_OK 1
+#endif
+uniform float claudeLedger;        // 0 off, 1 write, 2 write + display
+uniform float claudeLedgerFrame;   // frame stamp
 uniform float claudeRawFrame;   // claude_raw_frame: 1 = no history, every frame shows only its own rays (the layered comparison)
 uniform float claudeBoost;      // claude_boost: 1 = extra-sample passes give young pixels more paths
 uniform float claudeGuide;      // claude_guide: 1 = bounce directions guided by per-block tallies (roadmap 3d-i)
@@ -1984,6 +1999,89 @@ vec3 fineEntryExact(vec3 hi, vec3 su, vec3 ro, vec3 stepDir, vec3 delta0,
 			fineEntryAxis(hi.y, su.y, ro.y, stepDir.y, delta0.y, t, 1, axis),
 			fineEntryAxis(hi.z, su.z, ro.z, stepDir.z, delta0.z, t, 2, axis));
 }
+
+#ifdef CLAUDE_LEDGER_OK
+const uint LEDGER_MASK = (1u << 22) - 1u;   // 4M entries of 8 uints (game.cpp sizes the buffers)
+uint ledgerHash(uint a, uint b)
+{
+	uint h = a * 0x9e3779b1u ^ (b + 0x7f4a7c15u + (a << 6) + (a >> 2));
+	h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+	return h;
+}
+// the patch behind a surface point x (grid coords) with cardinal normal n
+void ledgerKey(vec3 x, vec3 n, out uint klo, out uint khi)
+{
+	vec3 sp = x + gridOrigin - n * (0.5 / 16.0);   // half a piece inside the surface
+	vec3 cf = floor(sp);
+	vec3 f = (sp - cf) * 16.0;
+	int ax = abs(n.x) > 0.5 ? 0 : (abs(n.y) > 0.5 ? 1 : 2);
+	int face = ax * 2 + (n[ax] > 0.0 ? 1 : 0);
+	int u = int(floor(ax == 0 ? f.y : f.x)) & 15;
+	int v = int(floor(ax == 2 ? f.y : f.z)) & 15;
+	int d = int(floor(f[ax])) & 15;
+	ivec3 c = ivec3(cf);
+	klo = uint(c.x & 0xFFFF) | (uint(c.y & 0xFFFF) << 16);
+	khi = uint(c.z & 0xFFFF) | (uint(face) << 16) | (uint(u) << 19) | (uint(v) << 23)
+			| (uint(d) << 27) | 0x80000000u;
+}
+// last frame's average for a patch: rgb, count in .a (0 = never seen)
+vec4 ledgerRead(uint klo, uint khi)
+{
+	uint h = ledgerHash(klo, khi);
+	for (uint i = 0u; i < 8u; i++) {
+		uint e = ((h + i) & LEDGER_MASK) * 8u;
+		uint k = claudeLedgerR[e];
+		if (k == 0u)
+			return vec4(0.0);
+		if (k == khi && claudeLedgerR[e + 1u] == klo) {
+			float cnt = float(claudeLedgerR[e + 5u]);
+			if (cnt < 0.5)
+				return vec4(0.0);
+			return vec4(uintBitsToFloat(claudeLedgerR[e + 2u]), uintBitsToFloat(claudeLedgerR[e + 3u]),
+					uintBitsToFloat(claudeLedgerR[e + 4u]), cnt) / vec4(cnt, cnt, cnt, 1.0);
+		}
+	}
+	return vec4(0.0);
+}
+void ledgerAddF(uint i, float v)
+{
+	uint old = claudeLedgerW[i];
+	// INSTRUMENT (2026-10-08): entry 0's spare word counts additions that
+	// gave up after 16 tries, entry 1's counts all additions; a lost addition
+	// keeps its count and loses its light, which would read DARK
+	atomicAdd(claudeLedgerW[15], 1u);
+	// 64 tries, not 16: neighbouring pixels run together and hit the same
+	// patch at once, one wins per try; at 16 tries 30% of additions gave up
+	// (measured 2026-10-08), each keeping its count and losing its light
+	for (int k = 0; k < 64; k++) {
+		uint nw = floatBitsToUint(uintBitsToFloat(old) + v);
+		uint got = atomicCompSwap(claudeLedgerW[i], old, nw);
+		if (got == old)
+			return;
+		old = got;
+	}
+	atomicAdd(claudeLedgerW[7], 1u);
+}
+void ledgerWrite(uint klo, uint khi, vec3 val)
+{
+	uint h = ledgerHash(klo, khi);
+	for (uint i = 0u; i < 8u; i++) {
+		uint e = ((h + i) & LEDGER_MASK) * 8u;
+		uint prev = atomicCompSwap(claudeLedgerW[e], 0u, khi);
+		if (prev == 0u)
+			claudeLedgerW[e + 1u] = klo;     // claimed
+		else if (prev != khi || claudeLedgerW[e + 1u] != klo)
+			continue;                        // someone else's patch
+		ledgerAddF(e + 2u, val.r);
+		ledgerAddF(e + 3u, val.g);
+		ledgerAddF(e + 4u, val.b);
+		atomicAdd(claudeLedgerW[e + 5u], 1u);
+		claudeLedgerW[e + 6u] = uint(claudeLedgerFrame);
+		return;
+	}
+	// 8 probes all taken: dropped (game.cpp logs the table's fill)
+}
+#endif
 
 bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		out vec3 alb, out vec3 le, out float tHit, out vec3 cellOut,
@@ -4689,6 +4787,13 @@ void main(void)
 	// in the same error-at-equal-time sweep)
 	int gpTab0 = -1, gpTab1 = -1, gpBin0 = 0, gpBin1 = 0;
 	float gpTp0 = 0.0, gpTp1 = 0.0, gpL0 = 0.0, gpL1 = 0.0, gpF0 = 1.0, gpF1 = 1.0;
+	// claude_ledger: the first three scattering hits, settled at path end
+	int lgRec = 0;
+	uint lgLo0 = 0u, lgHi0 = 0u, lgLo1 = 0u, lgHi1 = 0u, lgLo2 = 0u, lgHi2 = 0u;
+	vec3 lgL0 = vec3(0.0), lgL1 = vec3(0.0), lgL2 = vec3(0.0);
+	vec3 lgT0 = vec3(0.0), lgT1 = vec3(0.0), lgT2 = vec3(0.0);
+	bool lgCam = false;                 // record 0 is the camera's own hit
+	vec3 lgCamLe = vec3(0.0), lgCamAlb = vec3(0.0);
 	for (int seg = 0; seg <= BOUNCE_CAP; seg++) {
 		{
 			float ln = L.r + L.g + L.b;
@@ -5101,6 +5206,20 @@ void main(void)
 		// so a BSDF ray from that vertex that does hit a lamp counts in
 		// full: no light is lost, it is only found the slow way.
 		g_bounceN = n;
+#ifdef CLAUDE_LEDGER_OK
+		if (claudeLedger > 0.5 && lgRec < 3 && !leafT && !hitFar && curMed < 0.5 && view == 0) {
+			// everything this path gathers from here on, divided by the
+			// throughput and colour here, is this point's incoming light
+			uint klo, khi;
+			ledgerKey(p + dir * tHit, n, klo, khi);
+			vec3 ta = tp * alb;
+			if (lgRec == 0) { lgLo0 = klo; lgHi0 = khi; lgL0 = L; lgT0 = ta;
+				if (seg == 0) { lgCam = true; lgCamLe = le; lgCamAlb = alb; } }
+			else if (lgRec == 1) { lgLo1 = klo; lgHi1 = khi; lgL1 = L; lgT1 = ta; }
+			else { lgLo2 = klo; lgHi2 = khi; lgL2 = L; lgT2 = ta; }
+			lgRec++;
+		}
+#endif
 		if (!hitFar && nLights > 0) {
 			float r0cN = g_rays;
 			vec3 cN = tp * neeDirect(hp, n, alb, nLights, 1.0, curMed);
@@ -5219,6 +5338,33 @@ void main(void)
 	}
 	guideDeposit(gpTab0, gpBin0, gpTp0, gpL0, gpF0, L);
 	guideDeposit(gpTab1, gpBin1, gpTp1, gpL1, gpF1, L);
+#if defined(CLAUDE_LEDGER_OK) && CLAUDE_SUBPASS == 0
+	vec4 lgCamMean = vec4(0.0);
+	if (claudeLedger > 0.5) {
+		if (lgCam && claudeLedger > 1.5)
+			lgCamMean = ledgerRead(lgLo0, lgHi0);   // last frame's, before this one lands
+		for (int r = 0; r < 3; r++) {
+			if (r >= lgRec)
+				break;
+			uint klo = r == 0 ? lgLo0 : (r == 1 ? lgLo1 : lgLo2);
+			uint khi = r == 0 ? lgHi0 : (r == 1 ? lgHi1 : lgHi2);
+			// the camera's own hit: neighbours land on the same patch, so
+			// each pixel deposits it every 4th frame in a rotating 2x2
+			// pattern (a regular subset of real samples: still an honest
+			// average) instead of every pixel colliding every frame
+			if (r == 0 && lgCam && ((int(gl_FragCoord.x) & 1) + 2 * (int(gl_FragCoord.y) & 1)
+					+ int(claudeLedgerFrame)) % 4 != 0)
+				continue;
+			vec3 lb = r == 0 ? lgL0 : (r == 1 ? lgL1 : lgL2);
+			vec3 ta = r == 0 ? lgT0 : (r == 1 ? lgT1 : lgT2);
+			if (any(lessThan(ta, vec3(1e-6))))
+				continue;   // a colour channel this surface absorbs entirely
+			vec3 inc = max(L - lb, vec3(0.0)) / ta;
+			if (all(lessThan(inc, vec3(1e30))))
+				ledgerWrite(klo, khi, inc);
+		}
+	}
+#endif
 	{
 		float ln = L.r + L.g + L.b;
 		if (ln > wLprev) wGain = wB;
@@ -5621,6 +5767,26 @@ void main(void)
 		a = 1.0;
 		nPix = 0.0;
 	}
+#if defined(CLAUDE_LEDGER_OK) && CLAUDE_SUBPASS == 0
+	if (claudeLedger > 1.5 && lgCam && lgCamMean.a > 0.5) {
+		// Two averages of real rays for this pixel: its own history (this
+		// frame blended in at weight a, so about 1/a samples) and its patch's
+		// ledger entry (count samples, from every view, frame and bounce).
+		// Each weighted by its sample count, the standard way to merge two
+		// averages: a freshly revealed pixel takes the ledger, a pixel long
+		// on screen keeps mostly its own finer grain. The first version
+		// (2026-10-08) replaced the pixel outright: right brightness, but
+		// noise in 1/16 m blocks.
+		vec3 own = mix(prev, fresh, a);
+		float nOwn = 1.0 / max(a, 1e-4);
+		vec3 led = lgCamLe + lgCamAlb * lgCamMean.rgb;
+		float nLed = lgCamMean.a;
+		vec3 merged = (own * nOwn + led * nLed) / (nOwn + nLed);
+		prev = merged;
+		fresh = merged;
+		a = 1.0;
+	}
+#endif
 	gl_FragColor = vec4(mix(prev, fresh, a), tPack);
 #ifdef CLAUDE_SPLIT_OUT
 	vec3 freshD = max(Ld, vec3(0.0));

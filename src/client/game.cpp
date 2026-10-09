@@ -1209,6 +1209,123 @@ static void claudeTreeBuild(bool descend, bool model_far)
 			<< model_far << ", " << (porting::getTimeMs() - t0) << " ms" << std::endl;
 }
 
+
+// THE TRUTH LEDGER (claude_ledger, 2026-10-08): two 4M-entry tables of 8
+// uints (key hi, key lo, R, G, B float bits, count, frame stamp). Each frame
+// the trace reads last frame's table (binding 5) and adds to this frame's
+// (binding 6), which a compute pass first fills with last frame's contents
+// under the staleness cap. Cleared when it fills past 3/4 (v1: no eviction).
+static GLuint g_ledger[2] = {0, 0};
+static int g_ledger_read = 0;
+static GLuint g_ledger_carry = 0;
+static u32 g_ledger_frame = ~0u;
+static bool g_ledger_clear = false;   // pseudo-key claude_ledger_clear: forget everything
+static const char *LEDGER_CARRY_SRC = R"GLSL(#version 460
+layout(local_size_x = 64) in;
+layout(std430, binding = 5) readonly buffer A { uint a[]; };
+layout(std430, binding = 6) writeonly buffer B { uint b[]; };
+uniform float capN;
+void main() {
+	uint e = gl_GlobalInvocationID.x * 8u;
+	if (e >= uint(a.length())) return;
+	uint n = a[e + 5u];
+	float s = 1.0;
+	if (float(n) > capN) { s = capN / float(n); n = uint(capN); }
+	b[e] = a[e]; b[e + 1u] = a[e + 1u];
+	b[e + 2u] = floatBitsToUint(uintBitsToFloat(a[e + 2u]) * s);
+	b[e + 3u] = floatBitsToUint(uintBitsToFloat(a[e + 3u]) * s);
+	b[e + 4u] = floatBitsToUint(uintBitsToFloat(a[e + 4u]) * s);
+	b[e + 5u] = n; b[e + 6u] = a[e + 6u]; b[e + 7u] = a[e + 7u];
+}
+)GLSL";
+static void claudeLedgerBind(float frame)
+{
+	const size_t ENTRIES = (size_t)1 << 22, BYTES = ENTRIES * 8 * 4;
+	if (!g_ledger[0]) {
+		GL.GenBuffers(2, g_ledger);
+		for (int i = 0; i < 2; i++) {
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[i]);
+			GL.BufferData(GL.SHADER_STORAGE_BUFFER, BYTES, nullptr, GL.DYNAMIC_DRAW);
+			GL.ClearBufferData(GL.SHADER_STORAGE_BUFFER, GL.R32UI, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+		}
+		GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+		GLuint sh = GL.CreateShader(GL.COMPUTE_SHADER);
+		GL.ShaderSource(sh, 1, &LEDGER_CARRY_SRC, nullptr);
+		GL.CompileShader(sh);
+		GLint ok = 0;
+		GL.GetShaderiv(sh, GL.COMPILE_STATUS, &ok);
+		if (!ok) {
+			char log[2048] = {};
+			GL.GetShaderInfoLog(sh, sizeof(log), nullptr, log);
+			errorstream << "[claude_ledger] carry shader: " << log << std::endl;
+			return;
+		}
+		g_ledger_carry = GL.CreateProgram();
+		GL.AttachShader(g_ledger_carry, sh);
+		GL.LinkProgram(g_ledger_carry);
+		actionstream << "[claude_ledger] tables 2 x " << (BYTES >> 20) << " MiB" << std::endl;
+	}
+	if (g_ledger_clear) {
+		g_ledger_clear = false;
+		for (int i = 0; i < 2; i++) {
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[i]);
+			GL.ClearBufferData(GL.SHADER_STORAGE_BUFFER, GL.R32UI, GL.RED_INTEGER, GL.UNSIGNED_INT, nullptr);
+		}
+		GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+		actionstream << "[claude_ledger] cleared on request" << std::endl;
+	}
+	if (g_ledger_frame != g_claude_frame_no) {
+		g_ledger_frame = g_claude_frame_no;
+		g_ledger_read ^= 1;   // last frame's written table is now the one read
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		GLint prev = 0;
+		GL.GetIntegerv(GL.CURRENT_PROGRAM, &prev);
+		GL.UseProgram(g_ledger_carry);
+		// TUNED: a patch remembers its last 256 samples | learn by: error at
+		// equal time on the loop's moving-light and torch stretches
+		GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), 256.0f);
+		GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[g_ledger_read]);
+		GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[g_ledger_read ^ 1]);
+		GL.DispatchCompute((GLuint)(ENTRIES / 64), 1, 1);
+		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+		GL.UseProgram(prev);
+		// the fill, once a second: v1 has no eviction, so clear at 3/4
+		if (g_claude_frame_no % 60 == 0) {
+			std::vector<u32> probe(8 * 4096);
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[g_ledger_read]);
+			size_t used = 0;
+			for (int blk = 0; blk < 16; blk++) {
+				GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, (ptrdiff_t)(blk * (BYTES / 16)),
+						probe.size() * 4, probe.data());
+				for (size_t i = 0; i < probe.size(); i += 8)
+					used += probe[i] != 0;
+			}
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+			const double fill = (double)used / (16 * 4096);
+			u32 cnt[16];
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[g_ledger_read]);
+			GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, 0, sizeof(cnt), cnt);
+			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+			static u32 lost0 = 0, adds0 = 0;
+			actionstream << "[claude_ledger] fill " << fill << " (sampled) | additions this second "
+					<< (cnt[15] - adds0) << ", gave up " << (cnt[7] - lost0) << std::endl;
+			lost0 = cnt[7];
+			adds0 = cnt[15];
+			if (fill > 0.75) {
+				for (int i = 0; i < 2; i++) {
+					GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[i]);
+					GL.ClearBufferData(GL.SHADER_STORAGE_BUFFER, GL.R32UI, GL.RED_INTEGER,
+							GL.UNSIGNED_INT, nullptr);
+				}
+				GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
+				actionstream << "[claude_ledger] cleared at fill " << fill << std::endl;
+			}
+		}
+	}
+	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[g_ledger_read]);
+	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[g_ledger_read ^ 1]);
+	(void)frame;
+}
 static u32 g_vis_frame = ~0u;
 static bool g_vis_list_changed = false;
 static void claudeVisBind()
@@ -2220,6 +2337,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_bricks_far_pixel{"claudeBricksFar"};
 	// claude_walk_exact (2026-10-07): every crossing from tcross()
 	// claude_bounce_uniform (2026-10-08): the scoreboard's control
+	// claude_ledger (2026-10-08): 1 write the truth ledger, 2 also display it
+	float m_ledger = 0.0f;
+	CachedPixelShaderSetting<float, 1, false> m_ledger_pixel{"claudeLedger"};
+	CachedPixelShaderSetting<float, 1, false> m_ledger_frame_pixel{"claudeLedgerFrame"};
 	float m_bounce_uniform = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce_uniform_pixel{"claudeBounceUniform"};
 	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
@@ -2447,6 +2568,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bricks_far",
 		"claude_walk_exact",
 		"claude_bounce_uniform",
+		"claude_ledger",
 		"claude_white_balance",
 		"claude_leaf_transmit",
 		"claude_model_far",
@@ -3395,6 +3517,8 @@ public:
 			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		if (name == "claude_ledger")
+			m_ledger = readAir("claude_ledger", 0.0f, 2.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3515,6 +3639,7 @@ public:
 		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		m_ledger = readAir("claude_ledger", 0.0f, 2.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -3844,6 +3969,13 @@ public:
 				m_bricks_far_pixel.set(&m_bricks_far, services);
 				m_walk_exact_pixel.set(&m_walk_exact, services);
 				m_bounce_uniform_pixel.set(&m_bounce_uniform, services);
+				m_ledger_pixel.set(&m_ledger, services);
+				{
+					float lf = (float)(g_claude_frame_no & 0xFFFFFF);
+					m_ledger_frame_pixel.set(&lf, services);
+					if (m_ledger > 0.5f)
+						claudeLedgerBind(lf);
+				}
 				SamplerLayer_t mtpal = 20, mtprobe = 21;
 				m_matpal_sampler_pixel.set(&mtpal, services);
 				m_matprobe_sampler_pixel.set(&mtprobe, services);
@@ -7221,6 +7353,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 			g_claude_accum_dump = patch.get(name);   // read back after the next frame
 			continue;
 		}
+		if (name == "claude_ledger_clear") {
+			g_ledger_clear = true;
+			continue;
+		}
 		if (name == "claude_brick_check") {
 			claudeBrickCheck();
 			continue;
@@ -7282,6 +7418,7 @@ static bool claudeApplyPatchFile(const std::string &path,
 			continue;
 		}
 		if (name == "claude_reset_accum") {
+			g_ledger_clear = true;   // an explicit reset forgets the ledger too (fair equal-time tests)
 			claudeResetAccumulation();
 			actionstream << "[claude_settings_patch] accumulation reset ("
 					<< patch.get(name) << ")" << std::endl;
