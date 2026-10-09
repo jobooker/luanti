@@ -82,6 +82,30 @@ private:
 // picture and undo an assumed display curve; this reads what the tracer
 // actually averaged, for checks that must not depend on that inversion.
 extern std::string g_claude_accum_dump;
+// THE DENOISER'S WHOLE INPUT SET (claude_dump_at, 2026-10-08, the ML
+// denoiser prototype): on request, this frame's accumulated radiance, its
+// direct part, the guide (accumulated albedo + face code), the moments and
+// the denoiser's output (what claude_present shows), each to
+// <path>.<name>.f32 plus one <path>.json. game.cpp sets the path on the
+// frames a schedule asks for (still_frames = N), so one accumulation gives
+// the inputs at several depths.
+extern std::string g_claude_set_dump;
+extern float g_claude_set_dump_frames;
+extern std::string g_claude_set_dump_extra;
+extern unsigned g_claude_set_dumps_written;
+class ClaudeSetReadback : public TrivialRenderStep
+{
+public:
+	ClaudeSetReadback(TextureBuffer *_buffer, std::vector<u8> _idx, std::vector<std::string> _names) :
+			buffer(_buffer), idx(_idx), names(_names) {};
+	void run(PipelineContext &context) override;
+
+private:
+	TextureBuffer *buffer;
+	std::vector<u8> idx;
+	std::vector<std::string> names;
+};
+
 class ClaudeAccumReadback : public TrivialRenderStep
 {
 public:

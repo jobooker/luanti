@@ -189,6 +189,11 @@ public:
 	//! Regenerates the mip map levels of the texture. */
 	virtual void regenerateMipMapLevels() = 0;
 
+	//! The driver's own name for the texture (the GL texture name for the
+	//! OpenGL drivers, 0 elsewhere): for engine code that runs its own GL
+	//! passes on a pipeline texture (claude_denoise_learned, 2026-10-09).
+	virtual u32 getNativeHandle() const { return 0; }
+
 	//! Get original size of the texture.
 	/** The texture is usually scaled, if it was created with an unoptimal
 	size. For example if the size was not a power of two. This method

@@ -46,7 +46,8 @@
 #include "porting.h"
 #include <fstream>
 #include <json/json.h>
-#include "client/render/secondstage.h" // g_claude_auto_exposure // claude_models manifest (phase 4.5)
+#include "client/render/secondstage.h"
+#include "client/render/claude_learned.h" // g_claude_auto_exposure // claude_models manifest (phase 4.5)
 #include <sstream>
 #include <array>
 #include <algorithm>
@@ -1504,6 +1505,12 @@ static void claudeGuideBind()
 }
 static std::string g_claude_shutter_token;
 static std::string g_claude_dump_at_shutter;   // claude_accum_dump_shutter
+// claude_dump_at = "1,4,16:prefix" (secondstage.h ClaudeSetReadback): armed
+// by the NEXT claude_shutter (whose reset starts the accumulation), then the
+// frame at which still_frames reaches each N dumps the set to prefix_N.
+static std::vector<int> g_claude_dump_pending, g_claude_dump_active;
+static std::string g_claude_dump_pending_prefix, g_claude_dump_prefix;
+static unsigned long long g_claude_dump_resets0 = 0;   // accum_resets when armed
 static float g_claude_shutter_fired = -1.0f;
 static std::string g_claude_shutter_fired_token;
 
@@ -2488,6 +2495,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// JOD 5.39 -> 7.16; no cost (13.7 vs 13.8 ms). Outdoors 8.58 -> 8.33 at
 	// unequal fps: recheck on the loop.
 	float m_denoise_young = 64.0f;
+	// claude_denoise_learned (2026-10-09): 1 = today's filter with per-pixel
+	// weights from a small trained network (client/render/claude_learned.h)
+	float m_denoise_learned = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_denoise_young_pixel{"claudeDenoiseYoung"};
 	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
 	float m_raw_frame = 0.0f;
@@ -2601,6 +2611,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_guide_impl",
 		"claude_guide_alpha",
 		"claude_denoise_young",
+		"claude_denoise_learned",
 		"claude_raw_frame",
 		"claude_tree_plant",
 		"claude_tree_variant",
@@ -3533,6 +3544,8 @@ public:
 			m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		if (name == "claude_denoise_young")
 			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		if (name == "claude_denoise_learned")
+			m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_tree_plant")
@@ -3662,6 +3675,7 @@ public:
 		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
@@ -4062,6 +4076,19 @@ public:
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				g_claude_grid.dial_denoise = m_denoise;
+				// the learned passes replace today's only where today's would
+				// filter at all (claude_denoise off(): denoise 0, a debug view,
+				// raster mode)
+				g_claude_dn_learned_wanted = m_denoise_learned > 0.5f && m_denoise > 0.5f
+						&& m_view < 0.5f && m_grid_debug > 2.5f;
+				{
+					float ex = m_exposure > 0.0f ? m_exposure : 1.0f;
+					if (m_auto_exposure > 0.5f && g_claude_auto_exposure[3] > 0.5f
+							&& g_claude_auto_exposure[0] > 0.0f && g_claude_auto_exposure[0] < 1e9f)
+						ex *= g_claude_auto_exposure[0];
+					g_claude_dn_learned_ex = ex;
+					g_claude_dn_learned_young = m_denoise_young;
+				}
 				// claude_trace's three dials. Delivered here, next to the
 				// samplers, because claude_present consumes claudeView
 				// too and both programs run every frame regardless of
@@ -7371,6 +7398,9 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// fired (-1 / "" until one has)
 			<< ", \"shutter_frames\": " << g_claude_shutter_fired
 			<< ", \"shutter_token\": \"" << g_claude_shutter_fired_token << "\""
+			<< ", \"dump_pending\": " << g_claude_dump_pending.size()
+			<< ", \"dump_active\": " << g_claude_dump_active.size()
+			<< ", \"dump_written\": " << g_claude_set_dumps_written
 			<< ", \"casc_valid\": [" << (g_claude_grid.casc[0].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[1].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[2].valid ? 1 : 0)
@@ -7731,6 +7761,23 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// read back from its own textures, plus the camera as the shader
 		// receives it, so a tree built offline can be checked against the
 		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_dump_at") {
+			const std::string v = patch.get(name);
+			const size_t c = v.find(':');
+			g_claude_dump_pending.clear();
+			if (c != std::string::npos) {
+				std::stringstream ss(v.substr(0, c));
+				std::string tok;
+				while (std::getline(ss, tok, ','))
+					if (atoi(tok.c_str()) > 0)
+						g_claude_dump_pending.push_back(atoi(tok.c_str()));
+				std::sort(g_claude_dump_pending.begin(), g_claude_dump_pending.end());
+				g_claude_dump_pending_prefix = v.substr(c + 1);
+			}
+			actionstream << "[claude_dump_at] pending " << g_claude_dump_pending.size()
+					<< " depths -> " << g_claude_dump_pending_prefix << std::endl;
+			continue;
+		}
 		if (name == "claude_accum_dump") {
 			g_claude_accum_dump = patch.get(name);   // read back after the next frame
 			continue;
@@ -7842,6 +7889,12 @@ static bool claudeApplyPatchFile(const std::string &path,
 			const float n = (float)atoi(v.c_str());
 			if (n > 0.0f) {
 				claudeResetAccumulation();
+				if (!g_claude_dump_pending.empty()) {
+					g_claude_dump_active = g_claude_dump_pending;
+					g_claude_dump_prefix = g_claude_dump_pending_prefix;
+					g_claude_dump_pending.clear();
+					g_claude_dump_resets0 = (unsigned long long)g_claude_grid.accum_resets;
+				}
 				g_claude_shutter_at = n;
 				g_claude_shutter_token = v;
 				actionstream << "[claude_settings_patch] shutter armed at "
@@ -11495,6 +11548,21 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 	/*
 		Drawing
 	*/
+	// claude_dump_at: this frame is a depth the schedule asked for (the
+	// same still_frames test the shutter applies after drawing)
+	if (!g_claude_dump_active.empty()
+			&& g_claude_grid.still_frames >= (float)g_claude_dump_active.front()) {
+		int want = g_claude_dump_active.front();
+		while (!g_claude_dump_active.empty()
+				&& g_claude_grid.still_frames >= (float)g_claude_dump_active.front())
+			g_claude_dump_active.erase(g_claude_dump_active.begin());
+		g_claude_set_dump = g_claude_dump_prefix + "_" + std::to_string(want);
+		g_claude_set_dump_frames = g_claude_grid.still_frames;
+		// a restart since the arming (a nudge blends history in) makes
+		// this dump something other than N clean frames: say so
+		g_claude_set_dump_extra = ", \"resets_since_arm\": " + std::to_string(
+				(unsigned long long)g_claude_grid.accum_resets - g_claude_dump_resets0);
+	}
 	TimeTaker tt_draw("Draw scene", nullptr, PRECISION_MICRO);
 	this->driver->beginScene(true, true, sky_color);
 
