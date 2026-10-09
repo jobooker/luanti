@@ -49,7 +49,14 @@ def main():
     args = ap.parse_args()
     if not args.skip_seat:
         price.start_seat()
-    fr = ci.do_freeze()
+    # three tries: a freshly settling seat restarts its picture now and
+    # then, and one restart during the check refused whole playtests
+    # (2026-10-08/09); a seat that never settles still refuses
+    for _try in range(3):
+        fr = ci.do_freeze()
+        if fr.get("deepening"):
+            break
+        time.sleep(10)
     if not fr.get("deepening"):
         print("REFUSED: time did not freeze: %r" % (fr,))
         return 2
