@@ -481,6 +481,11 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_GBUF_1, TEXTURE_GBUF_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_MOM_1, TEXTURE_MOM_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_EXP_1, TEXTURE_EXP_2);
+	// after every swap: the _1 textures hold this frame's, DEN_B what was shown
+	pipeline->addStep<ClaudeSetReadback>(buffer,
+			std::vector<u8> { TEXTURE_ACCUM_1, TEXTURE_DIRECT_1, TEXTURE_GBUF_1,
+					TEXTURE_MOM_1, TEXTURE_DEN_B },
+			std::vector<std::string> { "accum", "direct", "gbuf", "mom", "den" });
 
 	return present;
 }
@@ -523,6 +528,53 @@ void ClaudeAccumReadback::run(PipelineContext &context)
 			<< (fmt == video::ECF_A32B32G32R32F ? "rgba32f" : "rgba16f") << "\"}\n";
 	actionstream << "[claude_accum_dump] " << sz.Width << "x" << sz.Height << " -> " << path
 			<< ".f32" << std::endl;
+}
+
+std::string g_claude_set_dump;
+float g_claude_set_dump_frames = 0.0f;
+std::string g_claude_set_dump_extra;
+unsigned g_claude_set_dumps_written = 0;
+void ClaudeSetReadback::run(PipelineContext &context)
+{
+	if (g_claude_set_dump.empty())
+		return;
+	const std::string path = g_claude_set_dump;
+	g_claude_set_dump.clear();
+	core::dimension2du sz(0, 0);
+	std::string fmts;
+	for (size_t t = 0; t < idx.size(); t++) {
+		video::ITexture *tex = buffer->getTexture(idx[t]);
+		if (!tex)
+			continue;
+		const auto fmt = tex->getColorFormat();
+		sz = tex->getSize();
+		const void *px = tex->lock(video::ETLM_READ_ONLY);
+		if (!px)
+			continue;
+		const size_t n = (size_t)sz.Width * sz.Height * 4;
+		std::vector<float> out(n);
+		if (fmt == video::ECF_A32B32G32R32F) {
+			memcpy(out.data(), px, n * 4);
+		} else if (fmt == video::ECF_A16B16G16R16F) {
+			const u16 *h = (const u16 *)px;
+			for (size_t i = 0; i < n; i++) {
+				u32 v = h[i], sgn = (v >> 15) & 1, e = (v >> 10) & 31, m = v & 1023;
+				float f = e == 0 ? std::ldexp((float)m, -24)
+						: e == 31 ? INFINITY : std::ldexp((float)(m | 1024), (int)e - 25);
+				out[i] = sgn ? -f : f;
+			}
+		}
+		tex->unlock();
+		std::ofstream o(path + "." + names[t] + ".f32", std::ios::binary);
+		o.write((const char *)out.data(), out.size() * 4);
+		fmts += (fmts.empty() ? "\"" : ", \"") + names[t] + "\"";
+	}
+	std::ofstream j(path + ".json");
+	j << "{\"w\": " << sz.Width << ", \"h\": " << sz.Height << ", \"still_frames\": "
+			<< g_claude_set_dump_frames << g_claude_set_dump_extra << ", \"textures\": [" << fmts << "]}\n";
+	g_claude_set_dumps_written++;
+	actionstream << "[claude_dump_at] " << sz.Width << "x" << sz.Height << " at "
+			<< g_claude_set_dump_frames << " -> " << path << std::endl;
 }
 
 float g_claude_auto_exposure[4] = {0.0f, 0.0f, 0.0f, 0.0f};

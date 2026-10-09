@@ -1344,6 +1344,12 @@ static void claudeGuideBind()
 	GL.BindImageTexture(2, g_guide_alias, 0, 0, 0, GL.READ_ONLY, GL.R32UI);
 }
 static std::string g_claude_shutter_token;
+// claude_dump_at = "1,4,16:prefix" (secondstage.h ClaudeSetReadback): armed
+// by the NEXT claude_shutter (whose reset starts the accumulation), then the
+// frame at which still_frames reaches each N dumps the set to prefix_N.
+static std::vector<int> g_claude_dump_pending, g_claude_dump_active;
+static std::string g_claude_dump_pending_prefix, g_claude_dump_prefix;
+static unsigned long long g_claude_dump_resets0 = 0;   // accum_resets when armed
 static float g_claude_shutter_fired = -1.0f;
 static std::string g_claude_shutter_fired_token;
 
@@ -6862,6 +6868,9 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// fired (-1 / "" until one has)
 			<< ", \"shutter_frames\": " << g_claude_shutter_fired
 			<< ", \"shutter_token\": \"" << g_claude_shutter_fired_token << "\""
+			<< ", \"dump_pending\": " << g_claude_dump_pending.size()
+			<< ", \"dump_active\": " << g_claude_dump_active.size()
+			<< ", \"dump_written\": " << g_claude_set_dumps_written
 			<< ", \"casc_valid\": [" << (g_claude_grid.casc[0].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[1].valid ? 1 : 0)
 			<< "," << (g_claude_grid.casc[2].valid ? 1 : 0)
@@ -7217,6 +7226,23 @@ static bool claudeApplyPatchFile(const std::string &path,
 		// read back from its own textures, plus the camera as the shader
 		// receives it, so a tree built offline can be checked against the
 		// GPU's first hits (claude_view 22) pixel by pixel.
+		if (name == "claude_dump_at") {
+			const std::string v = patch.get(name);
+			const size_t c = v.find(':');
+			g_claude_dump_pending.clear();
+			if (c != std::string::npos) {
+				std::stringstream ss(v.substr(0, c));
+				std::string tok;
+				while (std::getline(ss, tok, ','))
+					if (atoi(tok.c_str()) > 0)
+						g_claude_dump_pending.push_back(atoi(tok.c_str()));
+				std::sort(g_claude_dump_pending.begin(), g_claude_dump_pending.end());
+				g_claude_dump_pending_prefix = v.substr(c + 1);
+			}
+			actionstream << "[claude_dump_at] pending " << g_claude_dump_pending.size()
+					<< " depths -> " << g_claude_dump_pending_prefix << std::endl;
+			continue;
+		}
 		if (name == "claude_accum_dump") {
 			g_claude_accum_dump = patch.get(name);   // read back after the next frame
 			continue;
@@ -7304,6 +7330,12 @@ static bool claudeApplyPatchFile(const std::string &path,
 			const float n = (float)atoi(v.c_str());
 			if (n > 0.0f) {
 				claudeResetAccumulation();
+				if (!g_claude_dump_pending.empty()) {
+					g_claude_dump_active = g_claude_dump_pending;
+					g_claude_dump_prefix = g_claude_dump_pending_prefix;
+					g_claude_dump_pending.clear();
+					g_claude_dump_resets0 = (unsigned long long)g_claude_grid.accum_resets;
+				}
 				g_claude_shutter_at = n;
 				g_claude_shutter_token = v;
 				actionstream << "[claude_settings_patch] shutter armed at "
@@ -10951,6 +10983,21 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 	/*
 		Drawing
 	*/
+	// claude_dump_at: this frame is a depth the schedule asked for (the
+	// same still_frames test the shutter applies after drawing)
+	if (!g_claude_dump_active.empty()
+			&& g_claude_grid.still_frames >= (float)g_claude_dump_active.front()) {
+		int want = g_claude_dump_active.front();
+		while (!g_claude_dump_active.empty()
+				&& g_claude_grid.still_frames >= (float)g_claude_dump_active.front())
+			g_claude_dump_active.erase(g_claude_dump_active.begin());
+		g_claude_set_dump = g_claude_dump_prefix + "_" + std::to_string(want);
+		g_claude_set_dump_frames = g_claude_grid.still_frames;
+		// a restart since the arming (a nudge blends history in) makes
+		// this dump something other than N clean frames: say so
+		g_claude_set_dump_extra = ", \"resets_since_arm\": " + std::to_string(
+				(unsigned long long)g_claude_grid.accum_resets - g_claude_dump_resets0);
+	}
 	TimeTaker tt_draw("Draw scene", nullptr, PRECISION_MICRO);
 	this->driver->beginScene(true, true, sky_color);
 
