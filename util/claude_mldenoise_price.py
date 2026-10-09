@@ -27,7 +27,8 @@ import claude_mldenoise_capture as cap  # noqa: E402
 # (each skipped while the learned one runs), 9 the learned step, 10 exposure
 DN = list(range(3, 9))
 LEARNED = 9
-ARMS = [("filter", cap.ANYTHING), ("learned", cap.LEARNED), ("honest", cap.HONEST)]
+ARMS = [(a, {"filter": cap.ANYTHING, "learned": cap.LEARNED, "learned2": cap.LEARNED2, "honest": cap.HONEST}[a])
+        for a in os.environ.get("MLD_ARMS", "filter,learned,honest").split(",")]
 ID = ("grid_hash", "area_emitters", "far_db_blocks", "sun_lux")
 OUT = os.path.expanduser("~/data/mldenoise/price")
 
@@ -65,7 +66,7 @@ def main():
         for rnd in range(int(os.environ.get("MLD_ROUNDS", 3))):
             # the order rotates each round: the trace's own time drifted with
             # the arm order on the first run (2026-10-09)
-            for name, dials in ARMS[rnd % 3:] + ARMS[:rnd % 3]:
+            for name, dials in ARMS[rnd % len(ARMS):] + ARMS[:rnd % len(ARMS)]:
                 push(dict(dials, **cap.DISPLAY, claude_exposure=ex))
                 time.sleep(8)   # the dial poll (~1 Hz) and the pass EMA (0.9) settle
                 xs = []

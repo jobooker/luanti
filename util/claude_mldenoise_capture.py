@@ -100,6 +100,7 @@ ANYTHING = dict(HONEST, claude_denoise=1)
 HONEST = dict(HONEST, claude_denoise_learned=0)
 ANYTHING = dict(ANYTHING, claude_denoise_learned=0)
 LEARNED = dict(ANYTHING, claude_denoise_learned=1)
+LEARNED2 = dict(ANYTHING, claude_denoise_learned=2)   # the lean path
 # the anything contender's frames in one second on the scoreboard's run of
 # 2026-10-08T17:16Z (reports/scoreboard.md): the equal-input depth
 ONE_SECOND = {"forest": 27, "plains": 47, "cabin": 70, "torchroom": 52}
@@ -288,7 +289,9 @@ def cmd_test_engine(scenes, depths, seeds, truth_frames):
         ex = tm["exposure"]
         rec = {"scene": sc, "exposure": ex, "shots": []}
         for s in seeds:
-            for arm, dials in (("filter", ANYTHING), ("learned", LEARNED)):
+            arms = {"filter": ANYTHING, "learned": LEARNED, "learned2": LEARNED2}
+            for arm in os.environ.get("MLD_ARMS", "filter,learned").split(","):
+                dials = arms[arm]
                 dd = dict(dials, **DISPLAY, claude_exposure=ex, claude_rng_seed=s)
                 png = shoot(pose, dd, max(depths), "%s-%s-s%d" % (sc, arm, s), depths,
                             os.path.join(d, "s%d_%s" % (s, arm)))

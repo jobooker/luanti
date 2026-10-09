@@ -39,6 +39,15 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 bool inFull(ivec2 q) { return q.x >= 0 && q.y >= 0 && q.x < uFull.x && q.y < uFull.y; }
 bool tapOK(float codeP, float codeQ) { return codeQ > 0.5 && abs(codeQ - abs(codeP)) < 0.5; }
 float leaky(float x) { return x > 0.0 ? x : 0.1 * x; }
+// torch bilinear, align_corners=False: src = max(scale * (dst + 0.5) - 0.5, 0)
+void taps(int dst, int insz, int outsz, out int i0, out int i1, out float l1)
+{
+	float scale = float(insz) / float(outsz);
+	float src = max(scale * (float(dst) + 0.5) - 0.5, 0.0);
+	i0 = int(src);
+	i1 = i0 + (i0 < insz - 1 ? 1 : 0);
+	l1 = src - float(i0);
+}
 
 // ---------------------------------------------------------------- pass 0
 #ifdef K_PREP
@@ -217,7 +226,12 @@ void main()
 // ---------------------------------------------------------------- conv c + head + activations
 #ifdef K_C
 layout(rgba32f, binding = BASE + 0) uniform readonly image2D iS[C / 4];
+#ifdef LEAN
+// mode 2: 11 maps (no affinity features), fp16, three images
+layout(rgba16f, binding = BASE + 8) uniform writeonly image2D oM[3];
+#else
 layout(rgba32f, binding = BASE + 8) uniform writeonly image2D oM[4];
+#endif
 void main()
 {
 	ivec2 t = ivec2(gl_GlobalInvocationID.xy);
@@ -264,10 +278,16 @@ void main()
 	}
 	for (int k = 0; k < 6; k++)
 		lg[k] /= se;
+#ifdef LEAN
+	imageStore(oM[0], t, vec4(sig[0], sig[1], sig[2], sig[3]));
+	imageStore(oM[1], t, vec4(sig[4], lg[0], lg[1], lg[2]));
+	imageStore(oM[2], t, vec4(lg[3], lg[4], lg[5], 0.0));
+#else
 	imageStore(oM[0], t, vec4(sig[0], sig[1], sig[2], sig[3]));
 	imageStore(oM[1], t, vec4(sig[4], h[5], h[6], h[7]));
 	imageStore(oM[2], t, vec4(h[8], lg[0], lg[1], lg[2]));
 	imageStore(oM[3], t, vec4(lg[3], lg[4], lg[5], 0.0));
+#endif
 }
 #endif
 
@@ -275,15 +295,6 @@ void main()
 #ifdef K_UP
 layout(rgba32f, binding = BASE + 0) uniform readonly image2D iM[4];
 layout(rgba32f, binding = BASE + 4) uniform writeonly image2D oP[4];
-// torch bilinear, align_corners=False: src = max(scale * (dst + 0.5) - 0.5, 0)
-void taps(int dst, int insz, int outsz, out int i0, out int i1, out float l1)
-{
-	float scale = float(insz) / float(outsz);
-	float src = max(scale * (float(dst) + 0.5) - 0.5, 0.0);
-	i0 = int(src);
-	i1 = i0 + (i0 < insz - 1 ? 1 : 0);
-	l1 = src - float(i0);
-}
 void main()
 {
 	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -315,7 +326,11 @@ layout(rgba32f, binding = BASE + 1) uniform readonly image2D iGbuf;
 layout(rgba32f, binding = BASE + 2) uniform readonly image2D iMom;
 layout(rgba32f, binding = BASE + 3) uniform readonly image2D iDir;
 layout(rgba32f, binding = BASE + 4) uniform readonly image2D iAcc;
+#ifdef LEAN
+layout(rgba16f, binding = BASE + 5) uniform readonly image2D iL[3];
+#else
 layout(rgba32f, binding = BASE + 5) uniform readonly image2D iP[4];
+#endif
 layout(rgba32f, binding = BASE + 9) uniform readonly image2D iB;
 layout(rgba32f, binding = BASE + 10) uniform writeonly image2D oS;
 layout(rgba32f, binding = BASE + 11) uniform writeonly image2D oB;
@@ -330,10 +345,28 @@ void main()
 	float code = g.a;
 	bool valid = abs(code) >= 0.5;
 	vec4 cp = imageLoad(iS, p);
+#ifdef LEAN
+	// the maps at this pixel, bilinear from 1/4 resolution right here
+	// (mode 1 wrote them out at full resolution first: 33 MB a frame)
+	int x0, x1, y0, y1;
+	float lx, ly;
+	taps(p.x, uQ.x, uFull.x, x0, x1, lx);
+	taps(p.y, uQ.y, uFull.y, y0, y1, ly);
+	vec4 m[3];
+	for (int j = 0; j < 3; j++) {
+		vec4 a = imageLoad(iL[j], ivec2(x0, y0)), b = imageLoad(iL[j], ivec2(x1, y0));
+		vec4 c = imageLoad(iL[j], ivec2(x0, y1)), d = imageLoad(iL[j], ivec2(x1, y1));
+		m[j] = (1.0 - ly) * ((1.0 - lx) * a + lx * b) + ly * ((1.0 - lx) * c + lx * d);
+	}
+	float sigm = uPass == 1 ? m[0].x : uPass == 2 ? m[0].y : uPass == 3 ? m[0].z : uPass == 4 ? m[0].w : m[1].x;
+	float mixk = uPass == 1 ? m[1].z : uPass == 2 ? m[1].w : uPass == 3 ? m[2].x : uPass == 4 ? m[2].y : m[2].z;
+	vec3 bin = uPass == 1 ? m[1].y * cp.rgb : imageLoad(iB, p).rgb;
+#else
 	vec4 p1 = imageLoad(iP[1], p), p2 = imageLoad(iP[2], p), p3 = imageLoad(iP[3], p);
 	float sigm = uPass == 1 ? p1.x : uPass == 2 ? p1.y : uPass == 3 ? p1.z : uPass == 4 ? p1.w : p2.x;
 	float mixk = uPass == 1 ? p2.z : uPass == 2 ? p2.w : uPass == 3 ? p3.x : uPass == 4 ? p3.y : p3.z;
 	vec3 bin = uPass == 1 ? p2.y * cp.rgb : imageLoad(iB, p).rgb;
+#endif
 	vec4 outv = cp;
 	if (valid) {
 		float vs = 0.0, vw = 0.0;
@@ -352,7 +385,9 @@ void main()
 		float lp = dot(cp.rgb, LUMA);
 		float neff = uPass == 5 ? LD(iDir, p).a : 1.0 / max(LD(iMom, p).g, 1e-4);
 		float kappa = uYoung > 0.5 ? clamp((neff - 1.0) / uYoung, 0.0, 1.0) : 1.0;
+#ifndef LEAN
 		vec4 fp = imageLoad(iP[0], p);
+#endif
 		vec3 sum = vec3(0.0);
 		float wsum = 0.0, vsum = 0.0;
 		for (int dy = -2; dy <= 2; dy++)
@@ -365,10 +400,12 @@ void main()
 				continue;
 			vec4 cq = imageLoad(iS, q);
 			float w = H5[dx + 2] * H5[dy + 2] * exp(-kappa * abs(dot(cq.rgb, LUMA) - lp) / sl);
+#ifndef LEAN
 			if (!ctr) {
 				vec4 df = imageLoad(iP[0], q) - fp;
 				w *= exp(-dot(df, df));
 			}
+#endif
 			sum += cq.rgb * w;
 			wsum += w;
 			vsum += w * w * cq.a;
