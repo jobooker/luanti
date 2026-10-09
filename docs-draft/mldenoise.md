@@ -176,7 +176,7 @@ Every single picture (each arm, depth and seed) is next to them as PNG.
 - **Correlation with the target:** B's shallow inputs share up to 64/2048 of
   their samples with the target. I measured A against B at 64 frames on every
   view: B is 3-5% closer, as expected, and nothing else differs.
-- **GPU time:** about 68 minutes for the 33 views that succeeded (plus retries and skipped views), plus about 15 minutes for the
+- **GPU time:** about 68 minutes for the 33 views that succeeded (plus retries and skipped views), plus about 17 minutes for the
   test truths and inputs.
 - **Size:** 20 GB in `~/data/mldenoise` (not in git).
 
@@ -214,7 +214,7 @@ output is linear radiance.
 - Batch of 16 crops of 128x128, random horizontal flips.
 - The display-space L1 fell from 0.0141 to 0.0089.
 
-On the held-out views the network cut the noisy input's RMSE 1.8-2.4x
+On the held-out views the network cut the noisy input's RMSE 1.8-2.5x
 outdoors and 3-5.5x indoors.
 
 ## What did not work
