@@ -11620,8 +11620,25 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 		bool ready = hold <= 0 || g_claude_grid.still_frames >= hold;
 		claudeDumpFrame(this->driver, this->client->getEnv().getLocalPlayer(),
 				g_claude_grid.still_frames, g_claude_path_frame < 0 || ready);
-		if (g_claude_path_frame >= 0 && ready)
+		if (g_claude_path_frame >= 0 && ready) {
+			// EACH POSE CONVERGES ON ITS OWN (claude_path_hold_fresh, default
+			// 1, 2026-10-09): moving to a DIFFERENT pose starts the picture
+			// over, so a reference frame is the converged image of that pose
+			// alone. Before, history from the poses before it rode along
+			// (reprojected), so the "truth" carried up to 3 % of the path's
+			// past (measured: the truth store's re-render of one turning
+			// pose, 2026-10-09). A held pose keeps converging.
+			bool fresh = hold > 0 && !g_claude_path.empty()
+					&& (!g_settings->exists("claude_path_hold_fresh")
+						|| g_settings->getFloat("claude_path_hold_fresh", 0.0f, 1.0f) >= 0.5f);
+			if (fresh) {
+				ClaudePathKey a = claudePathPose(g_claude_path_frame);
+				ClaudePathKey b = claudePathPose(g_claude_path_frame + 1);
+				if (a.x != b.x || a.y != b.y || a.z != b.z || a.yaw != b.yaw || a.pitch != b.pitch)
+					claudeResetAccumulation();
+			}
 			g_claude_path_frame++;
+		}
 	}
 
 	/*

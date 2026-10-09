@@ -157,21 +157,24 @@ def capture(args):
         st = lab.read_stats() or {}
         fps = max(2.0, float(st.get("fps") or 30.0))
         expo = (st.get("auto_exposure") or [None])[0]
-        # 2. the path in seconds at that fps, rounded to a 10 % step so runs
-        # at about the same speed share a path, and so a stored truth
-        fps_path = TS.quantize_fps(fps)
-        pk = path_frames(start, moves, fps_path)
+        # 2. the path in seconds at that fps -- or, when a truth is stored for
+        # these inputs at an fps within 10 % of it, THAT path (and its truth)
+        spec_base = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
+                     "hold": args.hold, "scale": 2, "all_run_dials": sorted(args.dial or []),
+                     "truth_def": TS.TRUTH_DEF}
+        man = None if args.fresh_truth else TS.find(spec_base, fps)
+        if man:
+            fps_path = man["spec"]["fps_path"]
+            pk = [tuple(k) for k in man["spec"]["keys"]]
+        else:
+            fps_path = round(fps, 3)
+            pk = path_frames(start, moves, fps_path)
         pf = os.path.join(d, "path.txt")
         with open(pf, "w") as f:
             for k in pk:
-                f.write("%d %r %r %r %r %r\n" % k)
-        # the stored truth for exactly these inputs, if any (its exposure is
-        # then this run's: the truth's pixels were made with it)
-        spec = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
-                "keys": [list(k) for k in pk], "hold": args.hold, "scale": 2,
-                "all_run_dials": sorted(args.dial or [])}
+                f.write("%d %r %r %r %r %r\n" % tuple(k))
+        spec = dict(spec_base, fps_path=fps_path, keys=[list(k) for k in pk])
         key = TS.key_for(spec)
-        man = None if args.fresh_truth else TS.lookup(key)
         expo_measured = expo
         if man:
             expo = man["exposure"]

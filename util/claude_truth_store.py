@@ -44,11 +44,35 @@ CHECK_SEED = 101    # the stored truth renders at seed 0
 CHECK_K = 1.5       # TUNED: fail above K x floor | learn by: history.jsonl passes on no-change vs fails on known changes
 EPS = 1e-4          # linear units: below this an error is 8-bit rounding, not a change
 BLOCK = 8
-FPS_STEP = 1.1      # TUNED: paths are laid out at fps rounded to 10 % steps, so runs share a truth | learn by: playtest scores at fps x1.1 vs x1.0 (does a 5 % pace error move them?)
+FPS_MATCH = 0.10    # TUNED: a stored path is reused when its fps is within 10 % of the measured | learn by: playtest scores at fps x1.1 vs x1.0 (does a 10 % pace error move them?)
+EPS_B = 0.005       # TUNED: brightness tolerance on top of K x the floor's | learn by: history.jsonl (the smallest real change it must catch)
+# THE TRUTH'S DEFINITION. 2 = each pose converges on its own (game.cpp
+# claude_path_hold_fresh, 2026-10-09); 1 = history from earlier poses rode
+# along (up to 3 % in a turn). A truth made under another definition is
+# never matched: bump this when the reference mode changes.
+TRUTH_DEF = 2
 
 
-def quantize_fps(fps):
-    return round(FPS_STEP ** round(np.log(fps) / np.log(FPS_STEP)), 3)
+def find(spec_base, fps):
+    """the stored truth for these inputs whose path was laid out at the fps
+    nearest the measured one, within FPS_MATCH; None if none"""
+    best = None
+    if not os.path.isdir(ROOT):
+        return None
+    for k in os.listdir(ROOT):
+        m = os.path.join(ROOT, k, "manifest.json")
+        if not os.path.exists(m):
+            continue
+        man = json.load(open(m))
+        sp = dict(man["spec"])
+        f = sp.pop("fps_path", None)
+        sp.pop("keys", None)
+        if sp != spec_base or not f or not all(os.path.isdir(man[x]) for x in ("reference", "faces")):
+            continue
+        err = abs(f / fps - 1.0)
+        if err <= FPS_MATCH and (best is None or err < best[0]):
+            best = (err, man)
+    return best[1] if best else None
 
 
 def key_for(spec):
@@ -168,6 +192,9 @@ def verdict(stats, floor):
         for m in ("px", "blk"):
             if s[m] > CHECK_K * f[m] + EPS:
                 bad.append("frame %d %s %.5f > %.1f x floor %.5f" % (s["frame"], m, s[m], CHECK_K, f[m]))
+        db, fb = abs(s["mean_ratio"] - 1.0), abs(f["mean_ratio"] - 1.0)
+        if db > CHECK_K * fb + EPS_B:
+            bad.append("frame %d brightness x%.4f (floor x%.4f)" % (s["frame"], s["mean_ratio"], f["mean_ratio"]))
     return not bad, bad
 
 
