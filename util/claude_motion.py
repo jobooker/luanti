@@ -99,15 +99,27 @@ def main():
     meta = os.path.join(out, "meta.jsonl")
     last_mt = 0
     hold = dials.get("claude_path_hold", 0)
-    # reference mode holds each pose for `hold` frames (~100 fps)
-    budget = 30 + n / 20.0 + n * hold / 60.0
-    while time.time() - t0 < budget:
+    # THE BUDGET FOLLOWS THE FRAME RATE THE CLIENT REPORTS (2026-10-09). It
+    # was 30 + n/20 + n*hold/60 s: it assumed 60 fps, so a 37 fps forest truth
+    # (10 poses x 1024) ran out at pose 8, the path was cancelled, and the
+    # dump went on writing unheld frames after this tool had read the list.
+    # Now: the measured fps (floor 5), and giving up early only when the
+    # client stops answering (its 1 Hz stats file goes stale).
+    fps_now = 60.0
+    last_alive = time.time()
+    while True:
         time.sleep(0.25)
         mt = os.path.getmtime(lab.STATS)
         if mt != last_mt:
             last_mt = mt
+            last_alive = time.time()
             st = lab.read_stats() or {}
             stats.append(st.get("frame_ms_avg", 0))
+            if st.get("frame_ms_avg"):
+                fps_now = 1000.0 / max(st["frame_ms_avg"], 1e-3)
+        budget = 30 + n / 20.0 + n * max(hold, 1) / max(5.0, 0.8 * fps_now)
+        if time.time() - t0 > budget or time.time() - last_alive > 20:
+            break
         if args.nodump:
             if time.time() - t0 > n / 60.0 + 3:
                 break
@@ -115,13 +127,24 @@ def main():
             break
     with open(lab.PATCH, "w") as f:
         f.write("claude_path = 0\n")
+        if not args.nodump:
+            # cancel what the dump has left: frames written after this tool
+            # read the list landed unheld in the same folder (2026-10-09)
+            f.write("claude_dump = 0:cancelled\n")
         if args.mover:
             f.write("claude_mover = 0\n")
     rep = {"token": token, "path": path, "frames": n, "dials": dials,
            "stats_frame_ms": stats}
     if not args.nodump:
-        rows = [json.loads(l) for l in open(meta)]
+        rows = [json.loads(l) for l in open(meta)] if os.path.exists(meta) else []
         rows.sort(key=lambda r: r["i"])
+        if len(rows) < n:
+            print("REFUSED: %d of %d frames dumped in %.0f s (client %s)"
+                  % (len(rows), n, time.time() - t0,
+                     "stopped answering" if time.time() - last_alive > 20 else "too slow for the budget"))
+            if not rows:
+                print(out)
+                return 2
         pf = [r["path_frame"] for r in rows]
         # THE PATH MUST BE THE PATH: every dumped frame on it, in order
         if min(pf) < 0 or any(b != a + 1 for a, b in zip(pf, pf[1:])):
@@ -131,6 +154,7 @@ def main():
             rep["refused"] = True
         dts = [r["dt_us"] / 1000.0 for r in rows[1:] if r["dt_us"] > 0]
         rep["dumped"] = len(rows)
+        dts = dts or [0.0]   # a one-frame dump has no frame-to-frame times
         rep["frame_ms"] = {"mean": statistics.mean(dts), "p50": pctl(dts, 0.5),
                            "p99": pctl(dts, 0.99), "max": max(dts)}
         json.dump(rep, open(os.path.join(out, "run.json"), "w"), indent=1)

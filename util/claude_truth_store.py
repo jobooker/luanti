@@ -159,6 +159,31 @@ def dial_problems(repo):
     return out
 
 
+def held_problems(dump_dir):
+    """reasons a dumped reference is not a held truth: every row must sit on
+    its own path frame (0, 1, 2, ...) and have converged its full hold (a
+    path cancelled mid-way dumped frames at path_frame -1, unheld)"""
+    rows = _rows(dump_dir)
+    out = []
+    hold = max(r["still_frames"] for r in rows) if rows else 0
+    for k, r in enumerate(rows):
+        if r["path_frame"] != k:
+            out.append("frame %d is on path frame %s" % (r["i"], r["path_frame"]))
+        elif k == 0 or _pose(r) != _pose(rows[k - 1]):
+            if r["still_frames"] < truth_hold_floor(rows):
+                out.append("frame %d held %d frames" % (r["i"], r["still_frames"]))
+        if len(out) >= 3:
+            break
+    return out
+
+
+def truth_hold_floor(rows):
+    """the hold every new pose of a reference must have reached: the most
+    common still_frames over its new poses"""
+    st = [r["still_frames"] for k, r in enumerate(rows) if k == 0 or _pose(r) != _pose(rows[k - 1])]
+    return max(set(st), key=st.count) if st else 0
+
+
 def feature_problems(dump_dir):
     """reasons a dumped video is not a truth: a row without the record, not
     in truth mode, or with a display feature on"""

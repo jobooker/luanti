@@ -260,7 +260,9 @@ def capture(args):
                       sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
                       ["--name", name + "-control", "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD])
             if not out or not os.path.isdir(out[-1]):
-                return False, {"why": "control render failed"}
+                return False, {"why": "control render failed: %s" % (out[-3:],)}
+            if any("REFUSED" in l for l in out):
+                return False, {"why": "control render refused: %s" % [l for l in out if "REFUSED" in l]}
             ok, info = TS.control_verdict(out[-1], ref_dir, i)
             keep = os.path.join(TS.ROOT, "checks", name, "%s-control" % time.strftime("%Y%m%d-%H%M%S"))
             os.makedirs(os.path.dirname(keep), exist_ok=True)
@@ -357,7 +359,8 @@ def capture(args):
             # every second pixel exactly instead
             fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
                       "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
-            fb = TS.feature_problems(ref[-1]) if ref and os.path.isdir(ref[-1]) else ["no truth render"]
+            fb = (TS.feature_problems(ref[-1]) + TS.held_problems(ref[-1])) if ref and os.path.isdir(ref[-1]) \
+                else ["no truth render: %s" % (ref[-3:],)]
             if any("REFUSED" in l for l in ref + fid) or not (ref and fid) or fb:
                 # guard 2: a video that is not truth mode in every frame is
                 # not a truth, and nothing is scored against it
@@ -377,7 +380,8 @@ def capture(args):
                 truth["control"] = cinfo
                 if floor is None or not cok:
                     truth["outcome"] = "NO TRUTH: " + ("floor check failed" if floor is None else
-                                                      "control disagrees: ratio %s tile %s" % (cinfo.get("ratio"), cinfo.get("tile_mad")))
+                                                      "control: %s" % (cinfo.get("why") or "disagrees, ratio %s tile %s"
+                                                                       % (cinfo.get("ratio"), cinfo.get("tile_mad"))))
                     man = {"reference": "", "faces": ""}
                 else:
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
