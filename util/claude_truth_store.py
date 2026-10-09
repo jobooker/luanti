@@ -41,6 +41,7 @@ ROOT = os.path.expanduser("~/data/luanti-truth")
 CHECK_FRAMES = 4    # TUNED: poses per check | learn by: smallest count that still fails every known rule change in history.jsonl
 CHECK_LEAD = 3      # predecessors before each check pose | learn by: floor_blk against lead (does more lead lower the floor?)
 CHECK_SEED = 101    # the stored truth renders at seed 0
+FLOOR_SEEDS = (101, 103, 105)  # TUNED: the floor is the worst of these | learn by: self-test passes at unused seeds (102, 104...) in history.jsonl
 CHECK_K = 1.5       # TUNED: fail above K x floor | learn by: history.jsonl passes on no-change vs fails on known changes
 EPS = 1e-4          # linear units: below this an error is 8-bit rounding, not a change
 BLOCK = 8
@@ -182,6 +183,23 @@ def compare(check_dir, ref_dir, idxs):
                     "blk": float(np.sqrt(((_blocks(a) - _blocks(b)) ** 2).mean())),
                     "mean_ratio": float(a.mean() / max(b.mean(), 1e-9)),
                     "ref_mean": float(b.mean()), "still": [crow[j]["still_frames"], rrow[i]["still_frames"]]})
+    return out
+
+
+def worst(floors):
+    """per frame, the largest error and the largest brightness deviation
+    over several floor renders; None if any of them failed"""
+    if not floors or any(f is None for f in floors):
+        return None
+    out = []
+    for fr in zip(*floors):
+        w = dict(fr[0])
+        w["px"] = max(f["px"] for f in fr)
+        w["blk"] = max(f["blk"] for f in fr)
+        dev = max(fr, key=lambda f: abs(f["mean_ratio"] - 1.0))
+        w["mean_ratio"] = dev["mean_ratio"]
+        w["seeds"] = len(fr)
+        out.append(w)
     return out
 
 

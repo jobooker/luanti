@@ -264,8 +264,15 @@ def capture(args):
                 truth["outcome"] = "render refused: not stored"
                 man = {"reference": ref[-1] if ref else "", "faces": fid[-1] if fid else ""}
             else:
-                # the floor: the same check, right away, against what was just made
-                idxs, floor = truth_check(ref[-1], "floor")
+                # the floor: the same check, right away, against what was just
+                # made, at FLOOR_SEEDS seeds; per frame the worst of them. One
+                # seed under-reads the noise: a fresh seed failed at 2x a
+                # one-seed floor indoors (2026-10-09 self-test)
+                floors = []
+                for sd in TS.FLOOR_SEEDS:
+                    idxs, fl = truth_check(ref[-1], "floor%d" % sd, seed=sd)
+                    floors.append(fl)
+                floor = TS.worst(floors)
                 if floor is None:
                     truth["outcome"] = "floor check failed: not stored"
                     man = {"reference": ref[-1], "faces": fid[-1]}
