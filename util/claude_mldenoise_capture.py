@@ -50,7 +50,7 @@ VIEWS = {
     "forest-se": (180, 8.5, 95, 225, -8, 0.7),
     "forest-far": (210, 8.5, 165, 0, -5, 0.55),
     "forest-sw": (125, 8.5, 92, 135, -10, 0.3),
-    "treeline-back": (100, 12, 123.5, 90, -10, 0.3),
+    "treeline-back": (100, 8.5, 123.5, 90, -10, 0.3),
     # open ground and high views
     "plains-w": (-40, 8.5, -30, 90, -6, 0.3),
     "plains-s": (10, 8.5, -60, 180, -10, 0.68),
@@ -226,29 +226,43 @@ def truth_meta(sc):
     return json.load(open(os.path.join(MAIN_TRUTH, sc, "meta.json")))
 
 
-def cmd_test(scenes, depths, seeds):
+def cmd_test(scenes, depths, seeds, truth_frames):
+    """per scene, ONE fresh game: the truth first (honest, seed 0, linear
+    dump), then the anything contender's noisy shots, same session and pose,
+    so truth and inputs see the same loaded scene (the main checkout's
+    truths were rendered on partly loaded scenes: instruments lane,
+    2026-10-08). Each shot's grid_hash and area_emitters are recorded and
+    compared with this truth's."""
     base = depths
     for sc in scenes:
         depths = sorted(set(base) | {ONE_SECOND[sc]})
         tm = truth_meta(sc)
         pos, yaw, pitch, tod = SCENES[sc]
         pose = (pos[0], pos[1], pos[2], yaw, pitch, tod)
-        seat()   # a fresh game per scene, as the scoreboard does
         d = os.path.join(DATA, "test", sc)
         os.makedirs(d, exist_ok=True)
-        rec = {"scene": sc, "exposure": tm["exposure"], "truth_scene_id": tm["scene_id"], "shots": []}
+        seat()   # a fresh game per scene, as the scoreboard does
+        ex = tm["exposure"]   # the scoreboard's pinned exposure for this scene
+        tpng = shoot(pose, dict(HONEST, **DISPLAY, claude_exposure=ex), truth_frames, "mldtruth-" + sc,
+                     [truth_frames], os.path.join(d, "truth"))
+        tst = capstats(tpng)
+        os.replace(tpng, os.path.join(d, "truth.png"))
+        tid = ident(tst)
+        print("%-10s truth %d frames  grid_hash %s  area_emitters %s" % (sc, truth_frames, tid["grid_hash"],
+              tid["area_emitters"]), flush=True)
+        rec = {"scene": sc, "exposure": ex, "truth": {"frames": truth_frames, "id": tid,
+               "prefix": "truth_%d" % truth_frames}, "main_truth_scene_id": tm["scene_id"], "shots": []}
         for s in seeds:
-            for arm_name, dials in (("anything", ANYTHING),):
-                dd = dict(dials, **DISPLAY, claude_exposure=tm["exposure"], claude_rng_seed=s)
-                png = shoot(pose, dd, max(depths), "%s-%s-s%d" % (sc, arm_name, s), depths,
-                            os.path.join(d, "s%d" % s))
-                st = capstats(png)
-                os.replace(png, os.path.join(d, "s%d_%d.png" % (s, max(depths))))
-                same = all(st.get(k) == tm["scene_id"].get(k) for k in ("area_emitters", "sun_lux"))
-                rec["shots"].append({"seed": s, "depths": depths, "id": ident(st), "same_scene": same})
-                print("%-10s seed %d  %s%s" % (sc, s, depths, "" if same else "  SCENE DIFFERS %s" % ident(st)),
-                      flush=True)
-        json.dump(rec, open(os.path.join(d, "meta.json"), "w"), indent=1)
+            dd = dict(ANYTHING, **DISPLAY, claude_exposure=ex, claude_rng_seed=s)
+            png = shoot(pose, dd, max(depths), "%s-anything-s%d" % (sc, s), depths, os.path.join(d, "s%d" % s))
+            st = capstats(png)
+            os.replace(png, os.path.join(d, "s%d_%d.png" % (s, max(depths))))
+            sid = ident(st)
+            same = all(sid.get(k) == tid.get(k) for k in ("grid_hash", "area_emitters"))
+            rec["shots"].append({"seed": s, "depths": depths, "id": sid, "same_scene": same})
+            print("%-10s seed %d  %s  grid_hash %s area_emitters %s%s" % (sc, s, depths, sid["grid_hash"],
+                  sid["area_emitters"], "" if same else "  SCENE DIFFERS FROM THIS TRUTH"), flush=True)
+            json.dump(rec, open(os.path.join(d, "meta.json"), "w"), indent=1)
 
 
 def cmd_truth(scenes, frames):
@@ -277,7 +291,8 @@ if __name__ == "__main__":
         cmd_train(only, int(os.environ.get("MLD_REF", 2048)))
     elif what == "test":
         cmd_test(rest or list(SCENES), [int(x) for x in os.environ.get("MLD_DEPTHS", "1,4,16,64").split(",")],
-                 [int(x) for x in os.environ.get("MLD_SEEDS", "101,102,103").split(",")])
+                 [int(x) for x in os.environ.get("MLD_SEEDS", "101,102,103").split(",")],
+                 int(os.environ.get("MLD_TRUTH_FRAMES", 8192)))
     elif what == "batch":
         # several jobs under ONE hold of the GPU lock (children inherit it):
         # one command per line in the file named

@@ -50,8 +50,14 @@ def load_set(prefix):
     def rd(n):
         return np.fromfile("%s.%s.f32" % (prefix, n), np.float32).reshape(h, w, 4)
     acc, dr, gb, mo = rd("accum"), rd("direct"), rd("gbuf"), rd("mom")
-    # 13 channels: radiance rgb, packed distance, direct rgb, albedo rgb, moments (m2, vfac, m1)
-    raw = np.concatenate([acc, dr[..., :3], gb[..., :3], mo[..., :3]], -1)
+    # the moments become the noise of the mean HERE, in float32: the raw
+    # second moment reaches 4e9 in a dusk interior and overflows the fp16
+    # the samples are kept in (it made the first training run NaN)
+    m2, vfac, m1 = (np.nan_to_num(mo[..., i].astype(np.float64)) for i in range(3))
+    sd = np.sqrt(np.maximum(m2 - m1 * m1, 0) * np.clip(vfac, 0, 1))
+    mo2 = np.stack([np.clip(sd, 0, 6e4), np.clip(vfac, 0, 1), np.zeros_like(sd)], -1).astype(np.float32)
+    # 13 channels: radiance rgb, packed distance, direct rgb, albedo rgb, (sd of the mean, vfac, 0)
+    raw = np.concatenate([acc, dr[..., :3], gb[..., :3], mo2], -1)
     raw = np.nan_to_num(raw, nan=0.0, posinf=6e4, neginf=0.0)
     raw[..., :3] = np.clip(raw[..., :3], 0, 6e4)
     raw[..., 4:7] = np.clip(raw[..., 4:7], 0, 6e4)
@@ -109,8 +115,7 @@ def torch_bits():
         same_r[..., :, :-1] = ((code[..., :, 1:] - code[..., :, :-1]).abs() < 0.5).float()
         same_d = torch.zeros_like(code)
         same_d[..., :-1, :] = ((code[..., 1:, :] - code[..., :-1, :]).abs() < 0.5).float()
-        var = (mo[:, 0:1] - mo[:, 2:3] ** 2).clamp(min=0) * mo[:, 1:2].clamp(0, 1)
-        f_sd = torch.log1p(torch.sqrt(var) * e)
+        f_sd = torch.log1p(mo[:, 0:1].clamp(min=0) * e)
         f_n = -torch.log2(mo[:, 1:2].clamp(min=1e-6)) / 11.0
         return torch.cat([f_irr, f_dir, alb.sqrt(), nrm, sky.float(), none.float(), mixed, f_d,
                           same_r, same_d, f_sd, f_n], 1)
@@ -212,7 +217,11 @@ def cmd_train(a):
         m, tgt, samples = load_view(d)
         ti = len(tlist)
         tlist.append(torch.from_numpy(tgt).permute(2, 0, 1).half())
+        if not np.isfinite(tgt).all() or np.abs(tgt).max() > 6e4:
+            raise SystemExit("REFUSED: target of %s not finite or past fp16" % name)
         for run, n, raw, code in samples:
+            if not np.isfinite(raw).all() or np.abs(raw).max() > 6.5e4:
+                raise SystemExit("REFUSED: %s %s_%d not finite or past fp16 (max %g)" % (name, run, n, np.abs(raw).max()))
             raws.append(torch.from_numpy(raw).permute(2, 0, 1).half())
             codes.append(torch.from_numpy(code)[None])
             exs.append(m["exposure"])
@@ -224,6 +233,7 @@ def cmd_train(a):
     EX = torch.tensor(exs, device=dev)
     VI = torch.tensor(vidx, device=dev)
     del raws, codes, tlist
+
     N, _, H, W = RAW.shape
     p = ckpt_path(a.tag)
     cfg = {"ch": [int(x) for x in a.ch.split(",")], "unshuffle": bool(a.unshuffle)}
@@ -266,10 +276,12 @@ def cmd_train(a):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
+        if not torch.isfinite(loss):
+            raise SystemExit("REFUSED: loss went non-finite at step %d" % step)
         losses.append(loss.item())
         step += 1
-        if step % 500 == 0:
-            print("step %6d  loss %.5f  lr %.2e  %.0f s left" % (step, np.mean(losses[-500:]), sched(step),
+        if step % a.log_every == 0:
+            print("step %6d  loss %.5f  lr %.2e  %.0f s left" % (step, np.mean(losses[-a.log_every:]), sched(step),
                   t_end - time.time()), flush=True)
         if step % 2000 == 0:
             save(torch, net, opt, step, cfg, p)
@@ -337,16 +349,13 @@ def cmd_eval(a):
 
 # ---------------------------------------------------------------- test (scoreboard scenes)
 def truth_lin(sc):
-    """the linear truth: this worktree's re-render when the main one is
-    stale (torchroom: its .f32 predates its .png), else the main one"""
-    for d in (os.path.join(DATA, "truth", sc), os.path.join(MAIN_TRUTH, sc)):
-        for pre in ("truth_16384", "truth"):
-            p = os.path.join(d, pre)
-            if os.path.exists(p + ".json") and (os.path.exists(p + ".accum.f32") or os.path.exists(p + ".f32")):
-                j = json.load(open(p + ".json"))
-                f = p + ".accum.f32" if os.path.exists(p + ".accum.f32") else p + ".f32"
-                return np.fromfile(f, np.float32).reshape(j["h"], j["w"], 4)[..., :3], f
-    raise SystemExit("no truth for " + sc)
+    """the linear truth rendered in the SAME session and pose as the test
+    inputs (claude_mldenoise_capture.py test)"""
+    d = os.path.join(DATA, "test", sc)
+    m = json.load(open(d + "/meta.json"))
+    p = os.path.join(d, m["truth"]["prefix"])
+    j = json.load(open(p + ".json"))
+    return np.fromfile(p + ".accum.f32", np.float32).reshape(j["h"], j["w"], 4)[..., :3], p
 
 
 def cmd_test(a):
@@ -395,70 +404,77 @@ def cmd_test(a):
 
 # ---------------------------------------------------------------- timing
 def cmd_time(a):
+    """ms per 960x540 frame. Two ways: (1) back-to-back, 50 frames between
+    two GPU events, the GPU never idle (the steady state inside a render
+    loop that keeps the GPU busy); (2) one frame at a time with a sync after
+    each, which on this card came out bimodal (p10 2 ms, median 14 ms on
+    2026-10-09: the clocks drop whenever the GPU idles between frames)."""
     import claude_gpu_lock
     claude_gpu_lock.hold("util/claude_mldenoise.py time " + a.tag)
     torch, nn, F, features, Net, radiance, tonemap = torch_bits()
     net, st = load_net(a.tag)
-    res = {}
+    res = {"cfg": st["cfg"]}
     raw = torch.rand(1, 13, 540, 960, device="cuda") * 2
     code = (torch.randint(0, 6, (1, 1, 540, 960), device="cuda") * 65536 + 1000).float()
     ex = torch.tensor([0.3], device="cuda")
     f = features(raw, code, ex)
     fp = F.pad(f, (0, 0, 0, 4), mode="replicate")
-    for dtype, name in ((torch.float32, "fp32"), (torch.float16, "fp16")):
-        for cl in (False, True):
-            m = make_net(Net, st["cfg"]).cuda().eval()
-            m.load_state_dict(net.state_dict())
-            m = m.to(dtype)
-            x = fp.to(dtype)
-            if cl:
-                m = m.to(memory_format=torch.channels_last)
-                x = x.contiguous(memory_format=torch.channels_last)
-            with torch.no_grad():
-                for _ in range(20):
-                    m(x)
-                torch.cuda.synchronize()
-                ts = []
-                for _ in range(100):
-                    s = torch.cuda.Event(enable_timing=True)
-                    e = torch.cuda.Event(enable_timing=True)
-                    s.record()
-                    m(x)
-                    e.record()
-                    torch.cuda.synchronize()
-                    ts.append(s.elapsed_time(e))
-            k = name + ("+channels_last" if cl else "")
-            res[k] = {"median_ms": float(np.median(ts)), "p10": float(np.percentile(ts, 10)),
-                      "p90": float(np.percentile(ts, 90))}
-            print("%-22s net only  %.3f ms (p10 %.3f, p90 %.3f)" % (k, res[k]["median_ms"], res[k]["p10"],
-                  res[k]["p90"]), flush=True)
-    # features + net + albedo back in, end to end, fp16
+
+    def bench(fn, n=50, reps=7):
+        for _ in range(30):
+            fn()
+        torch.cuda.synchronize()
+        loops = []
+        for _ in range(reps):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            for _ in range(n):
+                fn()
+            e.record()
+            torch.cuda.synchronize()
+            loops.append(s.elapsed_time(e) / n)
+        single = []
+        for _ in range(60):
+            s = torch.cuda.Event(enable_timing=True)
+            e = torch.cuda.Event(enable_timing=True)
+            s.record()
+            fn()
+            e.record()
+            torch.cuda.synchronize()
+            single.append(s.elapsed_time(e))
+        return {"back_to_back_ms": float(np.median(loops)), "back_to_back_min": float(np.min(loops)),
+                "single_median_ms": float(np.median(single)), "single_p10_ms": float(np.percentile(single, 10))}
+
     with torch.no_grad():
+        for dtype, name in ((torch.float32, "fp32"), (torch.float16, "fp16")):
+            for cl in (False, True):
+                m = make_net(Net, st["cfg"]).cuda().eval()
+                m.load_state_dict(net.state_dict())
+                m = m.to(dtype)
+                x = fp.to(dtype)
+                if cl:
+                    m = m.to(memory_format=torch.channels_last)
+                    x = x.contiguous(memory_format=torch.channels_last)
+                k = name + ("+channels_last" if cl else "")
+                res[k] = bench(lambda: m(x))
+                print("%-22s net only: back to back %.3f ms/frame (min %.3f); one at a time median %.3f, p10 %.3f"
+                      % (k, res[k]["back_to_back_ms"], res[k]["back_to_back_min"], res[k]["single_median_ms"],
+                         res[k]["single_p10_ms"]), flush=True)
         m = make_net(Net, st["cfg"]).cuda().eval().half()
         m.load_state_dict({k: v.half() for k, v in net.state_dict().items()})
+
         def e2e():
             f = features(raw, code, ex).half()
             f = F.pad(f, (0, 0, 0, 4), mode="replicate")
             o = m(f)[..., :540, :]
             return torch.expm1(o.float()) * raw[:, 7:10] / 0.3
-        for _ in range(10):
-            e2e()
-        torch.cuda.synchronize()
-        ts = []
-        for _ in range(100):
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            e2e()
-            e.record()
-            torch.cuda.synchronize()
-            ts.append(s.elapsed_time(e))
-    res["fp16_end_to_end"] = {"median_ms": float(np.median(ts))}
-    print("fp16 end to end (features + net + remodulate): %.3f ms" % np.median(ts))
-    nparam = sum(p.numel() for p in net.parameters())
-    res["params"] = nparam
+        res["fp16_end_to_end"] = bench(e2e)
+        print("fp16 end to end (features + net + albedo back in): back to back %.3f ms/frame" %
+              res["fp16_end_to_end"]["back_to_back_ms"], flush=True)
+    res["params"] = sum(p.numel() for p in net.parameters())
     res["device"] = torch.cuda.get_device_name(0)
-    print("params", nparam)
+    print("params", res["params"])
     os.makedirs(os.path.join(DATA, "time"), exist_ok=True)
     json.dump(res, open(os.path.join(DATA, "time", a.tag + ".json"), "w"), indent=1)
 
@@ -477,5 +493,6 @@ if __name__ == "__main__":
     ap.add_argument("--unshuffle", type=int, default=0)
     ap.add_argument("--amp", type=int, default=0)
     ap.add_argument("--dev", default="cuda")
+    ap.add_argument("--log-every", type=int, default=500)
     a = ap.parse_args()
     {"train": cmd_train, "eval": cmd_eval, "test": cmd_test, "time": cmd_time}[a.what](a)
