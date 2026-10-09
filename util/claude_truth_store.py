@@ -39,7 +39,7 @@ import numpy as np
 
 ROOT = os.path.expanduser("~/data/luanti-truth")
 CHECK_FRAMES = 4    # TUNED: poses per check | learn by: smallest count that still fails every known rule change in history.jsonl
-CHECK_LEAD = 3      # predecessors before each check pose | learn by: floor_blk against lead (does more lead lower the floor?)
+CHECK_LEAD = 0      # predecessors before each check pose: none since TRUTH_DEF 2 (each pose starts over, so nothing carries in) | learn by: floor_blk against lead
 CHECK_SEED = 101    # the stored truth renders at seed 0
 FLOOR_SEEDS = (101, 103, 105)  # TUNED: the floor is the worst of these | learn by: self-test passes at unused seeds (102, 104...) in history.jsonl
 CHECK_K = 1.5       # TUNED: fail above K x floor | learn by: history.jsonl passes on no-change vs fails on known changes
@@ -51,7 +51,13 @@ EPS_B = 0.005       # TUNED: brightness tolerance on top of K x the floor's | le
 # claude_path_hold_fresh, 2026-10-09); 1 = history from earlier poses rode
 # along (up to 3 % in a turn). A truth made under another definition is
 # never matched: bump this when the reference mode changes.
-TRUTH_DEF = 2
+TRUTH_DEF = 3
+# 3 (2026-10-09): THE DENOISER IS OFF in every truth run. Until then the
+# truth was 256 frames per pose PLUS today's denoiser: a filtered picture,
+# not a converged one (seen when one test forced the denoiser off: indoors,
+# 256 raw frames are grainy). The truth is the plain average of real paths,
+# held long enough to converge (claude_playtest --hold, default 4096).
+TRUTH_DIALS = ["claude_denoise=0", "claude_denoise_learned=0"]
 
 
 def find(spec_base, fps):

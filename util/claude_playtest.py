@@ -120,8 +120,21 @@ def run(cmd):
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True).stdout.strip().splitlines()
 
 
+def game_default(member):
+    """a dial's default as the engine source declares it (game.cpp
+    `float m_<member> = <v>f;`); refuses rather than guess"""
+    src = open(os.path.join(REPO, "src", "client", "game.cpp")).read()
+    m = re.search(r"float m_%s = ([0-9.]+)f;" % re.escape(member), src)
+    if not m:
+        sys.exit("REFUSED: no default for m_%s in game.cpp" % member)
+    return m.group(1)
+
+
 def capture(args):
     import claude_lab as lab
+    global PLAY_DENOISE
+    PLAY_DENOISE = ["--dial", "claude_denoise=1",
+                    "--dial", "claude_denoise_learned=" + game_default("denoise_learned")]
     run_dir = os.path.join(OUT, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(run_dir)
     keys = scrub_conf_like_look()
@@ -180,7 +193,9 @@ def capture(args):
             expo = man["exposure"]
         # every run at seed 0 unless it says otherwise (the truth check's own
         # seed would persist on the seat into the next run)
-        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0"] + \
+        # ...and the denoiser at the GAME'S defaults: the truth runs turn it
+        # off and dials persist on the seat into the next scenario
+        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0"] + PLAY_DENOISE + \
             (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
         # ARMS (2026-10-09): every arm plays the SAME path and is scored against
@@ -191,6 +206,8 @@ def capture(args):
         # its real-time run only; the truth runs get every arm key at 0 (the
         # truth must not see a display cache, e.g. claude_ledger).
         rt_off = sum([["--dial", k + "=0"] for k in arm_keys], [])
+        # the truth runs (and their checks): no denoiser (TRUTH_DEF 3)
+        TRUTH_ON = sum([["--dial", kv] for kv in TS.TRUTH_DIALS], [])
 
         def truth_check(ref_dir, tag, seed=TS.CHECK_SEED, dials=()):
             """a few poses of the stored truth, re-rendered at another seed
@@ -198,7 +215,7 @@ def capture(args):
             idxs, poses = TS.check_plan(ref_dir, pk)
             cp = os.path.join(d, "check-path-%s.txt" % tag)
             TS.write_check_path(poses, cp)
-            out = run([c if c != pf else cp for c in common] + rt_off +
+            out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
                       ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % args.hold,
                        "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
             stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
@@ -258,7 +275,7 @@ def capture(args):
                 truth["outcome"] = "replaced: " + "; ".join(why[:3])
                 man = None
         if not man:
-            ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
+            ref = run(common + rt_off + TRUTH_ON + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
             # face IDs at FULL resolution: the half-res dump blends with a linear
             # filter, which would invent codes at every edge; the scorer takes
             # every second pixel exactly instead
@@ -408,7 +425,9 @@ if __name__ == "__main__":
     claude_gpu_lock.hold('util/claude_playtest.py')
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*")
-    ap.add_argument("--hold", type=int, default=256)
+    # TUNED: frames per truth pose, denoiser off | learn by: playtest scores
+    # against a 4096 truth vs a 16384 one on one scenario (stop when they agree)
+    ap.add_argument("--hold", type=int, default=4096)
     ap.add_argument("--score")
     ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
     ap.add_argument("--rt-dial", action="append",
