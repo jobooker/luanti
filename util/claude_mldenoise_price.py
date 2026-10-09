@@ -62,7 +62,7 @@ def main():
             elif time.time() - since > 10:
                 break
         print("%s settled after %.0f s: %s" % (sc, time.time() - t0, dict(zip(ID, prev))), flush=True)
-        for rnd in range(3):
+        for rnd in range(int(os.environ.get("MLD_ROUNDS", 3))):
             # the order rotates each round: the trace's own time drifted with
             # the arm order on the first run (2026-10-09)
             for name, dials in ARMS[rnd % 3:] + ARMS[:rnd % 3]:

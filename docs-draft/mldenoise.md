@@ -1,11 +1,255 @@
 ---
-title: "Learned denoiser prototype: learned weights for today's filter clear the bar on the four scoreboard scenes"
-summary: "A 20k-parameter network that only re-weighs today's a-trous passes beats the filter on RMSE and FLIP at equal input and at equal time on all four held-out scenes, at 1.47 ms per frame in PyTorch (plus an estimated ~1 ms for the passes' extra reads); the U-Net, even with a gradient loss, loses on time."
+title: "Learned denoiser prototype: in the engine, the learned weights beat today's filter at equal time on the four scoreboard scenes"
+summary: "claude_denoise_learned (default 0) runs today's a-trous filter with per-pixel weights from a 20k-parameter network as GL compute passes; it matches its PyTorch twin to float precision, costs +0.3-0.6 ms of GPU pass time and +0.2-2.3 ms of whole frame, and still beats the filter on RMSE and FLIP at equal time on all four held-out scenes."
 tags: [luanti, report]
 author: claude
 ---
 
 # Learned denoiser prototype
+
+## Part 3 (2026-10-09): in the engine
+
+**Verdict: yes, in the engine too.** Behind the dial `claude_denoise_learned`
+(default 0), today's filter with learned per-pixel weights beats today's
+filter at equal time on all four held-out scoreboard scenes:
+- **RMSE:** better on all four.
+- **FLIP:** better on three, equal on the plains.
+
+**The cost is measured in the engine, not estimated:**
+- **The denoise stage on the GPU:** +0.31-0.55 ms per frame.
+- **The whole frame:** +0.24 to +2.3 ms. The whole frame grows more than the
+  denoise stage because the tracer's own pass time moves with the arm
+  (below). The win holds with the whole-frame number.
+
+**The win is not equally wide everywhere:**
+- **Forest and plains:** narrow. At its measured cost the learned filter gets
+  91-92% of the filter's frames and needs about 78-81% to match the filter's
+  FLIP.
+- **Cabin and torch room:** wide. It needs 50% and under 6%.
+
+**The engine and its PyTorch twin are the same function:** display-space
+RMSE 0.000000 and largest relative pixel difference 3.4e-4, on all four
+scenes.
+
+### What was built (branch `mldenoise`)
+
+**The dial and the code:**
+- **`claude_denoise_learned` (0/1, live).** At 0 the six `claude_denoise`
+  passes run exactly as before; each is wrapped in `ClaudeUnlessLearned`, and
+  the new step returns at once.
+  - **Checked:** at dial 0, every frame of the in-engine test's filter arm
+    equals the exact PyTorch port of today's filter to a relative 4.5e-6
+    (display RMSE 0.000000). That is the same check that passed before the
+    change.
+  - **Not done:** a bit-for-bit comparison against the old binary. Two
+    sessions of the same pose and seed do not accumulate identical samples:
+    the two arms of one session differed by 0.5% at 1 frame.
+- **At 1, compute passes replace all six.** The code is
+  `client/render/claude_learned.{h,cpp}` and
+  `client/shaders/claude_denoise/learned.comp.glsl`. There are 12 dispatches:
+  1. pass 0, exactly as today;
+  2. the 20 features, pooled 4x4;
+  3. three 3x3 convolutions at 1/4 and 1/8 resolution, then the head;
+  4. the maps upsampled bilinearly;
+  5. five weighted a-trous passes;
+  6. the blend over stages, written into DEN_B, which the present and
+     exposure passes read as before.
+
+  The passes use image units 8-20 and SSBO binding 9. Neither is used
+  elsewhere.
+- **Weights:** `util/claude_mldenoise_weights.bin` (81 KB, 20,349 floats),
+  exported by `claude_mldenoise_atrous.py export`. They are read at startup,
+  and the log line carries the fnv64 hash. The file in git is `wnet2`, hash
+  `34224733fdcbc15b`.
+- **Irrlicht:** `ITexture::getNativeHandle()` (the GL name), so that engine
+  passes can bind pipeline textures as images.
+- **Row order:** the network works in the dumps' top-down row order. Its
+  convolutions and the 1/8 branch are not symmetric under a vertical flip.
+
+**One bug, found by an instrument, not a theory.** The first in-engine check
+matched PyTorch closely on the plains and the cabin, but on the forest 5-10%
+of pixels differed by more than 1% (display RMSE 0.0013). Two hypotheses
+died on the measurement:
+- the moments computed in fp32 instead of fp64;
+- the wrong exposure: an exposure sweep had its minimum at the right value.
+
+Then I dumped the network's intermediate images on a dump frame
+(`claudeLearnedDump`) and re-did the GLSL formulas in numpy
+(`util/claude_mldenoise_replica.py`):
+- **Matched to 3e-6:** the features, conv a0 and conv a1.
+- **Did not match:** the 1/8-branch sum, and only on even 1/4 columns from
+  2 on.
+- **The cause:** the GPU divides floats as a reciprocal times, so
+  120.0/240.0 came out a hair under 0.5. Every even column then took the
+  parent texel to its left.
+
+With integer arithmetic, all four scenes match.
+
+### Cost in the engine
+
+How it was priced (`util/claude_mldenoise_price.py`):
+- **Pinned:** the camera pinned at each scoreboard pose, in a fresh game per
+  scene.
+- **Scene identity:** printed on every arm, and unchanged throughout.
+- **Arms:** filter (anything contender), learned, and honest (denoise off).
+  Every dial is spelled on every arm.
+- **Rounds:** 6, with the arm order rotating. The numbers are medians.
+
+| scene | honest busy | filter busy | learned busy | six passes (filter arm) | learned step (learned arm) | learned - filter, whole frame (paired per round, median) |
+|---|---|---|---|---|---|---|
+| forest | 24.71 | 22.67 | 24.99 | 0.676 | 1.037 | +2.19 |
+| plains | 17.60 | 16.73 | 18.27 | 1.014 | 1.564 | +1.41 |
+| cabin | 12.52 | 12.86 | 13.13 | 0.708 | 1.021 | +0.24 |
+| torchroom | 16.47 | 15.70 | 16.91 | 0.698 | 1.028 | +1.10 |
+
+**Differs from the PyTorch picture:**
+- **The denoise stage is cheaper than PyTorch said.** In the engine it costs
+  1.02-1.56 ms against today's 0.68-1.01 ms, so it adds 0.31-0.55 ms.
+  PyTorch had put the network alone at 1.47 ms, plus an estimated ~1 ms for
+  the passes.
+- **The whole frame grows more than the denoise stage**, except on the
+  cabin.
+  - The tracer's own pass time (pass_ms[2]) is lowest when today's filter is
+    on (forest 17.1 ms median). It is higher with the learned filter (19.0)
+    and higher still with the denoiser off (honest, 19.4), in every rotation
+    order.
+  - The tracer does not read the denoise dial. I suspect GPU timing or clock
+    state carrying over between frames, but I have not shown it. The
+    honest arm being slower than the filter arm, with less work, is the clue
+    worth an instruments-lane look.
+  - On the cabin, the tracer time held still and the whole-frame delta
+    (+0.24 ms) equals the pass delta.
+  - The equal-time table below uses the whole-frame numbers, the pessimistic
+    ones.
+- **An earlier pricing run was noisier.** The forest's first two rounds there
+  had the trace at 30-34 ms, while my CPU scoring ran alongside. Those numbers
+  are kept in `~/data/mldenoise/price_run2` but not used.
+
+### Head-to-head on the held-out scenes (in the engine)
+
+Same session per scene; truths re-rendered in that session wherever the
+scene loaded differently. The grid hashes:
+
+| scene | grid hash | truth |
+|---|---|---|
+| forest | 07c89acb… | re-rendered, 8192 frames |
+| plains | 177276cd… | reused, same hash |
+| cabin | a4622c80… | re-rendered, 8192 frames |
+| torchroom | d1bee6d9… | reused, same hash |
+
+Seeds 101-103, depths 1-64 plus the one-second counts. The arms:
+- **filter, learned:** what the engine displayed;
+- **noisy:** the filter arm's own input;
+- **U-Net + grad:** PyTorch on the filter arm's inputs, for reference.
+
+Each cell is RMSE / FLIP.
+
+| scene | frames | noisy | today's filter | **learned (engine)** | U-Net + grad (PyTorch) |
+|---|---|---|---|---|---|
+| forest | 1 | 0.0436 / 0.162 | 0.0355 / 0.100 | **0.0294 / 0.096** | 0.0196 / 0.090 |
+| forest | 27 | 0.0342 / 0.127 | 0.0265 / 0.081 | **0.0239 / 0.078** | 0.0156 / 0.073 |
+| plains | 1 | 0.0244 / 0.098 | 0.0134 / 0.045 | **0.0107 / 0.044** | 0.0074 / 0.044 |
+| plains | 47 | 0.0116 / 0.071 | 0.0080 / 0.029 | **0.0052 / 0.027** | 0.0042 / 0.030 |
+| cabin | 1 | 0.0454 / 0.154 | 0.0114 / 0.040 | **0.0082 / 0.037** | 0.0066 / 0.046 |
+| cabin | 70 | 0.0172 / 0.087 | 0.0060 / 0.029 | **0.0041 / 0.027** | 0.0036 / 0.029 |
+| torchroom | 1 | 0.1466 / 0.415 | 0.0282 / 0.114 | **0.0258 / 0.107** | 0.0237 / 0.119 |
+| torchroom | 52 | 0.1530 / 0.424 | 0.0279 / 0.118 | **0.0214 / 0.096** | 0.0201 / 0.104 |
+
+**Equal time, the one-second budget, using the engine's measured whole-frame
+ms.** Each arm gets floor(1000 / busy) frames, scored at the deepest captured
+depth at or below that.
+
+| scene | today's filter | **learned (engine)** | U-Net + grad (honest busy + 8.4 ms PyTorch) |
+|---|---|---|---|
+| forest | 44 (40): 0.0234 / 0.075 | 40 (40): **0.0214 / 0.072** | 30 (27): 0.0156 / 0.073 |
+| plains | 59 (56): 0.0067 / 0.028 | 54 (48): **0.0052 / 0.027** | 38 (32): 0.0046 / 0.032 |
+| cabin | 77 (70): 0.0060 / 0.029 | 76 (70): **0.0041 / 0.027** | 47 (40): 0.0041 / 0.031 |
+| torchroom | 63 (56): 0.0279 / 0.118 | 59 (56): **0.0212 / 0.096** | 40 (40): 0.0207 / 0.107 |
+
+The capture grid is coarse near the top: depths 40, 48, 56 and 64, and the
+forest's two arms land on the same depth. The finer test that settles it
+(`util/claude_mldenoise_need.py`) asks what share of the filter's frames the
+learned filter needs to match the filter's metric, interpolating in log
+frames between captured depths:
+
+| scene | share it gets at its measured cost | share it needs to match FLIP (16 / 32 / top) | share it needs to match RMSE (top) |
+|---|---|---|---|
+| forest | 91% | 78% / 80% / 81% | 73% |
+| plains | 92% | 81% / 77% / 78% | 42% |
+| cabin | 99% | 45% / 46% / 50% | 28% |
+| torchroom | 94% | 6% / 3% / 2% | 2% |
+
+**Reading it:**
+- **Forest and plains:** the win holds by about 10 points of frame share.
+  More whole-frame cost would erase it: about 2 ms more on the forest, 1.5 ms
+  on the plains.
+- **Cabin and torch room:** the learned filter beats the filter's whole
+  second with half its frames or fewer.
+
+Side-by-sides (noisy | today's filter | learned (engine) | U-Net + grad |
+truth; 1 frame on top, the one-second count below, seed 101):
+`~/code/luanti-wt/mldenoise/screenshots/mldenoise/test/engine/side-by-side-{forest,plains,cabin,torchroom}.png`.
+The tables are in `h2h_engine.md` in the same folder.
+
+### Longer training, and the gradient term's own effect (PyTorch, part 2's test data)
+
+**Training speed:** compiling the training step (torch.compile, after a
+one-time compile of about 6 min) made it 3.7x faster: 10 steps/s against
+2.7. 20 minutes gave 12.2k steps, against 4.1k before.
+
+| scene | frames | filter | wnet (4.1k, grad) | **wnet2 (12.2k, grad)** | wnet2l1 (12.2k, no grad term) |
+|---|---|---|---|---|---|
+| forest | 1 | 0.0408 / 0.129 | 0.0324 / 0.122 | 0.0322 / 0.121 | 0.0324 / 0.120 |
+| forest | 27 | 0.0306 / 0.107 | 0.0243 / 0.098 | 0.0240 / 0.098 | 0.0240 / 0.098 |
+| plains | 47 | 0.0080 / 0.029 | 0.0054 / 0.027 | 0.0052 / 0.027 | 0.0054 / 0.027 |
+| cabin | 70 | 0.0059 / 0.029 | 0.0043 / 0.027 | 0.0041 / 0.027 | 0.0042 / 0.027 |
+| torchroom | 52 | 0.0278 / 0.117 | 0.0216 / 0.097 | 0.0213 / 0.096 | 0.0214 / 0.096 |
+
+- **Three times the training** bought 1-4% RMSE and no FLIP. This design is
+  capacity-limited, not training-limited.
+- **The gradient term** is worth 0-4% RMSE and nothing in FLIP for the weight
+  network. Its FLIP advantage comes from re-weighing today's filter, which
+  leaves the filter's soft blotches rather than the U-Net's grain. That is
+  unlike the U-Net, where the term moved FLIP (part 2).
+- `wnet2` (with the term) was chosen before testing as the engine's weights.
+- **Held-out training views** (CPU): `wnet2` is within 1% of `wnet` (forest-far
+  at 1 frame 0.0204 against 0.0207).
+- **Unused:** the 4 learned affinity features came out ~0 everywhere. That
+  part of the design is unused and could be dropped to save reads.
+
+### What is next
+
+1. **Find why the tracer's pass time moves with the denoise arm.** It is most
+   of the whole-frame delta on the forest (+2.2 ms against +0.4 ms of
+   denoise passes). It also makes "denoiser off" slower than "filter on".
+   Until it is understood, the whole-frame cost is the honest number.
+2. **Cut reads:** drop the unused affinity features (25 reads per pixel per
+   pass), use fp16 maps, and fuse the map upsample into the passes.
+   My guess is that together these bring the stage close to today's cost;
+   that needs pricing.
+3. **Moving camera:** the history-trust row of 0w, still untested.
+4. **Fix the stair-stepped edges:** a per-pixel albedo-blend map, as part 2
+   proposed. The U-Net still has 30-40% less RMSE than the learned filter on
+   the forest. My guess, not measured, is that part of that gap is these
+   edges.
+
+### Tools added in part 3
+
+- `util/claude_mldenoise_capture.py test_engine`: both arms per seed, same
+  session, the truth re-rendered when the scene loads differently.
+- `util/claude_mldenoise_price.py`: the live-pricer pattern, rotating, N
+  rounds.
+- `util/claude_mldenoise_engine_score.py`: pictures and RMSE on the CPU, then
+  FLIP and the tables.
+- `util/claude_mldenoise_need.py`: frames needed against frames got.
+- `util/claude_mldenoise_atrous.py`: `export` and `refcheck`.
+- `util/claude_mldenoise_check0.py`: the dial-0 check.
+- Instruments from the forest bug:
+  - `util/claude_mldenoise_replica.py`, `_stages.py`, `_exprobe.py`,
+    `_sens.py`, `_where2.py`;
+  - `claudeLearnedDump`, which writes `<dump>.lF/.lM.f32` next to every set
+    dump with the dial on.
+
 
 ## Part 2 (2026-10-09): learned weights for today's filter
 

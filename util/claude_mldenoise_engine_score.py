@@ -96,7 +96,7 @@ def tables():
     for sc in SCENES:
         for arm in ("filter", "learned", "honest"):
             xs = [p for p in price if p["scene"] == sc and p["arm"] == arm]
-            ms[(sc, arm)] = {k: float(np.mean([p[k] for p in xs])) for k in ("busy_ms", "frame_ms", "dn_ms",
+            ms[(sc, arm)] = {k: float(np.median([p[k] for p in xs])) for k in ("busy_ms", "frame_ms", "dn_ms",
                                                                                "learned_ms", "trace_ms")}
             ms[(sc, arm)]["same_scene"] = all(p["same_scene"] for p in xs)
     unet_ms = json.load(open(os.path.join(DATA, "time", "careful_unetg.json")))["unetg"]["fp16_wall_ms"]
@@ -104,7 +104,7 @@ def tables():
     def stat(sc, k, n):
         rr = [r for r in rows if r["scene"] == sc and r["frames"] == n]
         return np.mean([r["rmse_" + k] for r in rr]), np.mean([r["flip_" + k] for r in rr])
-    L = ["## In-engine cost (ms per frame, pinned, interleaved, 2 rounds; busy = the frame's busy time)", "",
+    L = ["## In-engine cost (ms per frame, pinned, 6 rounds, arm order rotating, medians; busy = the whole frame)", "",
          "| scene | honest busy | filter busy | learned busy | six passes (filter arm) | learned step (learned arm) | learned - filter (busy) |",
          "|---|---|---|---|---|---|---|"]
     for sc in SCENES:
