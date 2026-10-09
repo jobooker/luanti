@@ -31,6 +31,13 @@ and a GIF: real time | reference, side by side.
 
 Pass/fail thresholds are John's (objectives): this reports numbers.
 
+THE TRUTH IS STORED (2026-10-09, util/claude_truth_store.py): rendered once
+per scenario and path, then each run re-renders a few of its poses at another
+seed and reuses it if they agree within the noise measured when it was stored;
+otherwise it is rendered again and replaced. --fresh-truth forces a render;
+--truth-check-only [--truth-check-seed N] [--truth-check-dial k=v] tests the
+check itself (another seed must pass; a change to the light rules must fail).
+
 An A/B is ONE run with several --arm: the arms share the path and the truth
 (rendered once), and each starts from the same settled, reset state.
 
@@ -43,6 +50,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +59,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 OUT = os.path.join(REPO, "screenshots", "playtest")
+import claude_truth_store as TS
 
 WALK = 4.0          # m/s (Luanti's walking speed)
 TURN = 90.0         # deg/s
@@ -148,13 +157,28 @@ def capture(args):
         st = lab.read_stats() or {}
         fps = max(2.0, float(st.get("fps") or 30.0))
         expo = (st.get("auto_exposure") or [None])[0]
-        # 2. the path in seconds at that fps
-        pk = path_frames(start, moves, fps)
+        # 2. the path in seconds at that fps, rounded to a 10 % step so runs
+        # at about the same speed share a path, and so a stored truth
+        fps_path = TS.quantize_fps(fps)
+        pk = path_frames(start, moves, fps_path)
         pf = os.path.join(d, "path.txt")
         with open(pf, "w") as f:
             for k in pk:
                 f.write("%d %r %r %r %r %r\n" % k)
-        fixed = ["--dial", "claude_auto_exposure=0"] + (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
+        # the stored truth for exactly these inputs, if any (its exposure is
+        # then this run's: the truth's pixels were made with it)
+        spec = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
+                "keys": [list(k) for k in pk], "hold": args.hold, "scale": 2,
+                "all_run_dials": sorted(args.dial or [])}
+        key = TS.key_for(spec)
+        man = None if args.fresh_truth else TS.lookup(key)
+        expo_measured = expo
+        if man:
+            expo = man["exposure"]
+        # every run at seed 0 unless it says otherwise (the truth check's own
+        # seed would persist on the seat into the next run)
+        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0"] + \
+            (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
         # ARMS (2026-10-09): every arm plays the SAME path and is scored against
         # the SAME truth, rendered once per scenario. Before, each A/B arm was
@@ -164,6 +188,40 @@ def capture(args):
         # its real-time run only; the truth runs get every arm key at 0 (the
         # truth must not see a display cache, e.g. claude_ledger).
         rt_off = sum([["--dial", k + "=0"] for k in arm_keys], [])
+
+        def truth_check(ref_dir, tag, seed=TS.CHECK_SEED, dials=()):
+            """a few poses of the stored truth, re-rendered at another seed
+            (claude_truth_store.py); returns (frames checked, stats or None)"""
+            idxs, poses = TS.check_plan(ref_dir, pk)
+            cp = os.path.join(d, "check-path-%s.txt" % tag)
+            TS.write_check_path(poses, cp)
+            out = run([c if c != pf else cp for c in common] + rt_off +
+                      ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % args.hold,
+                       "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
+            stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
+            if out and os.path.isdir(out[-1]) and out[-1].startswith(os.path.join(REPO, "screenshots", "dump")):
+                shutil.rmtree(out[-1])
+            return idxs, stats
+
+        if args.truth_check_only:
+            # the check's own test: an unchanged engine at another seed must
+            # pass, a change to the light rules (--truth-check-dial) must fail
+            if not man:
+                print("%-12s no stored truth for key %s" % (name, key), flush=True)
+                continue
+            idxs, stats = truth_check(man["reference"], "selftest", args.truth_check_seed,
+                                      args.truth_check_dial or [])
+            ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
+            TS.log({"event": "selftest", "key": key, "scenario": name, "pass": ok, "why": why,
+                    "seed": args.truth_check_seed, "dials": args.truth_check_dial or [],
+                    "stats": stats, "floor": man["floor"]})
+            print("%-12s self-test seed %d dials %r: %s  %s" % (name, args.truth_check_seed,
+                  args.truth_check_dial or [], "PASS" if ok else "FAIL", "; ".join(why[:3])), flush=True)
+            for s, f in zip(stats or [], man["floor"]):
+                print("             frame %d: px %.5f (floor %.5f)  blk %.5f (floor %.5f)  brightness x%.4f"
+                      % (s["frame"], s["px"], f["px"], s["blk"], f["blk"], s["mean_ratio"]), flush=True)
+            continue
+
         rt = {}
         for ai, (arm, kvs) in enumerate(arms):
             arm_dials = sum([["--dial", kv] for kv in kvs], [])
@@ -178,15 +236,47 @@ def capture(args):
                                        % (pin, arm, time.time_ns()))
             time.sleep(6)
             rt[arm] = run(common + arm_dials + ["--name", name + "-rt-" + arm])
-        ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
-        # face IDs at FULL resolution: the half-res dump blends with a linear
-        # filter, which would invent codes at every edge; the scorer takes
-        # every second pixel exactly instead
-        fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
-                  "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
-        meta["scenarios"][name] = {"fps_at_start": fps, "exposure": expo, "frames": pk[-1][0] + 1,
+        # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered
+        ref, fid = [], []
+        truth = {"key": key}
+        if man:
+            idxs, stats = truth_check(man["reference"], "verify")
+            ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
+            truth.update(stats=stats, floor=man["floor"], why=why)
+            TS.log({"event": "pass" if ok else "fail", "key": key, "scenario": name,
+                    "why": why, "stats": stats, "floor": man["floor"]})
+            if ok:
+                truth["outcome"] = "reused (stored %s)" % man["stored"]
+            else:
+                truth["outcome"] = "replaced: " + "; ".join(why[:3])
+                man = None
+        if not man:
+            ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
+            # face IDs at FULL resolution: the half-res dump blends with a linear
+            # filter, which would invent codes at every edge; the scorer takes
+            # every second pixel exactly instead
+            fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
+                      "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
+            if any("REFUSED" in l for l in ref + fid) or not (ref and fid):
+                truth["outcome"] = "render refused: not stored"
+                man = {"reference": ref[-1] if ref else "", "faces": fid[-1] if fid else ""}
+            else:
+                # the floor: the same check, right away, against what was just made
+                idxs, floor = truth_check(ref[-1], "floor")
+                if floor is None:
+                    truth["outcome"] = "floor check failed: not stored"
+                    man = {"reference": ref[-1], "faces": fid[-1]}
+                else:
+                    man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
+                                   {"fps_measured": fps, "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
+                    TS.log({"event": "store", "key": key, "scenario": name, "floor": floor})
+                    truth.setdefault("outcome", "stored")
+                    truth["floor"] = floor
+        print("%-12s truth %s: %s" % (name, key, truth.get("outcome")), flush=True)
+        meta["scenarios"][name] = {"fps_at_start": fps, "fps_path": fps_path, "exposure": expo,
+                                   "exposure_measured": expo_measured, "frames": pk[-1][0] + 1,
                                    "arms": {a: v[-1] for a, v in rt.items()},
-                                   "reference": ref[-1], "faces": fid[-1],
+                                   "reference": man["reference"], "faces": man["faces"], "truth": truth,
                                    "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
     open(lab.PATCH, "w").write("claude_path = 0\nclaude_view = 0\n")
@@ -312,7 +402,19 @@ if __name__ == "__main__":
     ap.add_argument("--arm", action="append",
                     help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
                          "and scored against one truth (NAME: alone = the game as it is)")
+    ap.add_argument("--fresh-truth", action="store_true",
+                    help="render the truth even if a stored one exists (and store it)")
+    ap.add_argument("--truth-check-only", action="store_true",
+                    help="only check each scenario's stored truth (no arms): the check's self-test")
+    ap.add_argument("--truth-check-seed", type=int, default=None,
+                    help="seed for --truth-check-only (default the check's own)")
+    ap.add_argument("--truth-check-dial", action="append",
+                    help="k=v on the --truth-check-only render: a deliberate rule change it must catch")
     a = ap.parse_args()
+    if a.truth_check_seed is None:
+        a.truth_check_seed = TS.CHECK_SEED
+    if a.truth_check_dial and not a.truth_check_only:
+        sys.exit("REFUSED: --truth-check-dial is for --truth-check-only")
     if a.arm and a.rt_dial:
         sys.exit("REFUSED: --arm and --rt-dial together (put the dials in the arms)")
     if "--score" in sys.argv:
