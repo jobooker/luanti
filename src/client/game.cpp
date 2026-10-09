@@ -2496,8 +2496,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// unequal fps: recheck on the loop.
 	float m_denoise_young = 64.0f;
 	// claude_denoise_learned (2026-10-09): 1 = today's filter with per-pixel
-	// weights from a small trained network (client/render/claude_learned.h)
-	float m_denoise_learned = 0.0f;
+	// weights from a small trained network (client/render/claude_learned.h);
+	// 2 = the lean version, THE DEFAULT since 2026-10-09: better than the
+	// filter at equal time on the four held-out scenes and in play (backing
+	// up indoors, the frame share below 80 % of the truth 18 % -> 2 %), for
+	// +0.14 ms (forest) / +0.24 ms (torch room) a frame, pinned (measured.md);
+	// 0 = today's filter alone
+	float m_denoise_learned = 2.0f;
 	CachedPixelShaderSetting<float, 1, false> m_denoise_young_pixel{"claudeDenoiseYoung"};
 	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
 	float m_raw_frame = 0.0f;
@@ -3545,7 +3550,7 @@ public:
 		if (name == "claude_denoise_young")
 			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		if (name == "claude_denoise_learned")
-			m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 2.0f);
+			m_denoise_learned = readAir("claude_denoise_learned", 2.0f, 2.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_tree_plant")
@@ -3675,7 +3680,7 @@ public:
 		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
-		m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 2.0f);
+		m_denoise_learned = readAir("claude_denoise_learned", 2.0f, 2.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
