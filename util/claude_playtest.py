@@ -147,7 +147,10 @@ def capture(args):
     meta = {"deferred_to_game_defaults": keys, "scenarios": {},
             "arms": {a: kvs for a, kvs in arms}, "dials_all_runs": args.dial or []}
     first = True
+    nonlocal_first = [True]
     for name, (start, moves) in SCENARIOS.items():
+        first = first or nonlocal_first[0]
+        nonlocal_first[0] = False
         if args.only and name not in args.only:
             continue
         d = os.path.join(run_dir, name)
@@ -195,7 +198,8 @@ def capture(args):
         # seed would persist on the seat into the next run)
         # ...and the denoiser at the GAME'S defaults: the truth runs turn it
         # off and dials persist on the seat into the next scenario
-        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0"] + PLAY_DENOISE + \
+        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0", "--dial", "claude_truth=0"] + \
+            PLAY_DENOISE + \
             (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
         # ARMS (2026-10-09): every arm plays the SAME path and is scored against
@@ -219,13 +223,36 @@ def capture(args):
                       ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % args.hold,
                        "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
             stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
+            keep = None
             if out and os.path.isdir(out[-1]) and out[-1].startswith(os.path.join(REPO, "screenshots", "dump")):
                 # kept beside the store (16 frames, ~32 MB): two checks that
                 # disagree are an instrument to look at, not a number
                 keep = os.path.join(TS.ROOT, "checks", name, "%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), tag))
                 os.makedirs(os.path.dirname(keep), exist_ok=True)
                 shutil.move(out[-1], keep)
-            return idxs, stats
+            return idxs, stats, keep
+
+        def control(ref_dir, idxs):
+            """guard 3: the scoreboard's control (the dumbest honest renderer)
+            held CONTROL_HOLD frames at the middle checked pose, against the
+            truth there. Its dials stay on the seat, so the seat restarts
+            before the next scenario."""
+            nonlocal_first[0] = True
+            i = idxs[len(idxs) // 2]
+            r = TS._rows(ref_dir)[i]
+            cp = os.path.join(d, "control-path.txt")
+            TS.write_check_path([TS.path_pose(pk, r["path_frame"])], cp)
+            out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
+                      sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
+                      ["--name", name + "-control", "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD])
+            if not out or not os.path.isdir(out[-1]):
+                return False, {"why": "control render failed"}
+            ok, info = TS.control_verdict(out[-1], ref_dir, i)
+            keep = os.path.join(TS.ROOT, "checks", name, "%s-control" % time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            shutil.move(out[-1], keep)
+            info["dump"] = keep
+            return ok, info
 
         if args.truth_check_only:
             # the check's own test: an unchanged engine at another seed must
@@ -233,8 +260,8 @@ def capture(args):
             if not man:
                 print("%-12s no stored truth for key %s (measured %.1f fps)" % (name, key, fps), flush=True)
                 continue
-            idxs, stats = truth_check(man["reference"], "selftest", args.truth_check_seed,
-                                      args.truth_check_dial or [])
+            idxs, stats, _ = truth_check(man["reference"], "selftest", args.truth_check_seed,
+                                         args.truth_check_dial or [])
             ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
             TS.log({"event": "selftest", "key": key, "scenario": name, "pass": ok, "why": why,
                     "seed": args.truth_check_seed, "dials": args.truth_check_dial or [],
@@ -260,20 +287,41 @@ def capture(args):
                                        % (pin, arm, time.time_ns()))
             time.sleep(6)
             rt[arm] = run(common + arm_dials + ["--name", name + "-rt-" + arm])
-        # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered
+        # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered;
+        # three guards (claude_truth_store, TRUTH_DEF 4): every dial classified,
+        # truth mode recorded in every frame, the dumb control agrees
         ref, fid = [], []
         truth = {"key": key}
         if man:
-            idxs, stats = truth_check(man["reference"], "verify")
+            fb = [] if man.get("admit") else TS.feature_problems(man["reference"])
+            idxs, stats, cdir = truth_check(man["reference"], "verify")
             ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
+            fb += TS.feature_problems(cdir) if cdir else ["check render kept nothing"]
+            if fb:
+                ok, why = False, why + fb
+            if ok and man.get("admit"):
+                cok, cinfo = control(man["reference"], idxs)
+                truth["control"] = cinfo
+                if cok:
+                    TS.admit(man, cinfo)
+                else:
+                    ok, why = False, why + ["control disagrees: ratio %s tile %s" % (cinfo.get("ratio"), cinfo.get("tile_mad"))]
             truth.update(stats=stats, floor=man["floor"], why=why)
-            TS.log({"event": "pass" if ok else "fail", "key": key, "scenario": name,
-                    "why": why, "stats": stats, "floor": man["floor"]})
+            TS.log({"event": ("admit" if man.get("admit") else "pass") if ok else "fail", "key": key,
+                    "scenario": name, "why": why, "stats": stats, "floor": man["floor"]})
             if ok:
-                truth["outcome"] = "reused (stored %s)" % man["stored"]
+                truth["outcome"] = ("admitted from TRUTH_DEF 3 (truth-mode check and control passed)"
+                                    if man.get("admit") else "reused (stored %s)" % man["stored"])
             else:
                 truth["outcome"] = "replaced: " + "; ".join(why[:3])
                 man = None
+        if not man:
+            dial_bad = TS.dial_problems(REPO)
+            if dial_bad:
+                # guard 1: no truth while any dial is unclassified, or a
+                # display dial escapes truth mode
+                truth["outcome"] = "NO TRUTH: " + "; ".join(dial_bad[:3])
+                man = {"reference": "", "faces": ""}
         if not man:
             ref = run(common + rt_off + TRUTH_ON + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
             # face IDs at FULL resolution: the half-res dump blends with a linear
@@ -281,9 +329,12 @@ def capture(args):
             # every second pixel exactly instead
             fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
                       "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
-            if any("REFUSED" in l for l in ref + fid) or not (ref and fid):
-                truth["outcome"] = "render refused: not stored"
-                man = {"reference": ref[-1] if ref else "", "faces": fid[-1] if fid else ""}
+            fb = TS.feature_problems(ref[-1]) if ref and os.path.isdir(ref[-1]) else ["no truth render"]
+            if any("REFUSED" in l for l in ref + fid) or not (ref and fid) or fb:
+                # guard 2: a video that is not truth mode in every frame is
+                # not a truth, and nothing is scored against it
+                truth["outcome"] = "NO TRUTH: " + "; ".join((fb or ["render refused"])[:3])
+                man = {"reference": "", "faces": ""}
             else:
                 # the floor: the same check, right away, against what was just
                 # made, at FLOOR_SEEDS seeds; per frame the worst of them. One
@@ -291,16 +342,20 @@ def capture(args):
                 # one-seed floor indoors (2026-10-09 self-test)
                 floors = []
                 for sd in TS.FLOOR_SEEDS:
-                    idxs, fl = truth_check(ref[-1], "floor%d" % sd, seed=sd)
+                    idxs, fl, _ = truth_check(ref[-1], "floor%d" % sd, seed=sd)
                     floors.append(fl)
                 floor = TS.worst(floors)
-                if floor is None:
-                    truth["outcome"] = "floor check failed: not stored"
-                    man = {"reference": ref[-1], "faces": fid[-1]}
+                cok, cinfo = control(ref[-1], idxs) if floor is not None else (False, {"why": "floor failed"})
+                truth["control"] = cinfo
+                if floor is None or not cok:
+                    truth["outcome"] = "NO TRUTH: " + ("floor check failed" if floor is None else
+                                                      "control disagrees: ratio %s tile %s" % (cinfo.get("ratio"), cinfo.get("tile_mad")))
+                    man = {"reference": "", "faces": ""}
                 else:
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
-                                   {"fps_measured": fps, "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
-                    TS.log({"event": "store", "key": key, "scenario": name, "floor": floor})
+                                   {"fps_measured": fps, "control": cinfo,
+                                    "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
+                    TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
                     truth.setdefault("outcome", "stored")
                     truth["floor"] = floor
         print("%-12s truth %s: %s" % (name, key, truth.get("outcome")), flush=True)
@@ -323,6 +378,9 @@ def score(run_dir):
     meta = json.load(open(os.path.join(run_dir, "meta.json")))
     report = {}
     for name, sc in meta["scenarios"].items():
+        if not sc.get("reference"):
+            print("%-12s NOT SCORED: no truth (%s)" % (name, sc.get("truth", {}).get("outcome")))
+            continue
         R, _ = J.load_dump(sc["reference"])
         # AN INSTRUMENT MUST SEE SOMETHING (2026-10-07): a path that walks the
         # camera into a solid block records black in BOTH arms, and two black

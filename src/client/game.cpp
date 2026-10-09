@@ -682,6 +682,11 @@ static void claudeDumpStop()
 }
 
 // Called once per frame after the scene is drawn, before endScene.
+// claude_truth (see m_truth): set at every uniform push; the dump writes
+// the record into each frame's row, the truth store reads it back
+static bool g_claude_truth_active = false;
+static std::string g_claude_features = "{}";
+
 static void claudeDumpFrame(video::IVideoDriver *driver, LocalPlayer *player,
 		float still_frames, bool want = true)
 {
@@ -794,7 +799,8 @@ static void claudeDumpFrame(video::IVideoDriver *driver, LocalPlayer *player,
 				<< ", \"dt_us\": " << dt_us << ", \"w\": " << w << ", \"h\": " << h
 				<< ", \"pos\": [" << pos.X << ", " << pos.Y << ", " << pos.Z
 				<< "], \"yaw\": " << player->getYaw() << ", \"pitch\": "
-				<< -player->getPitch() << ", \"still_frames\": " << still_frames << "}";
+				<< -player->getPitch() << ", \"still_frames\": " << still_frames
+				<< ", \"features\": " << g_claude_features << "}";
 		g_dump.meta[slot] = os.str();
 		g_dump.seq++;
 		g_dump.left--;
@@ -2506,6 +2512,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_denoise_young_pixel{"claudeDenoiseYoung"};
 	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
 	float m_raw_frame = 0.0f;
+	// TRUTH MODE (claude_truth, 2026-10-09). 1 = the picture is the plain
+	// average of real light paths and nothing else: every DISPLAY-side
+	// feature is forced off at the per-frame push (claudeTruthForce), each
+	// path pose starts over, and every dumped frame records what rendered it
+	// (g_claude_features). The playtest truth was "play settings minus a
+	// list of things remembered", so each new display feature leaked into
+	// it unless someone added it (the denoiser did, 2026-10-09). The dial
+	// classification in util/claude_truth_store.py must name every
+	// claude_* dial in SETTING_CALLBACKS, or no truth is stored.
+	float m_truth = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_raw_frame_pixel{"claudeRawFrame"};
 	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
 	float m_tree_plant = 0.0f;
@@ -2618,6 +2634,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_denoise_young",
 		"claude_denoise_learned",
 		"claude_raw_frame",
+		"claude_truth",
 		"claude_tree_plant",
 		"claude_tree_variant",
 		"claude_tree_dirs",
@@ -3553,6 +3570,11 @@ public:
 			m_denoise_learned = readAir("claude_denoise_learned", 2.0f, 2.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
+		if (name == "claude_truth") {
+			m_truth = readAir("claude_truth", 0.0f, 1.0f);
+			// leaving truth mode: the forced members take their dials again
+			claudeTruthReread();
+		}
 		if (name == "claude_tree_plant")
 			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		if (name == "claude_tree_variant")
@@ -3682,6 +3704,7 @@ public:
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		m_denoise_learned = readAir("claude_denoise_learned", 2.0f, 2.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
+		m_truth = readAir("claude_truth", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
@@ -3717,8 +3740,63 @@ public:
 		g_settings->deregisterAllChangedCallbacks(this);
 	}
 
+	// the members truth mode forces, read again from their dials
+	void claudeTruthReread()
+	{
+		m_denoise = readDenoise();
+		m_denoise_learned = readAir("claude_denoise_learned", 2.0f, 2.0f);
+		m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
+		m_boost = readAir("claude_boost", 0.0f, 1.0f);
+		m_split = readAir("claude_split", 0.0f, 100000.0f);
+		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
+		m_reproject = readAir("claude_reproject", 1.0f, 1.0f);
+		m_bounces = readBounces();
+		m_rng = readRng();
+	}
+
+	// TRUTH MODE, applied: the display side off (denoiser, learned denoiser,
+	// light memory, extra-sample passes, the one-bounce-first split,
+	// raw-frame mode, history carried through motion). Estimators of the
+	// same light (NEE, guiding, uniform bounces), the physics and the eye
+	// stay as dialled: the playtest's independent cross-check is what
+	// catches a bias in an estimator.
+	void claudeTruthForce()
+	{
+		g_claude_truth_active = m_truth > 0.5f;
+		if (g_claude_truth_active) {
+			m_denoise = 0.0f;
+			m_denoise_learned = 0.0f;
+			m_ledger = 0.0f;
+			m_boost = 0.0f;
+			m_split = 0.0f;
+			m_raw_frame = 0.0f;
+			m_reproject = 0.0f;
+			// and two physics guards the dial classification found
+			// (2026-10-09): fewer than 24 bounces truncates paths (biased;
+			// 24 is the shader's own cap, roulette beyond), and rng 0 is
+			// the old biased hash chain
+			m_bounces = 24.0f;
+			if (m_rng < 1.0f)
+				m_rng = 2.0f;
+		}
+		std::ostringstream os;
+		os << "{\"truth\": " << (g_claude_truth_active ? 1 : 0)
+				<< ", \"denoise\": " << m_denoise
+				<< ", \"denoise_learned\": " << m_denoise_learned
+				<< ", \"ledger\": " << m_ledger
+				<< ", \"boost\": " << m_boost
+				<< ", \"split\": " << m_split
+				<< ", \"raw_frame\": " << m_raw_frame
+				<< ", \"reproject\": " << m_reproject
+				<< ", \"guide\": " << m_guide
+				<< ", \"bounce_uniform\": " << m_bounce_uniform
+				<< ", \"bounces\": " << m_bounces << ", \"rng\": " << m_rng << "}";
+		g_claude_features = os.str();
+	}
+
 	void onSetUniforms(video::IMaterialRendererServices *services) override
 	{
+		claudeTruthForce();
 		u32 daynight_ratio = (float)m_client->getEnv().getDayNightRatio();
 		video::SColorf sunlight;
 		get_sunlight_color(&sunlight, daynight_ratio);
@@ -11634,7 +11712,7 @@ void Game::drawScene(ProfilerGraph *graph, RunStats *stats)
 			// past (measured: the truth store's re-render of one turning
 			// pose, 2026-10-09). A held pose keeps converging.
 			bool fresh = hold > 0 && !g_claude_path.empty()
-					&& (!g_settings->exists("claude_path_hold_fresh")
+					&& (g_claude_truth_active || !g_settings->exists("claude_path_hold_fresh")
 						|| g_settings->getFloat("claude_path_hold_fresh", 0.0f, 1.0f) >= 0.5f);
 			if (fresh) {
 				ClaudePathKey a = claudePathPose(g_claude_path_frame);

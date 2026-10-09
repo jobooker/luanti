@@ -57,7 +57,143 @@ TRUTH_DEF = 3
 # not a converged one (seen when one test forced the denoiser off: indoors,
 # 256 raw frames are grainy). The truth is the plain average of real paths,
 # held long enough to converge (claude_playtest --hold, default 4096).
-TRUTH_DIALS = ["claude_denoise=0", "claude_denoise_learned=0"]
+# 4 (2026-10-09, John: "make sure that doesn't happen again"): the ENGINE'S
+# truth mode (claude_truth=1) instead of a list of dials remembered to turn
+# off. Three guards, each catching what the others miss:
+#   1. truth mode forces every DISPLAY-side feature off (game.cpp
+#      claudeTruthForce), and every dial the engine watches must be
+#      classified in DIAL_CLASS below, a display dial must be one truth mode
+#      forces (dial_problems): a new feature cannot slip in unclassified;
+#   2. every frame records what rendered it (the dump row's "features"), and
+#      a truth whose rows show anything but truth mode is never stored or
+#      reused (feature_problems);
+#   3. a deliberately dumb renderer (CONTROL_DIALS, the scoreboard's control)
+#      run long at one pose must agree with the stored truth (control_verdict):
+#      it catches a truth that is wrong for a reason nobody listed.
+# A TRUTH_DEF 3 truth (made with the dials list) is ADMITTED to 4 only by
+# passing a truth-mode check and the control, never by being 3.
+TRUTH_DEF = 4
+TRUTH_DIALS = ["claude_truth=1"]
+FORCED_BY_TRUTH = {"claude_denoise", "claude_denoise_learned", "claude_ledger", "claude_boost",
+                   "claude_split", "claude_raw_frame", "claude_reproject", "claude_bounces"}
+FEATURE_OFF = ("denoise", "denoise_learned", "ledger", "boost", "split", "raw_frame", "reproject")
+CONTROL_DIALS = ["claude_nee=0", "claude_bounce_uniform=1", "claude_torch_nee=0", "claude_area_nee=0",
+                 "claude_guide=0", "claude_area_pick=0", "claude_area_skip=0", "claude_boost=0"]
+CONTROL_HOLD = 32768   # TUNED: the scoreboard check's frame count | learn by: the control's own two-seed spread at this count
+# DIAL CLASSES (filled from the shader, 2026-10-09). physics / geometry /
+# estimator / eye: the same in truth as in play; display: must be in
+# FORCED_BY_TRUTH; debug: instrument views and plants; dead: read, never used.
+DIAL_CLASS = {
+    # display: forced off by truth mode (FORCED_BY_TRUTH), or inert once it is
+    "claude_denoise": "display", "claude_denoise_learned": "display", "claude_ledger": "display",
+    "claude_boost": "display", "claude_split": "display", "claude_raw_frame": "display",
+    "claude_reproject": "display", "claude_bounces": "display",
+    "claude_denoise_young": "display-inert",   # the denoiser's fade-in: nothing to fade once it is off
+    "claude_motion_alpha": "display-inert",    # the history floor while reprojecting: off with reproject
+    "claude_truth": "truth",
+    # estimators: other unbiased ways to sample the same light (the control catches a bias)
+    "claude_rng": "estimator", "claude_nee": "estimator", "claude_torch_nee": "estimator",
+    "claude_area_nee": "estimator", "claude_area_pick": "estimator", "claude_area_skip": "estimator",
+    "claude_guide": "estimator", "claude_guide_deposit": "estimator", "claude_guide_keep": "estimator",
+    "claude_guide_impl": "estimator", "claude_guide_alpha": "estimator", "claude_bounce_uniform": "estimator",
+    # geometry: the world's shape walked differently, the same picture
+    "claude_pyramid": "geometry", "claude_descend": "geometry", "claude_model_far": "geometry",
+    "claude_bricks": "geometry", "claude_bricks_far": "geometry", "claude_walk_exact": "geometry",
+    # physics: what the true picture is
+    "claude_glass_flush": "physics", "claude_texel_colour": "physics", "claude_body_colour": "physics",
+    "claude_sun_redden": "physics", "claude_air_scatter": "physics", "claude_air_absorb": "physics",
+    "claude_air_g": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
+    "claude_flame": "physics", "claude_leaf_transmit": "physics",
+    # the eye: applied identically to the truth and to play
+    "claude_exposure": "eye", "claude_auto_exposure": "eye", "claude_white_balance": "eye",
+    "claude_night_vision": "eye", "claude_adapt_colour": "eye", "claude_adapt_brighter": "eye",
+    "claude_adapt_darker": "eye",
+    # debug: instrument views, planted defects, test skies
+    "claude_grid_debug": "debug", "claude_view": "debug", "claude_sky_uniform": "debug",
+    "claude_tree_plant": "debug", "claude_tree_variant": "debug", "claude_tree_dirs": "debug",
+    # dead: read and pushed, read by nothing (the five-pass chain and the raster
+    # path; classification 2026-10-09). Clean-up candidates.
+    "claude_water_reflections": "dead", "claude_gi": "dead", "claude_gi_split": "dead",
+    "claude_clay": "dead", "claude_texture": "dead", "claude_gray": "dead", "claude_pure": "dead",
+    "claude_bevel": "dead", "claude_parallax": "dead", "claude_jitter": "dead",
+    "claude_skybounce": "dead", "claude_sun_angle": "dead", "claude_night_sky": "dead",
+    "claude_moon_gain": "dead", "claude_bounce2": "dead", "claude_cache_sky": "dead",
+    "claude_bisect": "dead", "claude_nee_gate": "dead", "claude_cost": "dead",
+    "claude_face_direct": "dead", "claude_tiers": "dead", "claude_bounce_stride": "dead",
+    "claude_face_texels": "dead", "claude_cache_remap": "dead", "claude_far_hist": "dead",
+    "claude_light_ladder": "dead", "claude_lod_dither": "dead", "claude_far_grain": "dead",
+    "claude_far_fog": "dead", "claude_sky_azimuth": "dead", "claude_subvox": "dead",
+    "claude_refine": "dead",
+    "exposure_compensation": "dead", "golden_hour_strength": "dead", "ssao_strength": "dead",
+    "bump_strength": "dead",
+}
+# NOT a dial, part of what "truth" means here: the trace runs at half
+# resolution (claude_trace_scale 0.5) and claude_present upsamples it with a
+# joint-bilateral blend of 4 texels -- identical in the truth and in play.
+
+
+def dial_names(repo):
+    """every dial the engine watches (game.cpp SETTING_CALLBACKS)"""
+    import re
+    src = open(os.path.join(repo, "src", "client", "game.cpp")).read()
+    blk = src[src.index("SETTING_CALLBACKS[] = {"):]
+    return re.findall(r'"([a-z0-9_]+)"', blk[:blk.index("};")])
+
+
+def dial_problems(repo):
+    """reasons no truth may be stored: an unclassified dial, or a display
+    dial truth mode does not force off"""
+    out = []
+    for d in dial_names(repo):
+        c = DIAL_CLASS.get(d)
+        if c is None:
+            out.append("%s is not classified (claude_truth_store.DIAL_CLASS)" % d)
+        elif c == "display" and d not in FORCED_BY_TRUTH:
+            out.append("%s is display-side and truth mode does not force it off" % d)
+    return out
+
+
+def feature_problems(dump_dir):
+    """reasons a dumped video is not a truth: a row without the record, not
+    in truth mode, or with a display feature on"""
+    out = []
+    for r in _rows(dump_dir):
+        f = r.get("features")
+        if f is None:
+            out.append("frame %d has no feature record" % r["i"])
+        elif f.get("truth") != 1:
+            out.append("frame %d not in truth mode" % r["i"])
+        else:
+            on = [k for k in FEATURE_OFF if f.get(k, 1) != 0]
+            if f.get("bounces") != 24:
+                on.append("bounces=%s" % f.get("bounces"))
+            if not f.get("rng", 0) >= 1:
+                on.append("rng=%s" % f.get("rng"))
+            if on:
+                out.append("frame %d has %s on" % (r["i"], ",".join(on)))
+        if len(out) >= 3:
+            break
+    return out
+
+
+def control_verdict(ctrl_dir, ref_dir, idx):
+    """the control's frame against the stored truth's frame `idx`: the
+    scoreboard's rule (TUNED there: 1 % on the mean, 5 % median 16x16 tile)"""
+    c, t = _rows(ctrl_dir), _rows(ref_dir)
+    a, b = _frame(ctrl_dir, c[-1]), _frame(ref_dir, t[idx])
+    if not _near(_pose(c[-1]), _pose(t[idx])):
+        return False, {"why": "control pose differs"}
+    lum = lambda x: x @ np.array([0.2126, 0.7152, 0.0722])
+    la, lt = lum(a), lum(b)
+    ratio = float(la.mean() / max(lt.mean(), 1e-9))
+    k = 16
+    h, w = lt.shape
+    ta = la[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k).mean((1, 3))
+    tt = lt[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k).mean((1, 3))
+    mad = float(np.median(np.abs(ta - tt) / np.maximum(tt, 1e-6)))
+    feats = c[-1].get("features", {})
+    ok = abs(ratio - 1) < 0.01 and mad < 0.05 and feats.get("truth") == 1
+    return ok, {"ratio": ratio, "tile_mad": mad, "frame": idx, "control_truth_mode": feats.get("truth")}
 
 
 def find(spec_base, fps):
@@ -74,8 +210,13 @@ def find(spec_base, fps):
         sp = dict(man["spec"])
         f = sp.pop("fps_path", None)
         sp.pop("keys", None)
+        admit = False
+        if sp.get("truth_def") == 3 and spec_base.get("truth_def") == 4:
+            sp["truth_def"] = 4          # a candidate for admission, not a match
+            admit = True
         if sp != spec_base or not f or not all(os.path.isdir(man[x]) for x in ("reference", "faces")):
             continue
+        man["admit"] = admit
         if not all(fl.get("seeds", 1) >= len(FLOOR_SEEDS) for fl in man["floor"]):
             continue   # a floor from fewer seeds under-reads the noise
         err = abs(f / fps - 1.0)
@@ -209,6 +350,16 @@ def worst(floors):
         w["seeds"] = len(fr)
         out.append(w)
     return out
+
+
+def admit(man, control):
+    """a TRUTH_DEF 3 truth that passed a truth-mode check and the control
+    becomes a 4: its manifest says so, and how"""
+    m = os.path.join(os.path.dirname(man["reference"]), "manifest.json")
+    disk = json.load(open(m))
+    disk["spec"]["truth_def"] = 4
+    disk["admitted"] = {"from_def": 3, "control": control, "t": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    json.dump(disk, open(m, "w"), indent=1)
 
 
 def verdict(stats, floor):
