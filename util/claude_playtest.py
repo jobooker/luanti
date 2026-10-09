@@ -132,7 +132,8 @@ def game_default(member):
 
 def capture(args):
     import claude_lab as lab
-    global PLAY_DENOISE
+    global PLAY_DENOISE, BUILD
+    BUILD = TS.build_hash(REPO)
     PLAY_DENOISE = ["--dial", "claude_denoise=1",
                     "--dial", "claude_denoise_learned=" + game_default("denoise_learned")]
     run_dir = os.path.join(OUT, time.strftime("%Y%m%d-%H%M%S"))
@@ -291,8 +292,18 @@ def capture(args):
         # three guards (claude_truth_store, TRUTH_DEF 4): every dial classified,
         # truth mode recorded in every frame, the dumb control agrees
         ref, fid = [], []
-        truth = {"key": key}
-        if man:
+        truth = {"key": key, "build": BUILD}
+        if man and not man.get("admit") and BUILD in man.get("verified_builds", []) \
+                and not args.recheck_truth:
+            # this build already passed the check against this truth: the same
+            # build gives the same answer, so it is not asked again
+            fb = TS.feature_problems(man["reference"])
+            if not fb:
+                truth["outcome"] = "reused (build %s verified it before)" % BUILD
+            else:
+                truth["outcome"] = "replaced: " + "; ".join(fb[:3])
+                man = None
+        elif man:
             fb = [] if man.get("admit") else TS.feature_problems(man["reference"])
             idxs, stats, cdir = truth_check(man["reference"], "verify")
             ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
@@ -312,6 +323,7 @@ def capture(args):
             if ok:
                 truth["outcome"] = ("admitted from TRUTH_DEF 3 (truth-mode check and control passed)"
                                     if man.get("admit") else "reused (stored %s)" % man["stored"])
+                TS.mark_verified(man, BUILD)
             else:
                 truth["outcome"] = "replaced: " + "; ".join(why[:3])
                 man = None
@@ -356,6 +368,7 @@ def capture(args):
                                    {"fps_measured": fps, "control": cinfo,
                                     "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
                     TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
+                    TS.mark_verified(man, BUILD)
                     truth.setdefault("outcome", "stored")
                     truth["floor"] = floor
         print("%-12s truth %s: %s" % (name, key, truth.get("outcome")), flush=True)
@@ -493,6 +506,8 @@ if __name__ == "__main__":
     ap.add_argument("--arm", action="append",
                     help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
                          "and scored against one truth (NAME: alone = the game as it is)")
+    ap.add_argument("--recheck-truth", action="store_true",
+                    help="run the truth check even if this build already passed it")
     ap.add_argument("--fresh-truth", action="store_true",
                     help="render the truth even if a stored one exists (and store it)")
     ap.add_argument("--truth-check-only", action="store_true",

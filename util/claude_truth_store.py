@@ -352,6 +352,44 @@ def worst(floors):
     return out
 
 
+def build_hash(repo):
+    """what decides the picture: the engine binary, the shaders, the block
+    models (content), and the game's files (names, sizes, dates: it is
+    large). The same build gives the same answer to the truth check, so a
+    truth checked under this hash need not be checked again (2026-10-09:
+    the check was ~5 min of every playtest scenario)."""
+    h = hashlib.sha256()
+    def add_file(f):
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    add_file(os.path.join(repo, "bin", "luanti"))
+    for top in ("client/shaders", "util/claude_models"):
+        for dp, dn, fn in sorted(os.walk(os.path.join(repo, top))):
+            dn.sort()
+            for f in sorted(fn):
+                h.update(os.path.join(dp, f)[len(repo):].encode())
+                add_file(os.path.join(dp, f))
+    game = os.path.join(repo, "games", "mineclonia")
+    for dp, dn, fn in sorted(os.walk(game, followlinks=True)):
+        dn.sort()
+        for f in sorted(fn):
+            st = os.stat(os.path.join(dp, f))
+            h.update(("%s %d %d" % (os.path.join(dp, f)[len(game):], st.st_size, int(st.st_mtime))).encode())
+    return h.hexdigest()[:16]
+
+
+def mark_verified(man, build):
+    """this build passed (or made) the truth: remember it in the manifest"""
+    m = os.path.join(os.path.dirname(man["reference"]), "manifest.json")
+    disk = json.load(open(m))
+    vb = disk.setdefault("verified_builds", [])
+    if build not in vb:
+        vb.append(build)
+    json.dump(disk, open(m, "w"), indent=1)
+    man["verified_builds"] = vb
+
+
 def admit(man, control):
     """a TRUTH_DEF 3 truth that passed a truth-mode check and the control
     becomes a 4: its manifest says so, and how"""
