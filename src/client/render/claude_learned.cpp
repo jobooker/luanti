@@ -18,6 +18,7 @@ using GLuint = unsigned int;
 bool g_claude_dn_learned_wanted = false;
 float g_claude_dn_learned_ex = 1.0f;
 float g_claude_dn_learned_young = 64.0f;
+int g_claude_dn_learned_mode = 1;
 
 namespace {
 
@@ -33,6 +34,8 @@ struct Model {
 	GLuint ssbo = 0;
 	GLuint prog[7] = {};   // prep, pool, conv a0, conv a1, b, c, up, (pass uses [6+1])
 	GLuint pass = 0;
+	GLuint lean_c = 0, lean_pass = 0;   // mode 2
+	GLuint tex_lean[3] = {};            // its maps: 1/4 res, fp16
 	GLuint tex_full[4 + 4] = {};   // S ping-pong (2), B ping-pong (2), P (4)
 	GLuint tex_q[5 + 6 + 6 + 6 + 4] = {};   // F (5), H (6), Q (6), S (6), M (4)
 	int W = 0, H = 0;
@@ -166,11 +169,15 @@ bool init()
 		else
 			M.pass = p;
 	}
+	M.lean_c = compile(srcs[5] + "#define LEAN 1\n" + src, "c+head (lean)");
+	M.lean_pass = compile(srcs[7] + "#define LEAN 1\n" + src, "pass (lean)");
+	if (!M.lean_c || !M.lean_pass)
+		return false;
 	GL.GenBuffers(1, &M.ssbo);
 	GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, M.ssbo);
 	GL.BufferData(GL.SHADER_STORAGE_BUFFER, 4 * n, M.w.data(), GL.STATIC_DRAW);
 	GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
-	actionstream << "[claude_denoise_learned] 8 compute programs ready" << std::endl;
+	actionstream << "[claude_denoise_learned] 10 compute programs ready (modes 1 and 2)" << std::endl;
 	M.ok = true;
 	return true;
 }
@@ -183,6 +190,7 @@ void ensureTextures(int W, int H)
 	if (M.tex_full[0]) {
 		GL.DeleteTextures(8, M.tex_full);
 		GL.DeleteTextures(27, M.tex_q);
+		GL.DeleteTextures(3, M.tex_lean);
 	}
 	M.W = W;
 	M.H = H;
@@ -196,12 +204,22 @@ void ensureTextures(int W, int H)
 	};
 	make(M.tex_full, 8, W, H);
 	make(M.tex_q, 27, W / 4, H / 4);
+	GL.GenTextures(3, M.tex_lean);
+	for (int i = 0; i < 3; i++) {
+		GL.BindTexture(GL.TEXTURE_2D, M.tex_lean[i]);
+		GL.TexStorage2D(GL.TEXTURE_2D, 1, GL.RGBA16F, W / 4, H / 4);
+	}
+	GL.BindTexture(GL.TEXTURE_2D, 0);
 	actionstream << "[claude_denoise_learned] buffers " << W << "x" << H << " and " << W / 4 << "x" << H / 4 << std::endl;
 }
 
 void img(int unit, GLuint tex, bool write)
 {
 	GL.BindImageTexture(g_m.base + unit, tex, 0, 0, 0, write ? GL.WRITE_ONLY : GL.READ_ONLY, GL.RGBA32F);
+}
+void img16(int unit, GLuint tex, bool write)
+{
+	GL.BindImageTexture(g_m.base + unit, tex, 0, 0, 0, write ? GL.WRITE_ONLY : GL.READ_ONLY, GL.RGBA16F);
 }
 
 void uniforms(GLuint p, int W, int H, int step, int pass)
@@ -244,6 +262,8 @@ void claudeLearnedDump(const std::string &path)
 	};
 	grab(M.tex_q, 5, ".lF.f32");
 	grab(M.tex_q + 23, 4, ".lM.f32");
+	if (g_claude_dn_learned_mode >= 2)
+		grab(M.tex_lean, 3, ".lL.f32");
 }
 
 bool claudeLearnedOn()
@@ -312,22 +332,34 @@ void ClaudeLearnedDenoise::run(PipelineContext &context)
 	for (int i = 0; i < nc; i++) img(i, Q[i], false);
 	for (int i = 0; i < nc; i++) img(8 + i, S[i], true);
 	go(M.prog[4], Wq, Hq);
-	// conv c + head -> maps
-	use(M.prog[5]);
-	for (int i = 0; i < nc; i++) img(i, S[i], false);
-	for (int i = 0; i < 4; i++) img(8 + i, Mm[i], true);
-	go(M.prog[5], Wq, Hq);
-	// maps to full resolution
-	use(M.prog[6]);
-	for (int i = 0; i < 4; i++) img(i, Mm[i], false);
-	for (int i = 0; i < 4; i++) img(4 + i, P[i], true);
-	go(M.prog[6], W, H);
+	const bool lean = g_claude_dn_learned_mode >= 2;
+	if (lean) {
+		// mode 2: fp16 maps at 1/4 resolution, read by the passes directly
+		use(M.lean_c);
+		for (int i = 0; i < nc; i++) img(i, S[i], false);
+		for (int i = 0; i < 3; i++) img16(8 + i, M.tex_lean[i], true);
+		go(M.lean_c, Wq, Hq);
+	} else {
+		// conv c + head -> maps
+		use(M.prog[5]);
+		for (int i = 0; i < nc; i++) img(i, S[i], false);
+		for (int i = 0; i < 4; i++) img(8 + i, Mm[i], true);
+		go(M.prog[5], Wq, Hq);
+		// maps to full resolution
+		use(M.prog[6]);
+		for (int i = 0; i < 4; i++) img(i, Mm[i], false);
+		for (int i = 0; i < 4; i++) img(4 + i, P[i], true);
+		go(M.prog[6], W, H);
+	}
 	// the five weighted passes
 	for (int it = 1; it <= 5; it++) {
-		use(M.pass, 1 << (it - 1), it);
+		use(lean ? M.lean_pass : M.pass, 1 << (it - 1), it);
 		img(0, Sp[(it - 1) % 2], false);
 		img(1, G, false); img(2, Mo, false); img(3, D, false); img(4, A, false);
-		for (int i = 0; i < 4; i++) img(5 + i, P[i], false);
+		if (lean)
+			for (int i = 0; i < 3; i++) img16(5 + i, M.tex_lean[i], false);
+		else
+			for (int i = 0; i < 4; i++) img(5 + i, P[i], false);
 		img(9, Bp[(it - 1) % 2], false);
 		img(10, Sp[it % 2], true);
 		img(11, Bp[it % 2], true);

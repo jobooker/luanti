@@ -3545,7 +3545,7 @@ public:
 		if (name == "claude_denoise_young")
 			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
 		if (name == "claude_denoise_learned")
-			m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
+			m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 2.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_tree_plant")
@@ -3675,7 +3675,7 @@ public:
 		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
-		m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
+		m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 2.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
@@ -4081,6 +4081,7 @@ public:
 				// raster mode)
 				g_claude_dn_learned_wanted = m_denoise_learned > 0.5f && m_denoise > 0.5f
 						&& m_view < 0.5f && m_grid_debug > 2.5f;
+				g_claude_dn_learned_mode = m_denoise_learned > 1.5f ? 2 : 1;
 				{
 					float ex = m_exposure > 0.0f ? m_exposure : 1.0f;
 					if (m_auto_exposure > 0.5f && g_claude_auto_exposure[3] > 0.5f

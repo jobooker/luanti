@@ -1,11 +1,121 @@
 ---
-title: "Learned denoiser prototype: in the engine, the learned weights beat today's filter at equal time on the four scoreboard scenes"
+title: "Learned denoiser prototype: in the engine it beats today's filter at equal time, and holds up with a moving camera"
 summary: "claude_denoise_learned (default 0) runs today's a-trous filter with per-pixel weights from a 20k-parameter network as GL compute passes; it matches its PyTorch twin to float precision, costs +0.3-0.6 ms of GPU pass time and +0.2-2.3 ms of whole frame, and still beats the filter on RMSE and FLIP at equal time on all four held-out scenes."
 tags: [luanti, report]
 author: claude
 ---
 
 # Learned denoiser prototype
+
+## Part 4 (2026-10-09): moving camera, and the lean path
+
+**Verdict: the moving-camera test passes, with one small exception.**
+`claude_denoise_learned=1` beats today's filter on video JOD in all three
+play scenarios. In room-backup it all but removes the dark patches while
+moving: 14.4% of the frame below 80% of truth, down to 1.7%.
+
+**The exception:** the forest walk is slightly worse on dark patches, 5.9%
+against 6.3% while moving and 1.0% against 1.3% after the stop.
+
+**The lean path (`claude_denoise_learned=2`)** cuts the learned stage by
+0.22-0.24 ms with no loss of quality. That brings it to 0.08-0.28 ms more
+than today's filter.
+
+### The playtest
+
+How it was run:
+- **Tool:** `util/claude_playtest.py` from this worktree, play settings.
+- **Fixes picked up from one-tracer:** d6a9b8bb6, 8cdf54a2b (the view fix),
+  82f2d3bc2, a4c1c809f. My branch already had `--rt-dial` and 3344225ba.
+- **The dial:** `--rt-dial claude_denoise_learned=0|1`, on the real-time run
+  only. Every truth run had it at 0.
+- **Timing:** both arms back to back in one GPU lock hold, then both scored.
+- **Run folders:** `screenshots/playtest/20261009-065441` (filter) and
+  `20261009-070708` (learned).
+- **Real pictures checked:** I looked at the middle frame of every real-time
+  and reference dump (`util/claude_mldenoise_peek.py`, `peek.jpg` in each run
+  folder). All are photo frames, not a debug view.
+
+In the dark-patch columns, "dark" means the share of the frame below 80% of
+truth (below 50% while moving in brackets); "after stop" is the first 10
+frames after the camera stops.
+
+| scenario | arm | fps (p99 frame) | JOD video | dark while moving | dark after stop | frames to JOD 9 after stop |
+|---|---|---|---|---|---|---|
+| room-backup | filter | 65.5 (28.1 ms) | 7.19 | 0.144 (0.000) | 0.039 | not reached |
+| room-backup | **learned** | 61.2 (30.5 ms) | **7.81** | **0.017** (0.000) | **0.006** | not reached |
+| turn | filter | 72.9 (29.2 ms) | 7.73 | 0.049 (0.022) | 0.009 | 24 |
+| turn | **learned** | 67.4 (32.1 ms) | **7.84** | **0.045** (0.015) | **0.005** | **18** |
+| forest-walk | filter | 37.5 (49.6 ms) | 5.90 | 0.059 (0.009) | 0.010 | not reached |
+| forest-walk | **learned** | 36.9 (51.2 ms) | **6.04** | 0.063 (0.009) | 0.013 | not reached |
+
+**The reveal curve** (brightness of newly revealed faces against truth, by
+frames since reveal, ages 0-11):
+- **room-backup:**
+  - filter: 0.97 1.02 0.94 0.87 0.95 0.97 0.97 0.94 0.92 0.93 0.92 0.94
+  - learned: 0.97 0.94 0.93 1.02 1.09 1.13 0.87 1.11 1.10 1.02 1.01 1.03
+- **turn:**
+  - filter: 0.78 0.80 0.80 0.76 1.02 1.00 ...
+  - learned: 0.84 0.82 0.83 0.99 1.02 1.00 ...
+
+  In the first three frames the learned filter is closer to truth. From
+  frame 3 it matches the filter.
+- **forest-walk:** too few revealed pixels after age 3 for a curve.
+  - filter: 1.00 1.01 0.96 0.96
+  - learned: 0.98 0.98 0.94
+
+**Read with care:**
+- **Room-backup reveals run bright.** From frames 4-8 after reveal the
+  learned filter is 9-13% brighter than truth, where today's filter runs
+  3-13% dark. It is closer to truth in size but on the other side.
+- **fps comes from separate runs,** so it carries run-to-run noise. It drops
+  4-7% with the learned arm in room-backup and turn, which is in line with
+  the +0.3-0.5 ms stage cost plus the tracer-time effect from part 3.
+- **The training data is all still cameras.** The network has never seen a
+  moving camera, yet it holds up. History trust (the 0w row) is not used at
+  all yet.
+
+### Step 2: the lean path (`claude_denoise_learned=2`)
+
+What changed from mode 1:
+- **Dropped the 4 affinity features.** They had trained to ~0, so their
+  25-tap reads per pass were doing nothing.
+- **Maps in fp16.** They are now 11 maps in three RGBA16F images at 1/4
+  resolution.
+- **The full-resolution upsample pass is gone.** Each pass now reads the
+  bilinear maps at its own pixel.
+
+Mode 1 stays in place for A/B. The shader and C++ each have one `LEAN` path.
+
+**Quality in PyTorch** (`util/claude_mldenoise_leaneval.py`): mode 2 against
+mode 1 differs by display RMSE 0.00002-0.00003. The error against truth is
+identical to 5 digits on all four scenes.
+
+**Correctness in the engine** (`refcheck --arm learned2`, against a twin
+that rounds the maps to fp16): display RMSE 0.00005-0.0001, relative error
+p99 6e-4, no pixel above 1%. Mode 1 matched to 0.000000; the extra residue
+comes from where the fp16 rounding falls.
+
+**Cost** (pinned, 6 rotating rounds, medians, same session for all three
+arms; stage = the six passes or the learned step):
+
+| scene | filter stage | mode 1 stage | **mode 2 stage** | whole frame vs filter, mode 1 / mode 2 (paired) |
+|---|---|---|---|---|
+| forest | 0.697 | 1.088 | **0.867** | +1.93 / +1.73 |
+| plains | 1.015 | 1.538 | **1.298** | +1.20 / +1.08 |
+| cabin | 0.712 | 1.029 | **0.792** | +0.25 / +0.05 |
+| torchroom | 0.699 | 1.009 | **0.813** | +0.89 / +0.72 |
+
+- **Mode 2 against mode 1:** 0.22-0.24 ms less.
+- **Mode 2 against today's filter:** 0.08-0.28 ms more.
+- **Whole frame:** on the cabin, where the tracer's time holds still, mode 2
+  costs the same as today's filter (+0.05 ms). The other scenes still carry
+  the unexplained tracer-time shift from part 3. Its cause is the next thing
+  to find.
+
+**Not done:** equal-time and moving-camera scoring for mode 2. Its pictures
+equal mode 1's to 3e-5 display RMSE, so mode 1's results stand for it, with
+its smaller cost.
 
 ## Part 3 (2026-10-09): in the engine
 

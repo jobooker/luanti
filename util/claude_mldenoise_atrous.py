@@ -118,7 +118,7 @@ def bits():
             kappa = ((neff - 1.0) / young).clamp(0, 1) if young > 0.5 else torch.ones_like(lp)
             P = 2 * step
             rpd, vpd, cpd, lpd = pad(rgb, P), pad(v, P), pad(code, P), pad(lp, P)
-            fpd = pad(mod["feat"], P) if mod is not None else None
+            fpd = pad(mod["feat"], P) if mod is not None and mod.get("feat") is not None else None
             s = torch.zeros_like(rgb)
             ws = torch.zeros_like(lp)
             vsum = torch.zeros_like(lp)
@@ -199,6 +199,17 @@ def grad_l1(torch, a, b):
     dxa, dxb = a[..., :, 1:] - a[..., :, :-1], b[..., :, 1:] - b[..., :, :-1]
     dya, dyb = a[..., 1:, :] - a[..., :-1, :], b[..., 1:, :] - b[..., :-1, :]
     return (dxa - dxb).abs().mean() + (dya - dyb).abs().mean()
+
+
+def lean_mod(net, f):
+    """mode 2's maps: no affinity features, the 1/4-res maps rounded to fp16
+    (the engine stores them so), then bilinear to full resolution"""
+    import torch
+    import torch.nn.functional as F
+    a = net.low(F.avg_pool2d(f, 4)).half().float()
+    a = torch.cat([a[:, 0:5], a[:, 5 + NFEAT:]], 1)
+    up = F.interpolate(a, size=f.shape[-2:], mode="bilinear", align_corners=False)
+    return {"sig": up[:, 0:5], "feat": None, "mix": up[:, 5:11]}
 
 
 # ---------------------------------------------------------------- check
@@ -494,19 +505,20 @@ def cmd_refcheck(a):
         meta = json.load(open(d + "/meta.json"))
         ex = meta["exposure"]
         for shot in meta["shots"]:
-            if shot["arm"] != "learned":
+            if shot["arm"] != a.arm:
                 continue
             for n in shot["depths"]:
                 if n not in (1, 4, 16, 64) and n != max(shot["depths"]):
                     continue
-                pre = os.path.join(d, "s%d_learned_%d" % (shot["seed"], n))
+                pre = os.path.join(d, "s%d_%s_%d" % (shot["seed"], a.arm, n))
                 rc, code, _ = M.load_set(pre)
                 ru, _, _ = M.load_set(pre, clip=False)
                 den = M.load_den(pre)
                 with torch.no_grad():
                     t = lambda x: torch.from_numpy(x).permute(2, 0, 1)[None].float()
                     c = torch.from_numpy(code)[None, None]
-                    mod = net(features(t(rc), c, torch.tensor([ex])))
+                    f = features(t(rc), c, torch.tensor([ex]))
+                    mod = lean_mod(net, f) if a.arm == "learned2" else net(f)
                     out = atrous(t(ru), c, mod)[0].permute(1, 2, 0).numpy()
                 rel = np.abs(out - den) / np.maximum(np.abs(den), 1e-3)
                 r = {"scene": sc, "seed": shot["seed"], "frames": n,
@@ -519,7 +531,7 @@ def cmd_refcheck(a):
                                            r["rel_p99"], r["rel_max"], r["share_rel_gt_1e-2"]), flush=True)
             break   # one seed is enough for the twin check
     os.makedirs(os.path.join(M.DATA, "eval"), exist_ok=True)
-    json.dump(rows, open(os.path.join(M.DATA, "eval", "engine_vs_pytorch_%s.json" % a.tag), "w"), indent=1)
+    json.dump(rows, open(os.path.join(M.DATA, "eval", "engine_vs_pytorch_%s_%s.json" % (a.tag, a.arm)), "w"), indent=1)
 
 
 if __name__ == "__main__":
@@ -538,6 +550,7 @@ if __name__ == "__main__":
     ap.add_argument("--save-mod", type=int, default=1)
     ap.add_argument("--compile", type=int, default=1)
     ap.add_argument("--out", default="")
+    ap.add_argument("--arm", default="learned")
     a = ap.parse_args()
     {"check": cmd_check, "train": cmd_train, "test": cmd_test, "time": cmd_time, "export": cmd_export,
      "refcheck": cmd_refcheck}[a.what](a)

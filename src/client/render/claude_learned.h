@@ -17,6 +17,8 @@ extern bool g_claude_dn_learned_wanted;
 extern float g_claude_dn_learned_ex;
 // claude_denoise_young, as the filter passes get it
 extern float g_claude_dn_learned_young;
+// 1 = as first built; 2 = lean: no affinity features, fp16 maps, the upsample fused
+extern int g_claude_dn_learned_mode;
 
 // true when the learned passes will replace the six filter passes this frame
 bool claudeLearnedOn();
