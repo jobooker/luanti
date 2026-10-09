@@ -481,6 +481,110 @@ def goto(v):
     time.sleep(1.0)
 
 
+# What makes a scene the scene: the tracer grid's box and its contents, the
+# lights listed from it. All from claude_stats. far_db_blocks is here only
+# so load_scene waits for the far terrain to finish loading: it is a running
+# count of every block ever read from the world database this session
+# (claude_lod g_fd_loaded), so it depends on history by construction and is
+# NOT an identity (three loads of the torch room: 82438, 63703, 62205, with
+# every other field identical).
+SCENE_ID = ("grid_origin", "grid_blocks", "grid_blocks_hash", "grid_hash",
+            "area_emitters", "area_hash", "far_db_blocks")
+
+
+def scene_id(st=None):
+    st = st if st is not None else (read_stats() or {})
+    return {k: st.get(k) for k in SCENE_ID}
+
+
+def _await_stats(pred, timeout):
+    """The first stats record (read on change) for which pred(st) holds, or None."""
+    t0, last = time.time(), None
+    while time.time() - t0 < timeout:
+        try:
+            mt = os.path.getmtime(STATS)
+        except OSError:
+            mt = None
+        if mt != last:
+            last = mt
+            st = read_stats() or {}
+            if pred(st):
+                return st
+        time.sleep(0.1)
+    return None
+
+
+def load_scene(pos, yaw, pitch, pin_file, stable_s=5.0, timeout=120.0, park_up=48.0):
+    """Stand the PINNED camera at a pose with the scene loaded the same way
+    every time, whatever came before (2026-10-08, the torch room's lights).
+
+    MEASURED, three fresh games at the torch room, each logged for 150 s:
+    the client held 105/648, 110/729 and 107/729 of the map blocks in the
+    tracer's grid box, and grid_hash differed every time (a stored 9 vs
+    11 area lights is the same effect with a different history). Two
+    causes, both history:
+      * the SERVER sends a block only when it is in the camera's view cone
+        (isBlockInSight; only blocks touching the camera go regardless)
+        and not occlusion-culled, so the client holds whatever past poses
+        happened to see: the login position (where the last session
+        ended), the teleport, the aim;
+      * the CLIENT keeps the grid's previous origin while the camera
+        stays within 6 m of its centre (the origin deadband), so the box
+        itself depended on where the camera was before (origin x 176 vs
+        178 for the same pose).
+    So: (1) pin the camera `park_up` metres above the pose until the grid
+    re-centres there, (2) pin it at the pose, so the box is the pose's own,
+    (3) have the bridge send every block of that box (OPS.load_region,
+    player:send_mapblock), and (4) wait until the scene's identity
+    (SCENE_ID) has not changed for `stable_s` seconds.
+
+    pin_file: the claude_path file the caller pins with (rewritten with the
+    pose); the park pose goes in pin_file + ".park". The time of day and the
+    server-side teleport are the caller's. Returns {"ok", "id", ...}.
+    """
+    t0 = time.time()
+    out = {"ok": False}
+    park = pin_file + ".park"
+    with open(park, "w") as f:
+        f.write("0 %r %r %r %r %r\n" % (pos[0], pos[1] + park_up, pos[2], yaw, pitch))
+    with open(pin_file, "w") as f:
+        f.write("0 %r %r %r %r %r\n" % (pos[0], pos[1], pos[2], yaw, pitch))
+    before = (read_stats() or {}).get("grid_origin")
+    with open(PATCH, "w") as f:
+        f.write("claude_path = %s\n" % park)
+    st = _await_stats(lambda s: s.get("grid_origin") not in (None, before), 20)
+    if st is None:
+        out["error"] = "the grid did not re-centre on the park pose (origin %s)" % (before,)
+        return out
+    parked = st.get("grid_origin")
+    with open(PATCH, "w") as f:
+        f.write("claude_path = %s\n" % pin_file)
+    st = _await_stats(lambda s: s.get("grid_origin") not in (None, parked), 20)
+    if st is None:
+        out["error"] = "the grid did not re-centre on the pose (origin %s)" % (parked,)
+        return out
+    o = st["grid_origin"]
+    p1, p2 = dict(zip("xyz", o)), dict(zip("xyz", [v + 127 for v in o]))
+    out["load"] = []
+    for _ in range(10):
+        r = rpc("load_region", p1=p1, p2=p2) or {}
+        out["load"].append(r)
+        if r.get("missing") == 0:
+            break
+        time.sleep(2.0)    # an emerge was started for the missing ones
+    prev, since = None, time.time()
+    while time.time() - t0 < timeout:
+        cur = scene_id()
+        if cur != prev:
+            prev, since = cur, time.time()
+        elif time.time() - since >= stable_s:
+            out.update(ok=True, id=cur, s=round(time.time() - t0, 1))
+            return out
+        time.sleep(0.25)
+    out.update(error="scene still changing after %.0f s" % timeout, id=prev)
+    return out
+
+
 def parse_kv(pairs):
     kv = {}
     for pair in pairs:

@@ -9,6 +9,7 @@ at exactly --frames frames. Prints the PNG path. No referee, no verdict.
       --time 0.235 --frames 1500 --dial claude_nee=1 --name forest
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -83,12 +84,15 @@ def main():
             # unnoticed by every shot until an ML export view found it).
             # Teleport, then wait for the blocks to stop arriving.
             lab.goto(vantage)
-            prev, same, t0 = None, 0, time.time()
-            while same < 4 and time.time() - t0 < 30:
-                time.sleep(0.5)
-                n = (lab.read_stats() or {}).get("grid_solid")
-                same = same + 1 if (n == prev and n) else 0
-                prev = n
+            # THE SAME SCENE EVERY TIME (2026-10-08): "wait for the blocks
+            # to stop arriving" let the client's view history decide which
+            # blocks, and so which lights, the grid held (the torch room:
+            # 9 area lights for its truth, 11 later). load_scene re-centres
+            # the grid on this pose and has the server send its whole box.
+            ls = lab.load_scene(args.pos, args.yaw, args.pitch, pf)
+            print("scene: %s" % json.dumps(ls), file=sys.stderr, flush=True)
+            if not ls.get("ok"):
+                return "scene did not load: %s" % ls.get("error")
             before = (lab.read_stats() or {}).get("accum_resets")
             with open(lab.PATCH, "w") as f:
                 f.write("claude_reset_accum = %d\n" % time.time_ns())
@@ -132,7 +136,6 @@ def main():
     # shoot tool did not, and an afternoon of plains shots were empty)
     g = cap.get("grid") or {}
     try:
-        import json
         solid_now = json.load(open(png.replace(".png", ".capture.json")))["stats"].get("grid_solid")
     except Exception:
         solid_now = None

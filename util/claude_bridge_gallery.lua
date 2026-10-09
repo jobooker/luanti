@@ -513,6 +513,47 @@ function OPS.tp(p)
     return { pos = pl:get_pos(), yaw = p.yaw, pitch = p.pitch }
 end
 
+-- A FIXED REGION ON THE CLIENT, whatever the view history (2026-10-08).
+-- The server sends a block only when it lies in the camera's view cone
+-- (isBlockInSight; only blocks touching the camera are sent regardless
+-- of direction) and is not occlusion-culled, so the blocks a client holds
+-- are the union of everything every past pose happened to see. Measured
+-- at the torch room: 103-110 of the 648-729 blocks of the tracer's grid
+-- box present, a different set after every fresh start, and a different
+-- grid_hash each time. This sends every block of the box explicitly:
+--   in : { p1 = {x,y,z}, p2 = {x,y,z} } (nodes), player optional
+--   out: { blocks, sent, had (client already had it), missing }
+-- Missing = not generated yet (an emerge is started for them; call again).
+function OPS.load_region(p)
+    local pl = core.get_player_by_name(p.player or ADMIN)
+    if not pl then error("not online: " .. tostring(p.player or ADMIN)) end
+    local a, b = p.p1, p.p2
+    local lo = { x = math.min(a.x, b.x), y = math.min(a.y, b.y), z = math.min(a.z, b.z) }
+    local hi = { x = math.max(a.x, b.x), y = math.max(a.y, b.y), z = math.max(a.z, b.z) }
+    core.load_area(lo, hi)    -- from the database, synchronously; never generates
+    local b0 = { x = math.floor(lo.x / 16), y = math.floor(lo.y / 16), z = math.floor(lo.z / 16) }
+    local b1 = { x = math.floor(hi.x / 16), y = math.floor(hi.y / 16), z = math.floor(hi.z / 16) }
+    local n, sent, had, missing = 0, 0, 0, 0
+    for bz = b0.z, b1.z do
+        for by = b0.y, b1.y do
+            for bx = b0.x, b1.x do
+                n = n + 1
+                local bp = { x = bx, y = by, z = bz }
+                if core.get_node_or_nil({ x = bx * 16, y = by * 16, z = bz * 16 }) == nil then
+                    missing = missing + 1
+                    core.emerge_area({ x = bx * 16, y = by * 16, z = bz * 16 },
+                                     { x = bx * 16 + 15, y = by * 16 + 15, z = bz * 16 + 15 })
+                elseif pl:send_mapblock(bp) then
+                    sent = sent + 1
+                else
+                    had = had + 1
+                end
+            end
+        end
+    end
+    return { blocks = n, sent = sent, had = had, missing = missing }
+end
+
 -- Surface probe: the top-most non-air node in a column (loaded areas;
 -- OPS.emerge_region first if needed).
 function OPS.probe(p)
