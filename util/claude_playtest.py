@@ -203,14 +203,18 @@ def capture(args):
                        "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
             stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
             if out and os.path.isdir(out[-1]) and out[-1].startswith(os.path.join(REPO, "screenshots", "dump")):
-                shutil.rmtree(out[-1])
+                # kept beside the store (16 frames, ~32 MB): two checks that
+                # disagree are an instrument to look at, not a number
+                keep = os.path.join(TS.ROOT, "checks", name, "%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), tag))
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
+                shutil.move(out[-1], keep)
             return idxs, stats
 
         if args.truth_check_only:
             # the check's own test: an unchanged engine at another seed must
             # pass, a change to the light rules (--truth-check-dial) must fail
             if not man:
-                print("%-12s no stored truth for key %s" % (name, key), flush=True)
+                print("%-12s no stored truth for key %s (measured %.1f fps)" % (name, key, fps), flush=True)
                 continue
             idxs, stats = truth_check(man["reference"], "selftest", args.truth_check_seed,
                                       args.truth_check_dial or [])
