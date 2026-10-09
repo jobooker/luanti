@@ -221,7 +221,7 @@ def capture(args):
             cp = os.path.join(d, "check-path-%s.txt" % tag)
             TS.write_check_path(poses, cp)
             out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
-                      ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % args.hold,
+                      ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % TS.truth_hold(ref_dir, args.hold),
                        "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
             stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
             keep = None
@@ -335,7 +335,9 @@ def capture(args):
                 truth["outcome"] = "NO TRUTH: " + "; ".join(dial_bad[:3])
                 man = {"reference": "", "faces": ""}
         if not man:
-            ref = run(common + rt_off + TRUTH_ON + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
+            hold = args.hold or TS.hold_needed(name)
+            truth["hold"] = hold
+            ref = run(common + rt_off + TRUTH_ON + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % hold])
             # face IDs at FULL resolution: the half-res dump blends with a linear
             # filter, which would invent codes at every edge; the scorer takes
             # every second pixel exactly instead
@@ -463,11 +465,30 @@ def score(run_dir):
                     break
             dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
             after = list(range(last_move + 1, n))
+            # THE TRUTH'S NOISE SHARE (2026-10-09): the truth is an average too;
+            # its own noise adds to every arm's error in quadrature. Measured
+            # from the store's floor (two renders differ by sqrt(2) sigma) and
+            # each arm's RMS error while moving, linear. Over 5 % = the truth is
+            # too noisy for this arm: render it longer (TS.hold_needed).
+            tman = os.path.join(os.path.dirname(sc["reference"]), "manifest.json")
+            sig = float(np.median([f["px"] for f in json.load(open(tman))["floor"]])) / np.sqrt(2) \
+                if os.path.exists(tman) else None
+            mv = moving[::4] or [n - 1]
+            rms = float(np.median([np.sqrt(((J.lin(T[i]) - J.lin(R[i])) ** 2).mean()) for i in mv]))
+            share = (np.sqrt(rms * rms + sig * sig) / rms - 1.0) if sig is not None and rms > 0 else None
+            if sig is not None and os.path.exists(tman):
+                TS.note_arm_error(tman, key, rms)
             report[key] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
+                            rms_moving=rms, truth_noise=sig, truth_noise_share=share,
                                 dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
                                 dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
                                 frames_to_jod9_after_stop=settle, frames=n,
                                 fps_at_start=sc["fps_at_start"])
+            if report[key]["truth_noise_share"] is not None:
+                print("%-20s error vs truth while moving %.4f; the truth's own noise adds %.1f %%%s"
+                      % (key, report[key]["rms_moving"], 100 * report[key]["truth_noise_share"],
+                         "  ** TRUTH TOO NOISY FOR THIS ARM: render it longer **"
+                         if report[key]["truth_noise_share"] > 0.05 else ""))
             print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
                   % (key, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
                      jod, settle))
@@ -496,9 +517,9 @@ if __name__ == "__main__":
     claude_gpu_lock.hold('util/claude_playtest.py')
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*")
-    # TUNED: frames per truth pose, denoiser off | learn by: playtest scores
-    # against a 4096 truth vs a 16384 one on one scenario (stop when they agree)
-    ap.add_argument("--hold", type=int, default=4096)
+    # frames per truth pose: by default as many as the arms need
+    # (TS.hold_needed: the truth's noise under a third of the best arm's error)
+    ap.add_argument("--hold", type=int, default=0)
     ap.add_argument("--score")
     ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
     ap.add_argument("--rt-dial", action="append",

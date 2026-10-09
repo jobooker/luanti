@@ -352,6 +352,51 @@ def worst(floors):
     return out
 
 
+HOLD_FIRST = 1024        # TUNED: a scenario's first truth, before any arm has been measured against one | learn by: hold_needed's answers
+HOLD_MIN, HOLD_MAX = 256, 16384   # TUNED: bounds on hold_needed
+NOISE_SHARE = 0.32      # the truth's noise under this fraction of the best arm's error adds < 5 % to it (sqrt(1 + 0.32^2) = 1.05): a rule
+
+
+def truth_hold(ref_dir, default=0):
+    """the hold a stored truth was rendered at (its frames' still_frames on
+    moving poses), so its check renders the same"""
+    rows = _rows(ref_dir)
+    st = [r["still_frames"] for i, r in enumerate(rows[1:], 1) if _pose(r) != _pose(rows[i - 1])]
+    return int(min(st)) if st else (default or HOLD_FIRST)
+
+
+def note_arm_error(manifest_path, arm, rms):
+    """the scorer records each arm's error against this truth (for hold_needed)"""
+    m = json.load(open(manifest_path))
+    m.setdefault("arm_rms", {})[arm] = rms
+    json.dump(m, open(manifest_path, "w"), indent=1)
+
+
+def hold_needed(scenario):
+    """frames per pose for a NEW truth of this scenario: from the last stored
+    truth of it, its noise (floor) at its hold and the best arm's error
+    against it, the hold that puts the noise under NOISE_SHARE of that error
+    (noise falls as 1/sqrt(frames)). HOLD_FIRST with no history."""
+    best = None
+    if os.path.isdir(ROOT):
+        for k in os.listdir(ROOT):
+            mp = os.path.join(ROOT, k, "manifest.json")
+            if not os.path.exists(mp):
+                continue
+            m = json.load(open(mp))
+            if m["spec"].get("scenario") != scenario or not m.get("arm_rms") or not m.get("floor"):
+                continue
+            if best is None or m["stored"] > best["stored"]:
+                best = m
+    if best is None:
+        return HOLD_FIRST
+    sig = float(np.median([f["px"] for f in best["floor"]])) / np.sqrt(2)
+    e = min(best["arm_rms"].values())
+    n_ref = truth_hold(best["reference"])
+    need = n_ref * (sig / (NOISE_SHARE * e)) ** 2
+    return int(min(HOLD_MAX, max(HOLD_MIN, 2 ** int(np.ceil(np.log2(max(need, 1)))))))
+
+
 def build_hash(repo):
     """what decides the picture: the engine binary, the shaders, the block
     models (content), and the game's files (names, sizes, dates: it is
