@@ -120,6 +120,11 @@ def main():
     png, cap = ci.capture({"name": args.name}, vant, vs["furnace-050"],
                           dials, rundir, args.frames, vantage_name=args.name)
     if args.accum_dump:
+        # an old dump of the same name made the wait below return at once and
+        # the OLD numbers be read (2026-10-09): remove it first
+        for ext in (".json", ".f32"):
+            if os.path.exists(args.accum_dump + ext):
+                os.remove(args.accum_dump + ext)
         with open(lab.PATCH, "w") as f:
             f.write("claude_accum_dump = %s\n" % args.accum_dump)
         t0 = time.time()
