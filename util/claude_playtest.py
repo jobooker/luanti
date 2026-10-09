@@ -276,7 +276,12 @@ if __name__ == "__main__":
     ap.add_argument("--rt-dial", action="append",
                     help="k=v on the real-time run only; the truth runs get k=0")
     a = ap.parse_args()
-    if a.score:
+    if "--score" in sys.argv:
+        # an empty --score (a failed capture upstream) once fell through to a
+        # full capture of every scenario, without the GPU lock (scoring skips
+        # it), and held the GPU for two hours (2026-10-08)
+        if not a.score or not os.path.isdir(a.score):
+            sys.exit("REFUSED: --score needs an existing run folder, got %r" % a.score)
         score(a.score)
     else:
         capture(a)
