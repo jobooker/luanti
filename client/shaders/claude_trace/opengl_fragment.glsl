@@ -2026,12 +2026,16 @@ void ledgerKey(vec3 x, vec3 n, out uint klo, out uint khi)
 			| (uint(d) << 27) | 0x80000000u;
 }
 // last frame's average for a patch: rgb, count in .a (0 = never seen)
-vec4 ledgerRead(uint klo, uint khi, out float l2)
+// cam: the camera hits' own luminance mean, mean square and count (the
+// population a pixel's own history comes from), pooled over every pixel
+// and frame that saw this patch
+vec4 ledgerRead(uint klo, uint khi, out float l2, out vec3 cam)
 {
 	l2 = 0.0;
+	cam = vec3(0.0);
 	uint h = ledgerHash(klo, khi);
 	for (uint i = 0u; i < 8u; i++) {
-		uint e = ((h + i) & LEDGER_MASK) * 8u;
+		uint e = ((h + i) & LEDGER_MASK) * 12u;
 		uint k = claudeLedgerR[e];
 		if (k == 0u)
 			return vec4(0.0);
@@ -2040,6 +2044,10 @@ vec4 ledgerRead(uint klo, uint khi, out float l2)
 			if (cnt < 0.5)
 				return vec4(0.0);
 			l2 = uintBitsToFloat(claudeLedgerR[e + 7u]) / cnt;
+			float cc = float(claudeLedgerR[e + 10u]);
+			if (cc > 0.5)
+				cam = vec3(uintBitsToFloat(claudeLedgerR[e + 8u]) / cc,
+						uintBitsToFloat(claudeLedgerR[e + 9u]) / cc, cc);
 			return vec4(uintBitsToFloat(claudeLedgerR[e + 2u]), uintBitsToFloat(claudeLedgerR[e + 3u]),
 					uintBitsToFloat(claudeLedgerR[e + 4u]), cnt) / vec4(cnt, cnt, cnt, 1.0);
 		}
@@ -2060,11 +2068,11 @@ void ledgerAddF(uint i, float v)
 		old = got;
 	}
 }
-void ledgerWrite(uint klo, uint khi, vec3 val)
+void ledgerWrite(uint klo, uint khi, vec3 val, bool camHit)
 {
 	uint h = ledgerHash(klo, khi);
 	for (uint i = 0u; i < 8u; i++) {
-		uint e = ((h + i) & LEDGER_MASK) * 8u;
+		uint e = ((h + i) & LEDGER_MASK) * 12u;
 		uint prev = atomicCompSwap(claudeLedgerW[e], 0u, khi);
 		if (prev == 0u)
 			claudeLedgerW[e + 1u] = klo;     // claimed
@@ -2075,6 +2083,11 @@ void ledgerWrite(uint klo, uint khi, vec3 val)
 		ledgerAddF(e + 4u, val.b);
 		float lum = dot(val, vec3(0.2126, 0.7152, 0.0722));
 		ledgerAddF(e + 7u, lum * lum);
+		if (camHit) {
+			ledgerAddF(e + 8u, lum);
+			ledgerAddF(e + 9u, lum * lum);
+			atomicAdd(claudeLedgerW[e + 10u], 1u);
+		}
 		atomicAdd(claudeLedgerW[e + 5u], 1u);
 		claudeLedgerW[e + 6u] = uint(claudeLedgerFrame);
 		return;
@@ -4789,6 +4802,13 @@ void main(void)
 	float gpTp0 = 0.0, gpTp1 = 0.0, gpL0 = 0.0, gpL1 = 0.0, gpF0 = 1.0, gpF1 = 1.0;
 	// claude_ledger: the first three scattering hits, settled at path end
 	int lgRec = 0;
+	// claude_ledger 5 (2026-10-09, the established design: NVIDIA's SHaRC
+	// reads its cache "on each hit except the primary hit" and stops the
+	// path there). One pixel in four, rotating, traces in full and WRITES
+	// the ledger; the others READ it at their first bounce and stop, so the
+	// ledger only ever holds real rays (no pixel that used it writes to it)
+	bool lgUpdate = claudeLedger < 4.5 || ((int(gl_FragCoord.x) & 1) + 2 * (int(gl_FragCoord.y) & 1)
+			+ int(claudeLedgerFrame)) % 4 == 0;
 	uint lgLo0 = 0u, lgHi0 = 0u, lgLo1 = 0u, lgHi1 = 0u, lgLo2 = 0u, lgHi2 = 0u;
 	vec3 lgL0 = vec3(0.0), lgL1 = vec3(0.0), lgL2 = vec3(0.0);
 	vec3 lgT0 = vec3(0.0), lgT1 = vec3(0.0), lgT2 = vec3(0.0);
@@ -5207,7 +5227,27 @@ void main(void)
 		// full: no light is lost, it is only found the slow way.
 		g_bounceN = n;
 #ifdef CLAUDE_LEDGER_OK
-		if (claudeLedger > 0.5 && lgRec < 3 && !leafT && !hitFar && curMed < 0.5 && view == 0) {
+#ifdef CLAUDE_LEDGER_OK
+		if (claudeLedger > 4.5 && !lgUpdate && seg >= 1 && !leafT && !hitFar && curMed < 0.5
+				&& view == 0 && all(equal(le, vec3(0.0)))) {
+			// a non-glowing surface after the first bounce: if the ledger
+			// knows the light arriving here well enough, take it and stop
+			uint klo, khi;
+			ledgerKey(p + dir * tHit, n, klo, khi);
+			float l2;
+			vec3 pop;
+			vec4 m = ledgerRead(klo, khi, l2, pop);
+			// TUNED: 16 samples before the ledger is trusted | learn by: error
+			// at equal time on the scoreboard, still and moving
+			if (m.a >= 16.0) {
+				L += tp * alb * m.rgb;
+				if (nScat < 0.5)
+					Ld += tp * alb * m.rgb;
+				break;
+			}
+		}
+#endif
+		if (claudeLedger > 0.5 && lgUpdate && lgRec < 3 && !leafT && !hitFar && curMed < 0.5 && view == 0) {
 			// everything this path gathers from here on, divided by the
 			// throughput and colour here, is this point's incoming light
 			uint klo, khi;
@@ -5341,9 +5381,10 @@ void main(void)
 #if defined(CLAUDE_LEDGER_OK) && CLAUDE_SUBPASS == 0
 	vec4 lgCamMean = vec4(0.0);
 	float lgCamL2 = 0.0;   // the camera patch's mean squared luminance (albedo-free)
+	vec3 lgCamPop = vec3(0.0);   // its camera-hit population: mean, mean square, count
 	if (claudeLedger > 0.5) {
-		if (lgCam && claudeLedger > 1.5)
-			lgCamMean = ledgerRead(lgLo0, lgHi0, lgCamL2);   // last frame's, before this one lands
+		if (lgCam && claudeLedger > 1.5 && claudeLedger < 4.5)
+			lgCamMean = ledgerRead(lgLo0, lgHi0, lgCamL2, lgCamPop);   // last frame's, before this one lands
 		for (int r = 0; r < 3; r++) {
 			if (r >= lgRec)
 				break;
@@ -5362,7 +5403,7 @@ void main(void)
 				continue;   // a colour channel this surface absorbs entirely
 			vec3 inc = max(L - lb, vec3(0.0)) / ta;
 			if (all(lessThan(inc, vec3(1e30))))
-				ledgerWrite(klo, khi, inc);
+				ledgerWrite(klo, khi, inc, r == 0 && lgCam);
 		}
 	}
 #endif
@@ -5769,7 +5810,7 @@ void main(void)
 		nPix = 0.0;
 	}
 #if defined(CLAUDE_LEDGER_OK) && CLAUDE_SUBPASS == 0
-	if (claudeLedger > 1.5 && lgCam && lgCamMean.a > 0.5) {
+	if (claudeLedger > 1.5 && claudeLedger < 4.5 && lgCam && lgCamMean.a > 0.5) {
 		// Two averages of real rays for this pixel: its own history (this
 		// frame blended in at weight a, so about 1/a samples) and its patch's
 		// ledger entry (count samples, from every view, frame and bounce).
@@ -5780,30 +5821,43 @@ void main(void)
 		// noise in 1/16 m blocks.
 		vec3 own = mix(prev, fresh, a);
 		vec3 led = lgCamLe + lgCamAlb * lgCamMean.rgb;
-		// EACH AVERAGE WEIGHTED BY ONE OVER ITS OWN NOISE (2026-10-09). By
-		// sample count (the version before) is right only when both have the
-		// same noise per sample; in a dark room the ledger's samples include
-		// deep bounces and are far noisier, and its 1/16 m blocks showed. Both
-		// in the same units: luminance with the surface colour divided out.
+		// EACH AVERAGE WEIGHTED BY ONE OVER ITS NOISE, WITH NOISE THAT
+		// CANNOT SEE THIS PIXEL'S LUCK (2026-10-09, third design). By sample
+		// count the ledger's noisier samples showed as 1/16 m blocks indoors;
+		// by the pixel's OWN measured noise the merge read dark (a pixel that
+		// missed the bright samples looks darker AND calmer). Now the pixel's
+		// side uses the noise of the patch's camera hits, pooled over every
+		// pixel and frame that saw it; the ledger's side its own samples'.
+		// Units: luminance with the surface colour divided out.
 		float lm = dot(lgCamMean.rgb, vec3(0.2126, 0.7152, 0.0722));
-		float varLs = max(lgCamL2 - lm * lm, 0.0);          // ledger, per sample
-		float varLed = varLs / lgCamMean.a;                  // its mean
-		float varOwn = varLs;                                // one fresh sample, no history
+		float varLs = max(lgCamL2 - lm * lm, 0.0);           // ledger, per sample
+		float varLed = varLs / lgCamMean.a;                   // its mean
+		float varCs = lgCamPop.z >= 4.0
+				? max(lgCamPop.y - lgCamPop.x * lgCamPop.x, 0.0) : varLs;   // camera hits, per sample
+		float vfOwn = 1.0;                                    // one fresh sample, no history
 		vec4 hmL = texture2D(historyMom, huv);
-		if (a < 1.0 && hmL.g > 0.0 && hmL.g <= 1.0 && hmL.r >= 0.0 && hmL.r < 1e12) {
-			float varS = max(hmL.r - hmL.b * hmL.b, 0.0);    // the pixel's own, per sample
-			varOwn = varS * ((1.0 - a) * (1.0 - a) * hmL.g + a * a);
-		}
+		if (a < 1.0 && hmL.g > 0.0 && hmL.g <= 1.0)
+			vfOwn = (1.0 - a) * (1.0 - a) * hmL.g + a * a;    // the history's own weights: deterministic
+		float varOwn = varCs * vfOwn;
 		float wOwn = 1.0 / max(varOwn, 1e-12), wLed = 1.0 / max(varLed, 1e-12);
 		vec3 merged = (own * wOwn + led * wLed) / (wOwn + wLed);
-		if (claudeLedger > 2.5)
-			merged = led;   // INSTRUMENT (claude_ledger 3): the ledger alone, to find wrong patches
+		if (claudeLedger > 3.5)   // INSTRUMENT (claude_ledger 4): ledger noise / camera noise, per sample, / 10
+			merged = vec3(varLs / max(varCs, 1e-12) * 0.1);
 		// the output is the merged colour whatever a is; a itself is left
 		// alone, because the history bookkeeping below keeps each pixel's
 		// sample count from it. Setting it to 1 (first version) broke that
 		// count and made the ghost after a fast turn linger (2026-10-09)
-		prev = merged;
-		fresh = merged;
+		if (claudeLedger > 2.5 && claudeLedger < 3.5) {
+			// INSTRUMENT (claude_ledger 3): the ledger alone, AVERAGED over
+			// frames like the truth. The first version showed one frame's
+			// reading; camera rays jitter inside the pixel, so at every texel
+			// edge one jitter lands on the neighbour's patch: a constant
+			// 70% error that no number of samples could shrink (2026-10-09)
+			fresh = led;
+		} else {
+			prev = merged;
+			fresh = merged;
+		}
 	}
 #endif
 	gl_FragColor = vec4(mix(prev, fresh, a), tPack);

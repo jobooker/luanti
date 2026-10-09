@@ -1225,14 +1225,19 @@ static bool g_ledger_clear = false;
 // can then land between a sample's light and its count being added: the
 // mean is off by at most about one sample in the cap (1/256). The cap is
 // applied in place every 8th frame instead of every frame.
-static bool g_ledger_single = false;   // pseudo-key claude_ledger_clear: forget everything
+static bool g_ledger_single = false;
+// claude_ledger_cap: how many samples a patch remembers before older ones
+// fade. TUNED: 256 | learn by: error at equal time on still AND moving-light
+// stretches (2026-10-09: at 256 the torch-room ledger stopped improving after
+// 64 frames; per-pixel noise 82% of the brightness at 64 and at 512 frames)
+static float g_ledger_cap = 256.0f;   // pseudo-key claude_ledger_clear: forget everything
 static const char *LEDGER_CARRY_SRC = R"GLSL(#version 460
 layout(local_size_x = 64) in;
 layout(std430, binding = 5) readonly buffer A { uint a[]; };
 layout(std430, binding = 6) writeonly buffer B { uint b[]; };
 uniform float capN;
 void main() {
-	uint e = gl_GlobalInvocationID.x * 8u;
+	uint e = gl_GlobalInvocationID.x * 12u;
 	if (e >= uint(a.length())) return;
 	uint n = a[e + 5u];
 	float s = 1.0;
@@ -1243,11 +1248,16 @@ void main() {
 	b[e + 4u] = floatBitsToUint(uintBitsToFloat(a[e + 4u]) * s);
 	b[e + 5u] = n; b[e + 6u] = a[e + 6u];
 	b[e + 7u] = floatBitsToUint(uintBitsToFloat(a[e + 7u]) * s);   // sum of squares, same cap
+	// the camera hits' own population, under the same cap
+	b[e + 8u] = floatBitsToUint(uintBitsToFloat(a[e + 8u]) * s);
+	b[e + 9u] = floatBitsToUint(uintBitsToFloat(a[e + 9u]) * s);
+	b[e + 10u] = uint(float(a[e + 10u]) * s + 0.5);
+	b[e + 11u] = a[e + 11u];
 }
 )GLSL";
 static void claudeLedgerBind(float frame)
 {
-	const size_t ENTRIES = (size_t)1 << 22, BYTES = ENTRIES * 8 * 4;
+	const size_t ENTRIES = (size_t)1 << 22, BYTES = ENTRIES * 12 * 4;   // 12 words an entry
 	if (!g_ledger[0]) {
 		GL.GenBuffers(2, g_ledger);
 		for (int i = 0; i < 2; i++) {
@@ -1289,7 +1299,7 @@ static void claudeLedgerBind(float frame)
 			GLint prev = 0;
 			GL.GetIntegerv(GL.CURRENT_PROGRAM, &prev);
 			GL.UseProgram(g_ledger_carry);
-			GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), 256.0f);
+			GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), g_ledger_cap);
 			GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[0]);
 			GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[0]);   // in place
 			GL.DispatchCompute((GLuint)(ENTRIES / 64), 1, 1);
@@ -1305,7 +1315,7 @@ static void claudeLedgerBind(float frame)
 		GL.UseProgram(g_ledger_carry);
 		// TUNED: a patch remembers its last 256 samples | learn by: error at
 		// equal time on the loop's moving-light and torch stretches
-		GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), 256.0f);
+		GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), g_ledger_cap);
 		GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[g_ledger_read]);
 		GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[g_ledger_read ^ 1]);
 		GL.DispatchCompute((GLuint)(ENTRIES / 64), 1, 1);
@@ -1313,13 +1323,13 @@ static void claudeLedgerBind(float frame)
 		GL.UseProgram(prev);
 		// the fill, once a second: v1 has no eviction, so clear at 3/4
 		if (g_claude_frame_no % 60 == 0) {
-			std::vector<u32> probe(8 * 4096);
+			std::vector<u32> probe(12 * 4096);
 			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[g_ledger_read]);
 			size_t used = 0;
 			for (int blk = 0; blk < 16; blk++) {
 				GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, (ptrdiff_t)(blk * (BYTES / 16)),
 						probe.size() * 4, probe.data());
-				for (size_t i = 0; i < probe.size(); i += 8)
+				for (size_t i = 0; i < probe.size(); i += 12)
 					used += probe[i] != 0;
 			}
 			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
@@ -3533,7 +3543,7 @@ public:
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		if (name == "claude_ledger")
-			m_ledger = readAir("claude_ledger", 0.0f, 3.0f);
+			m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3654,7 +3664,7 @@ public:
 		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
-		m_ledger = readAir("claude_ledger", 0.0f, 3.0f);
+		m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -7370,6 +7380,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 		}
 		if (name == "claude_ledger_clear") {
 			g_ledger_clear = true;
+			continue;
+		}
+		if (name == "claude_ledger_cap") {
+			g_ledger_cap = std::max(1.0f, (float)atof(patch.get(name).c_str()));
 			continue;
 		}
 		if (name == "claude_ledger_single") {
