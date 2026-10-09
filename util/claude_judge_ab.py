@@ -169,8 +169,9 @@ if __name__ == "__main__":
     # the GPU lock for this tool's whole life (children inherit it): see util/claude_gpu_lock.py
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import claude_gpu_lock
-    if sys.argv[1:2] != ["score"]:   # scoring only reads files: no GPU lock
-        claude_gpu_lock.hold('util/claude_judge_ab.py')
+    # scoring takes the lock too: the video score (JOD) runs on the GPU
+    # through PyTorch, and ran out of memory beside a training job (2026-10-09)
+    claude_gpu_lock.hold('util/claude_judge_ab.py')
     if sys.argv[1] == "capture":
         capture(sys.argv[2])
     else:
