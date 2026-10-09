@@ -176,8 +176,9 @@ def capture(args):
         expo = (st.get("auto_exposure") or [None])[0]
         # 2. the path in seconds at that fps -- or, when a truth is stored for
         # these inputs at an fps within 10 % of it, THAT path (and its truth)
+        # (the hold is not an input: a truth is held as long as its arms need)
         spec_base = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
-                     "hold": args.hold, "scale": 2, "all_run_dials": sorted(args.dial or []),
+                     "scale": 2, "all_run_dials": sorted(args.dial or []),
                      "truth_def": TS.TRUTH_DEF}
         man = None if args.fresh_truth else TS.find(spec_base, fps)
         if man:
@@ -192,6 +193,18 @@ def capture(args):
                 f.write("%d %r %r %r %r %r\n" % tuple(k))
         spec = dict(spec_base, fps_path=fps_path, keys=[list(k) for k in pk])
         key = TS.key_for(spec)
+        # THE TRUTH IS A HANDFUL OF POSES (TRUTH_DEF 5, John 2026-10-09: "we
+        # don't need the whole video"): the start, the end and TS.TRUTH_MID
+        # poses through the move, as their own short path (tkeys). Flicker is
+        # measured on the real-time video alone, so it needs no truth.
+        if man and man.get("truth_keys"):
+            tkeys = [tuple(k) for k in man["truth_keys"]]
+            tframes = man["truth_frames"]
+        else:
+            tframes = TS.truth_frames(pk)
+            tkeys = [(j,) + TS.path_pose(pk, f) for j, f in enumerate(tframes)]
+        tpf = os.path.join(d, "truth-path.txt")
+        TS.write_check_path([k[1:] for k in tkeys], tpf)
         expo_measured = expo
         if man:
             expo = man["exposure"]
@@ -217,7 +230,7 @@ def capture(args):
         def truth_check(ref_dir, tag, seed=TS.CHECK_SEED, dials=()):
             """a few poses of the stored truth, re-rendered at another seed
             (claude_truth_store.py); returns (frames checked, stats or None)"""
-            idxs, poses = TS.check_plan(ref_dir, pk)
+            idxs, poses = TS.check_plan(ref_dir, tkeys)
             cp = os.path.join(d, "check-path-%s.txt" % tag)
             TS.write_check_path(poses, cp)
             out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
@@ -242,7 +255,7 @@ def capture(args):
             i = idxs[len(idxs) // 2]
             r = TS._rows(ref_dir)[i]
             cp = os.path.join(d, "control-path.txt")
-            TS.write_check_path([TS.path_pose(pk, r["path_frame"])], cp)
+            TS.write_check_path([TS.path_pose(tkeys, r["path_frame"])], cp)
             out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
                       sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
                       ["--name", name + "-control", "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD])
@@ -337,7 +350,8 @@ def capture(args):
         if not man:
             hold = args.hold or TS.hold_needed(name)
             truth["hold"] = hold
-            ref = run(common + rt_off + TRUTH_ON + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % hold])
+            ref = run([c if c != pf else tpf for c in common] + rt_off + TRUTH_ON +
+                      ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % hold])
             # face IDs at FULL resolution: the half-res dump blends with a linear
             # filter, which would invent codes at every edge; the scorer takes
             # every second pixel exactly instead
@@ -367,7 +381,8 @@ def capture(args):
                     man = {"reference": "", "faces": ""}
                 else:
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
-                                   {"fps_measured": fps, "control": cinfo,
+                                   {"fps_measured": fps, "control": cinfo, "hold": hold,
+                                    "truth_frames": tframes, "truth_keys": [list(k) for k in tkeys],
                                     "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
                     TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
                     TS.mark_verified(man, BUILD)
@@ -396,7 +411,7 @@ def score(run_dir):
         if not sc.get("reference"):
             print("%-12s NOT SCORED: no truth (%s)" % (name, sc.get("truth", {}).get("outcome")))
             continue
-        R, _ = J.load_dump(sc["reference"])
+        R, Rrows = J.load_dump(sc["reference"])
         # AN INSTRUMENT MUST SEE SOMETHING (2026-10-07): a path that walks the
         # camera into a solid block records black in BOTH arms, and two black
         # frames "agree" perfectly. Refuse instead of scoring them.
@@ -406,65 +421,95 @@ def score(run_dir):
                   "path enters something solid" % (name, len(black), black[0]))
             continue
         Fc, _ = J.load_dump(sc["faces"])
+        Rlum = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R]
+        Rpose = [TS._pose(r) for r in Rrows]
         # every arm against the one truth (old runs: a single "realtime")
         arms = sc.get("arms") or {"rt": sc["realtime"]}
         for arm, rt_dir in arms.items():
             key = name if len(arms) == 1 else name + "/" + arm
             T, rows = J.load_dump(rt_dir)
-            n = min(len(T), len(R), len(Fc))
+            n = min(len(T), len(Fc))
             pace = J.pacing(rows)
-            jod = J.jod_video(T[:n], R[:n], max(pace.get("fps_mean", 30.0), 1.0), clip=min(60, n))
-            # the reveal curve: pixels whose face code no pixel had the frame before
+            # THE TRUTH IS A HANDFUL OF POSES (TRUTH_DEF 5): a real-time frame is
+            # judged where the truth has its pose -- the start pose (every frame
+            # before the move), the end pose (every frame after it) and the
+            # sampled poses of the move. A full-video truth matches every frame.
+            tmap = {}
+            for i in range(n):
+                p = TS._pose(rows[i])
+                for j, q in enumerate(Rpose):
+                    if TS._near(p, q):
+                        tmap[i] = j
+                        break
+            moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
+                      or rows[i]["yaw"] != rows[i - 1]["yaw"]]
+            moving_t = [i for i in moving if i in tmap]
+            lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
+            # the reveal curve: pixels whose face code no pixel had the frame
+            # before; ages tracked on every frame (face IDs are cheap),
+            # brightness judged where a truth frame exists
             codes = [(f[::2, ::2].astype(np.int32) * np.array([1, 256, 65536])).sum(2) for f in Fc[:n]]
             sky = 255 + 255 * 256 + 255 * 65536
-            lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
-            lumR = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R[:n]]
             born = np.full(codes[0].shape, -1)
             ages = {}
             for i in range(1, n):
                 new = ~np.isin(codes[i], codes[i - 1]) & (codes[i] != sky)
                 same = codes[i] == codes[i - 1]
                 born = np.where(new, i, np.where(same, born, -1))
+                if i not in tmap:
+                    continue
                 age = np.where(born >= 0, i - born, -1)
                 for a in range(0, 31):
                     m = age == a
                     if m.sum() < 200:
                         continue
-                    t_, r_ = lumT[i][m].mean(), lumR[i][m].mean()
+                    t_, r_ = lumT[i][m].mean(), Rlum[tmap[i]][m].mean()
                     ages.setdefault(a, []).append((t_, r_, int(m.sum())))
             curve = {a: float(sum(t for t, r, c in v) / max(sum(r for t, r, c in v), 1e-9))
                      for a, v in sorted(ages.items())}
             # DARK PATCHES (what John saw: "starts off all dark"): locally
             # smoothed brightness, real time vs the truth at the same pose, and
-            # the share of the frame below 80 % / 50 % of the truth. The reveal
-            # curve above only catches faces that are NEW to the screen; backing
-            # up showed a dark band over ground that WAS on screen the frame
-            # before (its history lost while moving), which this sees.
+            # the share of the frame below 80 % / 50 % of the truth.
             def smooth(x, k=8):
                 h, w = x.shape
                 hh, ww = h // k, w // k
                 return x[:hh * k, :ww * k].reshape(hh, k, ww, k).mean((1, 3))
-            dark80, dark50 = [], []
-            for i in range(n):
-                st, sr = smooth(lumT[i]), smooth(lumR[i])
+            dark80, dark50 = {}, {}
+            for i in tmap:
+                st, sr = smooth(lumT[i]), smooth(Rlum[tmap[i]])
                 lit = sr > 1e-3
                 ratio = np.where(lit, st / np.maximum(sr, 1e-6), 1.0)
-                dark80.append(float(((ratio < 0.8) & lit).mean()))
-                dark50.append(float(((ratio < 0.5) & lit).mean()))
-            moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
-                      or rows[i]["yaw"] != rows[i - 1]["yaw"]]
-            # settling: per-frame JOD after the last move
-            last_move = max(i for i, r in enumerate(rows[:n]) if i > 0 and
-                            (r["pos"] != rows[i - 1]["pos"] or r["yaw"] != rows[i - 1]["yaw"])) \
-                if any(r["pos"] != rows[0]["pos"] or r["yaw"] != rows[0]["yaw"] for r in rows[:n]) else 0
+                dark80[i] = float(((ratio < 0.8) & lit).mean())
+                dark50[i] = float(((ratio < 0.5) & lit).mean())
+            last_move = moving[-1] if moving else 0
+            after = [i for i in range(last_move + 1, n) if i in tmap]
             settle = None
-            for i in range(last_move, n, max(1, (n - last_move) // 20)):
-                q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]), J.fit(R[i], J.display()["resolution"][::-1]))
+            for i in after[::max(1, len(after) // 20)]:
+                q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]),
+                                J.fit(R[tmap[i]], J.display()["resolution"][::-1]))
                 if q >= 9.0:
                     settle = i - last_move
                     break
-            dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
-            after = list(range(last_move + 1, n))
+            # closeness while moving: per-frame JOD at the sampled poses
+            jod_mv = [J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]),
+                                  J.fit(R[tmap[i]], J.display()["resolution"][::-1])) for i in moving_t[:8]]
+            jod_moving = float(np.mean(jod_mv)) if jod_mv else None
+            # FLICKER, from the real-time video alone (John 2026-10-09: "doesn't
+            # flicker and is close to the truth are different things"): per
+            # 16x16 block, |L[k] - (L[k-1] + L[k+1]) / 2| relative to brightness.
+            # Steady change from camera motion cancels; frame-to-frame jumping
+            # does not. Tested: a converged turn reads 0.0008 while turning (the
+            # motion floor), real time 0.0024-0.0027.
+            def fl(idx):
+                v = []
+                for k in idx:
+                    if 0 < k < n - 1:
+                        a_, b_, c_ = smooth(lumT[k - 1], 16), smooth(lumT[k], 16), smooth(lumT[k + 1], 16)
+                        v.append(np.median(np.abs(b_ - (a_ + c_) / 2) / np.maximum((a_ + b_ + c_) / 3, 1e-4)))
+                return float(np.median(v)) if v else None
+            still_idx = [i for i in range(1, n - 1) if i not in moving and i + 1 not in moving]
+            flicker_moving, flicker_still = fl(moving), fl(still_idx)
+            dm = lambda v, idx: float(np.mean([v[i] for i in idx if i in v])) if any(i in v for i in idx) else 0.0
             # THE TRUTH'S NOISE SHARE (2026-10-09): the truth is an average too;
             # its own noise adds to every arm's error in quadrature. Measured
             # from the store's floor (two renders differ by sqrt(2) sigma) and
@@ -473,34 +518,38 @@ def score(run_dir):
             tman = os.path.join(os.path.dirname(sc["reference"]), "manifest.json")
             sig = float(np.median([f["px"] for f in json.load(open(tman))["floor"]])) / np.sqrt(2) \
                 if os.path.exists(tman) else None
-            mv = moving[::4] or [n - 1]
-            rms = float(np.median([np.sqrt(((J.lin(T[i]) - J.lin(R[i])) ** 2).mean()) for i in mv]))
-            share = (np.sqrt(rms * rms + sig * sig) / rms - 1.0) if sig is not None and rms > 0 else None
-            if sig is not None and os.path.exists(tman):
+            mv = moving_t or after[-1:]
+            rms = float(np.median([np.sqrt(((J.lin(T[i]) - J.lin(R[tmap[i]])) ** 2).mean()) for i in mv])) if mv else None
+            share = (np.sqrt(rms * rms + sig * sig) / rms - 1.0) if sig is not None and rms else None
+            if sig is not None and rms and os.path.exists(tman):
                 TS.note_arm_error(tman, key, rms)
-            report[key] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
-                            rms_moving=rms, truth_noise=sig, truth_noise_share=share,
-                                dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
-                                dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
-                                frames_to_jod9_after_stop=settle, frames=n,
-                                fps_at_start=sc["fps_at_start"])
+            report[key] = dict(pace, jod_frame_moving=jod_moving, flicker_moving=flicker_moving,
+                               flicker_still=flicker_still, reveal_brightness_by_age=curve,
+                               rms_moving=rms, truth_noise=sig, truth_noise_share=share,
+                               dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
+                               dark80_after_stop=dm(dark80, after[:10]),
+                               frames_to_jod9_after_stop=settle, frames=n, judged_frames=len(tmap),
+                               judged_moving=len(moving_t), fps_at_start=sc["fps_at_start"])
             if report[key]["truth_noise_share"] is not None:
                 print("%-20s error vs truth while moving %.4f; the truth's own noise adds %.1f %%%s"
-                      % (key, report[key]["rms_moving"], 100 * report[key]["truth_noise_share"],
-                         "  ** TRUTH TOO NOISY FOR THIS ARM: render it longer **"
-                         if report[key]["truth_noise_share"] > 0.05 else ""))
-            print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
+                      % (key, rms, 100 * share, "  ** TRUTH TOO NOISY FOR THIS ARM: render it longer **"
+                         if share > 0.05 else ""))
+            print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD per frame while moving %s (%d poses) | "
+                  "flicker moving %s still %s | settle to JOD 9: %s frames"
                   % (key, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
-                     jod, settle))
+                     "%.2f" % jod_moving if jod_moving is not None else "-", len(jod_mv),
+                     "%.4f" % flicker_moving if flicker_moving is not None else "-",
+                     "%.4f" % flicker_still if flicker_still is not None else "-", settle))
             print("             dark patches (share of frame below 80%% / 50%% of truth): moving %.3f / %.3f, first 10 frames after stop %.3f"
                   % (report[key]["dark80_moving"], report[key]["dark50_moving"], report[key]["dark80_after_stop"]))
             print("             new-face reveal curve (catches only faces new to the screen): " +
                   " ".join("%d:%.2f" % (a, v) for a, v in list(curve.items())[:12]))
-            # the GIF: real time | reference
+            # the GIF: real time | the truth where it has the pose (black where not)
             frames = []
+            blank = Image.new("RGB", (480, 270))
             for i in range(0, n, max(1, n // 60)):
                 a = Image.fromarray(T[i]).resize((480, 270))
-                b = Image.fromarray(R[i]).resize((480, 270))
+                b = Image.fromarray(R[tmap[i]]).resize((480, 270)) if i in tmap else blank
                 c = Image.new("RGB", (960, 270)); c.paste(a, (0, 0)); c.paste(b, (480, 0))
                 frames.append(c)
             frames[0].save(os.path.join(run_dir, key.replace("/", "-") + ".gif"), save_all=True, append_images=frames[1:],

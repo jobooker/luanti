@@ -72,7 +72,13 @@ TRUTH_DEF = 3
 #      it catches a truth that is wrong for a reason nobody listed.
 # A TRUTH_DEF 3 truth (made with the dials list) is ADMITTED to 4 only by
 # passing a truth-mode check and the control, never by being 3.
-TRUTH_DEF = 4
+TRUTH_DEF = 5
+# 5 (2026-10-09, John: "we don't need the whole video ... doesn't flicker and
+# is close to the truth are different things"): the truth is a handful of
+# poses (truth_frames), each held as long as the arms need (hold_needed);
+# flicker is measured on the real-time video alone. ~70 converged poses at
+# 4096 frames became ~10 at a few hundred: hours to minutes.
+TRUTH_MID = 8      # TUNED: poses through the move | learn by: the spread of the moving-frame numbers over sampled subsets
 TRUTH_DIALS = ["claude_truth=1"]
 FORCED_BY_TRUTH = {"claude_denoise", "claude_denoise_learned", "claude_ledger", "claude_boost",
                    "claude_split", "claude_raw_frame", "claude_reproject", "claude_bounces"}
@@ -357,11 +363,21 @@ HOLD_MIN, HOLD_MAX = 256, 16384   # TUNED: bounds on hold_needed
 NOISE_SHARE = 0.32      # the truth's noise under this fraction of the best arm's error adds < 5 % to it (sqrt(1 + 0.32^2) = 1.05): a rule
 
 
+def truth_frames(keys):
+    """the path frames a truth renders: the start pose, TRUTH_MID poses spread
+    over the move, the end pose"""
+    F = int(keys[-1][0]) + 1
+    poses = [path_pose(keys, f) for f in range(F)]
+    moving = [f for f in range(1, F) if poses[f] != poses[f - 1]]
+    mid = [moving[int((j + 0.5) * len(moving) / TRUTH_MID)] for j in range(min(TRUTH_MID, len(moving)))]
+    return sorted(set([0] + mid + [F - 1]))
+
+
 def truth_hold(ref_dir, default=0):
     """the hold a stored truth was rendered at (its frames' still_frames on
     moving poses), so its check renders the same"""
     rows = _rows(ref_dir)
-    st = [r["still_frames"] for i, r in enumerate(rows[1:], 1) if _pose(r) != _pose(rows[i - 1])]
+    st = [r["still_frames"] for i, r in enumerate(rows) if i == 0 or _pose(r) != _pose(rows[i - 1])]
     return int(min(st)) if st else (default or HOLD_FIRST)
 
 
