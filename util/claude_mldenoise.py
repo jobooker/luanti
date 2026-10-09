@@ -43,7 +43,7 @@ DEV = os.environ.get("MLD_DEV", "cuda")
 
 
 # ---------------------------------------------------------------- data
-def load_set(prefix):
+def load_set(prefix, clip=True):
     j = json.load(open(prefix + ".json"))
     h, w = j["h"], j["w"]
 
@@ -55,12 +55,17 @@ def load_set(prefix):
     # the samples are kept in (it made the first training run NaN)
     m2, vfac, m1 = (np.nan_to_num(mo[..., i].astype(np.float64)) for i in range(3))
     sd = np.sqrt(np.maximum(m2 - m1 * m1, 0) * np.clip(vfac, 0, 1))
-    mo2 = np.stack([np.clip(sd, 0, 6e4), np.clip(vfac, 0, 1), np.zeros_like(sd)], -1).astype(np.float32)
-    # 13 channels: radiance rgb, packed distance, direct rgb, albedo rgb, (sd of the mean, vfac, 0)
+    # channel 12: the pixel's sample count (direct.a), which the filter's
+    # last pass reads for its brightness-test fade-in
+    mo2 = np.stack([np.clip(sd, 0, 6e4), np.clip(vfac, 0, 1), np.clip(dr[..., 3], 0, 6e4)], -1).astype(np.float32)
+    # 13 channels: radiance rgb, packed distance, direct rgb, albedo rgb, (sd of the mean, vfac, samples)
     raw = np.concatenate([acc, dr[..., :3], gb[..., :3], mo2], -1)
-    raw = np.nan_to_num(raw, nan=0.0, posinf=6e4, neginf=0.0)
-    raw[..., :3] = np.clip(raw[..., :3], 0, 6e4)
-    raw[..., 4:7] = np.clip(raw[..., 4:7], 0, 6e4)
+    if clip:   # fp16 storage for training; the filter-port check reads unclipped
+        raw = np.nan_to_num(raw, nan=0.0, posinf=6e4, neginf=0.0)
+        raw[..., :3] = np.clip(raw[..., :3], 0, 6e4)
+        raw[..., 4:7] = np.clip(raw[..., 4:7], 0, 6e4)
+    else:
+        raw[..., 10] = sd
     return raw, gb[..., 3].copy(), j
 
 
@@ -271,7 +276,11 @@ def cmd_train(a):
         with torch.autocast(dev, dtype=torch.bfloat16, enabled=bool(a.amp)):
             pred = radiance(net, r, c, ex)
         e = ex.view(-1, 1, 1, 1)
-        loss = (tonemap(pred.float() * e) - tonemap(t * e)).abs().mean()
+        dp, dt = tonemap(pred.float() * e), tonemap(t * e)
+        loss = (dp - dt).abs().mean()
+        if a.grad > 0:   # the high-frequency term (claude_mldenoise_atrous.grad_l1)
+            loss = loss + a.grad * ((dp[..., :, 1:] - dp[..., :, :-1] - dt[..., :, 1:] + dt[..., :, :-1]).abs().mean()
+                                    + (dp[..., 1:, :] - dp[..., :-1, :] - dt[..., 1:, :] + dt[..., :-1, :]).abs().mean())
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -494,5 +503,7 @@ if __name__ == "__main__":
     ap.add_argument("--amp", type=int, default=0)
     ap.add_argument("--dev", default="cuda")
     ap.add_argument("--log-every", type=int, default=500)
+    # TUNED: weight of the gradient term | learn by: FLIP on the held-out views
+    ap.add_argument("--grad", type=float, default=0.0)
     a = ap.parse_args()
     {"train": cmd_train, "eval": cmd_eval, "test": cmd_test, "time": cmd_time}[a.what](a)

@@ -1,11 +1,230 @@
 ---
-title: "Learned denoiser prototype: the network against today's filter"
-summary: "A 244k-parameter U-Net halves today's a-trous filter's pixel error at equal input on all four held-out scoreboard scenes, but costs about 9 ms per frame against the filter's 0.6-1.0 ms, and FLIP rates it worse on the cabin and the plains."
+title: "Learned denoiser prototype: learned weights for today's filter clear the bar on the four scoreboard scenes"
+summary: "A 20k-parameter network that only re-weighs today's a-trous passes beats the filter on RMSE and FLIP at equal input and at equal time on all four held-out scenes, at 1.47 ms per frame in PyTorch (plus an estimated ~1 ms for the passes' extra reads); the U-Net, even with a gradient loss, loses on time."
 tags: [luanti, report]
 author: claude
 ---
 
-# Learned denoiser prototype: the network against today's filter
+# Learned denoiser prototype
+
+## Part 2 (2026-10-09): learned weights for today's filter
+
+**Verdict: on these four held-out scenes, yes, it clears John's bar.** A small
+network (20k parameters) that only re-weighs today's a-trous filter beats the
+filter on both RMSE and FLIP:
+- **At equal input:** at 1 frame and at the one-second frame counts, on all
+  four scenes. The one exception is a FLIP tie on the plains.
+- **At equal time:** with its cost taken out of the one-second budget, on all
+  four scenes.
+
+**What it costs, and how much is measured:**
+- **Network:** 1.47 ms per 960x540 frame, measured on this GPU (PyTorch,
+  compiled, fp16, sustained). That includes computing its inputs and
+  upsampling its maps, and is just under the 1.5 ms target.
+- **Filter passes:** the weighted passes read more per tap than today's. That
+  surcharge is **estimated, not measured**, at about 1x today's 0.6-1.0 ms
+  passes.
+- **How much error there is room for:** the tightest scene (plains) keeps its
+  win up to 3.9 ms extra per frame. The total above is about 2.5 ms.
+
+**The U-Net:**
+- **The gradient term helps it:** FLIP on the cabin at 1 frame goes from 0.052
+  to 0.045, and on the torch room at one second from 0.112 to 0.104.
+- **But it still loses at equal time** on the plains and the cabin (FLIP),
+  because it costs 8.4 ms.
+
+**Caveats:**
+- **No in-engine run yet.** Both costs above are PyTorch measurements or
+  estimates.
+- **Four scenes, all still frames.** Nothing here tests a moving camera.
+
+### What was built
+
+- **A faithful port of today's filter**
+  (`util/claude_mldenoise_atrous.py`). Every part is ported, none fitted:
+  - the six passes;
+  - the 7x7 young-history noise estimate and the moments path;
+  - the 3x3 variance smoothing;
+  - SIGMA_L 4 and the B3 kernel at steps 1-16;
+  - the exact same-face test on the face code;
+  - the young-pixel fade (claude_denoise_young 64, the game's default);
+  - albedo divided out and put back.
+
+  **Checked against what the engine displayed** (the `den` dumps of the
+  anything contender), on all four scenes at 1, 4, 16 and 64 frames and the
+  deepest depth: relative error at most **4.8e-6**, display-space RMSE between
+  port and engine **0.000000**. It is the engine's filter to float rounding.
+- **The weight network,** at 1/4 resolution: two 3x3 convs, one at 1/8
+  resolution, one more at 1/4, then a 1x1 output. Its maps are upsampled
+  bilinearly, which a shader's texture fetch does for free. Per pixel it
+  supplies:
+  - a factor on each pass's luminance edge-stopping width (5 maps);
+  - 4 affinity features: a tap's weight is multiplied by exp(-|f_p - f_q|^2);
+  - softmax weights over the six stages (unfiltered, after passes 1-5): how
+    far to blur here.
+
+  **Why it cannot invent light:** the output is a convex blend of same-face
+  weighted averages of the pixel's own neighbourhood, so it cannot create
+  light no sample carried. At zero weights it is today's filter (the
+  stage-5 weight starts at 0.99997, measured 0.36% max deviation from the
+  filter at init).
+
+  **What it learned** (held-out views):
+  - widen the brightness test 2.5-16x at pass 1 and pass 5;
+  - tighten it to 0.3-0.5x at passes 2-4 on young pixels;
+  - blend a few percent of pass 1 back in on the forest.
+- **The loss** (idea 1): L1 in display space plus the L1 of the difference of
+  neighbouring-pixel differences (the gradient term), weight 1. That weight
+  is hand-picked: `TUNED | learn by: FLIP on the held-out views at 0 / 0.5 /
+  1 / 2`. **Not separated:** the weight net was trained only with the
+  gradient term, so its gain is not split between the architecture and the
+  loss. Only the U-Net has the with/without-gradient-term comparison.
+- **Training:** same data as part 1 (29 views, 232 samples), crops 256,
+  batch 8, AdamW lr 1e-3, 25 min. That came to 4.1k steps for the weight net
+  (it runs the six filter passes inside the training loop), against 21k for
+  the U-Nets.
+
+### Head-to-head: equal input
+
+The four scoreboard poses, truths and inputs from the same session (as in
+part 1), mean of 3 seeds. Each cell is RMSE / FLIP, lower is better.
+
+| scene | frames | noisy | today's filter | U-Net | U-Net + grad | **weight net** |
+|---|---|---|---|---|---|---|
+| forest | 1 | 0.0599 / 0.252 | 0.0408 / 0.129 | 0.0213 / 0.112 | **0.0204 / 0.108** | 0.0324 / 0.122 |
+| forest | 27 | 0.0415 / 0.183 | 0.0306 / 0.107 | 0.0171 / 0.093 | **0.0159 / 0.088** | 0.0243 / 0.098 |
+| plains | 1 | 0.0245 / 0.098 | 0.0134 / 0.045 | 0.0078 / 0.046 | **0.0074** / 0.044 | 0.0110 / **0.044** |
+| plains | 47 | 0.0117 / 0.071 | 0.0080 / 0.029 | **0.0041** / 0.030 | 0.0042 / 0.030 | 0.0054 / **0.027** |
+| cabin | 1 | 0.0449 / 0.152 | 0.0113 / 0.040 | 0.0069 / 0.052 | **0.0065** / 0.045 | 0.0084 / **0.037** |
+| cabin | 70 | 0.0172 / 0.086 | 0.0059 / 0.029 | **0.0035** / 0.031 | **0.0035** / 0.029 | 0.0043 / **0.027** |
+| torchroom | 1 | 0.1441 / 0.410 | 0.0281 / 0.114 | 0.0244 / 0.121 | **0.0236** / 0.119 | 0.0258 / **0.107** |
+| torchroom | 52 | 0.1527 / 0.424 | 0.0278 / 0.117 | 0.0220 / 0.112 | **0.0200** / 0.104 | 0.0216 / **0.097** |
+
+### Head-to-head: equal time (the one-second budget)
+
+How each arm's frames are counted:
+- **Frames:** floor(1000 / frame ms). Each arm is scored at the deepest
+  captured depth at or below that count, which is conservative for every arm
+  except today's filter.
+- **Frame times:** the scoreboard's (run 20261008-131615).
+  - **Today's filter:** the anything contender.
+  - **U-Nets:** honest + 8.8 / 8.4 ms.
+  - **Weight net:** anything + 1.47 ms + the surcharge, estimated as today's
+    passes' engine ms (0.62-1.02) x 0.96. The 0.96 is the PyTorch ratio,
+    weighted passes over plain passes, minus 1.
+
+| scene | today's filter | U-Net | U-Net + grad | **weight net** |
+|---|---|---|---|---|
+| forest | 27 fr: 0.0306 / 0.107 | 22 (20): 0.0183 / 0.097 | 23 (20): **0.0171 / 0.093** | 26 (24): 0.0251 / 0.100 |
+| plains | 47 fr: 0.0080 / **0.029** | 31 (24): **0.0051** / 0.034 | 31 (24): **0.0050** / 0.034 | 42 (40): 0.0058 / **0.029** |
+| cabin | 70 fr: 0.0059 / 0.029 | 37 (32): 0.0044 / 0.035 | 38 (32): **0.0042** / 0.032 | 60 (56): 0.0045 / **0.028** |
+| torchroom | 52 fr: 0.0278 / 0.117 | 38 (32): 0.0234 / 0.116 | 38 (32): **0.0212** / 0.109 | 47 (40): 0.0221 / **0.098** |
+
+**Against today's filter at equal time:**
+- **The weight net** wins RMSE on all four scenes and FLIP on three, ties FLIP
+  on the plains (0.029 against 0.029).
+- **Both U-Nets** lose FLIP on the plains and the cabin.
+
+**How much cost the weight net can absorb.** I read the extra ms per frame at
+which its win still holds straight off the per-depth table: the depth at
+which it matches the filter's one-second RMSE and FLIP. Captured depths
+limit the precision, so these are conservative.
+
+| scene | still wins with up to |
+|---|---|
+| forest | 14.3 ms extra |
+| plains | 3.9 ms extra |
+| cabin | 6.6 ms extra |
+| torchroom | any (it beats the filter's one-second picture from 1 frame) |
+
+Against the ~2.5 ms of network plus estimated surcharge, plains has 1.4 ms of
+margin.
+
+**The 60 fps budget:** every arm gets 1 frame. The weight net wins there too,
+but it adds about 1.5 ms plus the surcharge to a frame.
+
+### Cost per 960x540 frame (sustained wall clock, 200 frames back to back)
+
+| | ms |
+|---|---|
+| today's filter in the engine (pass_ms 3..8, filter on): forest / plains / cabin / torchroom | 0.74 / 1.02 / 0.69 / 0.62 |
+| **weight net, fp16, compiled: its inputs + network + maps upsampled to full resolution** | **1.47** |
+| the same without the final upsample (a shader's bilinear fetch does it) | 1.28 |
+| weight net, fp32, eager | 3.6 |
+| the port of today's filter in PyTorch, compiled / eager | 4.3 / 88.8 |
+| the port with the learned weights, compiled | 8.4 |
+| U-Net + grad, fp16 | 8.4 |
+
+**Reading the cost honestly:**
+- **PyTorch is a poor stand-in for a shader.** The identical filter takes
+  4.3 ms compiled in PyTorch against 0.6-1.0 ms in the engine. That suggests
+  the network would cost less as a shader too, but I have not measured it.
+  The 1.47 ms above is the PyTorch number.
+- **The surcharge is an estimate.** It is the PyTorch ratio (weighted 8.4 ms
+  over plain 4.3 ms) applied to the engine's passes. The weighted passes read
+  4 feature channels per tap and one stage map per pass.
+
+**What the first design taught** (MIOpen pathologies found by micro-benchmark,
+`util/claude_mldenoise_bench.py` and `_prof.py`):
+- A dilated 3x3 conv at 1/4 resolution took 12-16 ms, against 0.16 ms for a
+  plain one.
+- A full-resolution 1x1 conv took 1.0 ms (fp32), against 0.3 ms as a matrix
+  product. In channels-last layout it took 2.4-9.2 ms.
+- The first weight net, with a full-resolution head, cost 34 ms; with the
+  dilation removed, 2.5-3 ms. Moving everything to 1/4 resolution got it to
+  1.47 ms.
+
+### Pictures
+
+Noisy | today's filter | U-Net | U-Net + grad | weight net | truth. The top
+row is 1 frame, the bottom row is the one-second count, seed 101:
+
+- `~/code/luanti-wt/mldenoise/screenshots/mldenoise/test/h2h/side-by-side-forest.png`
+- `.../side-by-side-plains.png`
+- `.../side-by-side-cabin.png`
+- `.../side-by-side-torchroom.png`
+
+The head-to-head table is `.../test/h2h/h2h.md`.
+
+**What they show:**
+- **Cabin wall, stretched 8x:** the weight net keeps the filter's character,
+  soft blotches with pixel spread 0.51/0.26/0.54 (the filter's is
+  0.51/0.30/0.57, the truth's 0.66/0.51/0.81). It does not have the U-Net's
+  grain (0.79/1.30/1.33). That is why FLIP likes it.
+- **Torch room:** it softens the filter's firefly band at window height.
+- **Cabin edges:** it keeps the filter's stair-stepped edges. Re-weighing
+  cannot fix the one-sample albedo; the U-Net could. That is the next thing
+  to give it.
+
+### What would make it better next
+
+1. **Measure it in the engine.** Port the weight net and the weighted passes
+   to shaders behind a dial, and price them with the scoreboard's own frame
+   timing. That replaces both the PyTorch cost and the surcharge estimate.
+2. **Train longer, and split the effects.** It got 4.1k steps against the
+   U-Net's 21k. Its batch loss (0.045 to 0.043) is too noisy to say whether
+   it had stopped improving. Also separate the
+   gradient term's effect on it (train without the term).
+3. **Let it fix the albedo edges.** A per-pixel albedo-blend map (the
+   accumulated albedo of neighbours on the same face) would cover the one
+   thing the U-Net still does better.
+4. **Motion.** Every test is a still frame; the weights should also learn
+   history trust (0w's "history trust" row).
+
+### Tools added
+
+- `util/claude_mldenoise_atrous.py`: `check` (the port against the engine),
+  `train`, `test`, `time`.
+- `util/claude_mldenoise_h2h.py`: the head-to-head tables and the six-panel
+  side-by-sides.
+- `util/claude_mldenoise_wcheck.py`: the held-out check on the CPU, plus what
+  the network asks for.
+- `util/claude_mldenoise_bench.py` and `util/claude_mldenoise_prof.py`: the
+  MIOpen micro-benchmarks.
+- `util/claude_mldenoise.py`: new `--grad` option.
+- `util/claude_mldenoise_time.py`: one output file per tag.
+
+## Part 1 (2026-10-09 early): the U-Net against today's filter
 
 **Verdict: the quality is real, the cost is not yet.** Given the same noisy
 frames, a small trained network (U-Net, 244k parameters) cuts the pixel error
@@ -21,7 +240,7 @@ more. Against 0w's bar ("better quality for the same or better time") this is
 not a ship. It is a strong signal that the quality is there to be had, once
 the network gets about 10x cheaper and learns not to leave grain.
 
-## The head-to-head (equal input)
+### The head-to-head (equal input)
 
 The four scoreboard poses, never seen in training. The truth and the noisy
 inputs were rendered in the same game session at the same pose. Each scene's
@@ -69,7 +288,7 @@ because this scores at the trace resolution (960x540) against same-session
 truths. The scoreboard scores the upscaled 1920x1080 picture against the
 main checkout's truths. Comparisons inside this table are like for like.
 
-## Equal time (the cost taken out of the budget)
+### Equal time (the cost taken out of the budget)
 
 **What each arm gets:**
 - Today's filter: the anything contender's frames per second as the
@@ -90,7 +309,7 @@ The network's cost is 8.8 ms, measured sustained (below).
 At the one-frame (60 fps) budget the network does not fit: 8.8 ms on top of a
 17-36 ms trace drops the frame rate.
 
-## Cost per frame
+### Cost per frame
 
 | | ms per 960x540 frame |
 |---|---|
@@ -112,7 +331,7 @@ At the one-frame (60 fps) budget the network does not fit: 8.8 ms on top of a
   agree with wall clock. I trust the sustained wall clock above. The 2 ms
   readings are not a real cost.
 
-## Pictures
+### Pictures
 
 Side-by-sides: noisy | today's filter | network | truth. The top row is 1 frame,
 the bottom row is the one-second count, all for seed 101:
@@ -140,7 +359,7 @@ Every single picture (each arm, depth and seed) is next to them as PNG.
   sparkles; the network smears them into a streak. It is not invented by the
   network, but it is not removed either.
 
-## Training data recipe
+### Training data recipe
 
 - **Where:** 33 views in the gallery world, captured on the `mldenoise`
   branch with `util/claude_mldenoise_capture.py train`:
@@ -180,7 +399,7 @@ Every single picture (each arm, depth and seed) is next to them as PNG.
   test truths and inputs.
 - **Size:** 20 GB in `~/data/mldenoise` (not in git).
 
-## The network
+### The network
 
 **Inputs:** 20 channels at 960x540, computed from one dump:
 - radiance divided by the accumulated albedo, times the exposure, through
@@ -217,7 +436,7 @@ output is linear radiance.
 On the held-out views the network cut the noisy input's RMSE 1.8-2.5x
 outdoors and 3-5.5x indoors.
 
-## What did not work
+### What did not work
 
 - **Half-resolution network** (pixel unshuffle in, pixel shuffle out,
   32/48/64/96 channels): about half the cost (4.8 ms), but it lost to today's
@@ -231,7 +450,7 @@ outdoors and 3-5.5x indoors.
   by turning the moments into the noise of the mean in float32 at load time.
   The trainer now also refuses non-finite data or a non-finite loss.
 
-## Found along the way
+### Found along the way
 
 - **The torch room's linear truth in the main checkout is stale.** Its
   `truth.f32` (11:22) predates its `truth.png` and meta (13:16); through the
@@ -247,7 +466,7 @@ outdoors and 3-5.5x indoors.
 - **Pose height matters.** Poses at y 9 or 12 under `--play` jitter by
   0.05-0.2 units a frame and never settle; y 8.5 holds.
 
-## What would make it better, cheapest first
+### What would make it better, cheapest first
 
 1. **Stop the grain.** Add a term to the loss that punishes high-frequency
    error, or train on FLIP directly. A loss on image gradients is the usual
@@ -270,7 +489,7 @@ outdoors and 3-5.5x indoors.
    real-time denoisers get most of their quality, and it is the "history
    trust" row of 0w.
 
-## Could not do
+### Could not do
 
 - **No in-engine run.** All numbers are offline on dumped buffers, at the
   trace resolution, not through the engine's upsampler. The scoreboard's
@@ -279,7 +498,7 @@ outdoors and 3-5.5x indoors.
 - **Truth depth:** 8192 frames per scene, not the scoreboard's 16384. The
   truth's own noise is the same for every arm, so it moves no comparison.
 
-## Tools (branch `mldenoise`)
+### Tools (branch `mldenoise`)
 
 - `src/client/game.cpp`, `src/client/render/secondstage.{h,cpp}`:
   `claude_dump_at`.

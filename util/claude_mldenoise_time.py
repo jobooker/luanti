@@ -53,4 +53,4 @@ for tag in sys.argv[1:]:
                 res[dn + "_graph_ms"] = "failed: %s" % e
         print(tag, dn, res, flush=True)
     out[tag] = res
-json.dump(out, open(os.path.join(M.DATA, "time", "careful.json"), "w"), indent=1)
+json.dump(out, open(os.path.join(M.DATA, "time", "careful_%s.json" % "_".join(sys.argv[1:])), "w"), indent=1)
