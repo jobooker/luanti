@@ -141,24 +141,36 @@ def main():
             if "time" in over:
                 g["time"] = over["time"]
             lab.goto(g)
-            open(lab.PATCH, "w").write("claude_path = %s\n" % pin)
-            # wait for the blocks to stop arriving (an empty or half-loaded
-            # grid is cheap and wrong: the 2026-10-06 pinned-shot lesson)
-            prev, same, t0 = None, 0, time.time()
-            while same < 6 and time.time() - t0 < 60:
-                time.sleep(0.5)
-                n = (lab.read_stats() or {}).get("grid_solid")
-                same = same + 1 if (n == prev and n) else 0
-                prev = n
+            # THE SAME SCENE FOR EVERY ARM AND EVERY RUN (2026-10-08): waiting
+            # for grid_solid to stop changing let the view history decide
+            # which blocks were loaded (the torch room: 103-110 of 648-729
+            # blocks, a different set every fresh start). Loaded once per
+            # view; every later arm must find the same identity.
+            if an == ARMS[0][0]:
+                ls = lab.load_scene([x, y, z], yaw, pitch, pin)
+                if not ls.get("ok"):
+                    print("%-12s REFUSED: scene did not load: %s" % (vn, ls.get("error")), flush=True)
+                    break
+                scene = ls["id"]
+            else:
+                open(lab.PATCH, "w").write("claude_path = %s\n" % pin)
             time.sleep(4)
             st = lab.read_stats() or {}
+            now = lab.scene_id(st)
             pm = st.get("pass_ms") or [0] * 12
             res["%s/%s" % (vn, an)] = {"frame_ms": st.get("frame_ms_avg"), "trace_ms": pm[2],
                                        "other_ms": sum(pm) - pm[2], "fps": st.get("fps"),
-                                       "grid_solid": st.get("grid_solid")}
+                                       # busy = the frame minus FpsControl's sleep: a
+                                       # frame limiter or vsync would show here first
+                                       "busy_ms": st.get("busy_ms"),
+                                       "grid_solid": st.get("grid_solid"), "scene": now}
             r = res["%s/%s" % (vn, an)]
-            print("%-12s %-12s frame %6.1f ms (%5.1f fps)  trace %6.2f ms  other passes %5.2f ms  grid %s"
-                  % (vn, an, r["frame_ms"] or 0, r["fps"] or 0, r["trace_ms"], r["other_ms"], r["grid_solid"]),
+            changed = {k: v for k, v in now.items() if k != "far_db_blocks" and v != scene.get(k)}
+            print("%-12s %-12s frame %6.1f ms (%5.1f fps, busy %5.1f)  trace %6.2f ms  other passes %5.2f ms"
+                  "  grid %s%s"
+                  % (vn, an, r["frame_ms"] or 0, r["fps"] or 0, r["busy_ms"] or 0, r["trace_ms"],
+                     r["other_ms"], now.get("grid_hash"),
+                     "  SCENE CHANGED %s" % changed if changed else ""),
                   flush=True)
     lab.rpc("abm", on=True)
     open(lab.PATCH, "w").write("claude_path = 0\n")
