@@ -279,6 +279,17 @@ def cmd_train(a):
     total = a.total_steps
     sched = lambda s: a.lr * 0.5 * (1 + math.cos(math.pi * min(s, total) / total))
     P, B = a.crop, a.batch
+    gw = a.grad
+
+    def lossfn(r, c, t, ex):
+        pred = atrous(r, c, net(features(r, c, ex)))
+        e = ex.view(-1, 1, 1, 1)
+        dp, dt = tonemap(pred * e), tonemap(t * e)
+        return (dp - dt).abs().mean() + gw * grad_l1(torch, dp, dt)
+    if a.compile:
+        # one fused graph instead of ~400 small kernels a step (eager ran the
+        # filter's forward at 88 ms a frame, compiled at 4.3)
+        lossfn = torch.compile(lossfn)
     t_end = time.time() + a.minutes * 60
     losses = []
     while time.time() < t_end and step < total:
@@ -294,11 +305,7 @@ def cmd_train(a):
             r, c, t = r.flip(-1), c.flip(-1), t.flip(-1)
         for g in opt.param_groups:
             g["lr"] = sched(step)
-        mod = net(features(r, c, ex))
-        pred = atrous(r, c, mod)
-        e = ex.view(-1, 1, 1, 1)
-        dp, dt = tonemap(pred * e), tonemap(t * e)
-        loss = (dp - dt).abs().mean() + a.grad * grad_l1(torch, dp, dt)
+        loss = lossfn(r, c, t, ex)
         if not torch.isfinite(loss):
             raise SystemExit("REFUSED: loss went non-finite at step %d" % step)
         opt.zero_grad(set_to_none=True)
@@ -307,6 +314,10 @@ def cmd_train(a):
         opt.step()
         losses.append(loss.item())
         step += 1
+        if len(losses) == 1:
+            # the clock starts after the first step: compiling it took ~6 min
+            t_end = time.time() + a.minutes * 60
+            print("first step done (compiled) at %.0f s" % (time.time() - t0), flush=True)
         if step % a.log_every == 0:
             print("step %6d  loss %.5f  lr %.2e  %.0f s left" % (step, np.mean(losses[-a.log_every:]), sched(step),
                   t_end - time.time()), flush=True)
@@ -447,6 +458,70 @@ def cmd_time(a):
     json.dump(res, open(os.path.join(M.DATA, "time", a.tag + "_atrous.json"), "w"), indent=1)
 
 
+# ---------------------------------------------------------------- export
+def cmd_export(a):
+    """the weights file the engine reads (client/render/claude_learned.cpp)"""
+    import struct
+    import torch
+    st = torch.load(M.ckpt_path(a.tag), map_location="cpu")["net"]
+    order = ["a.0.0.weight", "a.0.0.bias", "a.1.0.weight", "a.1.0.bias", "b.0.weight", "b.0.bias",
+             "c.0.weight", "c.0.bias", "h.weight", "h.bias", "mix_bias"]
+    arrs = [st[k].float().reshape(-1).numpy() for k in order]
+    flat = np.concatenate(arrs).astype("<f4")
+    cin, c = st["a.0.0.weight"].shape[1], st["a.0.0.weight"].shape[0]
+    blob = b"MLDNW001" + struct.pack("<4i", cin, c, NFEAT, flat.size) + flat.tobytes()
+    out = a.out or os.path.join(REPO, "util", "claude_mldenoise_weights.bin")
+    open(out, "wb").write(blob)
+    h = 1469598103934665603
+    for ch in blob:
+        h = ((h ^ ch) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    print("%s: %d floats, cin %d, width %d, fnv64 %016x (from %s)" % (out, flat.size, cin, c, h, a.tag))
+
+
+# ---------------------------------------------------------------- the engine against its PyTorch twin
+def cmd_refcheck(a):
+    """(a) of the engine port: the engine's displayed picture (den, learned
+    arm) against this model on the same dumped inputs, CPU"""
+    torch, nn, F, atrous, WeightNet = bits()
+    _, _, _, features, _, _, _ = M.torch_bits()
+    torch.set_num_threads(8)
+    net = WeightNet()
+    net.load_state_dict(torch.load(M.ckpt_path(a.tag), map_location="cpu")["net"])
+    net.eval()
+    rows = []
+    for sc in a.scenes:
+        d = os.path.join(M.DATA, "test_engine", sc)
+        meta = json.load(open(d + "/meta.json"))
+        ex = meta["exposure"]
+        for shot in meta["shots"]:
+            if shot["arm"] != "learned":
+                continue
+            for n in shot["depths"]:
+                if n not in (1, 4, 16, 64) and n != max(shot["depths"]):
+                    continue
+                pre = os.path.join(d, "s%d_learned_%d" % (shot["seed"], n))
+                rc, code, _ = M.load_set(pre)
+                ru, _, _ = M.load_set(pre, clip=False)
+                den = M.load_den(pre)
+                with torch.no_grad():
+                    t = lambda x: torch.from_numpy(x).permute(2, 0, 1)[None].float()
+                    c = torch.from_numpy(code)[None, None]
+                    mod = net(features(t(rc), c, torch.tensor([ex])))
+                    out = atrous(t(ru), c, mod)[0].permute(1, 2, 0).numpy()
+                rel = np.abs(out - den) / np.maximum(np.abs(den), 1e-3)
+                r = {"scene": sc, "seed": shot["seed"], "frames": n,
+                     "display_rmse_engine_vs_pytorch": M.rmse_disp(M.tonemap_np(out, ex), M.tonemap_np(den, ex)),
+                     "rel_p50": float(np.median(rel)), "rel_p99": float(np.percentile(rel, 99)),
+                     "rel_max": float(rel.max()), "share_rel_gt_1e-2": float((rel > 1e-2).mean())}
+                rows.append(r)
+                print("%-10s seed %d %3d fr  engine vs PyTorch: display RMSE %.6f  rel err p50 %.1e p99 %.1e max %.1e  "
+                      "share >1%% %.5f" % (sc, shot["seed"], n, r["display_rmse_engine_vs_pytorch"], r["rel_p50"],
+                                           r["rel_p99"], r["rel_max"], r["share_rel_gt_1e-2"]), flush=True)
+            break   # one seed is enough for the twin check
+    os.makedirs(os.path.join(M.DATA, "eval"), exist_ok=True)
+    json.dump(rows, open(os.path.join(M.DATA, "eval", "engine_vs_pytorch_%s.json" % a.tag), "w"), indent=1)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("what")
@@ -461,5 +536,8 @@ if __name__ == "__main__":
     ap.add_argument("--grad", type=float, default=1.0)
     ap.add_argument("--log-every", type=int, default=250)
     ap.add_argument("--save-mod", type=int, default=1)
+    ap.add_argument("--compile", type=int, default=1)
+    ap.add_argument("--out", default="")
     a = ap.parse_args()
-    {"check": cmd_check, "train": cmd_train, "test": cmd_test, "time": cmd_time}[a.what](a)
+    {"check": cmd_check, "train": cmd_train, "test": cmd_test, "time": cmd_time, "export": cmd_export,
+     "refcheck": cmd_refcheck}[a.what](a)

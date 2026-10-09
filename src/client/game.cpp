@@ -46,7 +46,8 @@
 #include "porting.h"
 #include <fstream>
 #include <json/json.h>
-#include "client/render/secondstage.h" // g_claude_auto_exposure // claude_models manifest (phase 4.5)
+#include "client/render/secondstage.h"
+#include "client/render/claude_learned.h" // g_claude_auto_exposure // claude_models manifest (phase 4.5)
 #include <sstream>
 #include <array>
 #include <algorithm>
@@ -2331,6 +2332,9 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// JOD 5.39 -> 7.16; no cost (13.7 vs 13.8 ms). Outdoors 8.58 -> 8.33 at
 	// unequal fps: recheck on the loop.
 	float m_denoise_young = 64.0f;
+	// claude_denoise_learned (2026-10-09): 1 = today's filter with per-pixel
+	// weights from a small trained network (client/render/claude_learned.h)
+	float m_denoise_learned = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_denoise_young_pixel{"claudeDenoiseYoung"};
 	// claude_raw_frame (2026-10-07): 1 = no history, each frame only its own rays
 	float m_raw_frame = 0.0f;
@@ -2445,6 +2449,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_guide_impl",
 		"claude_guide_alpha",
 		"claude_denoise_young",
+		"claude_denoise_learned",
 		"claude_raw_frame",
 		"claude_tree_plant",
 		"claude_tree_variant",
@@ -3385,6 +3390,8 @@ public:
 			m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		if (name == "claude_denoise_young")
 			m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		if (name == "claude_denoise_learned")
+			m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
 		if (name == "claude_raw_frame")
 			m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		if (name == "claude_tree_plant")
@@ -3513,6 +3520,7 @@ public:
 		m_guide_impl = readAir("claude_guide_impl", 2.0f, 2.0f);
 		m_guide_alpha = readAir("claude_guide_alpha", 0.5f, 0.99f);
 		m_denoise_young = readAir("claude_denoise_young", 64.0f, 256.0f);
+		m_denoise_learned = readAir("claude_denoise_learned", 0.0f, 1.0f);
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
@@ -3905,6 +3913,19 @@ public:
 				m_refine_pixel.set(&m_refine, services);
 				m_denoise_pixel.set(&m_denoise, services);
 				g_claude_grid.dial_denoise = m_denoise;
+				// the learned passes replace today's only where today's would
+				// filter at all (claude_denoise off(): denoise 0, a debug view,
+				// raster mode)
+				g_claude_dn_learned_wanted = m_denoise_learned > 0.5f && m_denoise > 0.5f
+						&& m_view < 0.5f && m_grid_debug > 2.5f;
+				{
+					float ex = m_exposure > 0.0f ? m_exposure : 1.0f;
+					if (m_auto_exposure > 0.5f && g_claude_auto_exposure[3] > 0.5f
+							&& g_claude_auto_exposure[0] > 0.0f && g_claude_auto_exposure[0] < 1e9f)
+						ex *= g_claude_auto_exposure[0];
+					g_claude_dn_learned_ex = ex;
+					g_claude_dn_learned_young = m_denoise_young;
+				}
 				// claude_trace's three dials. Delivered here, next to the
 				// samplers, because claude_present consumes claudeView
 				// too and both programs run every frame regardless of

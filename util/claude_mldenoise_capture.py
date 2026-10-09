@@ -23,6 +23,7 @@ frame depths from ONE accumulation:
           (a linear truth into this worktree when the main one is stale)
 """
 import glob
+import shutil
 import json
 import os
 import subprocess
@@ -34,7 +35,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import claude_gpu_lock  # noqa: E402
 
-DATA = os.path.expanduser("~/data/mldenoise")
+DATA = os.environ.get("MLD_DATA") or os.path.expanduser("~/data/mldenoise")
 MAIN_TRUTH = os.path.expanduser("~/code/luanti/screenshots/scoreboard/truth")
 
 # name: (x, y, z, yaw, pitch, time). Every pose >= ~25 m from the four
@@ -95,6 +96,10 @@ HONEST = {"claude_nee": 1, "claude_bounce_uniform": 0, "claude_denoise": 0,
           "claude_torch_nee": 1, "claude_area_nee": 1, "claude_guide": 0,
           "claude_area_pick": 0, "claude_area_skip": 0, "claude_boost": 0}
 ANYTHING = dict(HONEST, claude_denoise=1)
+# every arm spells the learned dial (an unpushed dial keeps its last value)
+HONEST = dict(HONEST, claude_denoise_learned=0)
+ANYTHING = dict(ANYTHING, claude_denoise_learned=0)
+LEARNED = dict(ANYTHING, claude_denoise_learned=1)
 # the anything contender's frames in one second on the scoreboard's run of
 # 2026-10-08T17:16Z (reports/scoreboard.md): the equal-input depth
 ONE_SECOND = {"forest": 27, "plains": 47, "cabin": 70, "torchroom": 52}
@@ -193,8 +198,8 @@ def cmd_train(only, ref):
         if pa is None:
             continue
         sta, stb = capstats(pa), capstats(pb)
-        os.replace(pb, os.path.join(d, "B.png"))
-        os.replace(pa, os.path.join(d, "A.png"))
+        shutil.move(pb, os.path.join(d, "B.png"))
+        shutil.move(pa, os.path.join(d, "A.png"))
         meta = {"name": name, "pose": pose, "exposure": json.load(open(os.path.join(d, "exposure.json")))["exposure"],
                 "seeds": [sA, sB], "ref": ref,
                 "A": ident(sta), "B": ident(stb), "seconds": round(time.time() - t0),
@@ -246,7 +251,7 @@ def cmd_test(scenes, depths, seeds, truth_frames):
         tpng = shoot(pose, dict(HONEST, **DISPLAY, claude_exposure=ex), truth_frames, "mldtruth-" + sc,
                      [truth_frames], os.path.join(d, "truth"))
         tst = capstats(tpng)
-        os.replace(tpng, os.path.join(d, "truth.png"))
+        shutil.move(tpng, os.path.join(d, "truth.png"))
         tid = ident(tst)
         print("%-10s truth %d frames  grid_hash %s  area_emitters %s" % (sc, truth_frames, tid["grid_hash"],
               tid["area_emitters"]), flush=True)
@@ -256,13 +261,58 @@ def cmd_test(scenes, depths, seeds, truth_frames):
             dd = dict(ANYTHING, **DISPLAY, claude_exposure=ex, claude_rng_seed=s)
             png = shoot(pose, dd, max(depths), "%s-anything-s%d" % (sc, s), depths, os.path.join(d, "s%d" % s))
             st = capstats(png)
-            os.replace(png, os.path.join(d, "s%d_%d.png" % (s, max(depths))))
+            shutil.move(png, os.path.join(d, "s%d_%d.png" % (s, max(depths))))
             sid = ident(st)
             same = all(sid.get(k) == tid.get(k) for k in ("grid_hash", "area_emitters"))
             rec["shots"].append({"seed": s, "depths": depths, "id": sid, "same_scene": same})
             print("%-10s seed %d  %s  grid_hash %s area_emitters %s%s" % (sc, s, depths, sid["grid_hash"],
                   sid["area_emitters"], "" if same else "  SCENE DIFFERS FROM THIS TRUTH"), flush=True)
             json.dump(rec, open(os.path.join(d, "meta.json"), "w"), indent=1)
+
+
+def cmd_test_engine(scenes, depths, seeds, truth_frames):
+    """the engine's learned denoiser against today's filter, same session,
+    same pose, same seeds: per scene a fresh game, both arms per seed
+    (interleaved), and the truth re-rendered in THIS session unless the
+    scene loads to the same grid_hash as the stored one"""
+    base = depths
+    for sc in scenes:
+        depths = sorted(set(base) | {ONE_SECOND[sc]})
+        tm = truth_meta(sc)
+        old = json.load(open(os.path.join(DATA, "test", sc, "meta.json")))
+        pos, yaw, pitch, tod = SCENES[sc]
+        pose = (pos[0], pos[1], pos[2], yaw, pitch, tod)
+        d = os.path.join(DATA, "test_engine", sc)
+        os.makedirs(d, exist_ok=True)
+        seat()
+        ex = tm["exposure"]
+        rec = {"scene": sc, "exposure": ex, "shots": []}
+        for s in seeds:
+            for arm, dials in (("filter", ANYTHING), ("learned", LEARNED)):
+                dd = dict(dials, **DISPLAY, claude_exposure=ex, claude_rng_seed=s)
+                png = shoot(pose, dd, max(depths), "%s-%s-s%d" % (sc, arm, s), depths,
+                            os.path.join(d, "s%d_%s" % (s, arm)))
+                st = capstats(png)
+                shutil.move(png, os.path.join(d, "s%d_%s_%d.png" % (s, arm, max(depths))))
+                rec["shots"].append({"seed": s, "arm": arm, "depths": depths, "id": ident(st)})
+                print("%-10s seed %d %-8s grid_hash %s area_emitters %s" % (sc, s, arm, st.get("grid_hash"),
+                      st.get("area_emitters")), flush=True)
+                json.dump(rec, open(os.path.join(d, "meta.json"), "w"), indent=1)
+        hashes = {sh["id"]["grid_hash"] for sh in rec["shots"]}
+        same_old = hashes == {old["truth"]["id"]["grid_hash"]}
+        rec["shots_agree"] = len(hashes) == 1
+        if same_old:
+            rec["truth"] = dict(old["truth"], prefix=os.path.join("..", "..", "test", sc, old["truth"]["prefix"]))
+            print("%-10s scene identical to the stored truth's (%s): reusing it" % (sc, hashes), flush=True)
+        else:
+            tpng = shoot(pose, dict(HONEST, **DISPLAY, claude_exposure=ex), truth_frames, "mldtruth2-" + sc,
+                         [truth_frames], os.path.join(d, "truth"))
+            tst = capstats(tpng)
+            shutil.move(tpng, os.path.join(d, "truth.png"))
+            rec["truth"] = {"frames": truth_frames, "id": ident(tst), "prefix": "truth_%d" % truth_frames}
+            print("%-10s new truth in session: grid_hash %s (stored %s, shots %s)" % (
+                sc, tst.get("grid_hash"), old["truth"]["id"]["grid_hash"], hashes), flush=True)
+        json.dump(rec, open(os.path.join(d, "meta.json"), "w"), indent=1)
 
 
 def cmd_truth(scenes, frames):
@@ -276,7 +326,7 @@ def cmd_truth(scenes, frames):
         dd = dict(HONEST, **DISPLAY, claude_exposure=tm["exposure"])   # seed 0, as the scoreboard's truth
         png = shoot(pose, dd, frames, "mldtruth-" + sc, [frames], os.path.join(d, "truth"))
         st = capstats(png)
-        os.replace(png, os.path.join(d, "truth.png"))
+        shutil.move(png, os.path.join(d, "truth.png"))
         json.dump({"scene": sc, "frames": frames, "exposure": tm["exposure"], "id": ident(st),
                    "main_truth_scene_id": tm["scene_id"]}, open(os.path.join(d, "meta.json"), "w"), indent=1)
         print("truth", sc, ident(st), flush=True)
@@ -293,6 +343,10 @@ if __name__ == "__main__":
         cmd_test(rest or list(SCENES), [int(x) for x in os.environ.get("MLD_DEPTHS", "1,4,16,64").split(",")],
                  [int(x) for x in os.environ.get("MLD_SEEDS", "101,102,103").split(",")],
                  int(os.environ.get("MLD_TRUTH_FRAMES", 8192)))
+    elif what == "test_engine":
+        cmd_test_engine(rest or list(SCENES), [int(x) for x in os.environ.get("MLD_DEPTHS", "1,4,16,64").split(",")],
+                        [int(x) for x in os.environ.get("MLD_SEEDS", "101,102,103").split(",")],
+                        int(os.environ.get("MLD_TRUTH_FRAMES", 8192)))
     elif what == "batch":
         # several jobs under ONE hold of the GPU lock (children inherit it):
         # one command per line in the file named

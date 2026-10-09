@@ -5,6 +5,7 @@
 // Copyright (C) 2020 appgurueu, Lars Mueller <appgurulars@gmx.de>
 
 #include "secondstage.h"
+#include "claude_learned.h"
 #include <fstream>
 #include <cmath>
 #include "client/client.h"
@@ -444,12 +445,20 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 						TEXTURE_MOM_2, TEXTURE_DIRECT_2 }
 				: std::vector<u8> { in, TEXTURE_GBUF_2, TEXTURE_ACCUM_2,
 						it == 5 ? TEXTURE_DIRECT_2 : TEXTURE_MOM_2 };
-		PostProcessingStep *dn = pipeline->addStep<PostProcessingStep>(dn_id,
+		// claude_denoise_learned: today's pass runs unless the learned
+		// passes replace all six this frame (dial 0: exactly as before)
+		PostProcessingStep *dn = pipeline->createOwned<PostProcessingStep>(dn_id,
 				inputs);
 		dn->setRenderSource(buffer);
 		dn->setRenderTarget(pipeline->createOwned<TextureBufferOutput>(buffer,
 				out));
+		pipeline->addStep<ClaudeUnlessLearned>(dn);
 	}
+	// THE LEARNED DENOISER (claude_denoise_learned, 2026-10-09): the same
+	// filter with per-pixel weights from a small network, as compute
+	// passes writing DEN_B, where pass 5 would have (claude_learned.h)
+	pipeline->addStep<ClaudeLearnedDenoise>(buffer, TEXTURE_ACCUM_2, TEXTURE_DIRECT_2,
+			TEXTURE_GBUF_2, TEXTURE_MOM_2, TEXTURE_DEN_B);
 
 	// claude_exposure: one pixel. Reads what is about to be shown (DEN_B)
 	// and last frame's adapted brightness, writes this frame's. claude_

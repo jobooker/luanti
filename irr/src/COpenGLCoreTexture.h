@@ -420,6 +420,11 @@ public:
 		return TextureName;
 	}
 
+	u32 getNativeHandle() const override
+	{
+		return TextureName;
+	}
+
 	SStatesCache &getStatesCache() const
 	{
 		return StatesCache;
