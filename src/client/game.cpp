@@ -1219,7 +1219,13 @@ static GLuint g_ledger[2] = {0, 0};
 static int g_ledger_read = 0;
 static GLuint g_ledger_carry = 0;
 static u32 g_ledger_frame = ~0u;
-static bool g_ledger_clear = false;   // pseudo-key claude_ledger_clear: forget everything
+static bool g_ledger_clear = false;
+// claude_ledger_single (2026-10-08): ONE table, read and written in the same
+// frame, no per-frame copy (the copy moved 2 x 128 MB every frame). A read
+// can then land between a sample's light and its count being added: the
+// mean is off by at most about one sample in the cap (1/256). The cap is
+// applied in place every 8th frame instead of every frame.
+static bool g_ledger_single = false;   // pseudo-key claude_ledger_clear: forget everything
 static const char *LEDGER_CARRY_SRC = R"GLSL(#version 460
 layout(local_size_x = 64) in;
 layout(std430, binding = 5) readonly buffer A { uint a[]; };
@@ -1235,7 +1241,8 @@ void main() {
 	b[e + 2u] = floatBitsToUint(uintBitsToFloat(a[e + 2u]) * s);
 	b[e + 3u] = floatBitsToUint(uintBitsToFloat(a[e + 3u]) * s);
 	b[e + 4u] = floatBitsToUint(uintBitsToFloat(a[e + 4u]) * s);
-	b[e + 5u] = n; b[e + 6u] = a[e + 6u]; b[e + 7u] = a[e + 7u];
+	b[e + 5u] = n; b[e + 6u] = a[e + 6u];
+	b[e + 7u] = floatBitsToUint(uintBitsToFloat(a[e + 7u]) * s);   // sum of squares, same cap
 }
 )GLSL";
 static void claudeLedgerBind(float frame)
@@ -1274,7 +1281,22 @@ static void claudeLedgerBind(float frame)
 		GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
 		actionstream << "[claude_ledger] cleared on request" << std::endl;
 	}
-	if (g_ledger_frame != g_claude_frame_no) {
+	if (g_ledger_frame != g_claude_frame_no && g_ledger_single) {
+		g_ledger_frame = g_claude_frame_no;
+		g_ledger_read = 0;
+		if (g_claude_frame_no % 8 == 0) {
+			GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+			GLint prev = 0;
+			GL.GetIntegerv(GL.CURRENT_PROGRAM, &prev);
+			GL.UseProgram(g_ledger_carry);
+			GL.Uniform1f(GL.GetUniformLocation(g_ledger_carry, "capN"), 256.0f);
+			GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[0]);
+			GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[0]);   // in place
+			GL.DispatchCompute((GLuint)(ENTRIES / 64), 1, 1);
+			GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
+			GL.UseProgram(prev);
+		}
+	} else if (g_ledger_frame != g_claude_frame_no) {
 		g_ledger_frame = g_claude_frame_no;
 		g_ledger_read ^= 1;   // last frame's written table is now the one read
 		GL.MemoryBarrier(GL.ALL_BARRIER_BITS);
@@ -1302,15 +1324,7 @@ static void claudeLedgerBind(float frame)
 			}
 			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
 			const double fill = (double)used / (16 * 4096);
-			u32 cnt[16];
-			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[g_ledger_read]);
-			GL.GetBufferSubData(GL.SHADER_STORAGE_BUFFER, 0, sizeof(cnt), cnt);
-			GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, 0);
-			static u32 lost0 = 0, adds0 = 0;
-			actionstream << "[claude_ledger] fill " << fill << " (sampled) | additions this second "
-					<< (cnt[15] - adds0) << ", gave up " << (cnt[7] - lost0) << std::endl;
-			lost0 = cnt[7];
-			adds0 = cnt[15];
+			actionstream << "[claude_ledger] fill " << fill << " (sampled)" << std::endl;
 			if (fill > 0.75) {
 				for (int i = 0; i < 2; i++) {
 					GL.BindBuffer(GL.SHADER_STORAGE_BUFFER, g_ledger[i]);
@@ -1323,7 +1337,8 @@ static void claudeLedgerBind(float frame)
 		}
 	}
 	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 5, g_ledger[g_ledger_read]);
-	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6, g_ledger[g_ledger_read ^ 1]);
+	GL.BindBufferBase(GL.SHADER_STORAGE_BUFFER, 6,
+			g_ledger[g_ledger_single ? g_ledger_read : g_ledger_read ^ 1]);
 	(void)frame;
 }
 static u32 g_vis_frame = ~0u;
@@ -3518,7 +3533,7 @@ public:
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		if (name == "claude_ledger")
-			m_ledger = readAir("claude_ledger", 0.0f, 2.0f);
+			m_ledger = readAir("claude_ledger", 0.0f, 3.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
 		if (name == "claude_adapt_brighter")
@@ -3639,7 +3654,7 @@ public:
 		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
-		m_ledger = readAir("claude_ledger", 0.0f, 2.0f);
+		m_ledger = readAir("claude_ledger", 0.0f, 3.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
 		m_model_far = readAir("claude_model_far", 1.0f, 1.0f);
@@ -7355,6 +7370,11 @@ static bool claudeApplyPatchFile(const std::string &path,
 		}
 		if (name == "claude_ledger_clear") {
 			g_ledger_clear = true;
+			continue;
+		}
+		if (name == "claude_ledger_single") {
+			g_ledger_single = atof(patch.get(name).c_str()) > 0.5;   // tools write "1.0"
+			g_ledger_clear = true;   // switching modes starts the memory over
 			continue;
 		}
 		if (name == "claude_brick_check") {

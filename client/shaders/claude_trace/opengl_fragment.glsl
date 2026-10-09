@@ -577,7 +577,8 @@ uniform float claudeTreePlant;
 // for the display (claude_ledger 2), never fed back into paths, so no guess
 // is ever read back as a measurement. Two tables: last frame's (read) and
 // this frame's (written; game.cpp carries it forward each frame with the
-// staleness cap). Entry: key hi, key lo, R, G, B (float bits), count, frame.
+// staleness cap). Entry: key hi, key lo, R, G, B (float bits), count, frame, sum of squared luminance
+// (float bits: the patch's own noise, for the merge).
 layout(std430, binding = 5) readonly buffer ClaudeLedgerR { uint claudeLedgerR[]; };
 layout(std430, binding = 6) buffer ClaudeLedgerW { uint claudeLedgerW[]; };
 #define CLAUDE_LEDGER_OK 1
@@ -2025,8 +2026,9 @@ void ledgerKey(vec3 x, vec3 n, out uint klo, out uint khi)
 			| (uint(d) << 27) | 0x80000000u;
 }
 // last frame's average for a patch: rgb, count in .a (0 = never seen)
-vec4 ledgerRead(uint klo, uint khi)
+vec4 ledgerRead(uint klo, uint khi, out float l2)
 {
+	l2 = 0.0;
 	uint h = ledgerHash(klo, khi);
 	for (uint i = 0u; i < 8u; i++) {
 		uint e = ((h + i) & LEDGER_MASK) * 8u;
@@ -2037,6 +2039,7 @@ vec4 ledgerRead(uint klo, uint khi)
 			float cnt = float(claudeLedgerR[e + 5u]);
 			if (cnt < 0.5)
 				return vec4(0.0);
+			l2 = uintBitsToFloat(claudeLedgerR[e + 7u]) / cnt;
 			return vec4(uintBitsToFloat(claudeLedgerR[e + 2u]), uintBitsToFloat(claudeLedgerR[e + 3u]),
 					uintBitsToFloat(claudeLedgerR[e + 4u]), cnt) / vec4(cnt, cnt, cnt, 1.0);
 		}
@@ -2046,10 +2049,6 @@ vec4 ledgerRead(uint klo, uint khi)
 void ledgerAddF(uint i, float v)
 {
 	uint old = claudeLedgerW[i];
-	// INSTRUMENT (2026-10-08): entry 0's spare word counts additions that
-	// gave up after 16 tries, entry 1's counts all additions; a lost addition
-	// keeps its count and loses its light, which would read DARK
-	atomicAdd(claudeLedgerW[15], 1u);
 	// 64 tries, not 16: neighbouring pixels run together and hit the same
 	// patch at once, one wins per try; at 16 tries 30% of additions gave up
 	// (measured 2026-10-08), each keeping its count and losing its light
@@ -2060,7 +2059,6 @@ void ledgerAddF(uint i, float v)
 			return;
 		old = got;
 	}
-	atomicAdd(claudeLedgerW[7], 1u);
 }
 void ledgerWrite(uint klo, uint khi, vec3 val)
 {
@@ -2075,6 +2073,8 @@ void ledgerWrite(uint klo, uint khi, vec3 val)
 		ledgerAddF(e + 2u, val.r);
 		ledgerAddF(e + 3u, val.g);
 		ledgerAddF(e + 4u, val.b);
+		float lum = dot(val, vec3(0.2126, 0.7152, 0.0722));
+		ledgerAddF(e + 7u, lum * lum);
 		atomicAdd(claudeLedgerW[e + 5u], 1u);
 		claudeLedgerW[e + 6u] = uint(claudeLedgerFrame);
 		return;
@@ -5340,9 +5340,10 @@ void main(void)
 	guideDeposit(gpTab1, gpBin1, gpTp1, gpL1, gpF1, L);
 #if defined(CLAUDE_LEDGER_OK) && CLAUDE_SUBPASS == 0
 	vec4 lgCamMean = vec4(0.0);
+	float lgCamL2 = 0.0;   // the camera patch's mean squared luminance (albedo-free)
 	if (claudeLedger > 0.5) {
 		if (lgCam && claudeLedger > 1.5)
-			lgCamMean = ledgerRead(lgLo0, lgHi0);   // last frame's, before this one lands
+			lgCamMean = ledgerRead(lgLo0, lgHi0, lgCamL2);   // last frame's, before this one lands
 		for (int r = 0; r < 3; r++) {
 			if (r >= lgRec)
 				break;
@@ -5778,13 +5779,31 @@ void main(void)
 		// (2026-10-08) replaced the pixel outright: right brightness, but
 		// noise in 1/16 m blocks.
 		vec3 own = mix(prev, fresh, a);
-		float nOwn = 1.0 / max(a, 1e-4);
 		vec3 led = lgCamLe + lgCamAlb * lgCamMean.rgb;
-		float nLed = lgCamMean.a;
-		vec3 merged = (own * nOwn + led * nLed) / (nOwn + nLed);
+		// EACH AVERAGE WEIGHTED BY ONE OVER ITS OWN NOISE (2026-10-09). By
+		// sample count (the version before) is right only when both have the
+		// same noise per sample; in a dark room the ledger's samples include
+		// deep bounces and are far noisier, and its 1/16 m blocks showed. Both
+		// in the same units: luminance with the surface colour divided out.
+		float lm = dot(lgCamMean.rgb, vec3(0.2126, 0.7152, 0.0722));
+		float varLs = max(lgCamL2 - lm * lm, 0.0);          // ledger, per sample
+		float varLed = varLs / lgCamMean.a;                  // its mean
+		float varOwn = varLs;                                // one fresh sample, no history
+		vec4 hmL = texture2D(historyMom, huv);
+		if (a < 1.0 && hmL.g > 0.0 && hmL.g <= 1.0 && hmL.r >= 0.0 && hmL.r < 1e12) {
+			float varS = max(hmL.r - hmL.b * hmL.b, 0.0);    // the pixel's own, per sample
+			varOwn = varS * ((1.0 - a) * (1.0 - a) * hmL.g + a * a);
+		}
+		float wOwn = 1.0 / max(varOwn, 1e-12), wLed = 1.0 / max(varLed, 1e-12);
+		vec3 merged = (own * wOwn + led * wLed) / (wOwn + wLed);
+		if (claudeLedger > 2.5)
+			merged = led;   // INSTRUMENT (claude_ledger 3): the ledger alone, to find wrong patches
+		// the output is the merged colour whatever a is; a itself is left
+		// alone, because the history bookkeeping below keeps each pixel's
+		// sample count from it. Setting it to 1 (first version) broke that
+		// count and made the ghost after a fast turn linger (2026-10-09)
 		prev = merged;
 		fresh = merged;
-		a = 1.0;
 	}
 #endif
 	gl_FragColor = vec4(mix(prev, fresh, a), tPack);
