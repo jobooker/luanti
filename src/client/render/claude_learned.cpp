@@ -218,6 +218,34 @@ void uniforms(GLuint p, int W, int H, int step, int pass)
 
 } // namespace
 
+// INSTRUMENT (2026-10-09, the forest gap): the network's own intermediate
+// images on a dump frame, to compare stage by stage with the PyTorch twin.
+// <path>.lF.f32 = the pooled features (1/4 res, 5 x RGBA, top-down rows),
+// <path>.lM.f32 = the activated maps (1/4 res, 4 x RGBA), channels
+// interleaved per texel: [y][x][4 * image + component].
+void claudeLearnedDump(const std::string &path)
+{
+	Model &M = g_m;
+	if (!M.ok || !M.tex_q[0] || !g_claude_dn_learned_wanted)
+		return;
+	const int w = M.W / 4, h = M.H / 4;
+	auto grab = [&](const GLuint *t, int n, const std::string &suffix) {
+		std::vector<float> one((size_t)w * h * 4), all((size_t)w * h * 4 * n);
+		for (int i = 0; i < n; i++) {
+			GL.BindTexture(GL.TEXTURE_2D, t[i]);
+			GL.GetTexImage(GL.TEXTURE_2D, 0, GL.RGBA, GL.FLOAT, one.data());
+			for (size_t k = 0; k < (size_t)w * h; k++)
+				for (int c = 0; c < 4; c++)
+					all[k * 4 * n + 4 * i + c] = one[k * 4 + c];
+		}
+		GL.BindTexture(GL.TEXTURE_2D, 0);
+		std::ofstream o(path + suffix, std::ios::binary);
+		o.write((const char *)all.data(), all.size() * 4);
+	};
+	grab(M.tex_q, 5, ".lF.f32");
+	grab(M.tex_q + 23, 4, ".lM.f32");
+}
+
 bool claudeLearnedOn()
 {
 	return g_claude_dn_learned_wanted && init();

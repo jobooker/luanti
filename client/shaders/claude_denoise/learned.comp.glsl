@@ -183,9 +183,12 @@ void main()
 	ivec2 t = ivec2(gl_GlobalInvocationID.xy);
 	if (t.x >= uQ.x || t.y >= uQ.y)
 		return;
-	// torch nearest: src = min(floor(dst * (in / out)), in - 1), in float
-	ivec2 e = ivec2(min(int(floor(float(t.x) * (float(uE.x) / float(uQ.x)))), uE.x - 1),
-			min(int(floor(float(t.y) * (float(uE.y) / float(uQ.y)))), uE.y - 1));
+	// torch nearest: src = min(floor(dst * (in / out)), in - 1). In INTEGERS
+	// here: the GPU's float division is a reciprocal times, so 120.0 / 240.0
+	// came out a hair under 0.5 and every even column took the parent to its
+	// left (found 2026-10-09 by dumping this stage; the exact rational floor
+	// equals torch's float one for these sizes, gcd(67, 135) = 1)
+	ivec2 e = min((t * uE) / uQ, uE - ivec2(1));
 	float o[C];
 	for (int j = 0; j < C; j++)
 		o[j] = wt[BOFF + j];

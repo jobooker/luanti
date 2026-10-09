@@ -2,8 +2,8 @@
 """claude_mldenoise_price — what the learned denoiser costs IN THE ENGINE,
 the live pricer's way (util/claude_live_price.py): the camera pinned at a
 scoreboard pose, the scene left to stop changing and its identity printed
-on every arm, arms interleaved, every dial spelled every arm, the whole
-round twice. Per arm: the frame (busy_ms, frame_ms_avg) and the GPU pass
+on every arm, arms interleaved (order rotating), every dial spelled every arm, three
+rounds. Per arm: the frame (busy_ms, frame_ms_avg) and the GPU pass
 times (pass_ms; the six filter passes and the learned step are named by
 their position, read from this build's pipeline order below).
 
@@ -62,8 +62,10 @@ def main():
             elif time.time() - since > 10:
                 break
         print("%s settled after %.0f s: %s" % (sc, time.time() - t0, dict(zip(ID, prev))), flush=True)
-        for rnd in range(2):
-            for name, dials in ARMS:
+        for rnd in range(3):
+            # the order rotates each round: the trace's own time drifted with
+            # the arm order on the first run (2026-10-09)
+            for name, dials in ARMS[rnd % 3:] + ARMS[:rnd % 3]:
                 push(dict(dials, **cap.DISPLAY, claude_exposure=ex))
                 time.sleep(8)   # the dial poll (~1 Hz) and the pass EMA (0.9) settle
                 xs = []

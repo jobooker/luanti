@@ -7,6 +7,7 @@
 #pragma once
 
 #include "pipeline.h"
+#include <string>
 
 // set by game.cpp's uniform setter every frame: the dial, and whether the
 // filter would run at all (claude_denoise on, photo view, traced mode)
@@ -19,6 +20,8 @@ extern float g_claude_dn_learned_young;
 
 // true when the learned passes will replace the six filter passes this frame
 bool claudeLearnedOn();
+// instrument: the network's pooled features and maps next to a set dump
+void claudeLearnedDump(const std::string &path);
 
 // Runs the whole learned denoiser and writes the shown picture into `den`
 // (what claude_present and claude_exposure read). A no-op unless

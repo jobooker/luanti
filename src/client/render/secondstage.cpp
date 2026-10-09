@@ -581,6 +581,7 @@ void ClaudeSetReadback::run(PipelineContext &context)
 	std::ofstream j(path + ".json");
 	j << "{\"w\": " << sz.Width << ", \"h\": " << sz.Height << ", \"still_frames\": "
 			<< g_claude_set_dump_frames << g_claude_set_dump_extra << ", \"textures\": [" << fmts << "]}\n";
+	claudeLearnedDump(path);
 	g_claude_set_dumps_written++;
 	actionstream << "[claude_dump_at] " << sz.Width << "x" << sz.Height << " at "
 			<< g_claude_set_dump_frames << " -> " << path << std::endl;
