@@ -40,6 +40,7 @@ history is why this list is here):
     way furnace-050 is pinned at 0.982 rather than at 1.000.
 
 Usage: claude_skyfurnace_check.py IMAGE {050} [--lsky L] [--patch x0 y0 x1 y1]
+                                  [--linear DUMP_PREFIX]
 """
 import sys
 
@@ -84,9 +85,26 @@ def main():
     patch = im[y0:y1, x0:x1] / 255.0
 
     meas = aces_inverse(patch ** 2.2)
+    clipped = float((patch >= 254.0 / 255.0).mean())
+    # --linear PREFIX (2026-10-08): the same patch from the linear
+    # accumulated radiance (claude_accum_dump). The PNG inversion read
+    # this pad 1.2 % low and moved with image noise (spec/measured.md
+    # 2026-10-08, "a referee that wasn't"); the PNG reading is printed
+    # beside the linear one for comparison.
+    source = "png (aces_inverse(byte/255 ** 2.2))"
+    se = None
+    if "--linear" in sys.argv:
+        import claude_linear
+        prefix = sys.argv[sys.argv.index("--linear") + 1]
+        lin, meta = claude_linear.load(prefix)
+        png_mean = meas.mean(axis=(0, 1))
+        meas = claude_linear.box_px(lin, x0, y0, x1, y1, fb=(w, h))
+        _, se = claude_linear.mean_se(meas)
+        source = "linear %s (%dx%d %s)" % (prefix, meta["w"], meta["h"],
+                                           meta["format"])
+        clipped = 0.0
     mean = meas.mean(axis=(0, 1))
     std = meas.std(axis=(0, 1))
-    clipped = float((patch >= 254.0 / 255.0).mean())
 
     stored = np.array([TEX[variant]] * 3)
     rho = (stored / 255.0) ** 2.2
@@ -94,11 +112,19 @@ def main():
 
     print("skyfurnace %s  patch(%d,%d)-(%d,%d)  clipped %.1f%%  L_sky %.4f"
           % (variant, x0, y0, x1, y1, clipped * 100, l_sky))
+    print("source: %s" % source)
     print("stored color: %s   rho: %s" % (stored.astype(int), np.round(rho, 3)))
     for i, ch in enumerate("RGB"):
-        print("%s  measured %.4f +/- %.4f | analytic rho*L_sky %.4f "
-              "(ratio %.4f)"
+        print("%s  measured %.5f +/- %.5f | analytic rho*L_sky %.5f "
+              "(ratio %.5f)"
               % (ch, mean[i], std[i], analytic[i], mean[i] / analytic[i]))
+    if se is not None:
+        print("ratio standard error (pixels independent): %s"
+              % " ".join("%s %.5f" % (c, se[i] / analytic[i])
+                         for i, c in enumerate("RGB")))
+        print("png reading of the same patch: ratio %s"
+              % " ".join("%s %.5f" % (c, png_mean[i] / analytic[i])
+                         for i, c in enumerate("RGB")))
 
 
 if __name__ == "__main__":

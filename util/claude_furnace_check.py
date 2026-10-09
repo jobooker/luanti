@@ -24,7 +24,9 @@ The last two DIFFER (2.4x vs 5.5x at e=1) — reported alongside, since
 whichever one the measurement matches names the defect.
 
 Usage: claude_furnace_check.py IMAGE {050|073} [--patch X0 Y0 X1 Y1]
-Default patch: a 200x200 block left-of-center (avoids crosshair + hand).
+                               [--exposure E] [--linear DUMP_PREFIX]
+Default patch: a 200x200 block left-of-center (avoids crosshair + hand),
+in PNG pixels; with --linear the same box is read from the linear dump.
 """
 import sys
 import numpy as np
@@ -61,9 +63,26 @@ def main():
     if "--exposure" in sys.argv:
         exposure = float(sys.argv[sys.argv.index("--exposure") + 1])
     meas = aces_inverse(patch ** 2.2) / exposure
+    clipped = float((patch >= 254.0 / 255.0).mean())
+    # --linear PREFIX (2026-10-08): read the SAME patch from the linear
+    # accumulated radiance (claude_accum_dump) instead of inverting the
+    # 8-bit picture. Exposure and display curve are not involved, so
+    # --exposure is ignored and nothing can clip. The PNG reading is
+    # printed beside it, for comparison.
+    source = "png (aces_inverse(byte/255 ** 2.2) / exposure %g)" % exposure
+    se = None
+    if "--linear" in sys.argv:
+        import claude_linear
+        prefix = sys.argv[sys.argv.index("--linear") + 1]
+        lin, meta = claude_linear.load(prefix)
+        png_mean = meas.mean(axis=(0, 1))
+        meas = claude_linear.box_px(lin, x0, y0, x1, y1, fb=(w, h))
+        _, se = claude_linear.mean_se(meas)
+        source = "linear %s (%dx%d %s)" % (prefix, meta["w"], meta["h"],
+                                           meta["format"])
+        clipped = 0.0
     mean = meas.mean(axis=(0, 1))
     std = meas.std(axis=(0, 1))
-    clipped = float((patch >= 254.0 / 255.0).mean())
 
     # authored color survives the snapshot since ADR-0009 #3 (40720f6+)
     stored = np.array([tex, tex, tex])
@@ -80,15 +99,23 @@ def main():
 
     print("furnace %s  patch(%d,%d)-(%d,%d)  clipped %.1f%%"
           % (variant, x0, y0, x1, y1, clipped * 100))
+    print("source: %s" % source)
     print("stored color: %s   rho: %s" % (stored.astype(int), np.round(rho, 3)))
     for i, ch in enumerate("RGB"):
         note = "  [rho=1: 4-bounce truncated sum]" if rho[i] > 0.999 else ""
-        print("%s  measured %.3f +/- %.3f | analytic Le/(1-rho) %.3f "
-              "(ratio %.3f) | 5-event trunc %.3f (ratio %.3f) | "
+        print("%s  measured %.5f +/- %.5f | analytic Le/(1-rho) %.5f "
+              "(ratio %.5f) | 5-event trunc %.3f (ratio %.3f) | "
               "eye-hit-only %.3f (ratio %.3f)%s"
               % (ch, mean[i], std[i], analytic[i], mean[i] / analytic[i],
                  trunc5[i], mean[i] / trunc5[i],
                  eyehit[i], mean[i] / eyehit[i], note))
+    if se is not None:
+        print("ratio standard error (pixels independent): %s"
+              % " ".join("%s %.5f" % (c, se[i] / analytic[i])
+                         for i, c in enumerate("RGB")))
+        print("png reading of the same patch: ratio %s"
+              % " ".join("%s %.5f" % (c, png_mean[i] / analytic[i])
+                         for i, c in enumerate("RGB")))
     print("Le (transport) per channel: %s" % np.round(le, 3))
 
 

@@ -175,7 +175,10 @@ def cmd_run(scenes):
                 png = shoot(sc, dials, n, "%s-%s-%d" % (sc, cn, n))
                 s2 = stats_of(png)
                 ident = {k: s2.get(k) for k in ("grid_hash", "area_emitters", "far_db_blocks", "sun_lux")}
-                same = all(ident[k] == tm["scene_id"].get(k) for k in ("area_emitters", "sun_lux"))
+                # grid_hash too since 2026-10-08: claude_shoot --pin loads the
+                # scene the same way every time (claude_lab.load_scene), so the
+                # grid's contents must match the truth's, not only its light count
+                same = all(ident[k] == tm["scene_id"].get(k) for k in ("grid_hash", "area_emitters", "sun_lux"))
                 shots["shots"].append({"scene": sc, "contender": cn, "budget": bn, "frame_ms": ms,
                                        "frames": n, "png": png, "scene_id": ident, "same_scene": same})
                 print("%-10s %-9s %-11s %6.2f ms/frame -> %5d frames%s" % (
@@ -209,7 +212,7 @@ def cmd_try(scene, variants):
             n = max(1, int(math.floor(budget / ms)))
             png = shoot(scene, d, n, "%s-%s-%d" % (scene, vn.replace(" ", "_"), n))
             s2 = stats_of(png)
-            same = s2.get("area_emitters") == tm["scene_id"].get("area_emitters")
+            same = all(s2.get(k) == tm["scene_id"].get(k) for k in ("grid_hash", "area_emitters"))
             shots["shots"].append({"scene": scene, "contender": vn, "budget": bn, "frame_ms": ms,
                                    "frames": n, "png": png, "same_scene": same, "dials": over})
             print("%-10s %-26s %-11s %6.2f ms/frame -> %5d frames%s" % (scene, vn, bn, ms, n,

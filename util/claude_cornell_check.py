@@ -145,7 +145,7 @@ def load(path):
     return im, lin(im)
 
 
-def region_stats(path):
+def region_stats(path, linear=None):
     """{name: (lum_mean, rgb_mean, purity)} for the five REGIONS.
 
     purity is the fraction of pixels that still look like the named
@@ -153,16 +153,27 @@ def region_stats(path):
     near-neutral elsewhere. It is the box's own alarm: a HUD element, a
     chat line or a seam creeping into a box drops it below 1.0 long
     before it moves the mean enough to notice.
+
+    linear: a claude_accum_dump prefix (2026-10-08). The means then come
+    from the linear accumulated radiance over the same fraction boxes
+    (no display curve to invert, nothing quantised); purity still reads
+    the PNG, since it asks what surface is in the box, not how bright.
     """
     im, L = load(path)
     h, w = im.shape[:2]
-    lum = L @ LUMA
+    lin = None
+    if linear:
+        import claude_linear
+        lin, _ = claude_linear.load(linear)
     out = {}
     for name, boxes in REGIONS.items():
         pix, raw = [], []
         for (x0, y0, x1, y1) in boxes:
             sl = (slice(int(h * y0), int(h * y1)), slice(int(w * x0), int(w * x1)))
-            pix.append(L[sl].reshape(-1, 3))
+            if lin is not None:
+                pix.append(claude_linear.box_frac(lin, x0, y0, x1, y1).reshape(-1, 3))
+            else:
+                pix.append(L[sl].reshape(-1, 3))
             raw.append(im[sl].reshape(-1, 3))
         pix = np.concatenate(pix)
         raw = np.concatenate(raw)
@@ -177,8 +188,8 @@ def region_stats(path):
     return out
 
 
-def print_regions(path, tag="region"):
-    st = region_stats(path)
+def print_regions(path, tag="region", linear=None):
+    st = region_stats(path, linear)
     for name in REGIONS:
         m, rgb, pure = st[name]
         print("%s %-15s mean %.5f  rgb %s  purity %.3f"
@@ -186,17 +197,18 @@ def print_regions(path, tag="region"):
     return st
 
 
-def print_ratios(path, golden):
-    this = region_stats(path)
-    gold = region_stats(golden)
-    print("ratio golden: %s" % golden)
+def print_ratios(path, golden, linear=None, golden_linear=None, tag="ratio"):
+    this = region_stats(path, linear)
+    gold = region_stats(golden, golden_linear)
+    print("%s golden: %s%s" % (tag, golden,
+                               " (linear %s)" % golden_linear if golden_linear else ""))
     worst = 0.0
     for name in REGIONS:
         r = this[name][0] / max(gold[name][0], 1e-12)
         worst = max(worst, abs(r - 1.0))
-        print("ratio %-15s %.4f  (this %.5f / golden %.5f)  purity %.3f"
-              % (name, r, this[name][0], gold[name][0], this[name][2]))
-    print("ratio worst deviation: %.4f" % worst)
+        print("%s %-15s %.5f  (this %.5f / golden %.5f)  purity %.3f"
+              % (tag, name, r, this[name][0], gold[name][0], this[name][2]))
+    print("%s worst deviation: %.5f" % (tag, worst))
     return this, gold
 
 
@@ -242,13 +254,26 @@ def main():
                     help="print the five regions as this/golden")
     ap.add_argument("--no-legacy", action="store_true",
                     help="skip the legacy bleed/corner/emitter block")
+    ap.add_argument("--linear", metavar="PREFIX",
+                    help="region means from this image's linear dump "
+                         "(claude_accum_dump) instead of the PNG")
+    ap.add_argument("--ratio-linear", metavar="GOLDEN_PREFIX",
+                    help="the golden's linear dump; with --linear and "
+                         "--ratio, the ratios are linear/linear and the "
+                         "PNG ratios follow as 'pngratio' lines")
     args = ap.parse_args()
     if not args.no_legacy:
         legacy(args.image)
+    if args.linear:
+        print("source: linear %s" % args.linear)
     if args.regions or not args.ratio:
-        print_regions(args.image)
+        print_regions(args.image, linear=args.linear)
     if args.ratio:
-        print_ratios(args.image, args.ratio)
+        if args.linear and args.ratio_linear:
+            print_ratios(args.image, args.ratio, args.linear, args.ratio_linear)
+            print_ratios(args.image, args.ratio, tag="pngratio")
+        else:
+            print_ratios(args.image, args.ratio)
 
 
 if __name__ == "__main__":
