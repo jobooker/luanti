@@ -331,6 +331,7 @@ struct ClaudeTraceGrid
 	// their per-texel colour (claudeTexel) exactly like a B3 stair.
 	int relief_depth = 0;                        // dial the grid was built under
 	bool relief_flat = false;                    // claude_relief_flat, likewise
+	bool oak_model = false;                      // claude_oak_model, likewise
 	float relief_frac = 0.35f;                   // claude_relief_frac, likewise
 	std::vector<std::array<u8, 768>> relief_maps; // 1-based: depth per texel, top/bottom/side
 	std::unordered_map<content_t, u16> relief_base_of; // content -> map id, 0 = none
@@ -5263,6 +5264,17 @@ static bool claudeReliefFlat()
 			&& g_settings->getFloat("claude_relief_flat", 0.0f, 1.0f) >= 0.5f;
 }
 
+// claude_oak_model (default 0, 2026-10-09): 1 = oak logs use the old baked
+// model (log_oak_baked: one colour per cell plus a repeating carved glyph,
+// which hid the real bark texture: John, "they look good but they just
+// look fake"). 0 = a plain cube coloured per texel from the real texture,
+// carved only when claude_relief > 0.
+static bool claudeOakModel()
+{
+	return g_settings->exists("claude_oak_model")
+			&& g_settings->getFloat("claude_oak_model", 0.0f, 1.0f) >= 0.5f;
+}
+
 static float claudeReliefFrac()
 {
 	if (!g_settings->exists("claude_relief_frac"))
@@ -5720,7 +5732,7 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// RELIEF BEATS A TEXTURE-BAKED CUBE MODEL for the nodes it carves
 		// (claude_relief > 0): log_oak_baked is the older bake of the same
 		// idea, from the tile files, in one colour per cell.
-		bool relief_node = V.relief_depth > 0 && plain_solid
+		bool relief_node = (V.relief_depth > 0 || !V.oak_model) && plain_solid
 				&& claudeReliefCandidate(f);
 		if (!g_claude_grid.model_of.empty() && !relief_node
 				&& (plain_solid || leaves_model || (f.light_source > 0
@@ -5778,7 +5790,7 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 			video::SColor rtint(255, 255, 255, 255);
 			if (f.visuals)
 				f.visuals->getColor(n.getParam2(), &rtint);
-			u16 rm = V.relief_flat ? 0
+			u16 rm = (V.relief_flat || V.relief_depth == 0) ? 0
 					: claudeReliefMapId(client, c, f, col, rtint);
 			u8 ex = rm ? claudeReliefExposed(map, ndef,
 					origin + v3s16(x, y, z)) : 0;
@@ -6782,6 +6794,7 @@ static void claudeTraceGridSnapshot(Client *client)
 		V.relief_depth = rd;
 		V.relief_frac = rf;
 		V.relief_flat = claudeReliefFlat();
+		V.oak_model = claudeOakModel();
 		V.relief_cells = 0;
 	}
 	// RGBA per cell: rgb = the node type's average color (same one the
@@ -7944,6 +7957,7 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on
 					|| claudeReliefDepth() != g_claude_grid.relief_depth
 					|| claudeReliefFlat() != g_claude_grid.relief_flat
+					|| claudeOakModel() != g_claude_grid.oak_model
 					|| claudeReliefFrac() != g_claude_grid.relief_frac);
 		if (geom_moved) {
 			actionstream << "[claude_grid] geometry dial changed"
