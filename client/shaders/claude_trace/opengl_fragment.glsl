@@ -1437,7 +1437,11 @@ void hotLaw(float idx, vec3 cell, bool fine, vec3 sv, inout vec3 alb,
 
 // The VOXEL's own palette colour, for models flagged "colour": "palette"
 // (flowers, 2026-10-05). False (and `rgb` untouched) for every other cell.
-bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
+// "colour": "palette_tint" (flag 128; tall grass, fern, leaves, 2026-10-10):
+// the palette holds texel/mean x128 (game.cpp), and the colour is the CELL's
+// (`cellRgb`, minimap colour x biome tint) times that ratio: the texture's
+// pattern on the grid's hue, the mean linear albedo unchanged.
+bool modelVoxelColour(vec3 cell, vec3 sv, vec3 cellRgb, out vec3 rgb)
 {
 	rgb = vec3(0.0);
 	float mid = floor(texture3D(claudeModelIds,
@@ -1446,7 +1450,7 @@ bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
 		return false;
 	float m = floor(mid / 4.0) - 1.0;
 	vec4 p0 = texture2D(claudeModelPal, (vec2(0.0, m) + 0.5) / vec2(256.0, 64.0));
-	if (p0.b < 0.5)
+	if (p0.b < 0.25)
 		return false;
 	float rot = mod(mid, 4.0);
 	float layer = (m * 4.0 + rot) * 16.0 + sv.z;
@@ -1456,6 +1460,8 @@ bool modelVoxelColour(vec3 cell, vec3 sv, out vec3 rgb)
 	if (pidx < 0.5)
 		return false;
 	rgb = texture2D(claudeModelPal, (vec2(pidx, m) + 0.5) / vec2(256.0, 64.0)).rgb;
+	if (p0.b < 0.75)
+		rgb = min(cellRgb * rgb * (255.0 / 128.0), vec3(1.0));
 	return true;
 }
 
@@ -2299,7 +2305,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 				} else {
 					alb = cellAlbedo(s.rgb);
 					vec3 vrgb;
-					if (modelVoxelColour(cellHi, ci, vrgb))
+					if (modelVoxelColour(cellHi, ci, s.rgb, vrgb))
 						alb = cellAlbedo(vrgb);
 					le = alb * pal.r;   // the palette's emission column (§4: one Le)
 					if (claudeFlame > 0.5 && pal.r > 0.0)
@@ -2548,7 +2554,7 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// with a carved glyph. The same lookup, the same flag.
 		if (!hitAir && suHit.x >= 0.0) {
 			vec3 vrgb;
-			if (modelVoxelColour(ci, suHit, vrgb))
+			if (modelVoxelColour(ci, suHit, s.rgb, vrgb))
 				alb = cellAlbedo(vrgb);
 		}
 		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)

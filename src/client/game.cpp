@@ -5277,14 +5277,55 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 			palrgba[0] = (u8)(k16 >> 8);
 			palrgba[1] = (u8)(k16 & 0xFF);
 			// B: 255 = this model's fine hits take the VOXEL's palette
-			// colour (the model file says "colour": "palette" -- flowers)
-			palrgba[2] = (md.isMember("colour")
-					&& md["colour"].asString() == "palette") ? 255 : 0;
+			// colour (the model file says "colour": "palette" -- flowers);
+			// 128 = they take the CELL's colour times the voxel's texel
+			// relative to the model's mean ("colour": "palette_tint" --
+			// tall grass, fern, leaves: grayscale tiles whose biome tint
+			// comes through the cell colour). See the palette rewrite below.
+			const std::string cmode = md.isMember("colour")
+					? md["colour"].asString() : std::string();
+			palrgba[2] = cmode == "palette" ? 255
+					: cmode == "palette_tint" ? 128 : 0;
 			// A: 255 = this model's emitting voxels are FLAME (the model
 			// file says "light": "flame"); claude_trace gives them a
 			// flame's measured light under claude_units
 			palrgba[3] = (md.isMember("light")
 					&& md["light"].asString() == "flame") ? 255 : 0;
+		}
+		// TEXTURE TIMES TINT (2026-10-10, plants2; DECISIONS 0z.4). A
+		// "palette_tint" model's palette entries become RATIOS: texel / M,
+		// M per channel the voxel-weighted mean of the model's texels taken
+		// in the tracer's own linear space (cellAlbedo is c^2.2), so
+		// mean(ratio^2.2) = 1 and the model's mean linear albedo is the
+		// flat cell colour's, exactly. Encoded x128 (0..1.99; the widest
+		// texel of the tiles in use is 1.2x its mean). The shader multiplies
+		// the cell colour by it, so hue and brightness stay the grid's and
+		// only the texture's pattern is added. No emission on these models.
+		if (palrgba[2] == 128) {
+			double acc[3] = {0.0, 0.0, 0.0};
+			long nvox = 0;
+			for (int z = 0; z < 16; z++)
+			for (int y = 0; y < 16; y++)
+			for (int x = 0; x < 16; x++) {
+				int pi = vox[z][y][x].asInt();
+				if (pi <= 0 || pi >= npal)
+					continue;
+				for (int ch = 0; ch < 3; ch++)
+					acc[ch] += std::pow(palrgba[pi * 4 + ch] / 255.0, 2.2);
+				nvox++;
+			}
+			double M[3];
+			for (int ch = 0; ch < 3; ch++)
+				M[ch] = nvox > 0 ? std::max(std::pow(acc[ch] / nvox, 1.0 / 2.2)
+						* 255.0, 1.0) : 255.0;
+			for (int p = 1; p < npal; p++)
+				for (int ch = 0; ch < 3; ch++)
+					palrgba[p * 4 + ch] = (u8)std::clamp(
+							palrgba[p * 4 + ch] / M[ch] * 128.0 + 0.5,
+							0.0, 255.0);
+			infostream << "[claude_models] " << mname << ": texture x tint, "
+					<< nvox << " voxels, mean texel " << M[0] << " "
+					<< M[1] << " " << M[2] << std::endl;
 		}
 		V.models.push_back(rots);
 		V.model_vox.push_back(vrots);
