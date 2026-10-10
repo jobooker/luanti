@@ -24,6 +24,8 @@ code step is ~10 % of radiance): -1.6 %.
   compare OUT [mask=ARM] A/B ...   linear ratio with its standard error (per-pixel
                              variance from the two seeds), and the guard's
                              display-space metric of the same images
+  noise OUT ARM...           per-pixel variance (two seeds) times the frame
+                             count: flat if the average converges as 1/N
 
 THE REFEREE (vantage cave-skylight-noon, "Referee (2b)"). For a floor point,
 the directions that pass the 1-node-thick opening are those whose crossings
@@ -248,6 +250,20 @@ def cmd_compare(d, args):
         print(s + "  | guard's display metric %.4f" % (ga / gb))
 
 
+def cmd_noise(d, arms):
+    """does the average converge as 1/N? var * N is flat for a true running
+    average; it grows for an exponential one (found 2026-10-10: the per-pixel
+    count capped at 4096 made parked averages exponential past 4096 frames)"""
+    rs = runs(d)
+    for a in arms:
+        ns = sorted(n for n in rs if n.rsplit("_s", 1)[0] == a)
+        x, y = (load_y(d, n) @ LUM for n in ns[:2])
+        frames = min(rs[n]["stats"]["still_frames"] for n in ns[:2])
+        v = float(((x - y) ** 2 / 2).mean())
+        print("%-16s frames %6d  mean %.5f  per-pixel var %.5g  var x frames %.4g"
+              % (a, frames, (x.mean() + y.mean()) / 2, v, v * frames))
+
+
 # ---------------------------------------------------------------- arms
 DISPLAY_OFF = {"claude_denoise": 0, "claude_denoise_learned": 0, "claude_ledger": 0,
                "claude_boost": 0, "claude_split": 0, "claude_raw_frame": 0,
@@ -332,5 +348,7 @@ if __name__ == "__main__":
         cmd_pad(rest[0], rest[1:])
     elif c == "compare":
         cmd_compare(rest[0], rest[1:])
+    elif c == "noise":
+        cmd_noise(rest[0], rest[1:])
     else:
         sys.exit(__doc__)
