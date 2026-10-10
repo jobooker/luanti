@@ -183,14 +183,18 @@ def cmd_pad(d, names):
     rs = runs(d)
     st = rs[names[0]]["stats"]
     cos_a = 1.0 / np.sqrt(1.0 + TAN_A ** 2)
-    e = (st["sun_lux"] * (1 + cos_a) / 2 + st["sky_lux"]) / 1000.0
+    # a disc of half-angle a whose centre is at zenith angle z lights a
+    # horizontal plane with L pi sin^2 a cos z = sun_lux (1 + cos a)/2 cos z
+    # (the disc wholly above the horizon); the sun's direction from the stats
+    cos_z = (st.get("sun_dir") or [0.0, 1.0, 0.0])[1]
+    e = (st["sun_lux"] * (1 + cos_a) / 2 * cos_z + st["sky_lux"]) / 1000.0
     h, w = load_y(d, names[0]).shape[:2]
     pos, hits = floor_hits(camera(d, names), w, h, PAD, sub=1)
     ok = hits[0][2]
     ref = np.full((h, w), RHO / np.pi * e)
     _report(d, names, rs, ref, [("open pad (3-node margin)", ok)],
-            "camera %s; sun_lux %.0f sky_lux %.0f; fence ignored (< 0.3 %%)"
-            % (pos, st["sun_lux"], st["sky_lux"]))
+            "camera %s; sun_lux %.0f sky_lux %.0f sun cos(zenith) %.4f; fence ignored (< 0.3 %%)"
+            % (pos, st["sun_lux"], st["sky_lux"], cos_z))
 
 
 def _report(d, names, rs, ref, regions, head):
@@ -308,7 +312,7 @@ def cmd_run(spec_path, out):
                 cmd = [sys.executable, os.path.join(HERE, "claude_shoot.py"), "--skip-seat",
                        "--pin", "--play", "--pos"] + [str(v) for v in p[:3]] + [
                        "--yaw", str(p[3]), "--pitch", str(p[4]),
-                       "--time", str(spec.get("time", 0.5)),
+                       "--time", str(arm.get("time", spec.get("time", 0.5))),
                        "--frames", str(arm.get("frames", spec.get("frames", 4096))),
                        "--name", name, "--accum-dump", os.path.join(out, name)]
                 if arm.get("export"):
@@ -326,7 +330,8 @@ def cmd_run(spec_path, out):
                     rec["stats"] = {k: st.get(k) for k in (
                         "still_frames", "claude_nee", "claude_bounces", "claude_air_scatter",
                         "claude_air_absorb", "claude_sky_uniform", "sun_lux", "sky_lux",
-                        "sky_horizon", "sky_zenith", "grid_origin", "reset_why")}
+                        "sky_horizon", "sky_zenith", "grid_origin", "reset_why", "sun_dir",
+                        "features")}
                 except Exception as e:
                     rec["stats_err"] = str(e)
                 log.write(json.dumps(rec) + "\n")

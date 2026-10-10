@@ -428,6 +428,7 @@ struct ClaudeTraceGrid
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
 	float sun_airmass = 0.0f;   // for claude_stats.json: the sun's air mass
+	v3f sun_dir = v3f(0.0f, 1.0f, 0.0f);   // for claude_stats.json: the sun's direction
 	v3f sun_chroma = v3f(1.0f, 1.0f, 1.0f);
 	float dial_air_scatter = 0.0f;
 	float dial_flame = 0.0f;
@@ -2440,6 +2441,18 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// largest count a float holds exactly; 4096 = the old behaviour.
 	float m_count_cap = 16777216.0f;
 	CachedPixelShaderSetting<float, 1, false> m_count_cap_pixel{"claudeCountCap"};
+	// claude_sky_ground (2026-10-10, a physics RULE): the sky's radiance --
+	// the sun's beam (IES: 127.5 klx exp(-0.21 m)) and the dome (IES clear-sky
+	// diffuse) -- is what an observer AT THE GROUND measures, after the whole
+	// atmosphere, its extinction and its in-scattering. A ray segment that
+	// ends at the sky therefore carries no tracer air: neither extinction nor
+	// in-scatter along it (the measurement already holds both). Exact for
+	// every sun angle and every receiver, because the correction is the
+	// segment's own transmittance, not one constant. 1 (default) = that; 0 =
+	// the old double count (-3.7 % sun at noon, measured 2026-10-10).
+	// Segments that end at a surface keep the air (aerial perspective).
+	float m_skyg = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_skyg_pixel{"claudeSkyGround"};
 	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
@@ -2691,6 +2704,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_walk_exact",
 		"claude_bounce_uniform",
 		"claude_count_cap",
+		"claude_sky_ground",
 		"claude_ledger",
 		"claude_white_balance",
 		"claude_leaf_transmit",
@@ -3403,6 +3417,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			g_claude_grid.moon_name = m_sky->getMoonTextureName();
 		}
 		m_sky_sun_dir_pixel.set(sun_dir, services);
+		g_claude_grid.sun_dir = sun_dir;
 		sun_col *= m_plant_sun;   // 1 unless the guard's test plants an error
 		m_sky_sun_col_pixel.set(sun_col, services);
 		m_sky_sun_cos_pixel.set(&sun_cos, services);
@@ -3641,6 +3656,8 @@ public:
 			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		if (name == "claude_sky_ground")
+			m_skyg = readAir("claude_sky_ground", 1.0f, 1.0f);
 		if (name == "claude_count_cap")
 			m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
 		if (name == "claude_ledger")
@@ -3770,6 +3787,7 @@ public:
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
+		m_skyg = readAir("claude_sky_ground", 1.0f, 1.0f);
 		m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
@@ -4156,6 +4174,7 @@ public:
 				m_walk_exact_pixel.set(&m_walk_exact, services);
 				m_bounce_uniform_pixel.set(&m_bounce_uniform, services);
 				m_count_cap_pixel.set(&m_count_cap, services);
+				m_skyg_pixel.set(&m_skyg, services);
 				m_ledger_pixel.set(&m_ledger, services);
 				{
 					float lf = (float)(g_claude_frame_no & 0xFFFFFF);
@@ -7839,6 +7858,8 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"relief_shapes\": " << g_claude_grid.relief_shape_of.size()
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
+			<< ", \"sun_dir\": [" << g_claude_grid.sun_dir.X << "," << g_claude_grid.sun_dir.Y
+					<< "," << g_claude_grid.sun_dir.Z << "]"
 			<< ", \"sun_chroma\": [" << g_claude_grid.sun_chroma.X << ","
 			<< g_claude_grid.sun_chroma.Y << "," << g_claude_grid.sun_chroma.Z << "]"
 			<< ", \"claude_air_scatter\": " << g_claude_grid.dial_air_scatter

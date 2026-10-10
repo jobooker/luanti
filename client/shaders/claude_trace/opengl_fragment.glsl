@@ -3633,6 +3633,10 @@ uniform float claudePixelReset;     // 1 = a pixel whose surface changed drops i
 // Was a fixed 4096, which made every parked average past 4096 frames an
 // exponential one (claudePixelReset floors the weight at 1/(count+1)).
 uniform float claudeCountCap;
+// claude_sky_ground: 1 = the sky (sun beam and dome) is a ground-level
+// measurement, so a segment ending at the sky carries no tracer air
+// (game.cpp m_sky_ground). 0 = the old double count.
+uniform float claudeSkyGround;
 bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
@@ -4015,7 +4019,9 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
-	vec3 tr = curMed < 0.5 ? vec3(airTr(farExitT(x, wi)))
+	// (claude_sky_ground: the beam's value is the ground's, after the whole
+	// atmosphere; the tracer's air would count that extinction twice)
+	vec3 tr = curMed < 0.5 ? vec3(claudeSkyGround > 0.5 ? 1.0 : airTr(farExitT(x, wi)))
 			: medTr(curMed, farExitT(x, wi));
 	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL) * tr;
 }
@@ -4050,7 +4056,7 @@ vec3 neeSkyAir(vec3 x, vec3 dir)
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos));
 	float ph = hgPhase(dot(dir, wi), claudeAirG);
 	float w = pdfL / (pdfL + ph);
-	return w * ph * skyBody(wi) * airTr(farExitT(x, wi)) / pdfL;
+	return w * ph * skyBody(wi) * (claudeSkyGround > 0.5 ? 1.0 : airTr(farExitT(x, wi))) / pdfL;
 }
 
 // =====================================================================
@@ -4901,7 +4907,10 @@ void main(void)
 		// exactly 1). That is the whole estimator, and it is why no energy
 		// can be invented: a non-absorbing medium cannot move a sealed
 		// furnace (the furnace-050-air arm). Debug views see geometry only.
-		if (airSigT() > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)) {
+		// claude_sky_ground: a segment that reaches the sky has no air in it --
+		// the sky's radiance is measured at the ground, through all of it
+		if (airSigT() > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)
+				&& (hitS || claudeSkyGround < 0.5)) {
 			float tSeg = hitS ? tHit : farExitT(p, dir);
 			float ua = rnd1();
 			float sAir = -log(max(1.0 - ua, 1e-12)) / airSigT();

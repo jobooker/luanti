@@ -105,6 +105,8 @@ DIAL_CLASS = {
     # the per-pixel count cap: 4096 (old) makes a parked average past 4096
     # frames exponential, unbiased but no longer converging (2026-10-10)
     "claude_count_cap": "estimator",
+    # the sky is a ground-level measurement: no tracer air on sky-bound segments (2026-10-10)
+    "claude_sky_ground": "physics",
     # geometry: the world's shape walked differently, the same picture
     "claude_pyramid": "geometry", "claude_descend": "geometry", "claude_model_far": "geometry",
     "claude_bricks": "geometry", "claude_bricks_far": "geometry", "claude_walk_exact": "geometry",
