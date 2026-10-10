@@ -572,6 +572,11 @@ void ServerEnvironment::activateBlock(MapBlock *block)
 	if (block->isOrphan())
 		return;
 
+	// claude_freeze: the stored objects appear (they are part of the
+	// snapshot) but no LBM or node-timer catch-up changes the block
+	if (m_claude_freeze)
+		return;
+
 	/* Handle LoadingBlockModifiers */
 	m_lbm_mgr.applyLBMs(this, block, stamp, (float)dtime_s);
 	if (block->isOrphan())
@@ -868,6 +873,29 @@ void ServerEnvironment::step(float dtime)
 	/* Step time of day */
 	stepTimeOfDay(dtime);
 
+	// claude_freeze: DEMO MODE for tests -- the world holds still so a
+	// test run is a function of (build, world snapshot, path, dials).
+	// Skipped while frozen: entity steps (players still step: the client
+	// owns their movement), node timers, ABMs, LBMs and node timers on
+	// block activation, and liquid flow (Server::AsyncRunStep). Mod
+	// globalsteps are held back by the bridge (OPS.freeze). Read live
+	// once per step, like claude_abm.
+	m_claude_freeze = g_settings->getBool("claude_freeze");
+	if (m_claude_freeze != m_claude_freeze_last) {
+		m_claude_freeze_last = m_claude_freeze;
+		actionstream << "[claude_freeze] "
+				<< (m_claude_freeze ? "WORLD FROZEN (demo mode): no entity steps, "
+						"liquid flow, node timers, ABMs or LBMs"
+					: "world RUNNING again (the real game)")
+				<< std::endl;
+	}
+	if (m_claude_freeze && m_claude_freeze_report_interval.step(dtime, 60.0f)) {
+		actionstream << "[claude_freeze] still frozen: "
+				<< m_claude_freeze_held_objects << " entities held, "
+				<< getServerMap().transformingLiquidSize()
+				<< " liquid nodes waiting" << std::endl;
+	}
+
 	// Update this one
 	// NOTE: This is kind of funny on a singleplayer game, but doesn't
 	// really matter that much.
@@ -1004,7 +1032,9 @@ void ServerEnvironment::step(float dtime)
 					MOD_REASON_BLOCK_EXPIRED);
 			}
 
-			// Run node timers
+			// Run node timers (not while claude_freeze holds the world)
+			if (m_claude_freeze)
+				continue;
 			block->step(dtime, [&](v3s16 p, MapNode n, NodeTimer t) -> bool {
 				return m_script->node_on_timer(p, n, t.elapsed, t.timeout);
 			});
@@ -1037,7 +1067,7 @@ void ServerEnvironment::step(float dtime)
 				<< std::endl;
 	}
 	if (m_active_block_modifier_interval.step(dtime, m_cache_abm_interval)
-			&& claude_abm) {
+			&& claude_abm && !m_claude_freeze) {
 		ScopeProfiler sp(g_profiler, "SEnv: modify in blocks avg per interval", SPT_AVG);
 		TimeTaker timer("modify in active blocks per interval");
 
@@ -1114,18 +1144,25 @@ void ServerEnvironment::step(float dtime)
 		}
 
 		u32 object_count = 0;
+		u32 held = 0;
 
 		auto cb_state = [&](ServerActiveObject *obj) {
 			if (obj->isGone())
 				return;
 			object_count++;
 
-			// Step object
-			obj->step(dtime, send_recommended);
+			// Step object -- claude_freeze holds every entity (falling
+			// nodes, items, mobs) where it is; players still step. Their
+			// queued messages are still sent, so the client stays in sync.
+			if (m_claude_freeze && obj->getType() != ACTIVEOBJECT_TYPE_PLAYER)
+				held++;
+			else
+				obj->step(dtime, send_recommended);
 			// Read messages from object
 			obj->dumpAOMessagesToQueue(m_active_object_messages);
 		};
 		m_ao_manager.step(dtime, cb_state);
+		m_claude_freeze_held_objects = held;
 
 		m_active_object_gauge->set(object_count);
 	}

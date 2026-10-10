@@ -524,6 +524,14 @@ void set_default_settings()
 	// was ruled out (spec/handoffs/2026-08-16-still-the-world-abm.md
 	// says to read the code, not to pick by name).
 	settings->setDefault("claude_abm", "true");
+	// claude_freeze: DEMO MODE for tests (2026-10-09). true = the server
+	// world holds still: no entity steps (players still step), no liquid
+	// flow, no node timers, no ABMs, no LBMs. Read live each server step,
+	// set at runtime by the bridge (OPS.freeze), never written to a conf:
+	// the dedicated server does not save its settings, so a test cannot
+	// leave a play seat frozen. The bridge holds back the mods'
+	// globalsteps itself (Lua side). See ServerEnvironment::step.
+	settings->setDefault("claude_freeze", "false");
 	settings->setDefault("nodetimer_interval", "0.2");
 	settings->setDefault("ignore_world_load_errors", "false");
 	settings->setDefault("remote_media", "");

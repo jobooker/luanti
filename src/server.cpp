@@ -788,7 +788,10 @@ void Server::AsyncRunStep(float dtime, bool initial_step)
 		ScopeProfiler sp(g_profiler, "Server: liquid transform");
 
 		std::map<v3s16, MapBlock*> modified_blocks;
-		m_env->getServerMap().transformLiquids(modified_blocks, m_env);
+		// claude_freeze: liquids wait in their queue while the world is
+		// held (they flow on as soon as it is released)
+		if (!m_env->claudeFrozen())
+			m_env->getServerMap().transformLiquids(modified_blocks, m_env);
 
 		if (!modified_blocks.empty()) {
 			MapEditEvent event;
