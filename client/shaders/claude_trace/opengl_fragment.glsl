@@ -3628,6 +3628,10 @@ uniform float claudeFarPlants;      // 1 = far plants as a layer of blades
 // walked the far levels cell by cell (spec/measured.md 2026-10-06).
 uniform float claudeFarTop;
 uniform float claudePixelReset;     // 1 = a pixel whose surface changed drops its own history
+// claude_count_cap: the most samples the per-pixel count (direct alpha) records.
+// Was a fixed 4096, which made every parked average past 4096 frames an
+// exponential one (claudePixelReset floors the weight at 1/(count+1)).
+uniform float claudeCountCap;
 bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
@@ -5696,7 +5700,7 @@ void main(void)
 		gl_FragColor = vec4(mix(max(hS.rgb, vec3(0.0)), fresh, aS), hS.a);
 #ifdef CLAUDE_SPLIT_OUT
 		outDirect = vec4(mix(max(hdS.rgb, vec3(0.0)), max(Ld, vec3(0.0)), aS),
-				min(nS + 1.0, 4096.0));
+				min(nS + 1.0, claudeCountCap));
 #endif
 		return;
 	}
@@ -5887,7 +5891,7 @@ void main(void)
 	}
 	// alpha carries this pixel's sample count (reprojection; the present
 	// pass's split ramp reads it too). Capped: it only ever feeds a weight.
-	outDirect = vec4(mix(prevD, freshD, a), a < 1.0 ? min(nPix + 1.0, 4096.0) : 1.0);
+	outDirect = vec4(mix(prevD, freshD, a), a < 1.0 ? min(nPix + 1.0, claudeCountCap) : 1.0);
 
 	// the denoiser's guide and moments (see historyGbuf / historyMom)
 	vec3 albNow = guideSet ? max(guideAlb, vec3(ALBEDO_FLOOR)) : vec3(1.0);
