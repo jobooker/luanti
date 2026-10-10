@@ -106,6 +106,8 @@ nohup ./bin/luantiserver --world worlds/gallery --port 30000 \
 sleep 8
 nohup ./bin/luanti --address 127.0.0.1 --port 30000 --name claude --go \
     > /tmp/claude_look/client.log 2>&1 &
+# a passive record of every picture restart while you play (stops with the client)
+nohup python3 util/claude_play_log.py $! > /dev/null 2>&1 &
 sleep 10
 
 echo
