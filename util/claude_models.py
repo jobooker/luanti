@@ -835,31 +835,42 @@ def leaf_sheets(name, path):
     This bakes exactly that and nothing more: each face a 1/16 m sheet,
     with a voxel wherever the texel is opaque (alpha >= 128) and a real gap
     wherever it is not. Until now every leaf block was a solid 1 m cube,
-    so a canopy let no light through at all. Colour: the cell's own (the
-    biome tint), as for tall grass; the texture is grayscale."""
+    so a canopy let no light through at all. Colour: each voxel is its
+    texel (2026-10-10, plants2; until then one palette entry, the tile's
+    mean), drawn as the texel's pattern times the cell's biome tint (see
+    TINT_PATTERN_MODELS). The sheets' shape is unchanged."""
     img = np.asarray(Image.open(path).convert("RGBA").resize(
         (N, N), Image.NEAREST), dtype=np.float32)
     m = img[..., 3] >= 128                      # [v, u], v down the tile
-    opaque = img[..., :3][m]
-    pal = [None, dict(rgb=[int(c) for c in opaque.mean(axis=0)], emit=0)]
+    pal = [None]
+    pindex = {}
+
+    def pi(vv, u):
+        rgb = tuple(int(c) for c in img[vv, u, :3])
+        if rgb not in pindex:
+            pal.append(dict(rgb=list(rgb), emit=0))
+            pindex[rgb] = len(pal) - 1
+        return pindex[rgb]
+
     v = np.zeros((N, N, N), dtype=np.uint16)
     up = m[::-1, :]                             # [y, u]: row 0 at the bottom
     for a in range(N):
         for b in range(N):
+            # up[b, u] is texel row N-1-b, column u
             # x faces: u along z, v up y
             if up[b, a]:
-                v[0, b, a] = 1
+                v[0, b, a] = pi(N - 1 - b, a)
             if up[b, N - 1 - a]:
-                v[N - 1, b, a] = 1
+                v[N - 1, b, a] = pi(N - 1 - b, N - 1 - a)
             # z faces: u along x
             if up[b, N - 1 - a]:
-                v[a, b, 0] = 1
+                v[a, b, 0] = pi(N - 1 - b, N - 1 - a)
             if up[b, a]:
-                v[a, b, N - 1] = 1
+                v[a, b, N - 1] = pi(N - 1 - b, a)
             # y faces: the tile laid flat, u along x, v along z
             if m[b, a]:
-                v[a, 0, b] = 1
-                v[a, N - 1, b] = 1
+                v[a, 0, b] = pi(b, a)
+                v[a, N - 1, b] = pi(b, a)
     return name, pal, v
 
 
@@ -873,9 +884,9 @@ def _flower(name, tex):
 
 # Models whose fine hits take the VOXEL's palette colour instead of the
 # cell's one colour (game.cpp reads "colour": "palette"). Flowers: their
-# texels are the colour. Tall grass and fern are NOT here: their tiles are
-# grayscale and take the biome tint through the cell colour, as the
-# rasteriser does.
+# texels are the colour. Tall grass, fern and leaves are NOT here: their
+# tiles are grayscale and take the biome tint through the cell colour, as
+# the rasteriser does -- they are TINT_PATTERN_MODELS below.
 # Models whose emitting voxels are FLAME (2026-10-05, real light units):
 # under claude_units they glow with a flame's measured luminance and
 # colour, not "albedo x the light level's scale". Every emissive model in
@@ -883,6 +894,21 @@ def _flower(name, tex):
 # the lit furnace's firebox.
 FLAME_MODELS = {"torch_baked", "lantern_floor", "campfire_lit",
                 "furnace_baked"}
+
+# TEXTURE TIMES TINT (2026-10-10, plants2; DECISIONS 0z point 4, John:
+# "the grass should have the real texture too"). Biome-tinted plants:
+# their tiles are grayscale and the tint arrives per node through the cell
+# colour (minimap colour x param2 palette), so until now each tuft and each
+# leaf block was ONE flat colour. "colour": "palette_tint" = a fine hit
+# takes the cell colour times the voxel's texel relative to the model's
+# mean (game.cpp normalises the palette so the mean LINEAR albedo over the
+# model's voxels is the flat colour's, exactly): the pattern comes from the
+# texture, the hue and the brightness stay what the grid says. The same
+# rule the plain cubes' face tiles follow (claudeAtlasFaceTiles: texel over
+# the cell's reference colour), so a grass block and a tuft on it agree.
+TINT_PATTERN_MODELS = {"plant_tallgrass", "plant_fern",
+                       "leaves_oak", "leaves_dark_oak", "leaves_jungle",
+                       "leaves_spruce", "leaves_acacia", "leaves_birch"}
 
 PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_oxeye_daisy", "flower_cornflower",
@@ -1082,6 +1108,8 @@ def main():
                     voxels=v.tolist())
         if name in PALETTE_COLOUR_MODELS:
             data["colour"] = "palette"
+        elif name in TINT_PATTERN_MODELS:
+            data["colour"] = "palette_tint"
         if name in FLAME_MODELS:
             data["light"] = "flame"
         jp = os.path.join(outdir, name + ".json")
