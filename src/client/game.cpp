@@ -2567,6 +2567,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_raw_frame_pixel{"claudeRawFrame"};
 	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
 	float m_tree_plant = 0.0f;
+	// claude_plant_sun (2026-10-10): a PLANTED DEFECT for the truth guard's
+	// own test -- the sun's radiance times this (1 = none). Set on the
+	// control arm only, a 2 % error the guard must call a disagreement.
+	float m_plant_sun = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tree_plant_pixel{"claudeTreePlant"};
 	// claude_tree_variant (2026-10-07): walk ablations for pricing
 	float m_tree_variant = 0.0f;
@@ -2679,6 +2683,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_raw_frame",
 		"claude_truth",
 		"claude_tree_plant",
+		"claude_plant_sun",
 		"claude_tree_variant",
 		"claude_tree_dirs",
 		"claude_bricks",
@@ -3398,6 +3403,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			g_claude_grid.moon_name = m_sky->getMoonTextureName();
 		}
 		m_sky_sun_dir_pixel.set(sun_dir, services);
+		sun_col *= m_plant_sun;   // 1 unless the guard's test plants an error
 		m_sky_sun_col_pixel.set(sun_col, services);
 		m_sky_sun_cos_pixel.set(&sun_cos, services);
 		m_sky_moon_dir_pixel.set(moon_dir, services);
@@ -3621,6 +3627,8 @@ public:
 		}
 		if (name == "claude_tree_plant")
 			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		if (name == "claude_plant_sun")
+			m_plant_sun = readAir("claude_plant_sun", 1.0f, 4.0f);
 		if (name == "claude_tree_variant")
 			m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		if (name == "claude_tree_dirs")
@@ -3754,6 +3762,7 @@ public:
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_truth = readAir("claude_truth", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		m_plant_sun = readAir("claude_plant_sun", 1.0f, 4.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
@@ -7855,6 +7864,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 					<< g_claude_grid.sky_zenith.Y << ","
 					<< g_claude_grid.sky_zenith.Z << "]"
 			<< ", \"still_frames\": " << g_claude_grid.still_frames
+			<< ", \"features\": " << g_claude_features
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
 			<< ", \"still_drift\": " << g_claude_grid.still_drift

@@ -309,33 +309,79 @@ def _capture(args, lab, world):
                 shutil.move(out[-1], keep)
             return idxs, stats, keep
 
+        def shoot_lin(pose, dials, frames, tag, seed, lin_dir):
+            """one shot at a truth pose, its linear accumulation dumped at the
+            shutter (claude_shoot: pinned to the exact float pose, the world's
+            own frozen time); returns (dump prefix or None, stats or output)"""
+            px, py, pz, pyaw, ppitch = pose
+            pre = os.path.join(lin_dir, "%s_s%d_n%d" % (tag, seed, frames))
+            cmd = ["python3", "util/claude_shoot.py", "--skip-seat", "--pin", "--play", "--keep-time",
+                   "--pos", repr(px), repr(py), repr(pz), "--yaw", repr(pyaw), "--pitch", repr(ppitch),
+                   "--frames", str(frames), "--name", "%s-%s-s%d" % (name, tag, seed), "--accum-dump", pre]
+            for kv in list(dials) + ["claude_rng_seed=%d" % seed]:
+                cmd += ["--dial", kv]
+            # long shots outlast the shooter's default wait (>= 20 fps assumed)
+            env = dict(os.environ, CLAUDE_SETTLE_MAX_S=str(int(120 + frames / 20)))
+            r = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, env=env)
+            out = r.stdout.strip().splitlines()
+            if r.returncode != 0 or not os.path.exists(pre + ".f32"):
+                return None, out[-3:] + r.stderr.strip().splitlines()[-2:]
+            try:
+                st = json.load(open(out[-1].replace(".png", ".capture.json")))["stats"]
+            except Exception as e:
+                return None, ["no capture stats: %s" % e]
+            return pre, st
+
         def control(ref_dir, idxs):
-            """guard 3: the scoreboard's control (the dumbest honest renderer)
-            held CONTROL_HOLD frames at the middle checked pose, at
-            CONTROL_SEEDS seeds (their disagreement is its own noise),
-            against the truth there. Its dials stay on the seat, so the seat
-            restarts before the next scenario."""
+            """guard 3 (2026-10-10: IN LINEAR RADIANCE, claude_truth_store
+            linear_control_verdict): at the middle checked pose, a fresh
+            truth-mode render and the scoreboard's control (the dumbest honest
+            renderer), two seeds each, compared as linear accumulations. The
+            control runs a pilot, then as many frames as its error target
+            needs. The control's dials stay on the seat, so the seat restarts
+            before the next scenario."""
             nonlocal_first[0] = True
             i = idxs[len(idxs) // 2]
             r = TS._rows(ref_dir)[i]
-            cp = os.path.join(d, "control-path.txt")
-            TS.write_check_path([TS.path_pose(tkeys, r["path_frame"])], cp)
-            dirs = []
-            for sd in TS.CONTROL_SEEDS:
-                out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
-                          sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
-                          ["--name", name + "-control%d" % sd, "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD,
-                           "--dial", "claude_rng_seed=%d" % sd])
-                if not out or not os.path.isdir(out[-1]):
-                    return False, {"why": "control render failed: %s" % (out[-3:],)}
-                if any("REFUSED" in l for l in out):
-                    return False, {"why": "control render refused: %s" % [l for l in out if "REFUSED" in l]}
-                keep = os.path.join(TS.ROOT, "checks", name, "%s-control%d" % (time.strftime("%Y%m%d-%H%M%S"), sd))
-                os.makedirs(os.path.dirname(keep), exist_ok=True)
-                shutil.move(out[-1], keep)
-                dirs.append(keep)
-            ok, info = TS.control_verdict(dirs, ref_dir, i)
-            info["dumps"] = dirs
+            pose = TS.path_pose(tkeys, r["path_frame"])
+            lin_dir = os.path.join(TS.ROOT, "checks", name, "%s-linear" % time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(lin_dir, exist_ok=True)
+            base = ["claude_auto_exposure=0", "claude_replay=0", "claude_path_hold=0"] + \
+                (["claude_exposure=%r" % expo] if expo else []) + list(args.dial or []) + \
+                [k + "=0" for k in arm_keys] + TS.TRUTH_DIALS
+            # the truth: every control key at the GAME'S default (they persist
+            # on the seat from the last control)
+            tdials = base + ["%s=%s" % (kv.split("=")[0], game_default(kv.split("=")[0][len("claude_"):]))
+                             for kv in TS.CONTROL_DIALS]
+            cdials = base + TS.CONTROL_DIALS + list(args.control_dial or [])
+            info = {"pose": list(pose), "frame": i, "dir": lin_dir, "control_dials": cdials[len(base):]}
+
+            def shots(dials, frames, tag):
+                got = [shoot_lin(pose, dials, frames, tag, sd, lin_dir) for sd in TS.CONTROL_SEEDS]
+                bad = [o for p, o in got if p is None]
+                if bad:
+                    raise RuntimeError("%s render failed: %s" % (tag, bad[0]))
+                feats = [o.get("features") or {} for _, o in got]
+                if not all(f.get("truth") == 1 and all(f.get(k, 1) == 0 for k in TS.FEATURE_OFF)
+                           for f in feats):
+                    raise RuntimeError("%s not in truth mode: %s" % (tag, feats))
+                return [TS.lin_load(p) for p, _ in got], [o.get("still_frames") for _, o in got]
+
+            try:
+                T, tf = shots(tdials, TS.TRUTH_LIN_FRAMES, "truthlin")
+                n = TS.CONTROL_PILOT
+                C, cf = shots(cdials, n, "control")
+                r0, se0 = TS.ratio_se(C, T)
+                info["pilot"] = {"frames": n, "ratio": r0, "se": se0}
+                n2 = TS.control_frames(se0, n)
+                if n2 > n:
+                    C, cf = shots(cdials, n2, "control")
+            except RuntimeError as e:
+                info["why"] = str(e)
+                return False, info
+            ok, v = TS.linear_control_verdict(C, T, expo, ref_dir, i)
+            info.update(v, frames=n2, still_frames={"truth": tf, "control": cf},
+                        control_truth_mode=True)
             return ok, info
 
         if args.truth_check_only:
@@ -413,7 +459,7 @@ def _capture(args, lab, world):
             print(name, json.dumps(meta["scenarios"][name]), flush=True)
             continue
         if man and not man.get("admit") and BUILD in man.get("verified_builds", []) \
-                and not args.recheck_truth:
+                and not args.recheck_truth and not args.control_check:
             # this build already passed the check against this truth: the same
             # build gives the same answer, so it is not asked again
             fb = TS.feature_problems(man["reference"])
@@ -436,6 +482,15 @@ def _capture(args, lab, world):
                     TS.admit(man, cinfo)
                 else:
                     ok, why = False, why + ["control disagrees: ratio %s tile %s" % (cinfo.get("ratio"), cinfo.get("tile_mad"))]
+            if ok and args.control_check and not man.get("admit"):
+                cok, cinfo = control(man["reference"], idxs)
+                truth["control_check"] = cinfo
+                TS.log({"event": "control-check", "key": key, "scenario": name, "pass": cok,
+                        "control": cinfo})
+                print("%-12s control check: %s  ratio %.4f +- %.4f (display space %.4f)  %s"
+                      % (name, "AGREES" if cok else "DISAGREES", cinfo.get("ratio", float("nan")),
+                         cinfo.get("se", float("nan")), cinfo.get("display_ratio", float("nan")),
+                         cinfo.get("why") or cinfo.get("agree_by") or ""), flush=True)
             truth.update(stats=stats, floor=man["floor"], why=why)
             TS.log({"event": ("admit" if man.get("admit") else "pass") if ok else "fail", "key": key,
                     "scenario": name, "why": why, "stats": stats, "floor": man["floor"]})
@@ -727,6 +782,10 @@ if __name__ == "__main__":
                     help="seed for --truth-check-only (default the check's own)")
     ap.add_argument("--truth-check-dial", action="append",
                     help="k=v on the --truth-check-only render: a deliberate rule change it must catch")
+    ap.add_argument("--control-check", action="store_true",
+                    help="run guard 3 (the control) against each STORED truth too; reports, stores nothing")
+    ap.add_argument("--control-dial", action="append",
+                    help="k=v on the CONTROL renders only: a planted error guard 3 must catch")
     a = ap.parse_args()
     if a.truth_check_seed is None:
         a.truth_check_seed = TS.CHECK_SEED
