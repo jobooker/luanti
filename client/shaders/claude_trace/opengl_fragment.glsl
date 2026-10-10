@@ -1431,8 +1431,9 @@ void hotLaw(float idx, vec3 cell, bool fine, vec3 sv, inout vec3 alb,
 		alb = vec3(LAVA_RHO);
 		le = LAVA_RGB * LAVA_L;
 	} else if (fine && modelFlame(cell)) {
-		le = modelVoxelEmitScale(cell, sv) > 0.0
-				? FLAME_RGB * FLAME_L : vec3(0.0);
+		// slot 0 of a flame model is its flux scale (1 unless the model
+		// file carries "flux_scale"; game.cpp), 0 on non-emitting voxels
+		le = FLAME_RGB * FLAME_L * modelVoxelEmitScale(cell, sv);
 	}
 }
 
