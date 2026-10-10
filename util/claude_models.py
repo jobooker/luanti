@@ -1104,8 +1104,14 @@ def _flower(name, tex):
 # ours are 1/16 m): the night torch room measured 0.0072 mean against the old
 # slab torch's 0.0120 (/tmp/torch_nee_test2.log, 2048 frames, exposure 8).
 # John chose (b): "the new torch with its flame turned up so rooms get
-# today's light". 0.0120 / 0.0072 = 1.67; the engine multiplies the model's
-# flame scale K by this (game.cpp, flux_scale), checked by re-rendering.
+# today's light". 0.0120 / 0.0072 = 1.67; the engine multiplies the flame's
+# radiance by this (game.cpp slot 0 -> claude_trace hotLaw).
+# Checked by re-rendering (same pose, 2048 frames): room mean 0.0127 vs
+# 0.0120 (+6 %); the third nearest the torch 0.0256 vs 0.0177 -- the flame
+# sits higher on the real mesh, so the wall above gets more and the floor
+# less. One scale cannot match both; it matches the room.
+# TUNED: flame output vs the old slab torch | learn by: a linear (not
+# display-space) room-flux match, or John's eye on a torch-lit room
 FLUX_SCALE = {"torch_baked": 1.67, "torch_wall_baked": 1.67}
 
 FLAME_MODELS = {"torch_baked", "torch_wall_baked", "lantern_floor",

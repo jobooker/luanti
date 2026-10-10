@@ -5417,13 +5417,22 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 						&& pal[pi]["emit"].asInt() > 0)
 					emit_f += ex;
 			}
-			float K = emit_f > 0 ? (float)all_f / (float)emit_f : 1.0f;
+			const bool flame_model = md.isMember("light")
+					&& md["light"].asString() == "flame";
+			// A FLAME model's voxels take the flame's measured radiance
+			// (claude_trace hotLaw: FLAME_RGB * FLAME_L), so the K ratio
+			// below never reached them -- the shader only asked "K > 0?".
+			// For those models slot 0 carries the flux scale alone.
+			float K = flame_model ? 1.0f
+					: emit_f > 0 ? (float)all_f / (float)emit_f : 1.0f;
 			// flux_scale (2026-10-10): a model file may scale its flame's
 			// total output. The torches carry one: built from the game's mesh,
 			// the head shades the wall and a torch-lit room got 60 % of the
 			// old torch's light; John chose "the new torch with its flame
 			// turned up so rooms get today's light" (util/claude_models.py
-			// FLUX_SCALE, measured).
+			// FLUX_SCALE, measured). First wiring multiplied K, which the
+			// flame path ignores: the night room read 0.0072 with and without
+			// it. Now hotLaw multiplies the flame's radiance by slot 0.
 			if (md.isMember("flux_scale"))
 				K *= std::max(0.0f, md["flux_scale"].asFloat());
 			u32 k16 = (u32)std::clamp(K * 256.0f + 0.5f, 0.0f, 65535.0f);
