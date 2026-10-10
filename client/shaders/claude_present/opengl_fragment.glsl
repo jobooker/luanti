@@ -17,6 +17,7 @@ uniform sampler2D depthmap;
 // .r = the factor to multiply by, .g = 1 once written
 uniform sampler2D autoExposure;
 uniform float claudeAutoExposure;
+uniform float claudePresentGuide;   // 0 = plain bilinear upsample (instrument)
 // THE EYE (2026-10-05), both display only, both need real units:
 // claude_white_balance: CAT16 (Li et al. 2017) chromatic adaptation from
 //   the adapted white (claude_exposure texel 1) to the display white, at
@@ -63,6 +64,15 @@ uniform vec2 texelSize0;       // full-res texel (from merged)
 uniform vec2 volumeDepthRange; // camera near/far, world BS units
 
 CENTROID_ VARYING_ mediump vec2 varTexCoord;
+
+// raster depth buffer -> distance in nodes (4096 = nothing drawn: the sky)
+float rasterNodes(float d, float zn, float zf)
+{
+	if (d >= 0.9999)
+		return 4096.0;
+	float ez = 2.0 * zn * zf / (zf + zn - (2.0 * d - 1.0) * (zf - zn));
+	return min(ez / 10.0, 4090.0); // BS = 10
+}
 
 void main(void)
 {
@@ -112,14 +122,9 @@ void main(void)
 	// upsample's GUIDE, which is a different job. An empty depth leaves
 	// the guide at 4096, which is exactly where a traced miss packs its
 	// own distance, so a sky pixel's four taps agree perfectly.
-	float d = texture2D(depthmap, uv).r;
 	float zn = volumeDepthRange.x;
 	float zf = volumeDepthRange.y;
-	float guide = 4096.0;
-	if (d < 0.9999) {
-		float ez = 2.0 * zn * zf / (zf + zn - (2.0 * d - 1.0) * (zf - zn));
-		guide = min(ez / 10.0, 4090.0); // BS = 10
-	}
+	float guide = rasterNodes(texture2D(depthmap, uv).r, zn, zf);
 
 	// 4 nearest half-res texels, bilinear x depth-agreement weights
 	vec2 ht = texelSize0 * 2.0;
@@ -137,13 +142,36 @@ void main(void)
 		// per-node penalty would zero every tap. 0.8%, not 2% — the
 		// looser band blended across far cell edges and BLURRED the
 		// whole cascade field ("softwarey")
-		float dw = exp(-abs(s.a * 4096.0 - guide)
+		// THE TAP'S DISTANCE FROM THE RASTER DEPTH AT ITS CENTRE, not from
+		// s.a (2026-10-09, John: far blocks "very noisy/shimmery"). s.a is the
+		// CURRENT frame's primary distance, from a ray jittered inside its
+		// pixel, so at every edge it flips between the near and the far
+		// surface frame to frame (measured: 19-29 % of the far and middle
+		// pixels changed by over half a node between two still moments,
+		// while their light changed by under 1 %), and this weight flipped
+		// with it: the shimmer. The raster depth holds still. The light in
+		// s.rgb is the accumulated average, as before.
+		float tapd = claudePresentGuide > 1.5 ? s.a * 4096.0
+				: rasterNodes(texture2D(depthmap, base + o * ht).r, zn, zf);
+		float dw = exp(-abs(tapd - guide)
 				/ max(1.7, 0.008 * guide));
+		if (claudePresentGuide < 0.5)
+			dw = 1.0;
 		float w = bw * dw + 1e-5;
 		sum += s.rgb * w;
 		wsum += w;
 	}
 	vec3 c = sum / wsum;
+	// VIEW 41 (2026-10-09, the far-shimmer bisection): the upsample GUIDE
+	// itself, the raster depth in nodes, packed for an 8-bit dump: r = guide
+	// in 16-node steps, g = the 16-node remainder in 1/16 steps, b = the
+	// remaining fraction. Two still frames should be identical.
+	if (claudeView > 40.5 && claudeView < 41.5) {
+		float gq = floor(guide * 16.0 + 0.5) / 16.0;
+		gl_FragColor = vec4(floor(gq / 16.0) / 255.0, floor(mod(gq, 16.0)) / 16.0,
+				fract(gq), 1.0);
+		return;
+	}
 	// THE SPLIT now happens in claude_denoise's last pass, per trace pixel.
 
 	// DIAGNOSTIC VIEWS (claude_view 1-5) present LINEARLY. Their values

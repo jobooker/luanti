@@ -106,16 +106,20 @@ private:
 	std::vector<std::string> names;
 };
 
+// the per-pixel buffer next to the accumulation (rgb = direct light, a =
+// the pixel's own sample count): claude_direct_dump, same protocol
+extern std::string g_claude_direct_dump;
 class ClaudeAccumReadback : public TrivialRenderStep
 {
 public:
-	ClaudeAccumReadback(TextureBuffer *_buffer, u8 _index) :
-			buffer(_buffer), index(_index) {};
+	ClaudeAccumReadback(TextureBuffer *_buffer, u8 _index, std::string *_req = &g_claude_accum_dump) :
+			buffer(_buffer), index(_index), req(_req) {};
 	void run(PipelineContext &context) override;
 
 private:
 	TextureBuffer *buffer;
 	u8 index;
+	std::string *req;
 };
 
 RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep, v2f scale, Client *client);

@@ -2333,6 +2333,13 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	float m_adapt_darker = 2.5f;
 	float m_frame_dt = 0.016f;
 	CachedPixelShaderSetting<float, 1, false> m_auto_exposure_pixel{"claudeAutoExposure"};
+	// claude_present_guide (2026-10-09, the far-shimmer bisection): 1 (default)
+	// = the upsample weights its 4 taps by the RASTER depth at each tap against
+	// the raster depth at the pixel (steady); 2 = the old weighting by each
+	// tap's traced distance (the current frame's jittered ray: it shimmered);
+	// 0 = plain bilinear
+	float m_present_guide = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_present_guide_pixel{"claudePresentGuide"};
 	CachedPixelShaderSetting<float, 1, false> m_adapt_brighter_pixel{"claudeAdaptBrighter"};
 	CachedPixelShaderSetting<float, 1, false> m_adapt_darker_pixel{"claudeAdaptDarker"};
 	CachedPixelShaderSetting<float, 1, false> m_frame_dt_pixel{"claudeFrameDt"};
@@ -2644,6 +2651,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_split",
 		"claude_exposure",
 		"claude_auto_exposure",
+		"claude_present_guide",
 		"claude_torch_nee",
 		"claude_area_nee",
 		"claude_guide",
@@ -3061,7 +3069,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	{
 		if (!g_settings->exists("claude_view"))
 			return 0.0f;
-		return g_settings->getFloat("claude_view", 0.0f, 39.0f);
+		return g_settings->getFloat("claude_view", 0.0f, 41.0f);
 	}
 
 	// claude_trace path-depth cap, 0..24. 24 (default) = full transport.
@@ -3616,6 +3624,8 @@ public:
 			m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		if (name == "claude_auto_exposure")
 			m_auto_exposure = readAir("claude_auto_exposure", 1.0f, 1.0f);
+		if (name == "claude_present_guide")
+			m_present_guide = readAir("claude_present_guide", 1.0f, 2.0f);
 		if (name == "claude_adapt_brighter")
 			m_adapt_brighter = readAir("claude_adapt_brighter", 0.5f, 600.0f);
 		if (name == "claude_adapt_darker")
@@ -4143,6 +4153,7 @@ public:
 				m_still_pixel.set(&m_still, services);
 				m_exposure_pixel.set(&m_exposure, services);
 				m_auto_exposure_pixel.set(&m_auto_exposure, services);
+				m_present_guide_pixel.set(&m_present_guide, services);
 				m_white_balance_pixel.set(&m_white_balance, services);
 				m_leaf_transmit_pixel.set(&m_leaf_transmit, services);
 				m_model_far_pixel.set(&m_model_far, services);
@@ -4812,13 +4823,58 @@ static bool claudeFaceTileRGB(Client *client, const ContentFeatures &f,
 	return hb || ho;
 }
 
+static bool claudeReliefCandidate(const ContentFeatures &f);
+static int claudeReliefDepth();
+static bool claudeReliefFlat();
+static float claudeReliefFrac();
 static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
 		video::SColor ref, video::SColor tint)
 {
 	u32 *dst = (u32 *)g_claude_grid.atlas.data();
+	// A CARVED TEXEL LOSES ITS PAINTED SHADOW (2026-10-09, John: "if we do
+	// darkest furrows sink, they shouldn't sink AND stay dark ... they are
+	// dark in texture to simulate being deep, but we're making them deep").
+	// The texels claude_relief sinks (the same rank rule as
+	// claudeReliefMapId) are lifted to the mean luminance of the texels that
+	// stay up, colour kept: the groove's geometry does the darkening. The
+	// baked models do the same (claude_models.py _delight).
+	// claude_relief_lift (default 1; read when the tile is built, i.e. at
+	// startup): 0 = keep the painted shadow (the comparison arm)
+	const bool lift = claudeReliefCandidate(f) && claudeReliefDepth() > 0 && !claudeReliefFlat()
+			&& !(g_settings->exists("claude_relief_lift")
+				&& g_settings->getFloat("claude_relief_lift", 0.0f, 1.0f) < 0.5f);
+	const double frac = claudeReliefFrac();
 	for (int face = 0; face < 3; face++) {
 		double rgb[256][3];
 		claudeFaceTileRGB(client, f, face, ref, tint, rgb);
+		if (lift) {
+			double lum[256], mean = 0.0, var = 0.0;
+			for (int k = 0; k < 256; k++) {
+				lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1] + 0.0722 * rgb[k][2];
+				mean += lum[k] / 256.0;
+			}
+			for (int k = 0; k < 256; k++)
+				var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
+			bool sunk[256] = {};
+			double up = 0.0;
+			int nup = 0;
+			if (std::sqrt(var) >= 6.0) {   // claudeReliefMapId's FLAT_STD
+				for (int k = 0; k < 256; k++) {
+					int atmost = 0;
+					for (int j = 0; j < 256; j++)
+						atmost += lum[j] <= lum[k];
+					sunk[k] = atmost / 256.0 <= frac;
+					if (!sunk[k]) { up += lum[k]; nup++; }
+				}
+			}
+			if (nup > 0) {
+				up /= nup;
+				for (int k = 0; k < 256; k++)
+					if (sunk[k] && lum[k] > 1e-3)
+						for (int ch = 0; ch < 3; ch++)
+							rgb[k][ch] = std::min(255.0, rgb[k][ch] * up / lum[k]);
+			}
+		}
 		int ax = (mid % 16) * 16, ay = face * 256 + (mid / 16) * 16;
 		for (int k = 0; k < 256; k++) {
 			const double *c = rgb[k];
@@ -5392,8 +5448,11 @@ static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, Map &map,
 // geom_moved), because every carved cell's shape id changes with it.
 static int claudeReliefDepth()
 {
+	// default 1 since 2026-10-09: John picked the ground version where the
+	// bright 35 % stand proud (1/16 deep, claude_relief_frac 0.65); soil only,
+	// logs keep their carved model (claude_relief_trees)
 	if (!g_settings->exists("claude_relief"))
-		return 0;
+		return 1;
 	return (int)std::lround(g_settings->getFloat("claude_relief", 0.0f, 4.0f));
 }
 
@@ -5415,14 +5474,17 @@ static bool claudeReliefFlat()
 // carved only when claude_relief > 0.
 static bool claudeOakModel()
 {
-	return g_settings->exists("claude_oak_model")
-			&& g_settings->getFloat("claude_oak_model", 0.0f, 1.0f) >= 0.5f;
+	// default 1 since 2026-10-09: the carved oak model in its own colours,
+	// darkest furrows 2/16 (John's pick; util/claude_models.py log_oak_baked)
+	if (!g_settings->exists("claude_oak_model"))
+		return true;
+	return g_settings->getFloat("claude_oak_model", 0.0f, 1.0f) >= 0.5f;
 }
 
 static float claudeReliefFrac()
 {
 	if (!g_settings->exists("claude_relief_frac"))
-		return 0.35f;
+		return 0.65f;   // John's pick 2026-10-09: the bright 35 % stand proud
 	return g_settings->getFloat("claude_relief_frac", 0.0f, 1.0f);
 }
 
@@ -5430,10 +5492,18 @@ static float claudeReliefFrac()
 // plain opaque cubes.
 // TUNED: the set of carved nodes (groups tree, dirt) | learn by: John's eye
 // on the side-by-sides, material by material
+static bool claudeReliefTrees()
+{
+	// claude_relief_trees (2026-10-09): 1 = relief carves logs too. Default 0:
+	// logs have their own carved model (claude_oak_model), and soil and logs
+	// were picked separately
+	return g_settings->exists("claude_relief_trees")
+			&& g_settings->getFloat("claude_relief_trees", 0.0f, 1.0f) >= 0.5f;
+}
 static bool claudeReliefCandidate(const ContentFeatures &f)
 {
 	return f.drawtype == NDT_NORMAL && f.light_source == 0 && !f.isLiquid()
-			&& (f.getGroup("tree") > 0 || f.getGroup("dirt") > 0);
+			&& ((claudeReliefTrees() && f.getGroup("tree") > 0) || f.getGroup("dirt") > 0);
 }
 
 // One content's groove depths: per face tile (0 top, 1 bottom, 2 side, the
@@ -7226,12 +7296,26 @@ static void claudeUpdateAccum(Client *client)
 		g_claude_grid.reset_why[3]++;
 	} else if (moved > 0.05f || turned > 1e-4f) {
 		{
-			// 2026-10-07 instrument: what "moved" a pinned camera
+			// 2026-10-07 instrument: what "moved" a pinned camera. 2026-10-09
+			// (John: underground "the light just regenerates as if i moved
+			// even if i haven't"): the first 40 only, it missed every restart
+			// after login. Now: every restart that hits a picture already
+			// built up (>= 30 still frames), at most one line a second, with
+			// how far it moved and turned (engine units: 10 per block) and
+			// which threshold tripped.
 			static int logged = 0;
-			if (logged < 40) {
+			static u64 last_us = 0;
+			u64 now_us = porting::getTimeUs();
+			bool early = logged < 40;
+			bool built = g_claude_grid.still_frames >= 30.0f && now_us - last_us > 1000000;
+			if (early || built) {
 				logged++;
+				if (built)
+					last_us = now_us;
 				actionstream << "[claude_moved] moved=" << moved << " turned=" << turned
-						<< " pos=(" << p.X << "," << p.Y << "," << p.Z << ") dir=("
+						<< " (" << (moved > 0.05f ? "position" : "") << (moved > 0.05f && turned > 1e-4f ? "+" : "")
+						<< (turned > 1e-4f ? "direction" : "") << ") after " << g_claude_grid.still_frames
+						<< " still frames pos=(" << p.X << "," << p.Y << "," << p.Z << ") dir=("
 						<< d.X << "," << d.Y << "," << d.Z << ") frame=" << g_claude_frame_no
 						<< std::endl;
 			}
@@ -7893,6 +7977,10 @@ static bool claudeApplyPatchFile(const std::string &path,
 			}
 			actionstream << "[claude_dump_at] pending " << g_claude_dump_pending.size()
 					<< " depths -> " << g_claude_dump_pending_prefix << std::endl;
+			continue;
+		}
+		if (name == "claude_direct_dump") {
+			g_claude_direct_dump = patch.get(name);
 			continue;
 		}
 		if (name == "claude_accum_dump") {

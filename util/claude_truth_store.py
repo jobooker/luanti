@@ -111,7 +111,7 @@ DIAL_CLASS = {
     "claude_air_g": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
     "claude_flame": "physics", "claude_leaf_transmit": "physics",
     # the eye: applied identically to the truth and to play
-    "claude_exposure": "eye", "claude_auto_exposure": "eye", "claude_white_balance": "eye",
+    "claude_exposure": "eye", "claude_auto_exposure": "eye", "claude_present_guide": "eye", "claude_white_balance": "eye",
     "claude_night_vision": "eye", "claude_adapt_colour": "eye", "claude_adapt_brighter": "eye",
     "claude_adapt_darker": "eye",
     # debug: instrument views, planted defects, test skies

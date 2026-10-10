@@ -486,6 +486,9 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_ACCUM_1, TEXTURE_ACCUM_2);
 	// after the swap, ACCUM_1 holds this frame's accumulated radiance
 	pipeline->addStep<ClaudeAccumReadback>(buffer, TEXTURE_ACCUM_1);
+	// the sample counts (direct buffer alpha), 2026-10-09: is a still,
+	// converged picture really converged at its edges and far away?
+	pipeline->addStep<ClaudeAccumReadback>(buffer, TEXTURE_DIRECT_1, &g_claude_direct_dump);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_DIRECT_1, TEXTURE_DIRECT_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_GBUF_1, TEXTURE_GBUF_2);
 	pipeline->addStep<SwapTexturesStep>(buffer, TEXTURE_MOM_1, TEXTURE_MOM_2);
@@ -500,12 +503,13 @@ RenderStep *addPostProcessing(RenderPipeline *pipeline, RenderStep *previousStep
 }
 
 std::string g_claude_accum_dump;
+std::string g_claude_direct_dump;
 void ClaudeAccumReadback::run(PipelineContext &context)
 {
-	if (g_claude_accum_dump.empty())
+	if (req->empty())
 		return;
-	const std::string path = g_claude_accum_dump;
-	g_claude_accum_dump.clear();
+	const std::string path = *req;
+	req->clear();
 	video::ITexture *tex = buffer->getTexture(index);
 	if (!tex) {
 		warningstream << "[claude_accum_dump] no accumulation texture" << std::endl;

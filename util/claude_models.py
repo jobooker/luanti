@@ -536,7 +536,12 @@ def model_log_oak():
                       "default_tree_top.png"),
              bottom=_mcl("ITEMS", "mcl_core", "textures",
                          "default_tree_top.png")),
-        maxdepth=2 if var == "d2" else 1, albedo=ALBEDO_TARGET["log"],
+        # no albedo target (2026-10-09): ALBEDO_TARGET["log"] = 0.30 cites no
+        # source and made the bark pale; bark measures among the darker barks
+        # in visible light (Juola et al. 2022). The texture's own mean, as
+        # the plain cube and the ground relief use: only the painted groove
+        # shadow is removed (_delight)
+        maxdepth=2 if var == "d2" else 1, albedo=None,
         carve_faces=("left", "right", "back", "front"))
 
 
