@@ -44,6 +44,12 @@ def start_seat():
     claude_gpu_lock.hold("start_seat")
     ci.stop_seat()
     ci.pin_conf()
+    # the bridge mod is assembled from util/ fragments; only claude_ci did
+    # it, so a seat started here ran the last assembled copy (2026-10-10:
+    # after the demo-mode merge, playtests failed "unknown op: freeze")
+    ok, info = ci.assemble_bridge()
+    if not ok:
+        sys.exit("bridge assembly failed: %s" % info.get("stderr"))
     for tag, cmd, wait in (("server", ci.SERVER_CMD, ci.SEAT_BOOT_WAIT),
                            ("client", ci.HEADLESS_WRAP + ci.CLIENT_CMD, 0)):
         subprocess.Popen(cmd, cwd=ci.REPO,
