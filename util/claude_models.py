@@ -247,6 +247,11 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
         return pindex[key]
 
     v = np.full((N, N, N), pi(fill), dtype=np.uint16)
+    # what each carved cell would show if the bake floor plugs it: the
+    # texel's PAINTED colour (see PAINTED_PLUG_MODELS); last face wins, as
+    # for the written voxels
+    plug_on = np.zeros((N, N, N), dtype=bool)
+    plug_rgb = np.zeros((N, N, N, 3), dtype=np.float32)
     # 'side' shorthand expands to the four lateral faces
     faces = {}
     for face, img in imgs.items():
@@ -335,9 +340,13 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                 for dd in range(d):
                     x, y, z = _face_map(face, u, vv, dd)
                     v[z, y, x] = 0
+                    plug_on[z, y, x] = not is_fire
+                    plug_rgb[z, y, x] = img[vv, u]
                 x, y, z = _face_map(face, u, vv, d)
                 v[z, y, x] = pi((int(r), int(g), int(b)),
                                 emit_level if is_fire else 0)
+                plug_on[z, y, x] = False
+    PLUG_PAINT[name] = (plug_on, plug_rgb)
     return name, pal, v
 
 
@@ -687,7 +696,29 @@ def shell_count(n=N, depth=SHELL):
 # keeps a 1-2 texel rim instead of 3, so its grooves get 14x14 or 12x12 of
 # each face instead of 10x10 (the 3-texel frame is what boxed every log face
 # into a panel). Opt-in per model: changing it changes that block's look.
-OWN_SHELL_MODELS = {"log_oak_baked"}
+OWN_SHELL_MODELS = {"log_oak_baked",
+                    # 2026-10-09 (blockcolour): the same frame on every
+                    # texture bake carved shallower than 3 -- plank board
+                    # seams stopped 3 texels short of each block edge, so
+                    # a wall read as a grid of framed glyph tiles. Furnace
+                    # carves 3 deep: no change.
+                    "planks_oak_baked", "planks_spruce_baked",
+                    "cobble_baked", "crafting_baked", "bookshelf_baked"}
+
+# PLUG COLOUR = THE TEXEL'S PAINTED COLOUR (2026-10-09, blockcolour). A cell
+# the bake floor plugs was a carved texel: _delight had lifted its colour
+# because geometry was going to shadow it, and then the plug made it flat
+# again and painted it the INTERIOR FILL (the node's mean colour). Once a
+# model's fine hits show its own colours ("colour": "palette"), that is a
+# flat mean-coloured patch wherever a groove reaches a block edge (the
+# bark's seam bands were the same cause). A flat texel should look as the
+# artist painted it, so a plug takes the face's ORIGINAL texel colour (not
+# delit: there is no recess left to shadow it). Opt-in per model; the shape
+# (and so the no-leak proof) is untouched, only the plug's palette entry.
+PAINTED_PLUG_MODELS = {"planks_oak_baked", "planks_spruce_baked",
+                       "cobble_baked", "crafting_baked", "bookshelf_baked",
+                       "furnace_baked"}
+PLUG_PAINT = {}     # name -> (mask, rgb), filled by bake_from_tiles
 
 
 def carve_depth(v):
@@ -718,6 +749,16 @@ def enforce_opaque(name, pal, v):
     plugs = [(int(x), int(y), int(z))
              for z, y, x in np.argwhere(bad)]
     v[bad] = mat
+    if name in PAINTED_PLUG_MODELS and name in PLUG_PAINT:
+        on, rgb = PLUG_PAINT[name]
+        index = {(tuple(p["rgb"]), p["emit"]): i
+                 for i, p in enumerate(pal) if p}
+        for z, y, x in np.argwhere(bad & on):
+            key = (tuple(int(c) for c in rgb[z, y, x]), 0)
+            if key not in index:
+                pal.append(dict(rgb=list(key[0]), emit=0))
+                index[key] = len(pal) - 1
+            v[z, y, x] = index[key]
     after = through_lines(v)
     return v, dict(before=len(before), after=len(after), plugs=plugs,
                    material=mat, depth=depth)
