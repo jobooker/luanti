@@ -62,6 +62,7 @@ OUT = os.path.join(REPO, "screenshots", "playtest")
 import claude_truth_store as TS
 
 WALK = 4.0          # m/s (Luanti's walking speed)
+SETTLE_S = 5.0      # TUNED: standing still at the start of every replay, before the scenario's own moves | learn by: the start pose's error vs truth at the first move
 TURN = 90.0         # deg/s
 
 # name: start pose (x, y, z, yaw, pitch), then moves: ("hold", s) |
@@ -120,8 +121,22 @@ def run(cmd):
     return subprocess.run(cmd, cwd=REPO, capture_output=True, text=True).stdout.strip().splitlines()
 
 
+def game_default(member):
+    """a dial's default as the engine source declares it (game.cpp
+    `float m_<member> = <v>f;`); refuses rather than guess"""
+    src = open(os.path.join(REPO, "src", "client", "game.cpp")).read()
+    m = re.search(r"float m_%s = ([0-9.]+)f;" % re.escape(member), src)
+    if not m:
+        sys.exit("REFUSED: no default for m_%s in game.cpp" % member)
+    return m.group(1)
+
+
 def capture(args):
     import claude_lab as lab
+    global PLAY_DENOISE, BUILD
+    BUILD = TS.build_hash(REPO)
+    PLAY_DENOISE = ["--dial", "claude_denoise=1",
+                    "--dial", "claude_denoise_learned=" + game_default("denoise_learned")]
     run_dir = os.path.join(OUT, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(run_dir)
     keys = scrub_conf_like_look()
@@ -134,7 +149,10 @@ def capture(args):
     meta = {"deferred_to_game_defaults": keys, "scenarios": {},
             "arms": {a: kvs for a, kvs in arms}, "dials_all_runs": args.dial or []}
     first = True
+    nonlocal_first = [True]
     for name, (start, moves) in SCENARIOS.items():
+        first = first or nonlocal_first[0]
+        nonlocal_first[0] = False
         if args.only and name not in args.only:
             continue
         d = os.path.join(run_dir, name)
@@ -157,27 +175,53 @@ def capture(args):
         st = lab.read_stats() or {}
         fps = max(2.0, float(st.get("fps") or 30.0))
         expo = (st.get("auto_exposure") or [None])[0]
-        # 2. the path in seconds at that fps, rounded to a 10 % step so runs
-        # at about the same speed share a path, and so a stored truth
-        fps_path = TS.quantize_fps(fps)
-        pk = path_frames(start, moves, fps_path)
+        # 2. the path in seconds at that fps -- or, when a truth is stored for
+        # these inputs at an fps within 10 % of it, THAT path (and its truth)
+        # (the hold is not an input: a truth is held as long as its arms need)
+        spec_base = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
+                     "replay": 1, "settle_s": SETTLE_S,
+                     "scale": 2, "all_run_dials": sorted(args.dial or []),
+                     "truth_def": TS.TRUTH_DEF}
+        man = None if args.fresh_truth else TS.find(spec_base, fps)
+        if man:
+            fps_path = man["spec"]["fps_path"]
+            pk = [tuple(k) for k in man["spec"]["keys"]]
+        else:
+            fps_path = args.path_fps or round(fps, 3)
+            # REPLAY: the path starts with SETTLE_S of standing still, made
+            # inside the replay (the replay restarts the picture at path start,
+            # so the old 6 s park no longer carries over)
+            pk = path_frames(start, [("hold", SETTLE_S)] + list(moves), fps_path)
         pf = os.path.join(d, "path.txt")
         with open(pf, "w") as f:
             for k in pk:
-                f.write("%d %r %r %r %r %r\n" % k)
-        # the stored truth for exactly these inputs, if any (its exposure is
-        # then this run's: the truth's pixels were made with it)
-        spec = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
-                "keys": [list(k) for k in pk], "hold": args.hold, "scale": 2,
-                "all_run_dials": sorted(args.dial or [])}
+                f.write("%d %r %r %r %r %r\n" % tuple(k))
+        spec = dict(spec_base, fps_path=fps_path, keys=[list(k) for k in pk])
         key = TS.key_for(spec)
-        man = None if args.fresh_truth else TS.lookup(key)
+        # THE TRUTH IS A HANDFUL OF POSES (TRUTH_DEF 5, John 2026-10-09: "we
+        # don't need the whole video"): the start, the end and TS.TRUTH_MID
+        # poses through the move, as their own short path (tkeys). Flicker is
+        # measured on the real-time video alone, so it needs no truth.
+        if man and man.get("truth_keys"):
+            tkeys = [tuple(k) for k in man["truth_keys"]]
+            tframes = man["truth_frames"]
+        else:
+            tframes = TS.truth_frames(pk)
+            tkeys = [(j,) + TS.path_pose(pk, f) for j, f in enumerate(tframes)]
+        tpf = os.path.join(d, "truth-path.txt")
+        TS.write_check_path([k[1:] for k in tkeys], tpf)
         expo_measured = expo
         if man:
             expo = man["exposure"]
         # every run at seed 0 unless it says otherwise (the truth check's own
         # seed would persist on the seat into the next run)
-        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0"] + \
+        # ...and the denoiser at the GAME'S defaults: the truth runs turn it
+        # off and dials persist on the seat into the next scenario
+        # REPLAY (game.cpp claude_replay): loading the path restarts the frame
+        # counter, the picture and the eye; the eye adapts on the path's own step
+        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0", "--dial", "claude_truth=0",
+                 "--dial", "claude_replay=1", "--dial", "claude_replay_dt=%r" % (1.0 / fps_path)] + \
+            PLAY_DENOISE + \
             (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
         # ARMS (2026-10-09): every arm plays the SAME path and is scored against
@@ -188,29 +232,60 @@ def capture(args):
         # its real-time run only; the truth runs get every arm key at 0 (the
         # truth must not see a display cache, e.g. claude_ledger).
         rt_off = sum([["--dial", k + "=0"] for k in arm_keys], [])
+        # the truth runs (and their checks): no denoiser (TRUTH_DEF 3)
+        TRUTH_ON = sum([["--dial", kv] for kv in TS.TRUTH_DIALS], [])
 
         def truth_check(ref_dir, tag, seed=TS.CHECK_SEED, dials=()):
             """a few poses of the stored truth, re-rendered at another seed
             (claude_truth_store.py); returns (frames checked, stats or None)"""
-            idxs, poses = TS.check_plan(ref_dir, pk)
+            idxs, poses = TS.check_plan(ref_dir, tkeys)
             cp = os.path.join(d, "check-path-%s.txt" % tag)
             TS.write_check_path(poses, cp)
-            out = run([c if c != pf else cp for c in common] + rt_off +
-                      ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % args.hold,
+            out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
+                      ["--name", name + "-check-" + tag, "--dial", "claude_path_hold=%d" % TS.truth_hold(ref_dir, args.hold),
                        "--dial", "claude_rng_seed=%d" % seed] + sum([["--dial", kv] for kv in dials], []))
             stats = TS.compare(out[-1], ref_dir, idxs) if out and os.path.isdir(out[-1]) else None
+            keep = None
             if out and os.path.isdir(out[-1]) and out[-1].startswith(os.path.join(REPO, "screenshots", "dump")):
-                shutil.rmtree(out[-1])
-            return idxs, stats
+                # kept beside the store (16 frames, ~32 MB): two checks that
+                # disagree are an instrument to look at, not a number
+                keep = os.path.join(TS.ROOT, "checks", name, "%s-%s" % (time.strftime("%Y%m%d-%H%M%S"), tag))
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
+                shutil.move(out[-1], keep)
+            return idxs, stats, keep
+
+        def control(ref_dir, idxs):
+            """guard 3: the scoreboard's control (the dumbest honest renderer)
+            held CONTROL_HOLD frames at the middle checked pose, against the
+            truth there. Its dials stay on the seat, so the seat restarts
+            before the next scenario."""
+            nonlocal_first[0] = True
+            i = idxs[len(idxs) // 2]
+            r = TS._rows(ref_dir)[i]
+            cp = os.path.join(d, "control-path.txt")
+            TS.write_check_path([TS.path_pose(tkeys, r["path_frame"])], cp)
+            out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
+                      sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
+                      ["--name", name + "-control", "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD])
+            if not out or not os.path.isdir(out[-1]):
+                return False, {"why": "control render failed: %s" % (out[-3:],)}
+            if any("REFUSED" in l for l in out):
+                return False, {"why": "control render refused: %s" % [l for l in out if "REFUSED" in l]}
+            ok, info = TS.control_verdict(out[-1], ref_dir, i)
+            keep = os.path.join(TS.ROOT, "checks", name, "%s-control" % time.strftime("%Y%m%d-%H%M%S"))
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            shutil.move(out[-1], keep)
+            info["dump"] = keep
+            return ok, info
 
         if args.truth_check_only:
             # the check's own test: an unchanged engine at another seed must
             # pass, a change to the light rules (--truth-check-dial) must fail
             if not man:
-                print("%-12s no stored truth for key %s" % (name, key), flush=True)
+                print("%-12s no stored truth for key %s (measured %.1f fps)" % (name, key, fps), flush=True)
                 continue
-            idxs, stats = truth_check(man["reference"], "selftest", args.truth_check_seed,
-                                      args.truth_check_dial or [])
+            idxs, stats, _ = truth_check(man["reference"], "selftest", args.truth_check_seed,
+                                         args.truth_check_dial or [])
             ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
             TS.log({"event": "selftest", "key": key, "scenario": name, "pass": ok, "why": why,
                     "seed": args.truth_check_seed, "dials": args.truth_check_dial or [],
@@ -223,6 +298,7 @@ def capture(args):
             continue
 
         rt = {}
+        scene_ids = {}
         for ai, (arm, kvs) in enumerate(arms):
             arm_dials = sum([["--dial", kv] for kv in kvs], [])
             # every arm starts the same way: parked at the start pose with its
@@ -232,50 +308,122 @@ def capture(args):
             run(["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pin,
                  "--nodump", "--frames", "120", "--name", name + "-park-" + arm] + extra + arm_dials)
             lab.goto({"pos": [x, y, z], "yaw": yaw, "pitch": pitch})
-            open(lab.PATCH, "w").write("claude_path = %s\nclaude_reset_accum = %s-%d\n"
-                                       % (pin, arm, time.time_ns()))
-            time.sleep(6)
+            # THE SCENE LOADED EXACTLY (2026-10-09): two identical arms in one
+            # session differed only through the doorway, where distant terrain
+            # was still streaming in. claude_lab.load_scene sends every block of
+            # the box and waits until the scene identity holds still; the
+            # identity is recorded, and an arm whose scene is not the truth's
+            # is not scored. (The replay restarts the picture at path start, so
+            # the old 6 s settle happens inside the path now.)
+            ls = lab.load_scene([x, y, z], yaw, pitch, pin)
+            scene_ids[arm] = ls.get("id")
+            if not ls.get("ok"):
+                print("%-12s arm %s: scene did not settle: %s" % (name, arm, ls.get("error")), flush=True)
             rt[arm] = run(common + arm_dials + ["--name", name + "-rt-" + arm])
-        # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered
+        # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered;
+        # three guards (claude_truth_store, TRUTH_DEF 4): every dial classified,
+        # truth mode recorded in every frame, the dumb control agrees
         ref, fid = [], []
-        truth = {"key": key}
-        if man:
-            idxs, stats = truth_check(man["reference"], "verify")
+        truth = {"key": key, "build": BUILD}
+        lt = lab.load_scene([x, y, z], yaw, pitch, pin)
+        truth["scene_id"] = lt.get("id")
+        if args.no_truth:
+            # arms only (the replay repeatability test needs no truth)
+            meta["scenarios"][name] = {"fps_at_start": fps, "fps_path": fps_path, "frames": pk[-1][0] + 1,
+                                       "arms": {a: v[-1] for a, v in rt.items()}, "reference": "", "faces": "",
+                                       "scene_ids": scene_ids,
+                                       "truth": {"outcome": "skipped (--no-truth)"}}
+            print(name, json.dumps(meta["scenarios"][name]), flush=True)
+            continue
+        if man and not man.get("admit") and BUILD in man.get("verified_builds", []) \
+                and not args.recheck_truth:
+            # this build already passed the check against this truth: the same
+            # build gives the same answer, so it is not asked again
+            fb = TS.feature_problems(man["reference"])
+            if not fb:
+                truth["outcome"] = "reused (build %s verified it before)" % BUILD
+            else:
+                truth["outcome"] = "replaced: " + "; ".join(fb[:3])
+                man = None
+        elif man:
+            fb = [] if man.get("admit") else TS.feature_problems(man["reference"])
+            idxs, stats, cdir = truth_check(man["reference"], "verify")
             ok, why = TS.verdict(stats, man["floor"]) if stats else (False, ["check render failed"])
+            fb += TS.feature_problems(cdir) if cdir else ["check render kept nothing"]
+            if fb:
+                ok, why = False, why + fb
+            if ok and man.get("admit"):
+                cok, cinfo = control(man["reference"], idxs)
+                truth["control"] = cinfo
+                if cok:
+                    TS.admit(man, cinfo)
+                else:
+                    ok, why = False, why + ["control disagrees: ratio %s tile %s" % (cinfo.get("ratio"), cinfo.get("tile_mad"))]
             truth.update(stats=stats, floor=man["floor"], why=why)
-            TS.log({"event": "pass" if ok else "fail", "key": key, "scenario": name,
-                    "why": why, "stats": stats, "floor": man["floor"]})
+            TS.log({"event": ("admit" if man.get("admit") else "pass") if ok else "fail", "key": key,
+                    "scenario": name, "why": why, "stats": stats, "floor": man["floor"]})
             if ok:
-                truth["outcome"] = "reused (stored %s)" % man["stored"]
+                truth["outcome"] = ("admitted from TRUTH_DEF 3 (truth-mode check and control passed)"
+                                    if man.get("admit") else "reused (stored %s)" % man["stored"])
+                TS.mark_verified(man, BUILD)
             else:
                 truth["outcome"] = "replaced: " + "; ".join(why[:3])
                 man = None
         if not man:
-            ref = run(common + rt_off + ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % args.hold])
+            dial_bad = TS.dial_problems(REPO)
+            if dial_bad:
+                # guard 1: no truth while any dial is unclassified, or a
+                # display dial escapes truth mode
+                truth["outcome"] = "NO TRUTH: " + "; ".join(dial_bad[:3])
+                man = {"reference": "", "faces": ""}
+        if not man:
+            hold = args.hold or TS.hold_needed(name)
+            truth["hold"] = hold
+            ref = run([c if c != pf else tpf for c in common] + rt_off + TRUTH_ON +
+                      ["--name", name + "-ref", "--dial", "claude_path_hold=%d" % hold])
             # face IDs at FULL resolution: the half-res dump blends with a linear
             # filter, which would invent codes at every edge; the scorer takes
             # every second pixel exactly instead
             fid = run([c if c != "2" else "1" for c in common] + rt_off + ["--name", name + "-faces",
                       "--dial", "claude_path_hold=1", "--dial", "claude_view=22"])
-            if any("REFUSED" in l for l in ref + fid) or not (ref and fid):
-                truth["outcome"] = "render refused: not stored"
-                man = {"reference": ref[-1] if ref else "", "faces": fid[-1] if fid else ""}
+            fb = (TS.feature_problems(ref[-1]) + TS.held_problems(ref[-1])) if ref and os.path.isdir(ref[-1]) \
+                else ["no truth render: %s" % (ref[-3:],)]
+            if any("REFUSED" in l for l in ref + fid) or not (ref and fid) or fb:
+                # guard 2: a video that is not truth mode in every frame is
+                # not a truth, and nothing is scored against it
+                truth["outcome"] = "NO TRUTH: " + "; ".join((fb or ["render refused"])[:3])
+                man = {"reference": "", "faces": ""}
             else:
-                # the floor: the same check, right away, against what was just made
-                idxs, floor = truth_check(ref[-1], "floor")
-                if floor is None:
-                    truth["outcome"] = "floor check failed: not stored"
-                    man = {"reference": ref[-1], "faces": fid[-1]}
+                # the floor: the same check, right away, against what was just
+                # made, at FLOOR_SEEDS seeds; per frame the worst of them. One
+                # seed under-reads the noise: a fresh seed failed at 2x a
+                # one-seed floor indoors (2026-10-09 self-test)
+                floors = []
+                for sd in TS.FLOOR_SEEDS:
+                    idxs, fl, _ = truth_check(ref[-1], "floor%d" % sd, seed=sd)
+                    floors.append(fl)
+                floor = TS.worst(floors)
+                cok, cinfo = control(ref[-1], idxs) if floor is not None else (False, {"why": "floor failed"})
+                truth["control"] = cinfo
+                if floor is None or not cok:
+                    truth["outcome"] = "NO TRUTH: " + ("floor check failed" if floor is None else
+                                                      "control: %s" % (cinfo.get("why") or "disagrees, ratio %s tile %s"
+                                                                       % (cinfo.get("ratio"), cinfo.get("tile_mad"))))
+                    man = {"reference": "", "faces": ""}
                 else:
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
-                                   {"fps_measured": fps, "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
-                    TS.log({"event": "store", "key": key, "scenario": name, "floor": floor})
+                                   {"fps_measured": fps, "control": cinfo, "hold": hold,
+                                    "scene_id": truth.get("scene_id"),
+                                    "truth_frames": tframes, "truth_keys": [list(k) for k in tkeys],
+                                    "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
+                    TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
+                    TS.mark_verified(man, BUILD)
                     truth.setdefault("outcome", "stored")
                     truth["floor"] = floor
         print("%-12s truth %s: %s" % (name, key, truth.get("outcome")), flush=True)
         meta["scenarios"][name] = {"fps_at_start": fps, "fps_path": fps_path, "exposure": expo,
                                    "exposure_measured": expo_measured, "frames": pk[-1][0] + 1,
-                                   "arms": {a: v[-1] for a, v in rt.items()},
+                                   "arms": {a: v[-1] for a, v in rt.items()}, "scene_ids": scene_ids,
                                    "reference": man["reference"], "faces": man["faces"], "truth": truth,
                                    "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
@@ -285,6 +433,11 @@ def capture(args):
     print(run_dir)
 
 
+def lab_scene_fields():
+    import claude_lab
+    return claude_lab.SCENE_ID
+
+
 def score(run_dir):
     import numpy as np
     from PIL import Image
@@ -292,7 +445,10 @@ def score(run_dir):
     meta = json.load(open(os.path.join(run_dir, "meta.json")))
     report = {}
     for name, sc in meta["scenarios"].items():
-        R, _ = J.load_dump(sc["reference"])
+        if not sc.get("reference"):
+            print("%-12s NOT SCORED: no truth (%s)" % (name, sc.get("truth", {}).get("outcome")))
+            continue
+        R, Rrows = J.load_dump(sc["reference"])
         # AN INSTRUMENT MUST SEE SOMETHING (2026-10-07): a path that walks the
         # camera into a solid block records black in BOTH arms, and two black
         # frames "agree" perfectly. Refuse instead of scoring them.
@@ -302,82 +458,154 @@ def score(run_dir):
                   "path enters something solid" % (name, len(black), black[0]))
             continue
         Fc, _ = J.load_dump(sc["faces"])
+        Rlum = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R]
+        Rpose = [TS._pose(r) for r in Rrows]
         # every arm against the one truth (old runs: a single "realtime")
         arms = sc.get("arms") or {"rt": sc["realtime"]}
+        # the truth's scene: as stored with it (a reused truth was made in
+        # another session), else as loaded for it this run
+        tman_p = os.path.join(os.path.dirname(sc["reference"]), "manifest.json")
+        tid = (json.load(open(tman_p)).get("scene_id") if os.path.exists(tman_p) else None) \
+            or (sc.get("truth") or {}).get("scene_id")
         for arm, rt_dir in arms.items():
             key = name if len(arms) == 1 else name + "/" + arm
+            aid = (sc.get("scene_ids") or {}).get(arm)
+            if tid and aid:
+                diff = [f for f, u, v in zip(lab_scene_fields(), tid, aid) if u != v]
+                # grid_hash and far_db_blocks: WARN, do not refuse. Two arms
+                # whose frames matched to 0.0003 pixel RMS had different
+                # grid_hash (2026-10-09): it moves for something invisible,
+                # not yet known; the far loader keeps filling during a run.
+                # Which blocks and lights are loaded must match.
+                near = [f for f in diff if f not in ("far_db_blocks", "grid_hash")]
+                if near:
+                    print("%-20s NOT SCORED: its scene is not the truth's (%s)" % (key, ", ".join(near)))
+                    continue
+                if diff:
+                    print("%-20s warning: %s differ from the scene of the truth" % (key, ", ".join(diff)))
             T, rows = J.load_dump(rt_dir)
-            n = min(len(T), len(R), len(Fc))
+            n = min(len(T), len(Fc))
             pace = J.pacing(rows)
-            jod = J.jod_video(T[:n], R[:n], max(pace.get("fps_mean", 30.0), 1.0), clip=min(60, n))
-            # the reveal curve: pixels whose face code no pixel had the frame before
+            # THE TRUTH IS A HANDFUL OF POSES (TRUTH_DEF 5): a real-time frame is
+            # judged where the truth has its pose -- the start pose (every frame
+            # before the move), the end pose (every frame after it) and the
+            # sampled poses of the move. A full-video truth matches every frame.
+            tmap = {}
+            for i in range(n):
+                p = TS._pose(rows[i])
+                for j, q in enumerate(Rpose):
+                    if TS._near(p, q):
+                        tmap[i] = j
+                        break
+            moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
+                      or rows[i]["yaw"] != rows[i - 1]["yaw"]]
+            moving_t = [i for i in moving if i in tmap]
+            lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
+            # the reveal curve: pixels whose face code no pixel had the frame
+            # before; ages tracked on every frame (face IDs are cheap),
+            # brightness judged where a truth frame exists
             codes = [(f[::2, ::2].astype(np.int32) * np.array([1, 256, 65536])).sum(2) for f in Fc[:n]]
             sky = 255 + 255 * 256 + 255 * 65536
-            lumT = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in T[:n]]
-            lumR = [J.lin(f) @ np.array([0.2126, 0.7152, 0.0722]) for f in R[:n]]
             born = np.full(codes[0].shape, -1)
             ages = {}
             for i in range(1, n):
                 new = ~np.isin(codes[i], codes[i - 1]) & (codes[i] != sky)
                 same = codes[i] == codes[i - 1]
                 born = np.where(new, i, np.where(same, born, -1))
+                if i not in tmap:
+                    continue
                 age = np.where(born >= 0, i - born, -1)
                 for a in range(0, 31):
                     m = age == a
                     if m.sum() < 200:
                         continue
-                    t_, r_ = lumT[i][m].mean(), lumR[i][m].mean()
+                    t_, r_ = lumT[i][m].mean(), Rlum[tmap[i]][m].mean()
                     ages.setdefault(a, []).append((t_, r_, int(m.sum())))
             curve = {a: float(sum(t for t, r, c in v) / max(sum(r for t, r, c in v), 1e-9))
                      for a, v in sorted(ages.items())}
             # DARK PATCHES (what John saw: "starts off all dark"): locally
             # smoothed brightness, real time vs the truth at the same pose, and
-            # the share of the frame below 80 % / 50 % of the truth. The reveal
-            # curve above only catches faces that are NEW to the screen; backing
-            # up showed a dark band over ground that WAS on screen the frame
-            # before (its history lost while moving), which this sees.
+            # the share of the frame below 80 % / 50 % of the truth.
             def smooth(x, k=8):
                 h, w = x.shape
                 hh, ww = h // k, w // k
                 return x[:hh * k, :ww * k].reshape(hh, k, ww, k).mean((1, 3))
-            dark80, dark50 = [], []
-            for i in range(n):
-                st, sr = smooth(lumT[i]), smooth(lumR[i])
+            dark80, dark50 = {}, {}
+            for i in tmap:
+                st, sr = smooth(lumT[i]), smooth(Rlum[tmap[i]])
                 lit = sr > 1e-3
                 ratio = np.where(lit, st / np.maximum(sr, 1e-6), 1.0)
-                dark80.append(float(((ratio < 0.8) & lit).mean()))
-                dark50.append(float(((ratio < 0.5) & lit).mean()))
-            moving = [i for i in range(1, n) if rows[i]["pos"] != rows[i - 1]["pos"]
-                      or rows[i]["yaw"] != rows[i - 1]["yaw"]]
-            # settling: per-frame JOD after the last move
-            last_move = max(i for i, r in enumerate(rows[:n]) if i > 0 and
-                            (r["pos"] != rows[i - 1]["pos"] or r["yaw"] != rows[i - 1]["yaw"])) \
-                if any(r["pos"] != rows[0]["pos"] or r["yaw"] != rows[0]["yaw"] for r in rows[:n]) else 0
+                dark80[i] = float(((ratio < 0.8) & lit).mean())
+                dark50[i] = float(((ratio < 0.5) & lit).mean())
+            last_move = moving[-1] if moving else 0
+            after = [i for i in range(last_move + 1, n) if i in tmap]
             settle = None
-            for i in range(last_move, n, max(1, (n - last_move) // 20)):
-                q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]), J.fit(R[i], J.display()["resolution"][::-1]))
+            for i in after[::max(1, len(after) // 20)]:
+                q = J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]),
+                                J.fit(R[tmap[i]], J.display()["resolution"][::-1]))
                 if q >= 9.0:
                     settle = i - last_move
                     break
-            dm = lambda v, idx: float(np.mean([v[i] for i in idx])) if idx else 0.0
-            after = list(range(last_move + 1, n))
-            report[key] = dict(pace, jod_video=jod, reveal_brightness_by_age=curve,
-                                dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
-                                dark80_after_stop=dm(dark80, after[:10]), dark80_curve=dark80,
-                                frames_to_jod9_after_stop=settle, frames=n,
-                                fps_at_start=sc["fps_at_start"])
-            print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD video %.2f | settle to JOD 9: %s frames"
+            # closeness while moving: per-frame JOD at the sampled poses
+            jod_mv = [J.jod_still(J.fit(T[i], J.display()["resolution"][::-1]),
+                                  J.fit(R[tmap[i]], J.display()["resolution"][::-1])) for i in moving_t[:8]]
+            jod_moving = float(np.mean(jod_mv)) if jod_mv else None
+            # FLICKER, from the real-time video alone (John 2026-10-09: "doesn't
+            # flicker and is close to the truth are different things"): per
+            # 16x16 block, |L[k] - (L[k-1] + L[k+1]) / 2| relative to brightness.
+            # Steady change from camera motion cancels; frame-to-frame jumping
+            # does not. Tested: a converged turn reads 0.0008 while turning (the
+            # motion floor), real time 0.0024-0.0027.
+            def fl(idx):
+                v = []
+                for k in idx:
+                    if 0 < k < n - 1:
+                        a_, b_, c_ = smooth(lumT[k - 1], 16), smooth(lumT[k], 16), smooth(lumT[k + 1], 16)
+                        v.append(np.median(np.abs(b_ - (a_ + c_) / 2) / np.maximum((a_ + b_ + c_) / 3, 1e-4)))
+                return float(np.median(v)) if v else None
+            still_idx = [i for i in range(1, n - 1) if i not in moving and i + 1 not in moving]
+            flicker_moving, flicker_still = fl(moving), fl(still_idx)
+            dm = lambda v, idx: float(np.mean([v[i] for i in idx if i in v])) if any(i in v for i in idx) else 0.0
+            # THE TRUTH'S NOISE SHARE (2026-10-09): the truth is an average too;
+            # its own noise adds to every arm's error in quadrature. Measured
+            # from the store's floor (two renders differ by sqrt(2) sigma) and
+            # each arm's RMS error while moving, linear. Over 5 % = the truth is
+            # too noisy for this arm: render it longer (TS.hold_needed).
+            tman = os.path.join(os.path.dirname(sc["reference"]), "manifest.json")
+            sig = float(np.median([f["px"] for f in json.load(open(tman))["floor"]])) / np.sqrt(2) \
+                if os.path.exists(tman) else None
+            mv = moving_t or after[-1:]
+            rms = float(np.median([np.sqrt(((J.lin(T[i]) - J.lin(R[tmap[i]])) ** 2).mean()) for i in mv])) if mv else None
+            share = (np.sqrt(rms * rms + sig * sig) / rms - 1.0) if sig is not None and rms else None
+            if sig is not None and rms and os.path.exists(tman):
+                TS.note_arm_error(tman, key, rms)
+            report[key] = dict(pace, jod_frame_moving=jod_moving, flicker_moving=flicker_moving,
+                               flicker_still=flicker_still, reveal_brightness_by_age=curve,
+                               rms_moving=rms, truth_noise=sig, truth_noise_share=share,
+                               dark80_moving=dm(dark80, moving), dark50_moving=dm(dark50, moving),
+                               dark80_after_stop=dm(dark80, after[:10]),
+                               frames_to_jod9_after_stop=settle, frames=n, judged_frames=len(tmap),
+                               judged_moving=len(moving_t), fps_at_start=sc["fps_at_start"])
+            if report[key]["truth_noise_share"] is not None:
+                print("%-20s error vs truth while moving %.4f; the truth's own noise adds %.1f %%%s"
+                      % (key, rms, 100 * share, "  ** TRUTH TOO NOISY FOR THIS ARM: render it longer **"
+                         if share > 0.05 else ""))
+            print("%-20s fps %.1f (p99 frame %.1f ms, spikes %d) | JOD per frame while moving %s (%d poses) | "
+                  "flicker moving %s still %s | settle to JOD 9: %s frames"
                   % (key, pace.get("fps_mean", 0), pace.get("frame_ms_p99", 0), pace.get("spikes_over_2x", 0),
-                     jod, settle))
+                     "%.2f" % jod_moving if jod_moving is not None else "-", len(jod_mv),
+                     "%.4f" % flicker_moving if flicker_moving is not None else "-",
+                     "%.4f" % flicker_still if flicker_still is not None else "-", settle))
             print("             dark patches (share of frame below 80%% / 50%% of truth): moving %.3f / %.3f, first 10 frames after stop %.3f"
                   % (report[key]["dark80_moving"], report[key]["dark50_moving"], report[key]["dark80_after_stop"]))
             print("             new-face reveal curve (catches only faces new to the screen): " +
                   " ".join("%d:%.2f" % (a, v) for a, v in list(curve.items())[:12]))
-            # the GIF: real time | reference
+            # the GIF: real time | the truth where it has the pose (black where not)
             frames = []
+            blank = Image.new("RGB", (480, 270))
             for i in range(0, n, max(1, n // 60)):
                 a = Image.fromarray(T[i]).resize((480, 270))
-                b = Image.fromarray(R[i]).resize((480, 270))
+                b = Image.fromarray(R[tmap[i]]).resize((480, 270)) if i in tmap else blank
                 c = Image.new("RGB", (960, 270)); c.paste(a, (0, 0)); c.paste(b, (480, 0))
                 frames.append(c)
             frames[0].save(os.path.join(run_dir, key.replace("/", "-") + ".gif"), save_all=True, append_images=frames[1:],
@@ -394,7 +622,9 @@ if __name__ == "__main__":
     claude_gpu_lock.hold('util/claude_playtest.py')
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", nargs="*")
-    ap.add_argument("--hold", type=int, default=256)
+    # frames per truth pose: by default as many as the arms need
+    # (TS.hold_needed: the truth's noise under a third of the best arm's error)
+    ap.add_argument("--hold", type=int, default=0)
     ap.add_argument("--score")
     ap.add_argument("--dial", action="append", help="k=v on every capture (an A/B arm)")
     ap.add_argument("--rt-dial", action="append",
@@ -402,6 +632,11 @@ if __name__ == "__main__":
     ap.add_argument("--arm", action="append",
                     help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
                          "and scored against one truth (NAME: alone = the game as it is)")
+    ap.add_argument("--path-fps", type=float, default=0,
+                    help="lay the path out at this fps instead of the measured one (runs that must share a path)")
+    ap.add_argument("--no-truth", action="store_true", help="arms only; no truth, nothing to score against")
+    ap.add_argument("--recheck-truth", action="store_true",
+                    help="run the truth check even if this build already passed it")
     ap.add_argument("--fresh-truth", action="store_true",
                     help="render the truth even if a stored one exists (and store it)")
     ap.add_argument("--truth-check-only", action="store_true",
