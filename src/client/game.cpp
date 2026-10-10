@@ -213,7 +213,9 @@ struct ClaudeTraceGrid
 	// (2026-10-07): moves under the 0.05 "moved" threshold blend into the
 	// average instead of restarting it, so a still shot must prove this ~0
 	v3f still_anchor;
+	v3f still_anchor_dir;          // the view direction when the picture started
 	float still_drift = 0.0f;
+	float still_drift_px = 0.0f;   // how far, in screen pixels, the view has drifted since
 	// ---- INCREMENTAL RE-SNAP (2026-08-16) ------------------------------
 	// The CPU mirrors of the uploaded grids, kept alive BETWEEN
 	// snapshots so a changed 16^3 block can be re-walked in place and
@@ -7253,10 +7255,37 @@ static void claudeUpdateAccum(Client *client)
 	v3f p = cam->getPosition();
 	v3f d = cam->getDirection();
 	float moved = p.getDistanceFrom(g_claude_grid.prev_cam_pos);
-	if (g_claude_grid.still_frames < 0.5f)
+	if (g_claude_grid.still_frames < 0.5f) {
 		g_claude_grid.still_anchor = p;
+		g_claude_grid.still_anchor_dir = d;
+	}
 	g_claude_grid.still_drift = p.getDistanceFrom(g_claude_grid.still_anchor);
 	float turned = (d - g_claude_grid.prev_cam_dir).getLength();
+	// STILL MEANS "NOTHING MOVED ON SCREEN" (claude_still_px, 2026-10-09;
+	// John: underground "the light just regenerates as if i moved even if i
+	// haven't"). The old test restarted the picture when the camera moved
+	// 0.05 engine units (half a millimetre) or turned 1e-4 rad (a sixth of
+	// a pixel) in ONE frame: a hand resting on the mouse or the body
+	// settling restarts it. Now, measured from where the picture started (so
+	// slow drift cannot smear it unnoticed), the drift in screen pixels:
+	// turning, the angle over one pixel's angle; moving, the distance over
+	// the nearest anything can be (the player's collision box keeps the eye
+	// ~0.3 node from any surface; 0.25 node, a rule with margin) over one
+	// pixel's angle. Restart when it exceeds claude_still_px (TUNED 0.25 px |
+	// learn by: the sharpness of a converged still against a pinned one at
+	// growing drift); 0 = the old per-frame thresholds.
+	float still_px = g_settings->exists("claude_still_px")
+			? g_settings->getFloat("claude_still_px", 0.0f, 4.0f) : 0.25f;
+	{
+		float h = (float)std::max(1u, RenderingEngine::get_video_driver()->getScreenSize().Height);
+		float px_angle = std::max(cam->getFovY(), 1e-3f) / h;
+		float cosang = core::clamp(d.dotProduct(g_claude_grid.still_anchor_dir), -1.0f, 1.0f);
+		float rot_px = std::acos(cosang) / px_angle;
+		float move_px = (g_claude_grid.still_drift / BS) / 0.25f / px_angle;
+		g_claude_grid.still_drift_px = std::max(rot_px, move_px);
+	}
+	bool view_moved = still_px > 0.0f ? g_claude_grid.still_drift_px > still_px
+			: (moved > 0.05f || turned > 1e-4f);
 	bool origin_changed = g_claude_grid.origin != g_claude_grid.prev_origin;
 	v3s16 odelta = g_claude_grid.origin - g_claude_grid.prev_origin;
 	g_claude_grid.origin_delta = origin_changed
@@ -7294,7 +7323,7 @@ static void claudeUpdateAccum(Client *client)
 		g_claude_grid.still_frames = 0.0f;
 		g_claude_grid.accum_resets++;
 		g_claude_grid.reset_why[3]++;
-	} else if (moved > 0.05f || turned > 1e-4f) {
+	} else if (view_moved) {
 		{
 			// 2026-10-07 instrument: what "moved" a pinned camera. 2026-10-09
 			// (John: underground "the light just regenerates as if i moved
@@ -7592,6 +7621,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
 			<< ", \"still_drift\": " << g_claude_grid.still_drift
+			<< ", \"still_drift_px\": " << g_claude_grid.still_drift_px
 			<< ", \"reset_why\": [" << g_claude_grid.reset_why[0] << "," << g_claude_grid.reset_why[1] << ","
 					<< g_claude_grid.reset_why[2] << "," << g_claude_grid.reset_why[3] << ","
 					<< g_claude_grid.reset_why[4] << "," << g_claude_grid.reset_why[5] << "]"
