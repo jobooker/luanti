@@ -4829,6 +4829,104 @@ static bool claudeReliefCandidate(const ContentFeatures &f);
 static int claudeReliefDepth();
 static bool claudeReliefFlat();
 static float claudeReliefFrac();
+
+// ---- HEIGHT MAPS FROM THE REAL OBJECT (carve2, 2026-10-10; DECISIONS 0z) ----
+// A face tile's groove depths come from util/claude_heightmaps/<stem>.json
+// when that file exists: a 16x16 depth map (1/16 m, row 0 = the top row of
+// the image) that a vision model proposed from the texture and what it
+// depicts (soil clods proud and the soil between them down; the grass fringe
+// at a grass block's top edge proud). The same files feed the baked models
+// (util/claude_models.py). <stem> is the tile name without ".png", plus
+// "+<overlay>" when the face has an overlay (the grass side:
+// "default_dirt^mcl_dirt_grass_shadow+mcl_core_grass_block_side_overlay").
+// No file = today's brightness-rank rule. claude_heightmaps 0 = ignore the
+// files (the comparison arm; read when a tile is first built).
+static std::string claudeTileStem(const ContentFeatures &f, int face)
+{
+	auto strip = [](std::string t) {
+		size_t p;
+		while ((p = t.find(".png")) != std::string::npos)
+			t.erase(p, 4);
+		return t;
+	};
+	std::string st = strip(f.tiledef[face].name);
+	if (!st.empty() && !f.tiledef_overlay[face].name.empty())
+		st += "+" + strip(f.tiledef_overlay[face].name);
+	return st;
+}
+
+static const std::array<u8, 256> *claudeHeightMap(const ContentFeatures &f, int face)
+{
+	static std::map<std::string, std::unique_ptr<std::array<u8, 256>>> cache;
+	if (g_settings->exists("claude_heightmaps")
+			&& g_settings->getFloat("claude_heightmaps", 0.0f, 1.0f) < 0.5f)
+		return nullptr;
+	const std::string stem = claudeTileStem(f, face);
+	if (stem.empty() || stem.find('/') != std::string::npos)
+		return nullptr;
+	auto it = cache.find(stem);
+	if (it != cache.end())
+		return it->second.get();
+	std::unique_ptr<std::array<u8, 256>> h;
+	std::ifstream in(porting::path_user + "/util/claude_heightmaps/" + stem + ".json");
+	if (in.good()) {
+		Json::Value j;
+		try { in >> j; } catch (...) { j = Json::Value(); }
+		const Json::Value &hv = j["height"];
+		bool ok = hv.isArray() && hv.size() == 16;
+		auto a = std::make_unique<std::array<u8, 256>>();
+		for (int r = 0; ok && r < 16; r++) {
+			if (!hv[r].isArray() || hv[r].size() != 16) {
+				ok = false;
+				break;
+			}
+			for (int c = 0; c < 16; c++)
+				(*a)[r * 16 + c] = (u8)std::clamp(hv[r][c].asInt(), 0, 15);
+		}
+		if (ok)
+			h = std::move(a);
+		actionstream << "[claude_relief] height map " << stem << ": "
+				<< (ok ? "read" : "MALFORMED, brightness rule used") << std::endl;
+	}
+	const std::array<u8, 256> *p = h.get();
+	cache[stem] = std::move(h);
+	return p;
+}
+
+// THE PAINTED DEPTH-SHADOW OUT, THE COLOUR KEPT (util/claude_models.py
+// _normalise, the same rule): fit log(linear luminance) = a + b * depth over
+// the tile's texels; where deeper texels are darker (b < 0) every texel's
+// linear RGB is multiplied by exp(-b * depth). Texels at one depth all move
+// by one factor, so their own colour and brightness differences stay as
+// painted (John: "some parts of the stone face are darker than others for
+// different colors"); only the darkening the depth explains goes, because
+// the groove's real geometry now does it.
+static void claudeNormaliseByDepth(double rgb[256][3], const u8 depth[256])
+{
+	double lin[256][3];
+	double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+	for (int k = 0; k < 256; k++) {
+		for (int ch = 0; ch < 3; ch++)
+			lin[k][ch] = std::pow(std::clamp(rgb[k][ch] / 255.0, 0.0, 1.0), 2.2);
+		double L = 0.2126 * lin[k][0] + 0.7152 * lin[k][1] + 0.0722 * lin[k][2];
+		if (L <= 1e-4)
+			continue;
+		double x = depth[k], y = std::log(L);
+		n += 1; sx += x; sy += y; sxx += x * x; sxy += x * y;
+	}
+	const double den = n * sxx - sx * sx;
+	if (n < 8 || den <= 1e-9)
+		return;
+	const double b = (n * sxy - sx * sy) / den;
+	if (b >= 0.0)
+		return;
+	for (int k = 0; k < 256; k++) {
+		const double kf = std::exp(-b * depth[k]);
+		for (int ch = 0; ch < 3; ch++)
+			rgb[k][ch] = 255.0 * std::pow(std::min(lin[k][ch] * kf, 1.0), 1.0 / 2.2);
+	}
+}
+
 static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
 		video::SColor ref, video::SColor tint)
 {
@@ -4849,7 +4947,14 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 	for (int face = 0; face < 3; face++) {
 		double rgb[256][3];
 		claudeFaceTileRGB(client, f, face, ref, tint, rgb);
-		if (lift) {
+		const std::array<u8, 256> *hm = lift ? claudeHeightMap(f, face) : nullptr;
+		if (hm) {
+			// the depth the relief carves from this map (claudeReliefMapId)
+			u8 d[256];
+			for (int k = 0; k < 256; k++)
+				d[k] = (u8)std::min<int>((*hm)[k], claudeReliefDepth());
+			claudeNormaliseByDepth(rgb, d);
+		} else if (lift) {
 			double lum[256], mean = 0.0, var = 0.0;
 			for (int k = 0; k < 256; k++) {
 				lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1] + 0.0722 * rgb[k][2];
@@ -5573,6 +5678,16 @@ static u16 claudeReliefMapId(Client *client, content_t c,
 	std::array<u8, 768> m{};
 	bool any = false;
 	for (int face = 0; face < 3; face++) {
+		// a height map, when the tile has one: the real object's depths,
+		// capped at the relief depth D (the bake floor's shell width)
+		if (const std::array<u8, 256> *hm = claudeHeightMap(f, face)) {
+			for (int k = 0; k < 256; k++) {
+				int d = std::min<int>((*hm)[k], D);
+				m[face * 256 + k] = (u8)d;
+				any = any || d > 0;
+			}
+			continue;
+		}
 		double rgb[256][3];
 		if (!claudeFaceTileRGB(client, f, face, col, tint, rgb))
 			continue;

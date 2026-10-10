@@ -49,6 +49,9 @@
   "cobble_baked": [
    "mcl_core:cobble"
   ],
+  "stonebrick_baked": [
+   "mcl_core:stonebrick"
+  ],
   "plant_tallgrass": [
    "mcl_flowers:tallgrass"
   ],
