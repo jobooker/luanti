@@ -152,6 +152,18 @@ FACES = {
    allowed='0, 1', tile=(3, 1)),
 }
 
+
+FACES['default_furnace_front'] = dict(block='Furnace, unlit (mcl_furnaces:furnace)', face='front',
+   depicts='the front of a stone furnace: masonry of stone blocks with mortar joints around a fire mouth opening in the lower middle; the furnace is cold, so the mouth is a dark empty opening (a grate may be visible inside)',
+   expect='Stone block faces are the surface (0); mortar joints between the stones are recessed (1); the fire mouth is a genuinely deep opening (3) -- the dark interior and any grate sit at the back of it.',
+   tiling='A single block; it does not need to continue across its edges.',
+   allowed='0, 1, 2, 3', deep3=', 3 = recessed 3/16 m (ONLY for the fire mouth)', tile=(2, 1))
+FACES['mcl_books_bookshelf_top'] = dict(block='Bookshelf (mcl_books:bookshelf)', face='top and bottom',
+   depicts='the top of a wooden bookshelf: wooden planks (horizontal boards laid edge to edge) inside a darker border',
+   expect='Decide from the picture what the real object is: the board faces are flat (0); seams between boards are narrow grooves (1); the darker border is either the edge of the shelf frame (flush, 0) or a seam (1). Grain and knots are colour, not depth. Use 2 only if a seam is genuinely deep.',
+   tiling='Bookshelves stack and stand side by side; the top meets the next block only at its edges and need not continue across them.',
+   allowed='0, 1, 2', tile=(2, 2))
+
 def build_prompt(stem, extra=''):
     f = FACES[stem]
     rgb = load(stem)

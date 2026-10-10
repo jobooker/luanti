@@ -336,12 +336,25 @@ struct ClaudeTraceGrid
 	bool relief_flat = false;                    // claude_relief_flat, likewise
 	bool oak_model = false;                      // claude_oak_model, likewise
 	float relief_frac = 0.35f;                   // claude_relief_frac, likewise
-	std::vector<std::array<u8, 768>> relief_maps; // 1-based: depth per texel, top/bottom/side
-	std::unordered_map<content_t, u16> relief_base_of; // content -> map id, 0 = none
-	std::unordered_map<u32, u16> relief_shape_of;      // (map id << 6 | exposed) -> nbox id
+	// one content's groove depths per WORLD face (0 +Y, 1 -Y, 2 +X, 3 -X,
+	// 4 +Z, 5 -Z; 256 texels each, the atlas's texel order) and its shell
+	// width D (the deepest carve the leak rules are sized for)
+	struct ReliefMap {
+		std::array<u8, 1536> depth{};
+		u8 D = 0;
+	};
+	std::vector<ReliefMap> relief_maps;          // 1-based
+	// (block bit 31 | facedir << 16 | content) -> map id, 0 = none
+	std::unordered_map<u32, u16> relief_base_of;
+	// (map id | open << 16 | partial << 22 | edge-ok << 28) -> nbox id
+	std::unordered_map<u64, u16> relief_shape_of;
 	u32 relief_cells = 0;                        // cells carved in the last full walk
-	std::unordered_map<content_t, u8> palette;
-	std::vector<u8> atlas; // BGRA
+	bool relief_blocks = true;                   // claude_relief_blocks the grid was built under
+	// material id per (facedir << 16 | content): a relief block's id is per
+	// orientation (its six face tiles are placed by facedir), every other
+	// content has facedir 0 here
+	std::unordered_map<u32, u8> palette;
+	std::vector<u8> atlas; // BGRA, 256 x 1536: six 16x16 face tiles per id
 	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
 	bool atlas_dirty = false;
 	// temporal accumulation state (updated once per frame)
@@ -4927,8 +4940,139 @@ static void claudeNormaliseByDepth(double rgb[256][3], const u8 depth[256])
 	}
 }
 
+// ---- RELIEF BLOCKS (seams, 2026-10-10) ----------------------------------
+// The blocks that used to be TEXTURE-BAKED MODELS (util/claude_models.py
+// bake_from_tiles: planks, logs, cobble, stone bricks, bookshelf, crafting
+// table, unlit furnace) carve through the relief path instead: per EXPOSED
+// face of each cell, from the vision-model height maps, so a groove runs on
+// across a seam to the next block (a model cannot know its neighbours, so
+// it kept a D-wide uncarved rim on every face: bands at log seams, brick
+// joints broken at block edges, a raised frame on block tops).
+// util/claude_relief_blocks.json names them (the set is the baked models'
+// set: John's eye picked those blocks for carving); "faces": "sides" keeps a
+// block's top and bottom tiles flat (the log's end grain, as the model did).
+// A face whose tile has no height map stays flat.
+// claude_relief_blocks (default 1): 0 = those blocks take their baked models
+// again (the A/B arm). Geometry follows the dial live (full re-walk); the
+// face colours are built when a material is first seen, so set it at start.
+static constexpr int CLAUDE_RELIEF_SHELL = 3;   // claude_models.py SHELL: no carve deeper
+
+static bool claudeReliefBlocksOn()
+{
+	if (!g_settings->exists("claude_relief_blocks"))
+		return true;
+	return g_settings->getFloat("claude_relief_blocks", 0.0f, 1.0f) >= 0.5f;
+}
+
+struct ClaudeReliefBlock {
+	bool sides_only = false;
+};
+
+static const std::map<std::string, ClaudeReliefBlock> &claudeReliefBlockList()
+{
+	static std::map<std::string, ClaudeReliefBlock> list;
+	static bool loaded = false;
+	if (loaded)
+		return list;
+	loaded = true;
+	std::ifstream in(porting::path_user + "/util/claude_relief_blocks.json");
+	Json::Value j;
+	if (in.good()) {
+		try { in >> j; } catch (...) { j = Json::Value(); }
+	}
+	const Json::Value &b = j["blocks"];
+	if (b.isObject()) {
+		for (const std::string &name : b.getMemberNames()) {
+			ClaudeReliefBlock rb;
+			rb.sides_only = b[name].isObject()
+					&& b[name].get("faces", "all").asString() == "sides";
+			list[name] = rb;
+		}
+	}
+	actionstream << "[claude_relief] relief blocks: " << list.size()
+			<< " (util/claude_relief_blocks.json)" << std::endl;
+	return list;
+}
+
+// the relief-block entry of a plain unlit opaque cube, else nullptr
+static const ClaudeReliefBlock *claudeReliefBlock(const ContentFeatures &f)
+{
+	if (f.drawtype != NDT_NORMAL || f.light_source != 0 || f.isLiquid())
+		return nullptr;
+	const auto &l = claudeReliefBlockList();
+	auto it = l.find(f.name);
+	return it == l.end() ? nullptr : &it->second;
+}
+
+// WHICH TILE A WORLD FACE SHOWS, AND TURNED HOW: the engine's own table
+// (mapblock_mesh.cpp getNodeTile, dir_to_tile), copied so the tracer puts
+// the furnace front where the raster game puts it. Rows: facedir 0..23;
+// columns: direction index (dir.X + 2 dir.Y + 3 dir.Z) & 7; values: tile
+// index, rotation in quarter turns (TileRotation R0..R270).
+static void claudeWorldFaceTile(u8 fd, int W, int &tile, int &rot)
+{
+	static const u8 T[24][8][2] = {
+		{{0,0},{2,0},{0,0},{4,0},{0,0},{5,0},{1,0},{3,0}},
+		{{0,0},{4,0},{0,3},{3,0},{0,0},{2,0},{1,1},{5,0}},
+		{{0,0},{3,0},{0,2},{5,0},{0,0},{4,0},{1,2},{2,0}},
+		{{0,0},{5,0},{0,1},{2,0},{0,0},{3,0},{1,3},{4,0}},
+		{{0,0},{2,3},{5,0},{0,2},{0,0},{1,0},{4,2},{3,1}},
+		{{0,0},{4,3},{2,0},{0,1},{0,0},{1,1},{3,2},{5,1}},
+		{{0,0},{3,3},{4,0},{0,0},{0,0},{1,2},{5,2},{2,1}},
+		{{0,0},{5,3},{3,0},{0,3},{0,0},{1,3},{2,2},{4,1}},
+		{{0,0},{2,1},{4,2},{1,2},{0,0},{0,0},{5,0},{3,3}},
+		{{0,0},{4,1},{3,2},{1,3},{0,0},{0,3},{2,0},{5,3}},
+		{{0,0},{3,1},{5,2},{1,0},{0,0},{0,2},{4,0},{2,3}},
+		{{0,0},{5,1},{2,2},{1,1},{0,0},{0,1},{3,0},{4,3}},
+		{{0,0},{0,3},{3,3},{4,1},{0,0},{5,3},{2,3},{1,3}},
+		{{0,0},{0,2},{5,3},{3,1},{0,0},{2,3},{4,3},{1,0}},
+		{{0,0},{0,1},{2,3},{5,1},{0,0},{4,3},{3,3},{1,1}},
+		{{0,0},{0,0},{4,3},{2,1},{0,0},{3,3},{5,3},{1,2}},
+		{{0,0},{1,1},{2,1},{4,3},{0,0},{5,1},{3,1},{0,1}},
+		{{0,0},{1,2},{4,1},{3,3},{0,0},{2,1},{5,1},{0,0}},
+		{{0,0},{1,3},{3,1},{5,3},{0,0},{4,1},{2,1},{0,3}},
+		{{0,0},{1,0},{5,1},{2,3},{0,0},{3,1},{4,1},{0,2}},
+		{{0,0},{3,2},{1,2},{4,2},{0,0},{5,2},{0,2},{2,2}},
+		{{0,0},{5,2},{1,3},{3,2},{0,0},{2,2},{0,1},{4,2}},
+		{{0,0},{2,2},{1,0},{5,2},{0,0},{4,2},{0,0},{3,2}},
+		{{0,0},{4,2},{1,1},{2,2},{0,0},{3,2},{0,3},{5,2}},
+	};
+	// world face order 0 +Y, 1 -Y, 2 +X, 3 -X, 4 +Z, 5 -Z -> direction index
+	static const int DI[6] = {2, 6, 1, 7, 3, 5};
+	const u8 *e = T[fd % 24][DI[W]];
+	tile = e[0];
+	rot = e[1];
+}
+
+// The texel a turned tile shows at atlas texel k (= row * 16 + col, the
+// tracer's own face convention, faceTileRatio). The engine turns texture
+// coordinates (u, v) -> R90 (1 - v, u), R180 (1 - u, 1 - v), R270 (v, 1 - u)
+// (content_mapblock.cpp setupCuboidVertices); applied in the tracer's
+// convention, so a turned tile is laid exactly as an unturned one is.
+static int claudeRotTexel(int rot, int k)
+{
+	int c = k % 16, r = k / 16, c2 = c, r2 = r;
+	switch (rot & 3) {
+	case 1: c2 = 15 - r; r2 = c; break;
+	case 2: c2 = 15 - c; r2 = 15 - r; break;
+	case 3: c2 = r; r2 = 15 - c; break;
+	default: break;
+	}
+	return r2 * 16 + c2;
+}
+
+// THE SIX FACE TILES (seams, 2026-10-10). Until now three tiles per id (top,
+// bottom, one side standing in for all four). A furnace's front and a
+// crafting table's front and back are their own tiles, and the block's
+// orientation (param2, facedir) decides which world face shows which. Atlas
+// rows face * 256 + (mid / 16) * 16 with face in WORLD order 0 +Y, 1 -Y,
+// 2 +X, 3 -X, 4 +Z, 5 -Z (faceTileRatio picks by the hit normal). A relief
+// block fills each world face with the tile the engine's mesh puts there
+// (claudeWorldFaceTile), turned as the mesh turns it, so its material id is
+// per (content, facedir). Every other material keeps exactly the old
+// picture: top, bottom, and tile 2 on all four sides.
 static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &f,
-		video::SColor ref, video::SColor tint)
+		video::SColor ref, video::SColor tint, u8 fd, bool block)
 {
 	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	// A CARVED TEXEL LOSES ITS PAINTED SHADOW (2026-10-09, John: "if we do
@@ -4940,51 +5084,73 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 	// baked models do the same (claude_models.py _delight).
 	// claude_relief_lift (default 1; read when the tile is built, i.e. at
 	// startup): 0 = keep the painted shadow (the comparison arm)
-	const bool lift = claudeReliefCandidate(f) && claudeReliefDepth() > 0 && !claudeReliefFlat()
-			&& !(g_settings->exists("claude_relief_lift")
-				&& g_settings->getFloat("claude_relief_lift", 0.0f, 1.0f) < 0.5f);
+	const bool liftdial = !(g_settings->exists("claude_relief_lift")
+			&& g_settings->getFloat("claude_relief_lift", 0.0f, 1.0f) < 0.5f);
+	const bool lift = liftdial && !claudeReliefFlat() && (block
+			? claudeReliefBlocksOn()
+			: (claudeReliefCandidate(f) && claudeReliefDepth() > 0));
+	const ClaudeReliefBlock *rb = block ? claudeReliefBlock(f) : nullptr;
 	const double frac = claudeReliefFrac();
-	for (int face = 0; face < 3; face++) {
-		double rgb[256][3];
-		claudeFaceTileRGB(client, f, face, ref, tint, rgb);
-		const std::array<u8, 256> *hm = lift ? claudeHeightMap(f, face) : nullptr;
-		if (hm) {
-			// the depth the relief carves from this map (claudeReliefMapId)
-			u8 d[256];
-			for (int k = 0; k < 256; k++)
-				d[k] = (u8)std::min<int>((*hm)[k], claudeReliefDepth());
-			claudeNormaliseByDepth(rgb, d);
-		} else if (lift) {
-			double lum[256], mean = 0.0, var = 0.0;
-			for (int k = 0; k < 256; k++) {
-				lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1] + 0.0722 * rgb[k][2];
-				mean += lum[k] / 256.0;
-			}
-			for (int k = 0; k < 256; k++)
-				var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
-			bool sunk[256] = {};
-			double up = 0.0;
-			int nup = 0;
-			if (std::sqrt(var) >= 6.0) {   // claudeReliefMapId's FLAT_STD
+	double tiles[6][256][3];
+	bool done[6] = {};
+	for (int W = 0; W < 6; W++) {
+		int face, rot = 0;
+		if (block)
+			claudeWorldFaceTile(fd, W, face, rot);
+		else
+			face = W < 2 ? W : 2;
+		double (*rgb)[3] = tiles[face];
+		if (!done[face]) {
+			done[face] = true;
+			claudeFaceTileRGB(client, f, face, ref, tint, rgb);
+			const std::array<u8, 256> *hm = lift ? claudeHeightMap(f, face) : nullptr;
+			if (hm && block) {
+				// a relief block: the depth its relief carves from this
+				// map (claudeReliefMapId); an uncarved tile keeps its paint
+				if (!(rb && rb->sides_only && face < 2)) {
+					u8 d[256];
+					for (int k = 0; k < 256; k++)
+						d[k] = (u8)std::min<int>((*hm)[k], CLAUDE_RELIEF_SHELL);
+					claudeNormaliseByDepth(rgb, d);
+				}
+			} else if (hm) {
+				// the depth the relief carves from this map (claudeReliefMapId)
+				u8 d[256];
+				for (int k = 0; k < 256; k++)
+					d[k] = (u8)std::min<int>((*hm)[k], claudeReliefDepth());
+				claudeNormaliseByDepth(rgb, d);
+			} else if (lift && !block) {
+				double lum[256], mean = 0.0, var = 0.0;
 				for (int k = 0; k < 256; k++) {
-					int atmost = 0;
-					for (int j = 0; j < 256; j++)
-						atmost += lum[j] <= lum[k];
-					sunk[k] = atmost / 256.0 <= frac;
-					if (!sunk[k]) { up += lum[k]; nup++; }
+					lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1] + 0.0722 * rgb[k][2];
+					mean += lum[k] / 256.0;
+				}
+				for (int k = 0; k < 256; k++)
+					var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
+				bool sunk[256] = {};
+				double up = 0.0;
+				int nup = 0;
+				if (std::sqrt(var) >= 6.0) {   // claudeReliefMapId's FLAT_STD
+					for (int k = 0; k < 256; k++) {
+						int atmost = 0;
+						for (int j = 0; j < 256; j++)
+							atmost += lum[j] <= lum[k];
+						sunk[k] = atmost / 256.0 <= frac;
+						if (!sunk[k]) { up += lum[k]; nup++; }
+					}
+				}
+				if (nup > 0) {
+					up /= nup;
+					for (int k = 0; k < 256; k++)
+						if (sunk[k] && lum[k] > 1e-3)
+							for (int ch = 0; ch < 3; ch++)
+								rgb[k][ch] = std::min(255.0, rgb[k][ch] * up / lum[k]);
 				}
 			}
-			if (nup > 0) {
-				up /= nup;
-				for (int k = 0; k < 256; k++)
-					if (sunk[k] && lum[k] > 1e-3)
-						for (int ch = 0; ch < 3; ch++)
-							rgb[k][ch] = std::min(255.0, rgb[k][ch] * up / lum[k]);
-			}
 		}
-		int ax = (mid % 16) * 16, ay = face * 256 + (mid / 16) * 16;
+		int ax = (mid % 16) * 16, ay = W * 256 + (mid / 16) * 16;
 		for (int k = 0; k < 256; k++) {
-			const double *c = rgb[k];
+			const double *c = rgb[claudeRotTexel(rot, k)];
 			double r[3] = {(double)ref.getRed(), (double)ref.getGreen(),
 					(double)ref.getBlue()};
 			u32 px = 0xFF000000u;
@@ -4999,10 +5165,10 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 }
 
 static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
-		video::SColor fallback, video::SColor tint)
+		video::SColor fallback, video::SColor tint, u8 fd, bool block)
 {
 	if (g_claude_grid.atlas.empty())
-		g_claude_grid.atlas.assign(256 * 768 * 4, 0);
+		g_claude_grid.atlas.assign(256 * 1536 * 4, 0);
 	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
 	bool ok = false;
@@ -5151,7 +5317,7 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 	// The single top-tile DETAIL written above is superseded by the three
 	// face tiles (it was read by nothing since ADR-0011); they overwrite
 	// the same rows 0..255 for face 0.
-	claudeAtlasFaceTiles(client, mid, f, fallback, tint);
+	claudeAtlasFaceTiles(client, mid, f, fallback, tint, fd, block);
 	g_claude_grid.atlas_dirty = true;
 }
 
@@ -5637,9 +5803,10 @@ static float claudeReliefFrac()
 }
 
 // Which nodes are carved: logs and soil, by the game's own groups, and only
-// plain opaque cubes.
-// TUNED: the set of carved nodes (groups tree, dirt) | learn by: John's eye
-// on the side-by-sides, material by material
+// plain opaque cubes (kind 1, depth claude_relief); and the relief blocks
+// (claudeReliefBlock, depth from their maps up to CLAUDE_RELIEF_SHELL).
+// TUNED: the set of carved nodes (groups tree, dirt; the relief-block list)
+// | learn by: John's eye on the side-by-sides, material by material
 static bool claudeReliefTrees()
 {
 	// claude_relief_trees (2026-10-09): 1 = relief carves logs too. Default 0:
@@ -5654,142 +5821,358 @@ static bool claudeReliefCandidate(const ContentFeatures &f)
 			&& ((claudeReliefTrees() && f.getGroup("tree") > 0) || f.getGroup("dirt") > 0);
 }
 
-// One content's groove depths: per face tile (0 top, 1 bottom, 2 side, the
-// three tiles the atlas holds and faceTileRatio() colours by), a depth per
-// texel. Dark texels sink, by RANK within the tile, so a texture pack's
-// overall brightness does not change how much is carved. Memoised per
-// content; 0 = nothing to carve.
+// One content's groove depths per WORLD face (ClaudeTraceGrid::ReliefMap,
+// the atlas's face order and texel order, so the groove a ray finds is under
+// the texel the same ray is coloured by). Memoised per (content, facedir);
+// 0 = nothing to carve.
+// Soil (block = false): per face tile, the height map capped at the relief
+// depth D, or else dark texels sink by RANK within the tile, so a texture
+// pack's overall brightness does not change how much is carved; the four
+// sides share tile 2, as the atlas does for these.
+// A relief block (block = true): each world face from the tile the engine
+// puts there (claudeWorldFaceTile), turned as the engine turns it; depth =
+// the height map capped at CLAUDE_RELIEF_SHELL; no map, or an end tile of a
+// "sides" block, = flat. Its shell D is its own deepest carve (as the baked
+// models' OWN_SHELL_MODELS), so a 1-deep plank keeps 1-texel corner rims.
 static u16 claudeReliefMapId(Client *client, content_t c,
-		const ContentFeatures &f, video::SColor col, video::SColor tint)
+		const ContentFeatures &f, video::SColor col, video::SColor tint,
+		bool block, u8 fd)
 {
 	ClaudeTraceGrid &V = g_claude_grid;
-	auto it = V.relief_base_of.find(c);
+	const u32 key = (u32)c | ((u32)fd << 16) | (block ? 0x80000000u : 0u);
+	auto it = V.relief_base_of.find(key);
 	if (it != V.relief_base_of.end())
 		return it->second;
-	// TUNED: the darkest 35% of a tile's texels sink (claude_relief_frac,
-	// default 0.35; near 0.65 the bright texels stand proud instead) |
-	// learn by: the groove share John picks from side-by-sides, or authored
-	// height maps (LabPBR packs) as the known answer to fit brightness->height
-	const double CARVE_FRAC = V.relief_frac;
-	// TUNED: a tile whose luminance spread is under 6 sRGB levels is flat and
-	// is not carved | learn by: the same, on tiles John calls smooth
-	const double FLAT_STD = 6.0;
-	const int D = V.relief_depth;
-	std::array<u8, 768> m{};
+	ClaudeTraceGrid::ReliefMap rm;
 	bool any = false;
-	for (int face = 0; face < 3; face++) {
-		// a height map, when the tile has one: the real object's depths,
-		// capped at the relief depth D (the bake floor's shell width)
-		if (const std::array<u8, 256> *hm = claudeHeightMap(f, face)) {
+	if (block) {
+		const ClaudeReliefBlock *rb = claudeReliefBlock(f);
+		for (int W = 0; W < 6; W++) {
+			int t, rot;
+			claudeWorldFaceTile(fd, W, t, rot);
+			if (rb && rb->sides_only && t < 2)
+				continue;
+			const std::array<u8, 256> *hm = claudeHeightMap(f, t);
+			if (!hm)
+				continue;
 			for (int k = 0; k < 256; k++) {
-				int d = std::min<int>((*hm)[k], D);
-				m[face * 256 + k] = (u8)d;
+				int d = std::min<int>((*hm)[claudeRotTexel(rot, k)],
+						CLAUDE_RELIEF_SHELL);
+				rm.depth[W * 256 + k] = (u8)d;
+				rm.D = (u8)std::max<int>(rm.D, d);
 				any = any || d > 0;
 			}
-			continue;
 		}
-		double rgb[256][3];
-		if (!claudeFaceTileRGB(client, f, face, col, tint, rgb))
-			continue;
-		double lum[256], mean = 0.0, var = 0.0;
-		for (int k = 0; k < 256; k++) {
-			lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1]
-					+ 0.0722 * rgb[k][2];
-			mean += lum[k] / 256.0;
-		}
-		for (int k = 0; k < 256; k++)
-			var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
-		if (std::sqrt(var) < FLAT_STD)
-			continue;
-		for (int k = 0; k < 256; k++) {
-			// the share of the tile at least this dark. Ties count whole:
-			// a 4-level tile (grass) carves a whole level or none of it,
-			// so no more than CARVE_FRAC of a tile ever sinks
-			int atmost = 0;
-			for (int j = 0; j < 256; j++)
-				atmost += lum[j] <= lum[k];
-			double p = atmost / 256.0;
-			if (p > CARVE_FRAC)
+	} else {
+		// TUNED: the darkest 35% of a tile's texels sink (claude_relief_frac,
+		// default 0.35; near 0.65 the bright texels stand proud instead) |
+		// learn by: the groove share John picks from side-by-sides, or authored
+		// height maps (LabPBR packs) as the known answer to fit brightness->height
+		const double CARVE_FRAC = V.relief_frac;
+		// TUNED: a tile whose luminance spread is under 6 sRGB levels is flat and
+		// is not carved | learn by: the same, on tiles John calls smooth
+		const double FLAT_STD = 6.0;
+		const int D = V.relief_depth;
+		rm.D = (u8)D;
+		std::array<u8, 768> m{};
+		for (int face = 0; face < 3; face++) {
+			// a height map, when the tile has one: the real object's depths,
+			// capped at the relief depth D (the bake floor's shell width)
+			if (const std::array<u8, 256> *hm = claudeHeightMap(f, face)) {
+				for (int k = 0; k < 256; k++) {
+					int d = std::min<int>((*hm)[k], D);
+					m[face * 256 + k] = (u8)d;
+					any = any || d > 0;
+				}
 				continue;
-			int d = 1 + (int)(D * (CARVE_FRAC - p) / CARVE_FRAC);
-			m[face * 256 + k] = (u8)std::min(d, D);
-			any = true;
+			}
+			double rgb[256][3];
+			if (!claudeFaceTileRGB(client, f, face, col, tint, rgb))
+				continue;
+			double lum[256], mean = 0.0, var = 0.0;
+			for (int k = 0; k < 256; k++) {
+				lum[k] = 0.2126 * rgb[k][0] + 0.7152 * rgb[k][1]
+						+ 0.0722 * rgb[k][2];
+				mean += lum[k] / 256.0;
+			}
+			for (int k = 0; k < 256; k++)
+				var += (lum[k] - mean) * (lum[k] - mean) / 256.0;
+			if (std::sqrt(var) < FLAT_STD)
+				continue;
+			for (int k = 0; k < 256; k++) {
+				// the share of the tile at least this dark. Ties count whole:
+				// a 4-level tile (grass) carves a whole level or none of it,
+				// so no more than CARVE_FRAC of a tile ever sinks
+				int atmost = 0;
+				for (int j = 0; j < 256; j++)
+					atmost += lum[j] <= lum[k];
+				double p = atmost / 256.0;
+				if (p > CARVE_FRAC)
+					continue;
+				int d = 1 + (int)(D * (CARVE_FRAC - p) / CARVE_FRAC);
+				m[face * 256 + k] = (u8)std::min(d, D);
+				any = true;
+			}
 		}
+		for (int W = 0; W < 6; W++)
+			std::copy(m.begin() + (W < 2 ? W : 2) * 256,
+					m.begin() + ((W < 2 ? W : 2) + 1) * 256,
+					rm.depth.begin() + W * 256);
 	}
 	u16 id = 0;
-	if (any) {
-		V.relief_maps.push_back(m);
+	if (any && rm.D > 0) {
+		V.relief_maps.push_back(rm);
 		id = (u16)V.relief_maps.size();
 	}
-	V.relief_base_of[c] = id;
+	V.relief_base_of[key] = id;
 	return id;
 }
 
-// Which faces of the node at wp are open (bit 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z,
-// 5 -Z). A face against another plain opaque cube is closed and is not
-// carved, so a buried dirt block stays a plain cube and a trunk's grooves
-// run on across the seam to the next log. An unloaded neighbour counts as
-// closed: when it arrives, the incremental path's one-node halo re-walks
-// this cell.
-static u8 claudeReliefExposed(Map &map, const NodeDefManager *ndef, v3s16 wp)
+// ---- WHAT A CELL'S NEIGHBOURS ARE, FOR THE LEAK RULES (seams 2026-10-10) --
+// Face order (here and in the shape): 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z.
+// Three kinds of neighbour cell:
+//   SOLID   a plain opaque cube (NDT_NORMAL). The face between is CLOSED: not
+//           carved; a groove of another face may run up to it (rules below).
+//   OPEN    a cell light crosses freely and whole: air, liquid, glass,
+//           leaves, plants, fire, torches/signs/rails drawn as flats. The
+//           face is carved.
+//   PARTIAL anything else (node boxes, meshes: doors, panes, slabs, stairs,
+//           fences, beds, chests; rooted plants), and an unloaded cell. Such
+//           a shape can wall its own cell in two (a closed door does), so a
+//           groove opening into it could carry light round its edge. The
+//           face is not carved and no air may come within D of it.
+//           (Before seams these counted as open: grooves in a door jamb ran
+//           behind the door. Unloaded cells counted as solid.)
+// Plus, for each of the 12 edges of the cell, whether the EDGE-DIAGONAL
+// cell (the one across both faces of that edge) is OPEN.
+struct ClaudeReliefNbr {
+	u8 open = 0, partial = 0;
+	u16 diag = 0;   // bit e: edge e's diagonal cell is OPEN (claudeReliefEdge)
+	u8 nd[6] = {};  // a CLOSED face's neighbour: the shell it carves with (0 = none)
+};
+
+enum : u8 { CLAUDE_RN_SOLID = 0, CLAUDE_RN_OPEN = 1, CLAUDE_RN_PARTIAL = 2 };
+
+static u8 claudeReliefClass(Map &map, const NodeDefManager *ndef, v3s16 p)
 {
-	static const v3s16 dirs[6] = {v3s16(1, 0, 0), v3s16(-1, 0, 0),
-			v3s16(0, 1, 0), v3s16(0, -1, 0), v3s16(0, 0, 1), v3s16(0, 0, -1)};
-	u8 ex = 0;
-	for (int k = 0; k < 6; k++) {
-		content_t nc = map.getNode(wp + dirs[k]).getContent();
-		if (nc == CONTENT_IGNORE)
-			continue;
-		if (nc == CONTENT_AIR) {
-			ex |= (u8)(1 << k);
-			continue;
-		}
-		const ContentFeatures &nf = ndef->get(nc);
-		if (nf.drawtype != NDT_NORMAL || nf.isLiquid())
-			ex |= (u8)(1 << k);
+	content_t nc = map.getNode(p).getContent();
+	if (nc == CONTENT_IGNORE)
+		return CLAUDE_RN_PARTIAL;
+	if (nc == CONTENT_AIR)
+		return CLAUDE_RN_OPEN;
+	const ContentFeatures &nf = ndef->get(nc);
+	switch (nf.drawtype) {
+	case NDT_NORMAL:
+		return CLAUDE_RN_SOLID;
+	case NDT_AIRLIKE:
+	case NDT_LIQUID:
+	case NDT_FLOWINGLIQUID:
+	case NDT_GLASSLIKE:
+	case NDT_GLASSLIKE_FRAMED:
+	case NDT_GLASSLIKE_FRAMED_OPTIONAL:
+	case NDT_ALLFACES:
+	case NDT_ALLFACES_OPTIONAL:
+	case NDT_PLANTLIKE:
+	case NDT_FIRELIKE:
+	case NDT_TORCHLIKE:
+	case NDT_SIGNLIKE:
+	case NDT_RAILLIKE:
+		return CLAUDE_RN_OPEN;
+	default:
+		return CLAUDE_RN_PARTIAL;
 	}
-	return ex;
 }
 
-// (depth map, open faces) -> a 16^3 shape in the shared node-box pool.
+// THE SHELL A NEIGHBOUR CARVES WITH: how deep, at most, the plain cube nf
+// sinks any groove under the dials this grid is built with (its relief map's
+// D). 0 = it carves nothing: not a relief node, relief off or flat, or a
+// baked model (a model's pockets are open only to their own face: dead ends).
+static int claudeReliefShellOf(const ContentFeatures &nf)
+{
+	const ClaudeTraceGrid &V = g_claude_grid;
+	if (V.relief_flat || nf.drawtype != NDT_NORMAL || nf.light_source != 0
+			|| nf.isLiquid())
+		return 0;
+	if (V.relief_blocks) {
+		if (const ClaudeReliefBlock *rb = claudeReliefBlock(nf)) {
+			static std::unordered_map<std::string, int> cache;
+			auto it = cache.find(nf.name);
+			if (it != cache.end())
+				return it->second;
+			int D = 0;
+			for (int t = 0; t < 6; t++) {
+				if (rb->sides_only && t < 2)
+					continue;
+				if (const std::array<u8, 256> *hm = claudeHeightMap(nf, t))
+					for (int k = 0; k < 256; k++)
+						D = std::max<int>(D, std::min<int>((*hm)[k], CLAUDE_RELIEF_SHELL));
+			}
+			cache[nf.name] = D;
+			return D;
+		}
+	}
+	if (V.relief_depth > 0 && claudeReliefCandidate(nf))
+		return std::min(V.relief_depth, 7);
+	return 0;
+}
+
+// the index (0..11) of the edge between two faces on different axes, -1 for
+// two faces on one axis
+static int claudeReliefEdge(int a, int b)
+{
+	static int8_t tab[6][6];
+	static bool init = false;
+	if (!init) {
+		int e = 0;
+		for (int i = 0; i < 6; i++)
+			for (int j = 0; j < 6; j++)
+				tab[i][j] = -1;
+		for (int i = 0; i < 6; i++)
+			for (int j = i + 1; j < 6; j++)
+				if (i / 2 != j / 2) {
+					tab[i][j] = tab[j][i] = (int8_t)e;
+					e++;
+				}
+		init = true;
+	}
+	return tab[a][b];
+}
+
+static const v3s16 g_claude_relief_dirs[6] = {v3s16(1, 0, 0), v3s16(-1, 0, 0),
+		v3s16(0, 1, 0), v3s16(0, -1, 0), v3s16(0, 0, 1), v3s16(0, 0, -1)};
+
+// A neighbour that has not arrived counts as PARTIAL (nothing carved near
+// it): when it arrives, the incremental path's one-node halo (a box, so the
+// edge-diagonal cells too) re-walks this cell.
+static ClaudeReliefNbr claudeReliefNeighbours(Map &map, const NodeDefManager *ndef,
+		v3s16 wp)
+{
+	ClaudeReliefNbr nb;
+	for (int k = 0; k < 6; k++) {
+		const v3s16 q = wp + g_claude_relief_dirs[k];
+		u8 cl = claudeReliefClass(map, ndef, q);
+		if (cl == CLAUDE_RN_OPEN)
+			nb.open |= (u8)(1 << k);
+		else if (cl == CLAUDE_RN_PARTIAL)
+			nb.partial |= (u8)(1 << k);
+		else
+			nb.nd[k] = (u8)claudeReliefShellOf(ndef->get(map.getNode(q)));
+	}
+	if (!nb.open)
+		return nb;
+	// all twelve: rule (b) reads an edge whose face is partial for this
+	// cell too (the block across a closed face may carve there)
+	for (int a = 0; a < 6; a++)
+		for (int b = a + 1; b < 6; b++) {
+			int e = claudeReliefEdge(a, b);
+			if (e < 0)
+				continue;
+			if (claudeReliefClass(map, ndef, wp + g_claude_relief_dirs[a]
+					+ g_claude_relief_dirs[b]) == CLAUDE_RN_OPEN)
+				nb.diag |= (u16)(1 << e);
+		}
+	return nb;
+}
+
+// (depth map, neighbours) -> a 16^3 shape in the shared node-box pool.
 // Texel <-> voxel mapping is faceTileRatio()'s, so the colour a ray gets
 // is the texel the groove was carved from.
 //
-// THE BAKE FLOOR (util/claude_models.py enforce_opaque, proven 2026-08-17):
-// an air voxel must lie within D of EXACTLY ONE open face. Each face's air
-// is then its own box, open only through that face, so no straight ray can
-// cross the node. Closed faces do not count, which is what lets grooves
-// reach the edge where the neighbour is the same kind of cube; between two
-// OPEN faces (a trunk's vertical corner) a D-wide rim stays solid.
-static u16 claudeReliefShapeId(u16 mapid, u8 exposed)
+// THE LEAK RULES (seams, 2026-10-10; replaces "within D of exactly one open
+// face", which held for soil but left a D-wide rim at every outside edge and
+// had a hole, below). D = the content's shell (its deepest carve). Every
+// open face carves its texels' depths straight in (so every air voxel is
+// within D of a face it was carved from). Then an air voxel p is kept only
+// if, over the faces it lies within D of ("near"):
+//   (0) no near face is PARTIAL;
+//   (a) for two near faces that are both OPEN, the edge-diagonal cell
+//       between them is OPEN (an outside edge or corner may be carved only
+//       where the outside goes round it);
+//   (b) for a near OPEN face u and a near CLOSED face w (Y = wp + w, the
+//       plain cube across w, carving with shell D_Y, claudeReliefShellOf):
+//       for every other face v of Y that could carve near p (v across w's
+//       axis, p within D_Y of it) and that Y has open (wp + w + v OPEN): v
+//       is open for this cell too, p is within D of it, and (a) holds for
+//       u, v.
+//       In words: a groove may run up to a seam unless the block across
+//       the seam carves a DIFFERENT face there that this cell does not
+//       reach. Where the next block's same face is open, or the next block
+//       carves nothing near (a bookshelf standing on a floor), the groove
+//       runs on.
+// Two near closed faces impose nothing.
+//
+// WHY NO LIGHT CAN GET THROUGH (the proof). Call R(p) the set of cells an air
+// voxel p is "attached to": wp+u for every near open u, and wp+u+w for every
+// near open u and near closed w. Every cell in R(p) is OPEN ((b) for the
+// second kind), and R(p) is face-connected through OPEN cells: wp+u touches
+// wp+u+w, and two near open faces u, v are joined by wp+u+v, OPEN by (a).
+// (With (b) as stated, R(p) also takes wp+u+w only when it is OPEN.)
+// Now follow light through carved air, voxel to face-adjacent voxel:
+//  * leaving the cell through a near face f: f is open (p opens into wp+f,
+//    which is in R(p)) or closed (next case); never partial, by (0).
+//  * p and q in the same cell, one step apart: their near sets differ only
+//    on that step's axis, and both have a near open face (each was carved
+//    from one), so they share one (losing +X and gaining -X in one step is
+//    impossible with D <= 8): R(p) and R(q) intersect.
+//  * p in cell A and q across a closed face w in cell B = A+w (both plain
+//    cubes, both carved under these rules, each with its own D): p is at
+//    distance 0 from w and q from -w, at the same in-plane position. q was
+//    carved from an open face v of B within D_B of it, so p is within D_B
+//    of A's v-face and A+w+v = B+v is OPEN: rule (b) at p says
+//    v = u (then B+u = A+w+u is in R(p) and in R(q)), or v is a near open
+//    face of p with A+v+w OPEN (then B+v is in R(p) and in R(q)). R(p) and
+//    R(q) intersect.
+//    A baked model across w (any NDT_NORMAL cube with an authored model):
+//    its air is within D of exactly one of its faces, so a pocket open to
+//    the shared face is open to nothing else: a dead end, not a path.
+// So every connected piece of carved air, with the open cells it touches,
+// lies inside ONE set of open cells that were already face-connected before
+// any carving: carving joins nothing that was apart. A closed room stays
+// closed. Contact through a shared EDGE or CORNER of two voxels only (a ray
+// through a line) is measure zero, as it already is between whole blocks.
+// What the rules cost: an outside corner whose diagonal is solid (a cell
+// whose two open faces look into different spaces) and an inside corner
+// where the block across the seam carves another face close by keep a
+// D-wide uncarved strip, and so does every face next to a door, pane, slab
+// or other shaped node. Checked on random worlds at 1/16 m by
+// util/claude_relief_leak_check.py (whose control, the old rule, leaks).
+// The hole the old rule had: two blocks A, B = A+w, A open on +X, B open on
+// +Y, A's +Y and B's +X closed: A's +X groove and B's +Y groove met through
+// the seam, joining A+X and B+Y, two cells that touch only at a corner.
+static u16 claudeReliefShapeId(u16 mapid, const ClaudeReliefNbr &nb)
 {
 	ClaudeTraceGrid &V = g_claude_grid;
-	u32 key = ((u32)mapid << 6) | exposed;
+	u64 key = (u64)mapid | ((u64)nb.open << 16) | ((u64)nb.partial << 22)
+			| ((u64)nb.diag << 28);
+	for (int k = 0; k < 6; k++)
+		key |= (u64)(nb.nd[k] & 7) << (40 + 3 * k);
 	auto it = V.relief_shape_of.find(key);
 	if (it != V.relief_shape_of.end())
 		return it->second;
 	u16 id = 0;
 	if (V.nbox_masks.size() < ClaudeTraceGrid::NBOX_CAP) {
-		const std::array<u8, 768> &m = V.relief_maps[mapid - 1];
-		const int D = V.relief_depth;
+		const ClaudeTraceGrid::ReliefMap &m = V.relief_maps[mapid - 1];
+		const int D = m.D;
+		// world tile of each face: +X 2, -X 3, +Y 0, -Y 1, +Z 4, -Z 5
+		static const int WT[6] = {2, 3, 0, 1, 4, 5};
 		static bool air[16][16][16]; // [z][y][x]
 		memset(air, 0, sizeof(air));
 		for (int k = 0; k < 6; k++) {
-			if (!(exposed & (1 << k)))
+			if (!(nb.open & (1 << k)))
 				continue;
 			for (int a = 0; a < 16; a++)
 			for (int b = 0; b < 16; b++) {
 				// (a, b) = the two in-plane voxel coords; tx, ty = texel
-				int tile, tx, ty;
+				int tx, ty;
 				switch (k) {
-				case 0: tile = 2; tx = 15 - b; ty = 15 - a; break; // +X: y=a, z=b
-				case 1: tile = 2; tx = b; ty = 15 - a; break;      // -X
-				case 2: tile = 0; tx = a; ty = b; break;           // +Y: x=a, z=b
-				case 3: tile = 1; tx = a; ty = b; break;           // -Y
-				case 4: tile = 2; tx = a; ty = 15 - b; break;      // +Z: x=a, y=b
-				default: tile = 2; tx = 15 - a; ty = 15 - b; break; // -Z
+				case 0: tx = 15 - b; ty = 15 - a; break; // +X: y=a, z=b
+				case 1: tx = b; ty = 15 - a; break;      // -X
+				case 2: tx = a; ty = b; break;           // +Y: x=a, z=b
+				case 3: tx = a; ty = b; break;           // -Y
+				case 4: tx = a; ty = 15 - b; break;      // +Z: x=a, y=b
+				default: tx = 15 - a; ty = 15 - b; break; // -Z
 				}
-				int d = m[tile * 256 + ty * 16 + tx];
+				int d = m.depth[WT[k] * 256 + ty * 16 + tx];
 				for (int dd = 0; dd < d; dd++) {
 					int x, y, z;
 					switch (k) {
@@ -5812,10 +6195,52 @@ static u16 claudeReliefShapeId(u16 mapid, u8 exposed)
 			bool a = air[z][y][x];
 			if (a) {
 				const int dist[6] = {15 - x, x, 15 - y, y, 15 - z, z};
-				int n = 0;
+				int near[6], nn = 0;
 				for (int k = 0; k < 6; k++)
-					n += (exposed & (1 << k)) && dist[k] < D;
-				a = n == 1;
+					if (dist[k] < D)
+						near[nn++] = k;
+				for (int i = 0; a && i < nn; i++) {
+					const int fi = near[i];
+					if (nb.partial & (1 << fi)) {
+						a = false;                       // rule (0)
+						break;
+					}
+					for (int j = i + 1; j < nn; j++) {
+						const int fj = near[j];
+						const bool oi = nb.open & (1 << fi), oj = nb.open & (1 << fj);
+						if (!oi || !oj)
+							continue;
+						const int e = claudeReliefEdge(fi, fj);
+						if (e >= 0 && !(nb.diag & (1 << e))) {
+							a = false;                   // rule (a)
+							break;
+						}
+					}
+				}
+				// rule (b): near open u, near closed w, the block across w
+				for (int i = 0; a && i < nn; i++) {
+					const int u = near[i];
+					if (!(nb.open & (1 << u)))
+						continue;
+					for (int j = 0; a && j < nn; j++) {
+						const int w = near[j];
+						if (w / 2 == u / 2 || (nb.open & (1 << w)))
+							continue;                    // partial: rule (0)
+						for (int v = 0; v < 6; v++) {
+							if (v / 2 == w / 2 || v == u || dist[v] >= nb.nd[w])
+								continue;
+							if (!(nb.diag & (1 << claudeReliefEdge(w, v))))
+								continue;                // B does not carve v
+							const int euv = claudeReliefEdge(u, v);
+							const bool ok = (nb.open & (1 << v)) && dist[v] < D
+									&& euv >= 0 && (nb.diag & (1 << euv));
+							if (!ok) {
+								a = false;
+								break;
+							}
+						}
+					}
+				}
 			}
 			if (!a) {
 				mask[(z * 16 + y) * 2 + x / 8] |= (u8)(1 << (x % 8));
@@ -6103,9 +6528,15 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		// keep their existing nub+NEE treatment.
 		// RELIEF BEATS A TEXTURE-BAKED CUBE MODEL for the nodes it carves
 		// (claude_relief > 0): log_oak_baked is the older bake of the same
-		// idea, from the tile files, in one colour per cell.
-		bool relief_node = (V.relief_depth > 0 || !V.oak_model) && plain_solid
-				&& claudeReliefCandidate(f);
+		// idea, from the tile files, in one colour per cell. A RELIEF BLOCK
+		// (claude_relief_blocks, seams 2026-10-10) likewise: planks, logs,
+		// cobble, stone bricks, bookshelf, crafting table, unlit furnace.
+		const bool relief_block = plain_solid && V.relief_blocks
+				&& claudeReliefBlock(f) != nullptr;
+		bool relief_node = relief_block || ((V.relief_depth > 0 || !V.oak_model)
+				&& plain_solid && claudeReliefCandidate(f));
+		// a relief block's orientation: its face tiles are placed by it
+		const u8 rfd = relief_block ? n.getFaceDir(ndef, false) : 0;
 		if (!g_claude_grid.model_of.empty() && !relief_node
 				&& (plain_solid || leaves_model || (f.light_source > 0
 					&& f.drawtype == NDT_NORMAL))) {
@@ -6162,11 +6593,14 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 			video::SColor rtint(255, 255, 255, 255);
 			if (f.visuals)
 				f.visuals->getColor(n.getParam2(), &rtint);
-			u16 rm = (V.relief_flat || V.relief_depth == 0) ? 0
-					: claudeReliefMapId(client, c, f, col, rtint);
-			u8 ex = rm ? claudeReliefExposed(map, ndef,
-					origin + v3s16(x, y, z)) : 0;
-			u16 sid = ex ? claudeReliefShapeId(rm, ex) : 0;
+			u16 rm = V.relief_flat ? 0
+					: relief_block ? claudeReliefMapId(client, c, f, col, rtint, true, rfd)
+					: V.relief_depth == 0 ? 0
+					: claudeReliefMapId(client, c, f, col, rtint, false, 0);
+			ClaudeReliefNbr nb;
+			if (rm)
+				nb = claudeReliefNeighbours(map, ndef, origin + v3s16(x, y, z));
+			u16 sid = nb.open ? claudeReliefShapeId(rm, nb) : 0;
 			if (sid) {
 				V.nbox_all[i] = sid;
 				V.relief_cells++;
@@ -6200,18 +6634,23 @@ static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
 		else if (V.modelids[i])
 			hash = hash * 1099511628211ULL + (u64)V.modelids[i] * 31;
 		// material id (0 = untextured); palette + atlas grow on first sight
-		auto pit = g_claude_grid.palette.find(c);
+		const u32 pkey = (u32)c | ((u32)rfd << 16);
+		auto pit = g_claude_grid.palette.find(pkey);
 		if (pit != g_claude_grid.palette.end()) {
 			mids[i] = pit->second;
 		} else if (g_claude_grid.palette.size() < 254) {
 			u8 mid = (u8)(g_claude_grid.palette.size() + 1);
-			g_claude_grid.palette[c] = mid;
+			g_claude_grid.palette[pkey] = mid;
 			video::SColor tint0(255, 255, 255, 255);
 			if (f.visuals)
 				f.visuals->getColor(n.getParam2(), &tint0);
-			claudeAtlasAdd(client, mid, f, col, tint0);
+			claudeAtlasAdd(client, mid, f, col, tint0, rfd, relief_block);
 			mids[i] = mid;
 		}
+		// the face tiles are part of the content too: a furnace turned in
+		// place keeps its shape class but changes which face shows the front
+		if (relief_block)
+			hash = hash * 1099511628211ULL + (u64)mids[i] * 131;
 		solid++;
 	}
 	V.block_hash[b] = hash;
@@ -6902,7 +7341,7 @@ static void claudeTraceGridUploadAtlas()
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 768, 0, GL.BGRA,
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 1536, 0, GL.BGRA,
 			GL.UNSIGNED_BYTE, V.atlas.data());
 	// per-material response params (256x1 RGBA), unit 15
 	if (!V.matparams_tex)
@@ -7165,6 +7604,7 @@ static void claudeTraceGridSnapshot(Client *client)
 		}
 		V.relief_depth = rd;
 		V.relief_frac = rf;
+		V.relief_blocks = claudeReliefBlocksOn();
 		V.relief_flat = claudeReliefFlat();
 		V.oak_model = claudeOakModel();
 		V.relief_cells = 0;
@@ -7252,6 +7692,7 @@ static void claudeTraceGridSnapshot(Client *client)
 			<< " nbox_shapes=" << V.nbox_masks.size()
 			<< "/" << V.nbox_of.size()
 			<< " relief=" << V.relief_depth
+			<< " relief_blocks=" << (V.relief_blocks ? 1 : 0)
 			<< " relief_cells=" << V.relief_cells
 			<< " relief_shapes=" << V.relief_shape_of.size()
 			<< std::endl;
@@ -7753,6 +8194,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_texel_colour\": " << g_claude_grid.dial_texel
 			<< ", \"claude_relief\": " << g_claude_grid.relief_depth
 			<< ", \"claude_relief_flat\": " << (g_claude_grid.relief_flat ? 1 : 0)
+			<< ", \"claude_relief_blocks\": " << (g_claude_grid.relief_blocks ? 1 : 0)
 			<< ", \"claude_relief_frac\": " << g_claude_grid.relief_frac
 			<< ", \"relief_cells\": " << g_claude_grid.relief_cells
 			<< ", \"relief_shapes\": " << g_claude_grid.relief_shape_of.size()
@@ -8410,6 +8852,7 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 					|| claudeNodeBoxEnabled() != g_claude_grid.nodebox_on
 					|| claudeReliefDepth() != g_claude_grid.relief_depth
 					|| claudeReliefFlat() != g_claude_grid.relief_flat
+					|| claudeReliefBlocksOn() != g_claude_grid.relief_blocks
 					|| claudeOakModel() != g_claude_grid.oak_model
 					|| claudeReliefFrac() != g_claude_grid.relief_frac);
 		if (geom_moved) {

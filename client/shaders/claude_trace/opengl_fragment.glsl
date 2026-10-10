@@ -370,7 +370,7 @@ const float LAVA_L = 3.069;
 const float LAVA_RHO = 0.0465;
 // FACE-TILE COLOUR (claude_texel_colour, 2026-10-04). claudeMaterials is
 // the per-cell material id (unit 12, R8 128^3, 0 = none); claudeAtlas
-// (unit 13, 256x768) holds three 16x16 tiles per id — top, bottom, side —
+// (unit 13, 256x1536) holds six 16x16 tiles per id — +Y -Y +X -X +Z -Z —
 // each texel a RATIO x64 to the cell colour (game.cpp
 // claudeAtlasFaceTiles). Read only at a plain cube's hit: carved models
 // keep one colour per cell until their own delit palettes are wired
@@ -1531,20 +1531,22 @@ vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 	vec3 l = clamp(phit - cell, vec3(0.0), vec3(0.99999));
 	float face;
 	vec2 uv;
+	// six tiles per id since seams (2026-10-10), in world order 0 +Y, 1 -Y,
+	// 2 +X, 3 -X, 4 +Z, 5 -Z (game.cpp claudeAtlasFaceTiles)
 	if (abs(n.y) > 0.5) {
 		face = n.y > 0.0 ? 0.0 : 1.0;
 		uv = vec2(l.x, l.z);
 	} else if (abs(n.x) > 0.5) {
-		face = 2.0;
+		face = n.x > 0.0 ? 2.0 : 3.0;
 		uv = vec2(n.x > 0.0 ? 1.0 - l.z : l.z, 1.0 - l.y);
 	} else {
-		face = 2.0;
+		face = n.z > 0.0 ? 4.0 : 5.0;
 		uv = vec2(n.z > 0.0 ? l.x : 1.0 - l.x, 1.0 - l.y);
 	}
 	vec2 tx = floor(uv * 16.0);
 	vec2 at = vec2(mod(mid, 16.0) * 16.0 + tx.x,
 			face * 256.0 + floor(mid / 16.0) * 16.0 + tx.y);
-	return texture2D(claudeAtlas, (at + 0.5) / vec2(256.0, 768.0)).rgb
+	return texture2D(claudeAtlas, (at + 0.5) / vec2(256.0, 1536.0)).rgb
 			* (255.0 / 64.0);
 }
 

@@ -1,0 +1,13 @@
+{
+  "about": "Blocks carved through the engine relief path (game.cpp claudeReliefBlock; seams 2026-10-10): per exposed face, depth from util/claude_heightmaps, so grooves continue across block seams. The set is the texture-baked models' set (util/claude_models.py bake_from_tiles), the blocks John picked for carving; claude_relief_blocks 0 gives them their baked models back. faces 'sides' = top and bottom tiles stay flat (the log's end grain, as its model did). Lit furnaces glow and keep their baked model (per-voxel firebox emission).",
+  "blocks": {
+    "mcl_trees:tree_oak": {"faces": "sides"},
+    "mcl_trees:wood_oak": {},
+    "mcl_trees:wood_spruce": {},
+    "mcl_core:cobble": {},
+    "mcl_core:stonebrick": {},
+    "mcl_books:bookshelf": {},
+    "mcl_crafting_table:crafting_table": {},
+    "mcl_furnaces:furnace": {}
+  }
+}
