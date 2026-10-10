@@ -7279,8 +7279,17 @@ static void claudeUpdateAccum(Client *client)
 	{
 		float h = (float)std::max(1u, RenderingEngine::get_video_driver()->getScreenSize().Height);
 		float px_angle = std::max(cam->getFovY(), 1e-3f) / h;
-		float cosang = core::clamp(d.dotProduct(g_claude_grid.still_anchor_dir), -1.0f, 1.0f);
-		float rot_px = std::acos(cosang) / px_angle;
+		// the angle between two unit directions as 2 asin(|a - b| / 2): exactly
+		// 0 for the same direction. acos(a . b) was not: a . a rounds to
+		// 0.99999994 for many directions, acos of that is 3.5e-4 rad, about a
+		// third of a pixel, and the picture restarted every frame standing
+		// still (2026-10-10, the cave pose; the first test pose happened to
+		// round exactly)
+		v3f an = g_claude_grid.still_anchor_dir, dn = d;
+		an.normalize();
+		dn.normalize();
+		float chord = core::clamp((dn - an).getLength() * 0.5f, 0.0f, 1.0f);
+		float rot_px = 2.0f * std::asin(chord) / px_angle;
 		float move_px = (g_claude_grid.still_drift / BS) / 0.25f / px_angle;
 		g_claude_grid.still_drift_px = std::max(rot_px, move_px);
 	}
