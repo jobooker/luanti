@@ -15,7 +15,7 @@ VIEWS = {"forest": (146.5, 8.5, 123.5, 270, -5), "torchroom": (241.7, 8.5, 231.7
 BASE = {"claude_nee": 1, "claude_bounces": 24, "claude_area_pick": 0, "claude_area_skip": 0,
         "claude_area_nee": 1, "claude_descend": 1, "claude_leaf_transmit": 1, "claude_far_levels": 3,
         "claude_torch_nee": 1, "claude_model_far": 1, "claude_bricks": 1, "claude_bricks_far": 1,
-        "claude_walk_exact": 1, "claude_relief": 0, "claude_relief_blocks": 1,
+        "claude_walk_exact": 1, "claude_relief": 0, "claude_relief_blocks": 1, "claude_column_colour": 1,
         "claude_denoise": 1, "claude_denoise_learned": 0}
 ARMS = json.loads(sys.argv[1])
 # a dial set but not reset between arms leaks into every later arm (it

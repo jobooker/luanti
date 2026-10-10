@@ -2571,6 +2571,12 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
 	float m_tree_plant = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tree_plant_pixel{"claudeTreePlant"};
+	// claude_column_colour (seams 2026-10-10, default 1): a carved groove's
+	// side walls and a deep pocket's floor show the texel of the face they
+	// were carved into (their column), not the perpendicular face's tile;
+	// 0 = the old pick by hit normal (the comparison arm)
+	float m_column_colour = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_column_colour_pixel{"claudeColumnColour"};
 	// claude_tree_variant (2026-10-07): walk ablations for pricing
 	float m_tree_variant = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tree_variant_pixel{"claudeTreeVariant"};
@@ -2682,6 +2688,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_raw_frame",
 		"claude_truth",
 		"claude_tree_plant",
+		"claude_column_colour",
 		"claude_tree_variant",
 		"claude_tree_dirs",
 		"claude_bricks",
@@ -3623,6 +3630,8 @@ public:
 		}
 		if (name == "claude_tree_plant")
 			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		if (name == "claude_column_colour")
+			m_column_colour = readAir("claude_column_colour", 1.0f, 1.0f);
 		if (name == "claude_tree_variant")
 			m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		if (name == "claude_tree_dirs")
@@ -3754,6 +3763,7 @@ public:
 		m_raw_frame = readAir("claude_raw_frame", 0.0f, 1.0f);
 		m_truth = readAir("claude_truth", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
+		m_column_colour = readAir("claude_column_colour", 1.0f, 1.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
@@ -3973,6 +3983,7 @@ public:
 						- v3f(G.origin.X, G.origin.Y, G.origin.Z), m_view == 35.0f || m_view == 39.0f);
 			}
 			m_tree_plant_pixel.set(&m_tree_plant, services);
+			m_column_colour_pixel.set(&m_column_colour, services);
 			m_tree_variant_pixel.set(&m_tree_variant, services);
 			m_tree_dirs_pixel.set(&m_tree_dirs, services);
 			m_guide_deposit_pixel.set(&m_guide_deposit, services);

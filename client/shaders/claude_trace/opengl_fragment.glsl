@@ -1521,7 +1521,24 @@ vec3 hgSample(vec3 w, float g, float u1, float u2)
 	return normalize(tx * (sn * cos(ph)) + ty * (sn * sin(ph)) + w * c);
 }
 
+bool fineSolid(vec3 cell, vec3 sv);
+uniform float claudeColumnColour;
 // The face-tile ratio under a plain cube's hit point (claudeTexel).
+//
+// THE COLUMN'S COLOUR (seams, 2026-10-10; claude_column_colour, default 1).
+// A carved block (surface relief, game.cpp claudeReliefShapeId) is a face
+// whose texels are columns sunk to their depth. A ray that hits the side
+// WALL of a groove sees the side of the column next to it, so it takes that
+// column's texel on the face the groove was cut into -- not the texel of the
+// perpendicular face's tile at that spot (a bookshelf's frame board showed
+// book colours on its inner side, bark furrow walls showed the next face's
+// edge texels). The baked models did the same (claude_models.py COLUMN
+// COLOUR). Which hits: the air voxel the ray came from is inside the cell,
+// and straight on along the normal it meets solid again within the cell (a
+// wall or a pocket's floor: a groove floor, a slab top or a stair tread look
+// out of the cell and keep their own face). The face carved is the nearest
+// one (within 3 voxels, the deepest carve) that the air voxel has a clear
+// run to.
 vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 {
 	float mid = floor(texture3D(claudeMaterials,
@@ -1529,6 +1546,57 @@ vec3 faceTileRatio(vec3 cell, vec3 phit, vec3 n)
 	if (mid < 0.5)
 		return vec3(1.0);
 	vec3 l = clamp(phit - cell, vec3(0.0), vec3(0.99999));
+	if (claudeColumnColour > 0.5) {
+		vec3 h16 = (phit - cell) * 16.0;
+		vec3 air = floor(h16 + n * 0.5);
+		vec3 solid = floor(h16 - n * 0.5);
+		if (all(greaterThanEqual(air, vec3(0.0))) && all(lessThanEqual(air, vec3(15.0)))) {
+			bool blocked = false;
+			for (int k = 1; k <= 8; k++) {
+				vec3 p = air + n * float(k);
+				if (any(lessThan(p, vec3(0.0))) || any(greaterThan(p, vec3(15.0))))
+					break;
+				if (fineSolid(cell, p)) {
+					blocked = true;
+					break;
+				}
+			}
+			if (blocked) {
+				float best = 99.0;
+				vec3 bestd = n;
+				for (int a = 0; a < 6; a++) {
+					float ax = floor(float(a) / 2.0);
+					float sg = mod(float(a), 2.0) < 0.5 ? 1.0 : -1.0;
+					vec3 d = vec3(ax < 0.5 ? sg : 0.0, abs(ax - 1.0) < 0.5 ? sg : 0.0,
+							ax > 1.5 ? sg : 0.0);
+					if (abs(dot(d, n)) > 0.5)
+						continue;
+					float c = dot(air, abs(d));
+					float dist = sg > 0.0 ? 15.0 - c : c;
+					if (dist >= 3.0 || dist >= best)
+						continue;
+					bool clear = true;
+					for (int k = 1; k <= 2; k++) {
+						if (float(k) > dist)
+							break;
+						if (fineSolid(cell, air + d * float(k))) {
+							clear = false;
+							break;
+						}
+					}
+					if (clear) {
+						best = dist;
+						bestd = d;
+					}
+				}
+				if (best < 99.0) {
+					// the column: the solid voxel hit, read on the carved face
+					l = (solid + 0.5) / 16.0;
+					n = bestd;
+				}
+			}
+		}
+	}
 	float face;
 	vec2 uv;
 	// six tiles per id since seams (2026-10-10), in world order 0 +Y, 1 -Y,
