@@ -133,8 +133,13 @@ def main():
             return s
 
         def shots(tag):
+            """the traced picture, then the raster one (claude_grid_debug 0: the
+            plain renderer, which draws every entity; the tracer may not)"""
             p = lab.shot("freezecheck-%s-%d" % (tag, time.time()), settle=0.0, record=False)
-            return p
+            lab.doorway(claude_grid_debug=0)
+            q = lab.shot("freezecheck-%s-raster-%d" % (tag, time.time()), settle=0.5, record=False)
+            lab.doorway(claude_grid_debug=3)
+            return [p, q]
 
         t0 = time.time()
         rep["frozen"] = [sample("frozen", t0)]
