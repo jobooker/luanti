@@ -214,7 +214,8 @@ def _delight(img, carved, delight=1.0, target=None):
 
 
 def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
-                    emit_level=13, delight=1.0, albedo=None):
+                    emit_level=13, delight=1.0, albedo=None,
+                    grain_depth=1, carve_faces=None):
     """tiles: {face: png path}. Returns (name, palette, voxels) in the
     same shape the authored models use. Palette grows per unique
     (rgb, emit) — texel-true colors, no quantization.
@@ -254,7 +255,14 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
             faces.setdefault("front", img)
         else:
             faces[face] = img
-    for face, img in faces.items():
+    # an edge voxel belongs to two faces and holds one colour: the last
+    # face written wins. With carve_faces, the carving faces are written
+    # last (a log's side wins its top and bottom edge from the end grain's
+    # dark ring, which drew a dark line at every seam, 2026-10-09).
+    order = list(faces.items())
+    if carve_faces is not None:
+        order.sort(key=lambda fi: fi[0] in carve_faces)
+    for face, img in order:
         lum = img @ np.array([0.2126, 0.7152, 0.0722])
         lo, hi = lum.min(), max(lum.max(), lum.min() + 1.0)
         med = float(np.median(lum))
@@ -300,6 +308,13 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
             fire = ((img[:, :, 0] > 140.0)
                     & (img[:, :, 0] > 1.5 * img[:, :, 2])
                     & (img[:, :, 1] > 40.0))
+        # carve_faces: only these faces carve (None = all). A log's end
+        # grain stays flat (2026-10-09): carved, it cut into the side faces'
+        # top rows, and the bake floor refilled them with the interior fill,
+        # a dark band at every log seam.
+        if carve_faces is not None and face not in carve_faces:
+            deep = np.zeros_like(deep)
+            keep = np.zeros_like(keep)
         carved = (deep | (keep & interior)) & ~fire
         alb = _delight(img, carved, delight=delight, target=albedo)
         alb[fire] = img[fire]   # emissive brightness is real, not paint
@@ -312,8 +327,8 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                     d = maxdepth  # fire sits at the back of its recess
                 elif deep[vv, u]:
                     d = maxdepth
-                elif keep[vv, u] and 0 < vv < N - 1 and 0 < u < N - 1:
-                    d = 1
+                elif keep[vv, u] and interior[vv, u]:
+                    d = grain_depth
                 else:
                     d = 0
                 for dd in range(d):
@@ -506,6 +521,13 @@ def model_planks_spruce():
 
 
 def model_log_oak():
+    # 2026-10-09 (John: keep the sub-voxel bark, "add some texture back. And
+    # maybe make the grooves better"): the voxels keep the texture's own
+    # colours (PALETTE_COLOUR_MODELS) and the rim is only as wide as the
+    # carving (OWN_SHELL_MODELS). CLAUDE_BARK = "old" (1 deep, 3-texel rim,
+    # the shipped carving), "d1" (1 deep, 1-texel rim), "d2" (darkest
+    # furrows 2 deep, 2-texel rim) -- the comparison for John's pick.
+    var = os.environ.get("CLAUDE_BARK", "d2")
     return bake_from_tiles(
         "log_oak_baked",
         dict(side=_mcl("ITEMS", "mcl_core", "textures",
@@ -514,7 +536,8 @@ def model_log_oak():
                       "default_tree_top.png"),
              bottom=_mcl("ITEMS", "mcl_core", "textures",
                          "default_tree_top.png")),
-        maxdepth=1, albedo=ALBEDO_TARGET["log"])
+        maxdepth=2 if var == "d2" else 1, albedo=ALBEDO_TARGET["log"],
+        carve_faces=("left", "right", "back", "front"))
 
 
 def model_cobble():
@@ -652,6 +675,23 @@ def shell_count(n=N, depth=SHELL):
     return (np.minimum(idx, n - 1 - idx) < depth).sum(axis=0)
 
 
+# SHELL = THE MODEL'S OWN DEEPEST CARVE (2026-10-09, bark): the proof above
+# needs every air cell within D of exactly one face, where D is at least the
+# deepest carve -- any such D, not 3 in particular. A model carved 1-2 deep
+# keeps a 1-2 texel rim instead of 3, so its grooves get 14x14 or 12x12 of
+# each face instead of 10x10 (the 3-texel frame is what boxed every log face
+# into a panel). Opt-in per model: changing it changes that block's look.
+OWN_SHELL_MODELS = {"log_oak_baked"}
+
+
+def carve_depth(v):
+    """the deepest air cell's distance into the node, + 1 (0 = uncarved)"""
+    idx = np.indices(np.asarray(v).shape)
+    dist = np.minimum(idx, np.asarray(v).shape[0] - 1 - idx).min(axis=0)
+    air = np.asarray(v) == 0
+    return int(dist[air].max()) + 1 if air.any() else 0
+
+
 def enforce_opaque(name, pal, v):
     """Apply the bake floor: every air cell must sit in EXACTLY ONE
     face's carve shell, which makes the node opaque to any straight ray
@@ -666,13 +706,15 @@ def enforce_opaque(name, pal, v):
     v = np.asarray(v)
     before = through_lines(v)
     mat = base_material_index(pal, v)
-    bad = (v == 0) & (shell_count() != 1)
+    depth = max(1, carve_depth(v)) if (name in OWN_SHELL_MODELS
+                                       and os.environ.get("CLAUDE_BARK") != "old") else SHELL
+    bad = (v == 0) & (shell_count(depth=depth) != 1)
     plugs = [(int(x), int(y), int(z))
              for z, y, x in np.argwhere(bad)]
     v[bad] = mat
     after = through_lines(v)
     return v, dict(before=len(before), after=len(after), plugs=plugs,
-                   material=mat)
+                   material=mat, depth=depth)
 
 
 def extrude_cutout(name, path, thick=2, emit_level=12):
@@ -797,7 +839,10 @@ FLAME_MODELS = {"torch_baked", "lantern_floor", "campfire_lit",
 
 PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_oxeye_daisy", "flower_cornflower",
-                         "flower_allium", "flower_tulip_red"}
+                         "flower_allium", "flower_tulip_red",
+                         # the bark (2026-10-09): its bake is delit, so the
+                         # carved texels are not darkened twice
+                         "log_oak_baked"}
 
 
 def model_torch_baked():
@@ -967,7 +1012,7 @@ def main():
             # budget to argue about, and it is asserted on the RESULT so
             # a future carve that reaches deeper than SHELL trips it.
             leftover = int(((np.asarray(v) == 0)
-                            & (shell_count() != 1)).sum())
+                            & (shell_count(depth=floor["depth"]) != 1)).sum())
             if leftover:
                 raise SystemExit(
                     "BAKE FLOOR FAILED on %s: %d air cell(s) are not in "

@@ -2541,6 +2541,16 @@ bool marchMed(vec3 ro, vec3 rd, float curMed, out vec3 hp, out vec3 n,
 		// anyway — so this reports exactly what an arrival at air has
 		// always reported, at either rung.
 		alb = hitAir ? cellAlbedo(vec3(0.0)) : cellAlbedo(s.rgb);
+		// THE VOXEL'S OWN COLOUR on a carved model (2026-10-09): models
+		// flagged "colour": "palette" were coloured per voxel only on the
+		// plant/pane path above; a carved SOLID block (the bark) took one
+		// colour per cell here, which is what made the oak model a flat tan
+		// with a carved glyph. The same lookup, the same flag.
+		if (!hitAir && suHit.x >= 0.0) {
+			vec3 vrgb;
+			if (modelVoxelColour(ci, suHit, vrgb))
+				alb = cellAlbedo(vrgb);
+		}
 		le = hitAir ? vec3(0.0) : alb * pal.r; // emission column (§4: one Le)
 		if (claudeFlame > 0.5 && !hitAir && suHit.x >= 0.0 && pal.r > 0.0)
 			le *= modelVoxelEmitScale(ci, suHit);
