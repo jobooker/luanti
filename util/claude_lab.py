@@ -24,14 +24,16 @@ AND per config — a golden without its config record is not evidence
 Vantages live in util/claude_vantages.json (same shape as the beelink
 vantages.json, plus optional "time" applied before the shot).
 Env: CLAUDE_MT_DIR (user dir; defaults to the repo root — RUN_IN_PLACE),
-     CLAUDE_WORLD (world dir; defaults to <repo>/worlds/gallery).
+     CLAUDE_SEAT_WORLD (world dir the seat runs on, as claude_ci uses it;
+       util/claude_seat_world.py), else CLAUDE_WORLD, else <repo>/worlds/gallery.
 """
 import argparse, json, os, subprocess, sys, time, glob
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 MT = os.environ.get("CLAUDE_MT_DIR") or REPO
-WORLD = os.environ.get("CLAUDE_WORLD") or os.path.join(REPO, "worlds", "gallery")
+WORLD = os.path.join(REPO, os.environ.get("CLAUDE_SEAT_WORLD") or os.environ.get("CLAUDE_WORLD")
+                     or os.path.join("worlds", "gallery"))
 PATCH = os.path.join(MT, "claude_settings_patch.conf")
 SHOTS = os.path.join(MT, "screenshots")
 STATS = os.path.join(MT, "claude_stats.json")
