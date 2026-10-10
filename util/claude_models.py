@@ -717,7 +717,7 @@ OWN_SHELL_MODELS = {"log_oak_baked",
 # (and so the no-leak proof) is untouched, only the plug's palette entry.
 PAINTED_PLUG_MODELS = {"planks_oak_baked", "planks_spruce_baked",
                        "cobble_baked", "crafting_baked", "bookshelf_baked",
-                       "furnace_baked"}
+                       "furnace_baked", "log_oak_baked"}
 PLUG_PAINT = {}     # name -> (mask, rgb), filled by bake_from_tiles
 
 
