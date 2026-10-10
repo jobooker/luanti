@@ -68,8 +68,8 @@ def main():
     import claude_lab as lab
     import claude_denoise_price as price
     rep = {"world": world}
-    price.start_seat()
     try:
+        price.start_seat()     # inside the try: a seat that never got ready is stopped too
         rep["at_start"] = lab.rpc("freeze")
         rep["freeze_on"] = lab.rpc("freeze", on=True, hold_motion=not a.no_hold_motion)
         x, y, z = START
@@ -110,8 +110,11 @@ def main():
         # aim the pinned camera at the drop (eye 1.5 m above the feet)
         import math
         pitch = math.degrees(math.atan2(sand["y"] + 0.5 - (y + 1.5), cz + 0.0 - z))
-        open(pin, "w").write("0 %r %r %r 0 %r\n" % (x, y, z, pitch))
+        # a NEW file name: the client loads a path when the patch value changes
+        aim = pin + ".aim"
+        open(aim, "w").write("0 %r %r %r 0 %r\n" % (x, y, z, pitch))
         lab.rpc("tp", pos={"x": x, "y": y, "z": z}, yaw=0, pitch=pitch)
+        open(lab.PATCH, "w").write("claude_path = %s\nclaude_stats = 1\n" % aim)
         rep["camera_pitch"] = pitch
         time.sleep(2)
         lab.rpc("set_node", pos=sand, name=SAND)
@@ -164,6 +167,7 @@ def main():
         except Exception as e:
             print("unfreeze failed: %s" % e)
         open(lab.PATCH, "w").write("claude_path = 0\n")
+        rep["seat_stopped"] = SW.stop_seat_on(world)
     log = "/tmp/claude_denoise_price.server.log"
     rep["server_log"] = [l.rstrip() for l in open(log, errors="replace")
                          if "claude_freeze" in l or "FROZEN" in l or "unfrozen" in l

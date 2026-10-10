@@ -155,10 +155,12 @@ def capture(args):
     import claude_lab as lab
     if os.path.realpath(lab.WORLD) != os.path.realpath(world["run_copy"]):
         sys.exit("REFUSED: the bridge would talk to %s, the seat runs %s" % (lab.WORLD, world["run_copy"]))
+    run_dir = None
     try:
-        _capture(args, lab, world)
+        run_dir = _capture(args, lab, world)
     finally:
-        # the world runs again whatever happened (the seat stays up)
+        # the world runs again whatever happened (a --live-world seat stays up;
+        # a demo seat is stopped below)
         for what, fn in (("view", lambda: open(lab.PATCH, "w").write("claude_path = 0\nclaude_view = 0\n")),
                          ("unfreeze", lambda: lab.rpc("freeze", on=False) if world["demo"] else None),
                          ("abm", lambda: lab.rpc("abm", on=True))):
@@ -166,6 +168,12 @@ def capture(args):
                 fn()
             except Exception as e:
                 print("cleanup %s failed: %s" % (what, e), flush=True)
+        if world["demo"]:
+            # a seat on a per-run copy is invisible to every other checkout's
+            # stop_seat (it looks for worlds/gallery): it must not outlive the run
+            print("demo seat stopped: pids %s" % SW.stop_seat_on(world["run_copy"]), flush=True)
+    if run_dir:
+        print(run_dir)   # the last line: callers read the run folder from it
 
 
 def _capture(args, lab, world):
@@ -474,7 +482,7 @@ def _capture(args, lab, world):
                                    "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
     json.dump(meta, open(os.path.join(run_dir, "meta.json"), "w"), indent=1)
-    print(run_dir)
+    return run_dir
 
 
 def lab_scene_fields():

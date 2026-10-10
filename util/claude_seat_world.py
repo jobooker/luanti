@@ -79,6 +79,53 @@ def servers_on(world):
     return out
 
 
+def seat_pids(world):
+    """exact PIDs of the seat on `world`: its servers, and the headless clients
+    (luanti under gamescope) started from this checkout, with their gamescope
+    wrappers"""
+    pids = servers_on(world)
+    r = subprocess.run(["pgrep", "-x", "luanti"], capture_output=True, text=True)
+    for pid in r.stdout.split():
+        try:
+            cwd = os.readlink("/proc/%s/cwd" % pid)
+            chain, p = [], pid
+            for _ in range(3):      # luanti <- gamescopereaper <- gamescope
+                p = open("/proc/%s/stat" % p).read().rsplit(")", 1)[1].split()[1]
+                if not open("/proc/%s/comm" % p).read().strip().startswith("gamescope"):
+                    break
+                chain.append(int(p))
+        except OSError:
+            continue
+        if os.path.realpath(cwd) == os.path.realpath(REPO) and chain:
+            pids += [int(pid)] + chain
+    return pids
+
+
+def stop_seat_on(world, wait=20.0):
+    """A DEMO SEAT MUST NOT OUTLIVE ITS RUN (2026-10-10). Every other
+    checkout's claude_ci.stop_seat finds the seat by "--world worlds/gallery",
+    so a server on a per-run copy is invisible to them: one left up held port
+    30000 and every other seat start failed. Stops the seat on `world` by
+    exact PID (SIGTERM, then SIGKILL after `wait` s); returns the PIDs."""
+    import signal
+    pids = seat_pids(world)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    t0 = time.time()
+    while time.time() - t0 < wait and any(os.path.exists("/proc/%d" % p) for p in pids):
+        time.sleep(0.5)
+    for p in pids:
+        if os.path.exists("/proc/%d" % p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+    return pids
+
+
 def snapshots():
     return sorted(d for d in glob.glob(os.path.join(SNAP_ROOT, SNAP_GLOB)) if os.path.isdir(d))
 
