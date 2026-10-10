@@ -359,6 +359,23 @@ def _capture(args, lab, world):
 
         rt = {}
         scene_ids = {}
+        # THE FIRST ARM OF A SCENARIO WAS HANDICAPPED (2026-10-10, measured in
+        # the order off, on, on, off): room-backup's first arm had 13.9 % of the
+        # frame too dark while moving, the same settings run last 4.6 % --
+        # exactly what the light memory arms had, so its "3x fewer dark
+        # patches" was the order. Something the replay does not reset warms up
+        # (to find: far terrain still arriving, shader/GPU warm-up). Until it
+        # is found, one discarded run of the first arm's settings goes first.
+        if args.warmup and arms:
+            wkvs = arms[0][1]
+            run(["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pin,
+                 "--nodump", "--frames", "120", "--name", name + "-park-warmup"] + extra
+                + sum([["--dial", kv] for kv in wkvs], []))
+            lab.goto({"pos": [x, y, z], "yaw": yaw, "pitch": pitch})
+            lab.load_scene([x, y, z], yaw, pitch, pin)
+            wu = run(common + sum([["--dial", kv] for kv in wkvs], []) + ["--name", name + "-warmup"])
+            if wu and os.path.isdir(wu[-1]) and wu[-1].startswith(os.path.join(REPO, "screenshots", "dump")):
+                shutil.rmtree(wu[-1])
         for ai, (arm, kvs) in enumerate(arms):
             arm_dials = sum([["--dial", kv] for kv in kvs], [])
             # every arm starts the same way: parked at the start pose with its
@@ -692,6 +709,8 @@ if __name__ == "__main__":
     ap.add_argument("--arm", action="append",
                     help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
                          "and scored against one truth (NAME: alone = the game as it is)")
+    ap.add_argument("--no-warmup", dest="warmup", action="store_false",
+                    help="skip the discarded warm-up run before the arms (the first arm is handicapped without it)")
     ap.add_argument("--path-fps", type=float, default=0,
                     help="lay the path out at this fps instead of the measured one (runs that must share a path)")
     ap.add_argument("--no-truth", action="store_true", help="arms only; no truth, nothing to score against")
