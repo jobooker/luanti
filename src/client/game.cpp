@@ -350,6 +350,7 @@ struct ClaudeTraceGrid
 	std::unordered_map<u64, u16> relief_shape_of;
 	u32 relief_cells = 0;                        // cells carved in the last full walk
 	bool relief_blocks = true;                   // claude_relief_blocks the grid was built under
+	bool relief_partial_open = false;            // claude_relief_partial_open (INSTRUMENT), likewise
 	// material id per (facedir << 16 | content): a relief block's id is per
 	// orientation (its six face tiles are placed by facedir), every other
 	// content has facedir 0 here
@@ -6008,7 +6009,10 @@ static u8 claudeReliefClass(Map &map, const NodeDefManager *ndef, v3s16 p)
 	case NDT_RAILLIKE:
 		return CLAUDE_RN_OPEN;
 	default:
-		return CLAUDE_RN_PARTIAL;
+		// claude_relief_partial_open (an INSTRUMENT, default 0; can LEAK:
+		// the A/B arm that shows what the partial rule costs, e.g. the
+		// floor under a lantern that stays flat)
+		return g_claude_grid.relief_partial_open ? CLAUDE_RN_OPEN : CLAUDE_RN_PARTIAL;
 	}
 }
 
@@ -7634,6 +7638,13 @@ static void claudeTraceGridSnapshot(Client *client)
 		V.relief_depth = rd;
 		V.relief_frac = rf;
 		V.relief_blocks = claudeReliefBlocksOn();
+		{
+			const bool po = g_settings->exists("claude_relief_partial_open")
+					&& g_settings->getFloat("claude_relief_partial_open", 0.0f, 1.0f) >= 0.5f;
+			if (po != V.relief_partial_open)
+				V.relief_shape_of.clear();   // the neighbour classes changed
+			V.relief_partial_open = po;
+		}
 		V.relief_flat = claudeReliefFlat();
 		V.oak_model = claudeOakModel();
 		V.relief_cells = 0;
@@ -8882,6 +8893,9 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 					|| claudeReliefDepth() != g_claude_grid.relief_depth
 					|| claudeReliefFlat() != g_claude_grid.relief_flat
 					|| claudeReliefBlocksOn() != g_claude_grid.relief_blocks
+					|| (g_settings->exists("claude_relief_partial_open")
+						&& g_settings->getFloat("claude_relief_partial_open", 0.0f, 1.0f) >= 0.5f)
+						!= g_claude_grid.relief_partial_open
 					|| claudeOakModel() != g_claude_grid.oak_model
 					|| claudeReliefFrac() != g_claude_grid.relief_frac);
 		if (geom_moved) {
