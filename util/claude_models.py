@@ -839,8 +839,8 @@ def _flower(name, tex):
 # colour, not "albedo x the light level's scale". Every emissive model in
 # this shop is a fire: the torch, the lantern's flame, the campfire and
 # the lit furnace's firebox.
-FLAME_MODELS = {"torch_baked", "lantern_floor", "campfire_lit",
-                "furnace_baked"}
+FLAME_MODELS = {"torch_baked", "torch_wall_baked", "lantern_floor",
+                "campfire_lit", "furnace_baked"}
 
 PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_oxeye_daisy", "flower_cornflower",
@@ -850,14 +850,236 @@ PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "log_oak_baked"}
 
 
+# ---- MESH VOXELIZER (2026-10-09, torch2) ----------------------------------
+# The torch used to be made up: the flat inventory tile extruded into a
+# 2-voxel slab. Mineclonia draws it as a MESH (drawtype "mesh", api.lua):
+# Minecraft's construction, four full-tile planes at x = +-1/16 and
+# z = +-1/16 (mostly transparent) plus a small top and bottom face, and a
+# second mesh tilted 22.5 deg for the wall torch. This bakes those meshes.
+#
+# Rules encoded here, each from the engine source, not tuned:
+#  - irr/src/COBJMeshFileLoader.cpp readVec3/readUV: X = -x ("change
+#    handedness") and V = 1 - v, so V = 0 is the TOP image row.
+#  - mesh nodes are in node units centred on the node (nodedef scales by BS).
+#  - wallmounted nodes: content_mapblock.cpp drawMeshNode maps param2 through
+#    wallmounted_to_facedir (util/directiontables.cpp) and calls
+#    rotateMeshBy6dFacedir (client/mesh.cpp), mirrored below exactly.
+#  - a texel is solid at alpha >= 128 (use_texture_alpha = "clip").
+# Voxel of a point p: floor((p + 0.5) * 16), layout v[z][y][x], y up.
+
+WALLMOUNTED_TO_FACEDIR = (20, 0, 16 + 1, 12 + 3, 8, 4 + 2, 20 + 1, 0 + 1)
+
+
+def load_obj(path):
+    """(positions[n,3], uvs[n,2], tris[m,2,3] of (v index, vt index)) with
+    Irrlicht's load-time flips applied: X negated, V = 1 - v. Faces are
+    fanned from their first corner (as COBJMeshFileLoader does)."""
+    pos, uv, tris = [], [], []
+    for line in open(path):
+        w = line.split()
+        if not w:
+            continue
+        if w[0] == "v":
+            x, y, z = (float(a) for a in w[1:4])
+            pos.append((-x, y, z))
+        elif w[0] == "vt":
+            u, v = (float(a) for a in w[1:3])
+            uv.append((u, 1.0 - v))
+        elif w[0] == "f":
+            corners = []
+            for c in w[1:]:
+                parts = c.split("/")
+                vi = int(parts[0]) - 1
+                ti = int(parts[1]) - 1 if len(parts) > 1 and parts[1] else -1
+                corners.append((vi, ti))
+            for i in range(1, len(corners) - 1):
+                tris.append((corners[0], corners[i], corners[i + 1]))
+    return (np.array(pos, dtype=np.float64), np.array(uv, dtype=np.float64),
+            tris)
+
+
+def _rotate_uv_axes(p, a, b, degrees):
+    """client/mesh.cpp rotateMesh<U,V>: u' = c*u - s*v, v' = s*u + c*v"""
+    r = np.radians(degrees)
+    c, s_ = np.cos(r), np.sin(r)
+    u = p[:, a].copy()
+    v = p[:, b].copy()
+    p[:, a] = c * u - s_ * v
+    p[:, b] = s_ * u + c * v
+
+
+def rotate_by_6d_facedir(p, facedir):
+    """client/mesh.cpp rotateMeshBy6dFacedir, on an [n,3] array (X,Y,Z)."""
+    p = np.array(p, dtype=np.float64)
+    axisdir = facedir >> 2
+    fd = facedir & 3
+    if fd == 1:
+        _rotate_uv_axes(p, 0, 2, -90)
+    elif fd == 2:
+        _rotate_uv_axes(p, 0, 2, 180)
+    elif fd == 3:
+        _rotate_uv_axes(p, 0, 2, 90)
+    if axisdir == 1:
+        _rotate_uv_axes(p, 1, 2, 90)
+    elif axisdir == 2:
+        _rotate_uv_axes(p, 1, 2, -90)
+    elif axisdir == 3:
+        _rotate_uv_axes(p, 0, 1, -90)
+    elif axisdir == 4:
+        _rotate_uv_axes(p, 0, 1, 90)
+    elif axisdir == 5:
+        _rotate_uv_axes(p, 0, 1, -180)
+    return p
+
+
+def _is_flame(r, g, b):
+    # the same rule extrude_cutout has always used
+    return r > 180.0 and g > 100.0 and r > 1.4 * b
+
+
+def mesh_samples(obj_path, tex_rgba, facedir=0, per_voxel=24, nudge=1e-4):
+    """Dense samples of a mesh's OPAQUE texels, in voxel space.
+    Returns (vox[n,3] ints as (x, y, z), texel[n] = row * 16 + col).
+    Each triangle is sampled on a barycentric grid (at the small
+    triangles' centroids) of about `per_voxel` steps per voxel length of
+    its longest edge, so every triangle gets the SAME sample density per
+    unit area and a voxel's vote is area-weighted (a fixed step count per
+    triangle let the 1/8 m top face outvote the 1.4 m planes 64:1);
+    each sample is nudged `nudge` node units along the face normal toward
+    the mesh's vertex centroid, because the planes lie exactly on voxel
+    boundaries (x = +-1/16) and must fall on the INSIDE voxel."""
+    pos, uv, tris = load_obj(obj_path)
+    pos = rotate_by_6d_facedir(pos, facedir)
+    centroid = pos.mean(axis=0)
+    th, tw = tex_rgba.shape[:2]
+
+    def grid(steps):
+        # the centroids of the grid's small triangles, both orientations:
+        # never ON a grid line, so never on a texel edge (texel edges are
+        # voxel edges here, and the X mirror runs them in opposite
+        # directions, so a sample on an edge would take one side's texel
+        # and the other side's voxel)
+        ii, jj = np.meshgrid(np.arange(steps), np.arange(steps),
+                             indexing="ij")
+        up = ii + jj <= steps - 1
+        dn = ii + jj <= steps - 2
+        b1 = np.concatenate([ii[up] + 1 / 3, ii[dn] + 2 / 3])[:, None] / steps
+        b2 = np.concatenate([jj[up] + 1 / 3, jj[dn] + 2 / 3])[:, None] / steps
+        return 1.0 - b1 - b2, b1, b2
+
+    out_v, out_t = [], []
+    for (a, b, c) in tris:
+        pa, pb, pc = pos[a[0]], pos[b[0]], pos[c[0]]
+        edge = max(np.linalg.norm(pb - pa), np.linalg.norm(pc - pb),
+                   np.linalg.norm(pa - pc))
+        b0, b1, b2 = grid(max(2, int(np.ceil(edge * N * per_voxel))))
+        ta, tb, tc = uv[a[1]], uv[b[1]], uv[c[1]]
+        p = b0 * pa + b1 * pb + b2 * pc
+        t = b0 * ta + b1 * tb + b2 * tc
+        n = np.cross(pb - pa, pc - pa)
+        nl = np.linalg.norm(n)
+        if nl < 1e-12:
+            continue
+        n /= nl
+        side = np.sign((centroid - p) @ n)[:, None]
+        p = p + side * n * nudge
+        col = np.clip(np.floor(t[:, 0] * tw).astype(int), 0, tw - 1)
+        row = np.clip(np.floor(t[:, 1] * th).astype(int), 0, th - 1)
+        opaque = tex_rgba[row, col, 3] >= 128
+        vox = np.floor((p + 0.5) * N).astype(int)
+        inside = np.all((vox >= 0) & (vox < N), axis=1)
+        m = opaque & inside
+        out_v.append(vox[m])
+        out_t.append(row[m] * tw + col[m])
+    return np.concatenate(out_v), np.concatenate(out_t)
+
+
+def voxelize_meshes(name, tex_rgba, bakes, emit_level=12):
+    """Bake one or more (obj_path, facedir) into 16^3 grids sharing one
+    palette. Each voxel takes the texel most of its samples landed on
+    (ties: the lower texel index). Flame texels (_is_flame) emit at
+    emit_level. Returns (name, pal, [v per bake])."""
+    th, tw = tex_rgba.shape[:2]
+    results = []
+    used = set()
+    for obj_path, facedir in bakes:
+        vox, tex = mesh_samples(obj_path, tex_rgba, facedir)
+        lin = (vox[:, 2] * N + vox[:, 1]) * N + vox[:, 0]
+        key = lin.astype(np.int64) * (th * tw) + tex
+        uk, cnt = np.unique(key, return_counts=True)
+        kv, kt = uk // (th * tw), uk % (th * tw)
+        # per voxel, the max count; np.unique sorts by (voxel, texel) so a
+        # stable sort on -count keeps the lowest texel first among ties
+        order = np.lexsort((kt, -cnt, kv))
+        first = np.ones(len(order), dtype=bool)
+        first[1:] = kv[order][1:] != kv[order][:-1]
+        win_v, win_t = kv[order][first], kt[order][first]
+        used.update(int(t) for t in win_t)
+        results.append((win_v, win_t))
+    pal = [None]
+    pindex = {}
+    for t in sorted(used):
+        r, g, b, a = (float(c) for c in tex_rgba[t // tw, t % tw])
+        pal.append(dict(rgb=[int(r), int(g), int(b)],
+                        emit=emit_level if _is_flame(r, g, b) else 0))
+        pindex[t] = len(pal) - 1
+    grids = []
+    for win_v, win_t in results:
+        v = np.zeros((N, N, N), dtype=np.uint16)
+        flat = v.reshape(-1)
+        flat[win_v] = [pindex[int(t)] for t in win_t]
+        grids.append(v)
+    return name, pal, grids
+
+
+def _torch_paths():
+    d = _mcl("ITEMS", "mcl_torches")
+    # the node's tile is the animated strip (register.lua); frame 0
+    tex = np.asarray(Image.open(os.path.join(
+        d, "textures", "default_torch_on_floor_animated.png")).convert("RGBA"),
+        dtype=np.float32)[:16]
+    return (os.path.join(d, "models", "mcl_torches_torch_floor.obj"),
+            os.path.join(d, "models", "mcl_torches_torch_wall.obj"), tex)
+
+
 def model_torch_baked():
-    tdir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "..", "games", "mineclonia", "mods", "ITEMS",
-                        "mcl_torches", "textures")
-    return extrude_cutout(
-        "torch_baked",
-        os.path.join(tdir, "default_torch_on_floor.png"),
-        thick=2, emit_level=12)
+    """mcl_torches:torch from mcl_torches_torch_floor.obj. The floor torch
+    is always wallmounted 1 (facedir 0, the mesh as authored), so all four
+    rotation slots hold that one bake: param2 & 3 must not yaw it."""
+    floor, _, tex = _torch_paths()
+    name, pal, (v,) = voxelize_meshes(
+        "torch_baked", tex, [(floor, WALLMOUNTED_TO_FACEDIR[1])])
+    return name, pal, v, [v, v, v, v]
+
+
+def model_torch_wall_baked():
+    """mcl_torches:torch_wall from mcl_torches_torch_wall.obj. The four
+    wall directions are not yaw turns of one shape (the engine tips the
+    mesh over with a 6d facedir), so each is baked from the engine's own
+    rotation and stored explicitly: rotation slot = wallmounted & 3, so
+    slot 0 <- w4, 1 <- w5, 2 <- w2, 3 <- w3. wallmounted_dirs points
+    at the supporting node: w2 +x, w3 -x, w4 +z, w5 -z."""
+    _, wall, tex = _torch_paths()
+    ws = (4, 5, 2, 3)                       # slot r holds wallmounted ws[r]
+    name, pal, grids = voxelize_meshes(
+        "torch_wall_baked", tex,
+        [(wall, WALLMOUNTED_TO_FACEDIR[w]) for w in ws])
+    return name, pal, grids[0], grids
+
+
+def ascii_sections(v, title=""):
+    """Two side projections of a 16^3 grid: looking along -z (x across,
+    y up) and along x (z across, y up). '#' = any solid voxel on the
+    line of sight."""
+    v = np.asarray(v)
+    s = v > 0
+    lines = ["%s  [x->, y up | proj along z]   [z->, y up | proj along x]"
+             % title]
+    for y in range(N - 1, -1, -1):
+        a = "".join("#" if s[:, y, x].any() else "." for x in range(N))
+        b = "".join("#" if s[z, y, :].any() else "." for z in range(N))
+        lines.append("y%2d  %s     %s" % (y, a, b))
+    return "\n".join(lines)
 
 
 # ---- isometric preview (orthographic ray march, front-right-top) ----
@@ -937,7 +1159,9 @@ MANIFEST = {
                       "mcl_furnaces:furnace"],
     "chest_custom": ["mcl_chests:chest_small", "mcl_chests:chest"],
     "crafting_baked": ["mcl_crafting_table:crafting_table"],
-    "torch_baked": ["mcl_torches:torch", "mcl_torches:torch_wall"],
+    "torch_baked": ["mcl_torches:torch"],
+    # the wall torch is its own mesh (2026-10-09): four explicit rotations
+    "torch_wall_baked": ["mcl_torches:torch_wall"],
     "bookshelf_baked": ["mcl_books:bookshelf"],
     "bed_red_foot": ["mcl_beds:bed_red_bottom"],
     "bed_red_head": ["mcl_beds:bed_red_top"],
@@ -958,10 +1182,11 @@ MANIFEST = {
     "flower_cornflower": ["mcl_flowers:cornflower"],
     "flower_allium": ["mcl_flowers:allium"],
     "flower_tulip_red": ["mcl_flowers:tulip_red"],
-    # leaves (2026-10-05): six perforated sheets, see leaf_sheets(). With
-    # these the table holds 32 models, which is the atlas cap (game.cpp:
-    # 32 models x 4 rotations x 16 layers = 2048, GL's guaranteed 3-D
-    # texture depth). The next model needs that cap raised first.
+    # leaves (2026-10-05): six perforated sheets, see leaf_sheets(). The
+    # atlas cap is 32 models (game.cpp: 32 models x 4 rotations x 16
+    # layers = 2048, GL's guaranteed 3-D texture depth). Counted
+    # 2026-10-09: this table holds 30 with torch_wall_baked (only MANIFEST
+    # entries load; furnace_custom/crafting_custom are baked, not bound).
     "leaves_oak": ["mcl_trees:leaves_oak", "mcl_trees:leaves_oak_orphan"],
     "leaves_dark_oak": ["mcl_trees:leaves_dark_oak",
                         "mcl_trees:leaves_dark_oak_orphan"],
@@ -987,7 +1212,8 @@ def main():
                   indent=1)
     for fn in (model_furnace, model_chest, model_crafting,
                model_furnace_baked, model_crafting_baked,
-               model_torch_baked, model_bookshelf_baked,
+               model_torch_baked, model_torch_wall_baked,
+               model_bookshelf_baked,
                lambda: model_bed("foot"), lambda: model_bed("head"),
                model_lantern, model_campfire, model_carpet,
                model_flowerpot, model_planks_oak, model_planks_spruce,
@@ -1006,7 +1232,11 @@ def main():
                lambda: _leaves("leaves_spruce", "mcl_core", "mcl_core_leaves_spruce.png"),
                lambda: _leaves("leaves_acacia", "mcl_core", "default_acacia_leaves.png"),
                lambda: _leaves("leaves_birch", "mcl_core", "mcl_core_leaves_birch.png")):
-        name, pal, v = fn()
+        res = fn()
+        name, pal, v = res[:3]
+        # "rotations": per param2 & 3 voxel grids, for shapes that are not
+        # yaw turns of one grid (the wall torch); "voxels" = rotations[0]
+        rotations = res[3] if len(res) > 3 else None
         if name in SOLID_NODE_MODELS:
             v, floor = enforce_opaque(name, pal, v)
             holes = "  holes %d->%d  opacity fill %4d" % (
@@ -1033,6 +1263,9 @@ def main():
                                            emit=p["emit"])
                                       for p in pal[1:]],
                     voxels=v.tolist())
+        if rotations is not None:
+            assert np.array_equal(rotations[0], v)
+            data["rotations"] = [np.asarray(r).tolist() for r in rotations]
         if name in PALETTE_COLOUR_MODELS:
             data["colour"] = "palette"
         if name in FLAME_MODELS:
