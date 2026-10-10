@@ -823,6 +823,178 @@ function OPS.setting(p)
     return { name = p.name, value = core.settings:get(p.name) }
 end
 
+-- DEMO MODE: THE WORLD HOLDS STILL FOR A TEST (2026-10-09).
+--
+-- A test run should be a function of (build, world snapshot, path, dials).
+-- claude_abm stopped the ABMs, but the server kept simulating everything
+-- else: a row of white roof blocks once rendered as a smooth tube in one
+-- run (a falling-block entity, most likely), liquids flow, node timers
+-- fire, mods' globalsteps move mobs, weather and players' physics.
+--
+-- OPS.freeze{on=true} sets the engine setting claude_freeze (entity steps,
+-- liquid flow, node timers, ABMs, LBMs: ServerEnvironment::step) AND holds
+-- back every globalstep that is not this mod's own, by swapping
+-- core.registered_globalsteps for a table of only the bridge's entries.
+-- The engine looks that field up on every step (s_env.cpp
+-- environment_Step), and the registration closure keeps appending to the
+-- ORIGINAL table, so restoring it on {on=false} gives back every
+-- globalstep, including any registered meanwhile. The swap happens inside
+-- the bridge's own globalstep: core.run_callbacks has the old table on its
+-- stack and finishes this step's pass on it, so nothing is skipped or run
+-- twice. Held back while frozen: builtin's core.after scheduler too (it
+-- is a globalstep), so mods' delayed jobs wait as well.
+--
+-- Runtime only, like claude_abm: the dedicated server never writes its
+-- settings back, so a seat restart is unfrozen. {} (no "on") reads back.
+--
+-- A WORLD THAT STARTS FROZEN: a per-run world copy made by
+-- util/claude_seat_world.py carries the file claude_demo_freeze; with it,
+-- the ENGINE half is on from the server's first step (a falling block in
+-- the snapshot never takes a step). The globalsteps are held only when the
+-- harness calls OPS.freeze, after the client has joined: the game sets up
+-- a joining player (sky, physics, HUD) partly from globalsteps and
+-- core.after jobs, and a test should see the game's real setup.
+local FREEZE_MOD = core.get_current_modname()
+local freeze_all_steps = nil   -- the full globalstep table while held
+
+local function freeze_globalsteps(on)
+    if on and not freeze_all_steps then
+        local all = core.registered_globalsteps
+        local kept, held = {}, {}
+        for _, fn in ipairs(all) do
+            local o = core.callback_origins[fn]
+            local mod = o and o.mod or "??"
+            if mod == FREEZE_MOD then
+                kept[#kept + 1] = fn
+            else
+                held[#held + 1] = mod
+            end
+        end
+        freeze_all_steps = all
+        core.registered_globalsteps = kept
+        core.log("action", ("[claude_bridge] FROZEN: %d globalsteps held "
+            .. "(%s), %d of the bridge's own still run"):format(
+            #held, table.concat(held, ","), #kept))
+    elseif not on and freeze_all_steps then
+        core.registered_globalsteps = freeze_all_steps
+        freeze_all_steps = nil
+        core.log("action", ("[claude_bridge] unfrozen: all %d globalsteps "
+            .. "run again"):format(#core.registered_globalsteps))
+    end
+end
+
+local hold_motion, release_motion   -- the entity half, defined below
+local held_motion = {}     -- object id -> { obj, v, a }
+local held_motion_n = 0
+local motion_hold_on = true         -- {hold_motion=false}: the A/B for the client's own motion
+
+function OPS.freeze(p)
+    if p.on ~= nil then
+        local on = p.on and true or false
+        core.settings:set_bool("claude_freeze", on)
+        freeze_globalsteps(on)
+        motion_hold_on = p.hold_motion ~= false
+        if on and motion_hold_on then hold_motion() else release_motion() end
+    end
+    return {
+        claude_freeze = core.settings:get_bool("claude_freeze", false),
+        globalsteps_held = freeze_all_steps ~= nil,
+        globalsteps_running = #core.registered_globalsteps,
+        globalsteps_all = #(freeze_all_steps or core.registered_globalsteps),
+        entities_held = held_motion_n,
+        motion_hold = motion_hold_on,
+    }
+end
+
+do
+    local mark = core.get_worldpath() .. "/claude_demo_freeze"
+    local f = io.open(mark, "r")
+    if f then
+        f:close()
+        core.settings:set_bool("claude_freeze", true)
+        core.log("action", "[claude_bridge] demo world (" .. mark .. "): "
+            .. "claude_freeze ON from the first server step; mod "
+            .. "globalsteps run until OPS.freeze holds them")
+    end
+end
+
+-- HELD ENTITIES MUST LOOK HELD ON THE CLIENT TOO. The engine stops
+-- stepping entities, but the client moves an entity by itself between
+-- server updates: GenericCAO::step integrates the velocity and acceleration
+-- it was last sent (content_cao.cpp, with its own collision for physical
+-- ones). A falling block held mid-air on the server would keep falling on
+-- the client, at a speed set by the client's frame timing. So while
+-- claude_freeze is on, every entity's velocity and acceleration are
+-- remembered and zeroed, and its position re-sent (set_pos sends position,
+-- velocity and acceleration at once: LuaEntitySAO::sendPosition); entities
+-- that appear later (a block activated while frozen) are caught on the
+-- next 0.2 s tick. Released with the freeze, motion given back.
+local ZERO = vector.new(0, 0, 0)
+
+hold_motion = function()
+    for id, ent in pairs(core.luaentities) do
+        local obj = ent.object
+        if not held_motion[id] and obj and obj:is_valid() then
+            held_motion[id] = { obj = obj, v = obj:get_velocity(), a = obj:get_acceleration() }
+            held_motion_n = held_motion_n + 1
+            obj:set_velocity(ZERO)
+            obj:set_acceleration(ZERO)
+            if not obj:get_attach() then obj:set_pos(obj:get_pos()) end
+        end
+    end
+end
+
+release_motion = function()
+    local n = 0
+    for _, h in pairs(held_motion) do
+        if h.obj:is_valid() then
+            h.obj:set_velocity(h.v or ZERO)
+            h.obj:set_acceleration(h.a or ZERO)
+            if not h.obj:get_attach() then h.obj:set_pos(h.obj:get_pos()) end
+            n = n + 1
+        end
+    end
+    if held_motion_n > 0 then
+        core.log("action", ("[claude_bridge] motion given back to %d of %d held entities")
+            :format(n, held_motion_n))
+    end
+    held_motion, held_motion_n = {}, 0
+end
+
+local motion_timer = 0
+core.register_globalstep(function(dtime)
+    motion_timer = motion_timer + dtime
+    if motion_timer < 0.2 then return end
+    motion_timer = 0
+    if core.settings:get_bool("claude_freeze", false) and motion_hold_on then
+        hold_motion()
+    elseif held_motion_n > 0 then
+        release_motion()
+    end
+end)
+
+-- Test instruments for the freeze (2026-10-09): the entities near a point
+-- (a falling block is an entity while it falls), and the builtin falling
+-- check a player's dig or place would run next to a node (core.set_node
+-- alone never makes sand fall).
+function OPS.objects(p)
+    local out = {}
+    for _, obj in ipairs(core.get_objects_inside_radius(p.pos, p.radius or 8)) do
+        local e = obj:get_luaentity()
+        if e then
+            local pos = obj:get_pos()
+            out[#out + 1] = { name = e.name, pos = pos,
+                              node = e.node and e.node.name or nil }
+        end
+    end
+    return out
+end
+
+function OPS.check_falling(p)
+    core.check_for_falling(p.pos)
+    return core.get_node(p.pos)
+end
+
 -- Dig a node the way a player's hand does, not the way a mod does.
 --
 -- OPS.lamps and the room builders use core.set_node, which is the "mod

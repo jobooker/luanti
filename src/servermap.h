@@ -161,6 +161,8 @@ public:
 	void transformLiquidsLocal(std::map<v3s16, MapBlock*> &modified_blocks, UniqueQueue<v3s16> &liquid_queue,
 			ServerEnvironment *env, u32 liquid_loop_max);
 	void transforming_liquid_add(v3s16 p);
+	// claude_freeze report: liquid nodes waiting to flow
+	size_t transformingLiquidSize() const { return m_transforming_liquid.size(); }
 
 	MapSettingsManager settings_mgr;
 

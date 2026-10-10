@@ -171,7 +171,11 @@ SETTLE_POLL = 0.25
 # evidence for a boolean, and the other 5 s bought nothing.
 FREEZE_WAIT = 3.0
 SEAT_PORT = 30000          # server port for the CI seat
-SEAT_WORLD = "worlds/gallery"
+# The world the seat runs on: CLAUDE_SEAT_WORLD, else worlds/gallery as
+# always. Demo mode (claude_playtest) points it at a per-run copy of a
+# frozen snapshot: util/claude_seat_world.py.
+import claude_seat_world                     # noqa: E402
+SEAT_WORLD = claude_seat_world.seat_world()
 SEAT_CLIENT_NAME = "claude"
 SEAT_BOOT_WAIT = 6.0       # s to let the server listen before the client dials
 SEAT_TERM_WAIT = 20.0      # s to wait for SIGTERM'd seat processes to exit
@@ -192,9 +196,14 @@ CLIENT_CMD = ["./bin/luanti", "--address", "127.0.0.1", "--port",
               str(SEAT_PORT), "--name", SEAT_CLIENT_NAME, "--go"]
 # pkill -f patterns for the two known seat invocations (RUNTIME only — the
 # script owns the seat while it runs, and leaves it up afterwards).
-SEAT_PATTERNS = ["bin/luantiserver --world " + SEAT_WORLD,
+SEAT_PATTERNS = ["bin/luantiserver --world " + claude_seat_world.DEFAULT_WORLD,
+                 # a demo-mode seat, whichever per-run copy it is on
+                 "bin/luantiserver --world " + claude_seat_world.RUNS,
                  "bin/luanti --address 127.0.0.1",
                  "gamescope --backend headless"]
+if SEAT_WORLD != claude_seat_world.DEFAULT_WORLD \
+        and not SEAT_WORLD.startswith(claude_seat_world.RUNS):
+    SEAT_PATTERNS.insert(0, "bin/luantiserver --world " + SEAT_WORLD)
 # --headless: the client runs inside gamescope's headless backend, an
 # off-screen 1920x1080 output on the same GPU. Added 2026-10-04 on the
 # Linux rig: the only real seat that frames 1920x1080 is DP-2 (the MSI),

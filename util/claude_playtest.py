@@ -38,6 +38,12 @@ otherwise it is rendered again and replaced. --fresh-truth forces a render;
 --truth-check-only [--truth-check-seed N] [--truth-check-dial k=v] tests the
 check itself (another seed must pass; a change to the light rules must fail).
 
+DEMO MODE (2026-10-09, util/claude_seat_world.py): a capture runs on a fresh
+per-run copy of a frozen world snapshot, with the server world frozen
+(claude_freeze: no entities, liquids, node timers, ABMs, LBMs or mod
+globalsteps), so a run is a function of (build, snapshot, path, dials).
+--live-world runs on worlds/gallery as it is, unfrozen, as before.
+
 An A/B is ONE run with several --arm: the arms share the path and the truth
 (rendered once), and each starts from the same settled, reset state.
 
@@ -98,7 +104,8 @@ def scrub_conf_like_look():
         s = re.sub(r"(?m)^%s\s*=.*\n?" % re.escape(k), "", s)
     open(conf, "w").write(s)
     open(os.path.join(REPO, "claude_settings_patch.conf"), "w").close()
-    open(os.path.join(REPO, "worlds", "gallery", "claude_dial.conf"), "w").close()
+    import claude_lab
+    open(os.path.join(claude_lab.WORLD, "claude_dial.conf"), "w").close()
     return keys
 
 
@@ -135,7 +142,44 @@ def game_default(member):
 
 
 def capture(args):
+    global PLAY_DENOISE, BUILD
+    # DEMO MODE: a fresh copy of the frozen snapshot for this run. Set in the
+    # environment BEFORE claude_lab is imported: lab and every claude_motion
+    # child (claude_ci.SEAT_WORLD) read the seat world from it.
+    import claude_seat_world as SW
+    world = {"demo": not args.live_world}
+    if not args.live_world:
+        world["run_copy"] = SW.fresh()
+        world["snapshot"] = open(os.path.join(world["run_copy"], SW.DEMO_MARK)).read().split("snapshot: ")[-1].strip()
+        os.environ[SW.ENV] = world["run_copy"]
+        print("demo mode: world %s (snapshot %s)" % (world["run_copy"], world["snapshot"]), flush=True)
+    else:
+        world["run_copy"] = SW.seat_world_abs()
     import claude_lab as lab
+    if os.path.realpath(lab.WORLD) != os.path.realpath(world["run_copy"]):
+        sys.exit("REFUSED: the bridge would talk to %s, the seat runs %s" % (lab.WORLD, world["run_copy"]))
+    run_dir = None
+    try:
+        run_dir = _capture(args, lab, world)
+    finally:
+        # the world runs again whatever happened (a --live-world seat stays up;
+        # a demo seat is stopped below)
+        for what, fn in (("view", lambda: open(lab.PATCH, "w").write("claude_path = 0\nclaude_view = 0\n")),
+                         ("unfreeze", lambda: lab.rpc("freeze", on=False) if world["demo"] else None),
+                         ("abm", lambda: lab.rpc("abm", on=True))):
+            try:
+                fn()
+            except Exception as e:
+                print("cleanup %s failed: %s" % (what, e), flush=True)
+        if world["demo"]:
+            # a seat on a per-run copy is invisible to every other checkout's
+            # stop_seat (it looks for worlds/gallery): it must not outlive the run
+            print("demo seat stopped: pids %s" % SW.stop_seat_on(world["run_copy"]), flush=True)
+    if run_dir:
+        print(run_dir)   # the last line: callers read the run folder from it
+
+
+def _capture(args, lab, world):
     global PLAY_DENOISE, BUILD
     BUILD = TS.build_hash(REPO)
     PLAY_DENOISE = ["--dial", "claude_denoise=1",
@@ -149,7 +193,7 @@ def capture(args):
     if len({a for a, _ in arms}) != len(arms):
         sys.exit("REFUSED: two arms share a name: %r" % [a for a, _ in arms])
     arm_keys = sorted({kv.split("=")[0].strip() for _, kvs in arms for kv in kvs})
-    meta = {"deferred_to_game_defaults": keys, "scenarios": {},
+    meta = {"deferred_to_game_defaults": keys, "scenarios": {}, "world": world,
             "arms": {a: kvs for a, kvs in arms}, "dials_all_runs": args.dial or []}
     first = True
     nonlocal_first = [True]
@@ -170,6 +214,14 @@ def capture(args):
                    "--frames", "120", "--name", name + "-park"] + extra + ([] if first else ["--skip-seat"]))
         if first:
             lab.rpc("abm", on=False)
+            if world["demo"]:
+                # the engine half has been on since the server's first step
+                # (the copy's claude_demo_freeze); now hold the globalsteps
+                fz = lab.rpc("freeze", on=True)
+                world.setdefault("freeze", []).append(fz)
+                print("demo mode: %s" % json.dumps(fz), flush=True)
+                if not (fz.get("claude_freeze") and fz.get("globalsteps_held")):
+                    sys.exit("REFUSED: the world did not freeze: %r" % (fz,))
             time.sleep(60)            # the world-file reader fills the far levels
         first = False
         lab.goto({"pos": [x, y, z], "yaw": yaw, "pitch": pitch})
@@ -422,6 +474,8 @@ def capture(args):
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
                                    {"fps_measured": fps, "control": cinfo, "hold": hold,
                                     "scene_id": truth.get("scene_id"),
+                                    # the world it was rendered in (demo mode: the snapshot)
+                                    "world": world.get("snapshot") or world.get("run_copy"),
                                     "truth_frames": tframes, "truth_keys": [list(k) for k in tkeys],
                                     "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
                     TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
@@ -435,10 +489,8 @@ def capture(args):
                                    "reference": man["reference"], "faces": man["faces"], "truth": truth,
                                    "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
-    open(lab.PATCH, "w").write("claude_path = 0\nclaude_view = 0\n")
-    lab.rpc("abm", on=True)
     json.dump(meta, open(os.path.join(run_dir, "meta.json"), "w"), indent=1)
-    print(run_dir)
+    return run_dir
 
 
 def lab_scene_fields():
@@ -643,6 +695,9 @@ if __name__ == "__main__":
     ap.add_argument("--path-fps", type=float, default=0,
                     help="lay the path out at this fps instead of the measured one (runs that must share a path)")
     ap.add_argument("--no-truth", action="store_true", help="arms only; no truth, nothing to score against")
+    ap.add_argument("--live-world", action="store_true",
+                    help="run on worlds/gallery as it is, unfrozen (default: demo mode, a per-run copy "
+                         "of the frozen snapshot with the server world frozen)")
     ap.add_argument("--recheck-truth", action="store_true",
                     help="run the truth check even if this build already passed it")
     ap.add_argument("--fresh-truth", action="store_true",

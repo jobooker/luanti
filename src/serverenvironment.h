@@ -259,6 +259,9 @@ public:
 	// This makes stuff happen
 	void step(f32 dtime);
 
+	// claude_freeze: true while the test seat's world is held still
+	bool claudeFrozen() const { return m_claude_freeze; }
+
 	u32 getGameTime() const { return m_game_time; }
 
 	void reportMaxLagEstimate(float f) { m_max_lag_estimate = f; }
@@ -417,6 +420,12 @@ private:
 	// claude_abm, remembered only so the state change prints once
 	// instead of once per second. Starts true = the shipped default.
 	bool m_claude_abm_last = true;
+	// claude_freeze (demo mode), read once per step(); _last only so the
+	// change prints once; the counters feed the periodic frozen report
+	bool m_claude_freeze = false;
+	bool m_claude_freeze_last = false;
+	u32 m_claude_freeze_held_objects = 0;
+	IntervalLimiter m_claude_freeze_report_interval;
 
 	// peer_ids in here should be unique, except that there may be many 0s
 	std::vector<RemotePlayer*> m_players;

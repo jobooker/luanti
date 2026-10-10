@@ -83,6 +83,9 @@ look = {
     # accumulation every frame (roadmap 3c), so leave it frozen and move
     # time deliberately with /time.
     "time_speed":        "0",
+    # the /dial channel of THIS world: a demo-mode test seat pins its
+    # per-run world copy here (claude_ci.PINNED_CONF)
+    "claude_dial_file":  "worlds/gallery/claude_dial.conf",
 }
 if nee == "0":
     look["claude_nee"] = "0"      # --photo: photo mode is the definition
