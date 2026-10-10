@@ -207,24 +207,58 @@ def feature_problems(dump_dir):
     return out
 
 
-def control_verdict(ctrl_dir, ref_dir, idx):
-    """the control's frame against the stored truth's frame `idx`: the
-    scoreboard's rule (TUNED there: 1 % on the mean, 5 % median 16x16 tile)"""
-    c, t = _rows(ctrl_dir), _rows(ref_dir)
-    a, b = _frame(ctrl_dir, c[-1]), _frame(ref_dir, t[idx])
-    if not _near(_pose(c[-1]), _pose(t[idx])):
-        return False, {"why": "control pose differs"}
+CONTROL_SEEDS = (201, 202)   # two control renders: their disagreement is the control's own noise
+CONTROL_K = 2.5              # TUNED: agree within K x the control's tile noise | learn by: history.jsonl control verdicts on known-good and known-broken truths
+CONTROL_KMEAN = 3.0          # TUNED: the whole-frame mean within this many sigma of the control's mean noise
+
+
+def control_verdict(ctrl_dirs, ref_dir, idx):
+    """the controls' frames against the stored truth's frame `idx`. The
+    fixed tolerance alone (1 % mean, 5 % median 16x16 tile: the scoreboard
+    rule) assumed a clean control; in a dark room lit through a 1x1 hole the
+    control (no light sampling) finds the sun by luck and was 3.4x noisier
+    than the truth after 32768 frames, so it "disagreed" by its own noise
+    (2026-10-09, cave-turn). With two control seeds their disagreement
+    measures that noise: agree when within the fixed tolerance OR within
+    CONTROL_K (tiles) / CONTROL_KMEAN (mean) times the control's noise."""
+    if isinstance(ctrl_dirs, str):
+        ctrl_dirs = [ctrl_dirs]
+    t = _rows(ref_dir)
+    b = _frame(ref_dir, t[idx])
     lum = lambda x: x @ np.array([0.2126, 0.7152, 0.0722])
-    la, lt = lum(a), lum(b)
-    ratio = float(la.mean() / max(lt.mean(), 1e-9))
     k = 16
-    h, w = lt.shape
-    ta = la[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k).mean((1, 3))
-    tt = lt[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k).mean((1, 3))
-    mad = float(np.median(np.abs(ta - tt) / np.maximum(tt, 1e-6)))
-    feats = c[-1].get("features", {})
-    ok = abs(ratio - 1) < 0.01 and mad < 0.05 and feats.get("truth") == 1
-    return ok, {"ratio": ratio, "tile_mad": mad, "frame": idx, "control_truth_mode": feats.get("truth")}
+
+    def tiles(x):
+        l = lum(x)
+        h, w = l.shape
+        return l[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k).mean((1, 3))
+
+    cs, feats = [], []
+    for c in ctrl_dirs:
+        cr = _rows(c)
+        if not _near(_pose(cr[-1]), _pose(t[idx])):
+            return False, {"why": "control pose differs"}
+        cs.append(_frame(c, cr[-1]))
+        feats.append(cr[-1].get("features", {}).get("truth"))
+    tt = tiles(b)
+    ct = [tiles(c) for c in cs]
+    cm = sum(ct) / len(ct)
+    mb = float(lum(b).mean())
+    means = [float(lum(c).mean()) for c in cs]
+    ratio = (sum(means) / len(means)) / max(mb, 1e-9)
+    mad = float(np.median(np.abs(cm - tt) / np.maximum(tt, 1e-6)))
+    info = {"ratio": ratio, "tile_mad": mad, "frame": idx, "controls": len(cs),
+            "control_truth_mode": all(f == 1 for f in feats)}
+    ok_fixed = abs(ratio - 1) < 0.01 and mad < 0.05
+    ok_noise = False
+    if len(ct) >= 2:
+        sig_t = np.abs(ct[0] - ct[1]) / 2.0                 # noise of the mean of two
+        noise_mad = float(np.median(sig_t / np.maximum(tt, 1e-6)))
+        sig_m = abs(means[0] - means[1]) / 2.0 / max(mb, 1e-9)
+        info.update(noise_tile=noise_mad, noise_mean=sig_m)
+        ok_noise = mad <= CONTROL_K * noise_mad and abs(ratio - 1) <= max(0.01, CONTROL_KMEAN * sig_m)
+    info["agree_by"] = "tolerance" if ok_fixed else ("control noise" if ok_noise else None)
+    return (ok_fixed or ok_noise) and info["control_truth_mode"], info
 
 
 def find(spec_base, fps):

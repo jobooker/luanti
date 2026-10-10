@@ -256,26 +256,31 @@ def capture(args):
 
         def control(ref_dir, idxs):
             """guard 3: the scoreboard's control (the dumbest honest renderer)
-            held CONTROL_HOLD frames at the middle checked pose, against the
-            truth there. Its dials stay on the seat, so the seat restarts
-            before the next scenario."""
+            held CONTROL_HOLD frames at the middle checked pose, at
+            CONTROL_SEEDS seeds (their disagreement is its own noise),
+            against the truth there. Its dials stay on the seat, so the seat
+            restarts before the next scenario."""
             nonlocal_first[0] = True
             i = idxs[len(idxs) // 2]
             r = TS._rows(ref_dir)[i]
             cp = os.path.join(d, "control-path.txt")
             TS.write_check_path([TS.path_pose(tkeys, r["path_frame"])], cp)
-            out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
-                      sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
-                      ["--name", name + "-control", "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD])
-            if not out or not os.path.isdir(out[-1]):
-                return False, {"why": "control render failed: %s" % (out[-3:],)}
-            if any("REFUSED" in l for l in out):
-                return False, {"why": "control render refused: %s" % [l for l in out if "REFUSED" in l]}
-            ok, info = TS.control_verdict(out[-1], ref_dir, i)
-            keep = os.path.join(TS.ROOT, "checks", name, "%s-control" % time.strftime("%Y%m%d-%H%M%S"))
-            os.makedirs(os.path.dirname(keep), exist_ok=True)
-            shutil.move(out[-1], keep)
-            info["dump"] = keep
+            dirs = []
+            for sd in TS.CONTROL_SEEDS:
+                out = run([c if c != pf else cp for c in common] + rt_off + TRUTH_ON +
+                          sum([["--dial", kv] for kv in TS.CONTROL_DIALS], []) +
+                          ["--name", name + "-control%d" % sd, "--dial", "claude_path_hold=%d" % TS.CONTROL_HOLD,
+                           "--dial", "claude_rng_seed=%d" % sd])
+                if not out or not os.path.isdir(out[-1]):
+                    return False, {"why": "control render failed: %s" % (out[-3:],)}
+                if any("REFUSED" in l for l in out):
+                    return False, {"why": "control render refused: %s" % [l for l in out if "REFUSED" in l]}
+                keep = os.path.join(TS.ROOT, "checks", name, "%s-control%d" % (time.strftime("%Y%m%d-%H%M%S"), sd))
+                os.makedirs(os.path.dirname(keep), exist_ok=True)
+                shutil.move(out[-1], keep)
+                dirs.append(keep)
+            ok, info = TS.control_verdict(dirs, ref_dir, i)
+            info["dumps"] = dirs
             return ok, info
 
         if args.truth_check_only:
