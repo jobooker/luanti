@@ -166,15 +166,16 @@ def _face_map(face, u, v, d):
 
 LUMW = np.array([0.2126, 0.7152, 0.0722])
 
-# Physical mean albedo per material family, LINEAR (what pathAlbedo
-# produces). Game textures are painted to be DISPLAYED, not to be used
-# as reflectance: raw oak planks linearize to 0.136, about 3x darker
-# than real wood, and interiors are bounce-dominated so that error
-# compounds once per bounce (a 3-bounce corner keeps ~6% of its light).
-ALBEDO_TARGET = {
-    "wood": 0.35, "log": 0.30, "stone": 0.25, "cobble": 0.22,
-    "wool": 0.60, "book": 0.30, "default": 0.32,
-}
+# ALBEDO_TARGET REMOVED (2026-10-09, blockcolour). It was a table of
+# "physical mean albedo per material family" (wood 0.35, log 0.30, stone
+# 0.25, cobble 0.22, book 0.30 ...) that cited no source, and _delight
+# scaled each bake's mean to it. Nothing read the result until a model is
+# flagged "colour": "palette" (until then the tracer gave every fine hit
+# the cell's one colour), and on the first model that was (the oak log) it
+# made the bark pale. Every texture bake now keeps the texture's own mean
+# (albedo=None) and only loses the painted shadow on its carved texels
+# (delight). If a measured reflectance is wanted for a material, pass it
+# as albedo= at that model with its source next to it.
 
 
 def _delight(img, carved, delight=1.0, target=None):
@@ -246,6 +247,11 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
         return pindex[key]
 
     v = np.full((N, N, N), pi(fill), dtype=np.uint16)
+    # what each carved cell would show if the bake floor plugs it: the
+    # texel's PAINTED colour (see PAINTED_PLUG_MODELS); last face wins, as
+    # for the written voxels
+    plug_on = np.zeros((N, N, N), dtype=bool)
+    plug_rgb = np.zeros((N, N, N, 3), dtype=np.float32)
     # 'side' shorthand expands to the four lateral faces
     faces = {}
     for face, img in imgs.items():
@@ -334,9 +340,13 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                 for dd in range(d):
                     x, y, z = _face_map(face, u, vv, dd)
                     v[z, y, x] = 0
+                    plug_on[z, y, x] = not is_fire
+                    plug_rgb[z, y, x] = img[vv, u]
                 x, y, z = _face_map(face, u, vv, d)
                 v[z, y, x] = pi((int(r), int(g), int(b)),
                                 emit_level if is_fire else 0)
+                plug_on[z, y, x] = False
+    PLUG_PAINT[name] = (plug_on, plug_rgb)
     return name, pal, v
 
 
@@ -351,7 +361,7 @@ def model_furnace_baked():
              top=os.path.join(tdir, "default_furnace_top.png"),
              bottom=os.path.join(tdir, "default_furnace_bottom.png")),
         maxdepth=3, emissive_faces=("front",), emit_level=13,
-        albedo=ALBEDO_TARGET["stone"])
+        albedo=None)  # the texture's own mean (see ALBEDO_TARGET REMOVED)
 
 
 def model_crafting_baked():
@@ -363,7 +373,7 @@ def model_crafting_baked():
         dict(front=os.path.join(tdir, "crafting_workbench_front.png"),
              side=os.path.join(tdir, "crafting_workbench_side.png"),
              top=os.path.join(tdir, "crafting_workbench_top.png")),
-        maxdepth=2, albedo=ALBEDO_TARGET["wood"])
+        maxdepth=2, albedo=None)  # the texture's own mean
 
 
 def model_bookshelf_baked():
@@ -510,14 +520,14 @@ def model_planks_oak():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_wood.png")
     return bake_from_tiles("planks_oak_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=ALBEDO_TARGET["wood"])
+                           albedo=None)  # the texture's own mean
 
 
 def model_planks_spruce():
     t = _mcl("ITEMS", "mcl_core", "textures", "mcl_core_planks_spruce.png")
     return bake_from_tiles("planks_spruce_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=ALBEDO_TARGET["wood"])
+                           albedo=None)  # the texture's own mean
 
 
 def model_log_oak():
@@ -536,7 +546,7 @@ def model_log_oak():
                       "default_tree_top.png"),
              bottom=_mcl("ITEMS", "mcl_core", "textures",
                          "default_tree_top.png")),
-        # no albedo target (2026-10-09): ALBEDO_TARGET["log"] = 0.30 cites no
+        # no albedo target (2026-10-09): ALBEDO_TARGET["log"] = 0.30 cited no
         # source and made the bark pale; bark measures among the darker barks
         # in visible light (Juola et al. 2022). The texture's own mean, as
         # the plain cube and the ground relief use: only the painted groove
@@ -549,7 +559,7 @@ def model_cobble():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_cobble.png")
     return bake_from_tiles("cobble_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=ALBEDO_TARGET["cobble"])
+                           albedo=None)  # the texture's own mean
 
 
 # ---- the bake floor: no model may be see-through ---------------------
@@ -686,7 +696,29 @@ def shell_count(n=N, depth=SHELL):
 # keeps a 1-2 texel rim instead of 3, so its grooves get 14x14 or 12x12 of
 # each face instead of 10x10 (the 3-texel frame is what boxed every log face
 # into a panel). Opt-in per model: changing it changes that block's look.
-OWN_SHELL_MODELS = {"log_oak_baked"}
+OWN_SHELL_MODELS = {"log_oak_baked",
+                    # 2026-10-09 (blockcolour): the same frame on every
+                    # texture bake carved shallower than 3 -- plank board
+                    # seams stopped 3 texels short of each block edge, so
+                    # a wall read as a grid of framed glyph tiles. Furnace
+                    # carves 3 deep: no change.
+                    "planks_oak_baked", "planks_spruce_baked",
+                    "cobble_baked", "crafting_baked", "bookshelf_baked"}
+
+# PLUG COLOUR = THE TEXEL'S PAINTED COLOUR (2026-10-09, blockcolour). A cell
+# the bake floor plugs was a carved texel: _delight had lifted its colour
+# because geometry was going to shadow it, and then the plug made it flat
+# again and painted it the INTERIOR FILL (the node's mean colour). Once a
+# model's fine hits show its own colours ("colour": "palette"), that is a
+# flat mean-coloured patch wherever a groove reaches a block edge (the
+# bark's seam bands were the same cause). A flat texel should look as the
+# artist painted it, so a plug takes the face's ORIGINAL texel colour (not
+# delit: there is no recess left to shadow it). Opt-in per model; the shape
+# (and so the no-leak proof) is untouched, only the plug's palette entry.
+PAINTED_PLUG_MODELS = {"planks_oak_baked", "planks_spruce_baked",
+                       "cobble_baked", "crafting_baked", "bookshelf_baked",
+                       "furnace_baked"}
+PLUG_PAINT = {}     # name -> (mask, rgb), filled by bake_from_tiles
 
 
 def carve_depth(v):
@@ -717,6 +749,16 @@ def enforce_opaque(name, pal, v):
     plugs = [(int(x), int(y), int(z))
              for z, y, x in np.argwhere(bad)]
     v[bad] = mat
+    if name in PAINTED_PLUG_MODELS and name in PLUG_PAINT:
+        on, rgb = PLUG_PAINT[name]
+        index = {(tuple(p["rgb"]), p["emit"]): i
+                 for i, p in enumerate(pal) if p}
+        for z, y, x in np.argwhere(bad & on):
+            key = (tuple(int(c) for c in rgb[z, y, x]), 0)
+            if key not in index:
+                pal.append(dict(rgb=list(key[0]), emit=0))
+                index[key] = len(pal) - 1
+            v[z, y, x] = index[key]
     after = through_lines(v)
     return v, dict(before=len(before), after=len(after), plugs=plugs,
                    material=mat, depth=depth)
@@ -847,7 +889,12 @@ PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_allium", "flower_tulip_red",
                          # the bark (2026-10-09): its bake is delit, so the
                          # carved texels are not darkened twice
-                         "log_oak_baked"}
+                         "log_oak_baked",
+                         # the other texture bakes (2026-10-09, blockcolour):
+                         # same reason; one flat colour per block looked fake
+                         "planks_oak_baked", "planks_spruce_baked",
+                         "cobble_baked", "furnace_baked", "crafting_baked",
+                         "bookshelf_baked"}
 
 
 def model_torch_baked():
