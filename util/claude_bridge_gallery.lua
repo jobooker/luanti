@@ -884,6 +884,8 @@ local function freeze_globalsteps(on)
 end
 
 local hold_motion, release_motion   -- the entity half, defined below
+local held_motion = {}     -- object id -> { obj, v, a }
+local held_motion_n = 0
 local motion_hold_on = true         -- {hold_motion=false}: the A/B for the client's own motion
 
 function OPS.freeze(p)
@@ -927,8 +929,6 @@ end
 -- velocity and acceleration at once: LuaEntitySAO::sendPosition); entities
 -- that appear later (a block activated while frozen) are caught on the
 -- next 0.2 s tick. Released with the freeze, motion given back.
-local held_motion = {}     -- object id -> { obj, v, a }
-local held_motion_n = 0
 local ZERO = vector.new(0, 0, 0)
 
 hold_motion = function()
