@@ -377,6 +377,8 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
         return pindex[key]
 
     v = np.full((N, N, N), pi(fill), dtype=np.uint16)
+    # cells a face has coloured (its surface texels); see COLUMN COLOUR below
+    painted = np.zeros((N, N, N), dtype=bool)
     # what each carved cell would show if the bake floor plugs it: the
     # texel's PAINTED colour (see PAINTED_PLUG_MODELS); last face wins, as
     # for the written voxels
@@ -406,6 +408,7 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
     order = list(faces.items())
     if carve_faces is not None:
         order.sort(key=lambda fi: fi[0] in carve_faces)
+    fillidx = pi(fill)
     for face, img in order:
         if face in hfaces:
             h = hfaces[face].copy()
@@ -435,9 +438,26 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                         plug_on[z, y, x] = not is_fire
                         plug_rgb[z, y, x] = img[vv, u]
                     x, y, z = _face_map(face, u, vv, d)
-                    v[z, y, x] = pi((int(r), int(g), int(b)),
-                                    emit_level if is_fire else 0)
+                    col = pi((int(r), int(g), int(b)),
+                             emit_level if is_fire else 0)
+                    v[z, y, x] = col
+                    painted[z, y, x] = True
                     plug_on[z, y, x] = False
+                    # COLUMN COLOUR (2026-10-10, carve2): a texel is the top
+                    # of a column of ITS material, so the cells under it take
+                    # its colour too, down to SHELL. Those are the cells a
+                    # neighbouring groove's side wall shows. They used to keep
+                    # the interior fill (the raw mean of the side textures,
+                    # painted shadow included): measured on the oak log, the
+                    # surfaces facing into its grooves averaged 0.094 linear
+                    # luminance against 0.128 on the outer face, fill 0.075 --
+                    # the painted dark coming back on the furrow walls. Only
+                    # fill cells nobody has painted are touched; air stays air.
+                    if not is_fire:
+                        for dd in range(d + 1, SHELL):
+                            x, y, z = _face_map(face, u, vv, dd)
+                            if v[z, y, x] == fillidx and not painted[z, y, x]:
+                                v[z, y, x] = pi((int(r), int(g), int(b)))
             continue
         lum = img @ np.array([0.2126, 0.7152, 0.0722])
         lo, hi = lum.min(), max(lum.max(), lum.min() + 1.0)
