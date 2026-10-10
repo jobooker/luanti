@@ -76,6 +76,9 @@ SCENARIOS = {
     # backing 1.5 m straight away from the doorway (yaw 315 looks +x +z);
     # 3 m put the camera inside the back wall (all-black frames, 2026-10-07)
     "room-backup": ((241.7, 8.5, 231.7, 315, -12), [("hold", 1.0), ("move", -1.06, -1.06, 1.0), ("hold", 1.5)]),
+    # DARK (2026-10-09): the cave box, lit only through a 1x1 ceiling opening
+    # (claude_vantages.json cave-skylight-noon); a slow turn, what a cave is
+    "cave-turn": ((14, 8.5, 87, 0, -15), [("hold", 1.0), ("turn", 90, 1.5), ("hold", 1.5)]),
 }
 
 DEFER_RE = r'defer = \[(.*?)\]'
