@@ -354,7 +354,9 @@ struct ClaudeTraceGrid
 	// orientation (its six face tiles are placed by facedir), every other
 	// content has facedir 0 here
 	std::unordered_map<u32, u8> palette;
-	std::vector<u8> atlas; // BGRA, 256 x 1536: six 16x16 face tiles per id
+	// BGRA, 256 x 3072: six 16x16 face tiles per id, then the same six as
+	// painted (rows 1536+: no shadow taken out; claudeAtlasFaceTiles)
+	std::vector<u8> atlas;
 	std::vector<u8> matparams;  // 256 RGBA rows, indexed by material id
 	bool atlas_dirty = false;
 	// temporal accumulation state (updated once per frame)
@@ -5103,6 +5105,18 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 	const ClaudeReliefBlock *rb = block ? claudeReliefBlock(f) : nullptr;
 	const double frac = claudeReliefFrac();
 	double tiles[6][256][3];
+	// THE PAINTED COPY (seams 2026-10-10, John's rule, DECISIONS 0z: take
+	// the painted shading out only where real depth replaces it). The
+	// colour is per material but the carving is per cell: the leak rules
+	// leave texels uncarved cell by cell (next to a door, a flower pot, a
+	// wall post, at some inside corners). So every face tile is stored
+	// twice: normalised (rows face * 256) and as painted (rows (6 + face) *
+	// 256), and faceTileRatio takes the painted one for a hit on the cell's
+	// own outer surface -- a texel standing at full height, which nothing
+	// was carved out of -- and the normalised one for a hit inside the cell
+	// (a groove's floor or walls). A depth-0 texel is the same in both (the
+	// regression multiplies it by exp(0)), so only blocked carves change.
+	double raw[6][256][3];
 	bool done[6] = {};
 	for (int W = 0; W < 6; W++) {
 		int face, rot = 0;
@@ -5114,6 +5128,7 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 		if (!done[face]) {
 			done[face] = true;
 			claudeFaceTileRGB(client, f, face, ref, tint, rgb);
+			memcpy(raw[face], rgb, sizeof(raw[face]));
 			const std::array<u8, 256> *hm = lift ? claudeHeightMap(f, face) : nullptr;
 			if (hm && block) {
 				// a relief block: the depth its relief carves from this
@@ -5159,18 +5174,21 @@ static void claudeAtlasFaceTiles(Client *client, u8 mid, const ContentFeatures &
 				}
 			}
 		}
-		int ax = (mid % 16) * 16, ay = W * 256 + (mid / 16) * 16;
-		for (int k = 0; k < 256; k++) {
-			const double *c = rgb[claudeRotTexel(rot, k)];
-			double r[3] = {(double)ref.getRed(), (double)ref.getGreen(),
-					(double)ref.getBlue()};
-			u32 px = 0xFF000000u;
-			for (int ch = 0; ch < 3; ch++) {
-				double ratio = c[ch] / std::max(r[ch], 1.0);
-				u32 v = (u32)std::clamp(ratio * 64.0 + 0.5, 0.0, 255.0);
-				px |= v << (16 - ch * 8);
+		for (int layer = 0; layer < 2; layer++) {
+			double (*src)[3] = layer ? raw[face] : rgb;
+			int ax = (mid % 16) * 16, ay = (layer * 6 + W) * 256 + (mid / 16) * 16;
+			for (int k = 0; k < 256; k++) {
+				const double *c = src[claudeRotTexel(rot, k)];
+				double r[3] = {(double)ref.getRed(), (double)ref.getGreen(),
+						(double)ref.getBlue()};
+				u32 px = 0xFF000000u;
+				for (int ch = 0; ch < 3; ch++) {
+					double ratio = c[ch] / std::max(r[ch], 1.0);
+					u32 v = (u32)std::clamp(ratio * 64.0 + 0.5, 0.0, 255.0);
+					px |= v << (16 - ch * 8);
+				}
+				dst[(ay + k / 16) * 256 + ax + (k % 16)] = px;
 			}
-			dst[(ay + k / 16) * 256 + ax + (k % 16)] = px;
 		}
 	}
 }
@@ -5179,7 +5197,7 @@ static void claudeAtlasAdd(Client *client, u8 mid, const ContentFeatures &f,
 		video::SColor fallback, video::SColor tint, u8 fd, bool block)
 {
 	if (g_claude_grid.atlas.empty())
-		g_claude_grid.atlas.assign(256 * 1536 * 4, 0);
+		g_claude_grid.atlas.assign(256 * 3072 * 4, 0);
 	u32 *dst = (u32 *)g_claude_grid.atlas.data();
 	int ax = (mid % 16) * 16, ay = (mid / 16) * 16;
 	bool ok = false;
@@ -7352,7 +7370,7 @@ static void claudeTraceGridUploadAtlas()
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_MAG_FILTER, GL.NEAREST);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_S, GL.CLAMP_TO_EDGE);
 	GL.TexParameteri(GL.TEXTURE_2D, GL.TEXTURE_WRAP_T, GL.CLAMP_TO_EDGE);
-	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 1536, 0, GL.BGRA,
+	GL.TexImage2D(GL.TEXTURE_2D, 0, GL.RGBA8, 256, 3072, 0, GL.BGRA,
 			GL.UNSIGNED_BYTE, V.atlas.data());
 	// per-material response params (256x1 RGBA), unit 15
 	if (!V.matparams_tex)
