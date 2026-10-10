@@ -102,6 +102,9 @@ DIAL_CLASS = {
     "claude_area_nee": "estimator", "claude_area_pick": "estimator", "claude_area_skip": "estimator",
     "claude_guide": "estimator", "claude_guide_deposit": "estimator", "claude_guide_keep": "estimator",
     "claude_guide_impl": "estimator", "claude_guide_alpha": "estimator", "claude_bounce_uniform": "estimator",
+    # the per-pixel count cap: 4096 (old) makes a parked average past 4096
+    # frames exponential, unbiased but no longer converging (2026-10-10)
+    "claude_count_cap": "estimator",
     # geometry: the world's shape walked differently, the same picture
     "claude_pyramid": "geometry", "claude_descend": "geometry", "claude_model_far": "geometry",
     "claude_bricks": "geometry", "claude_bricks_far": "geometry", "claude_walk_exact": "geometry",

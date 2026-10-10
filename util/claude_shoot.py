@@ -47,6 +47,10 @@ def main():
     # the linear accumulated radiance, read BEFORE the pin is released (an
     # unpinned camera can restart the accumulation)
     ap.add_argument("--accum-dump", help="path prefix: write <p>.f32 + <p>.json")
+    # the camera the shot was taken with (camera.json: grid origin, position,
+    # basis), exported while the pin still holds it, for a referee that has
+    # to know which world point each pixel sees (cave sun patch, 2026-10-10)
+    ap.add_argument("--export-trace", help="dir: claude_export_trace (camera.json + grids)")
     args = ap.parse_args()
     if not args.skip_seat:
         price.start_seat()
@@ -136,6 +140,18 @@ def main():
             time.sleep(0.25)
         if not os.path.exists(args.accum_dump + ".json"):
             print("REFUSED: the linear dump did not arrive")
+            return 2
+    if args.export_trace:
+        cj = os.path.join(args.export_trace, "camera.json")
+        if os.path.exists(cj):
+            os.remove(cj)
+        with open(lab.PATCH, "w") as f:
+            f.write("claude_export_trace = %s\n" % args.export_trace)
+        t0 = time.time()
+        while time.time() - t0 < 15 and not os.path.exists(cj):
+            time.sleep(0.25)
+        if not os.path.exists(cj):
+            print("REFUSED: the trace export did not arrive")
             return 2
     if args.pin:
         with open(lab.PATCH, "w") as f:

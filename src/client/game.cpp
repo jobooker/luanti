@@ -2446,6 +2446,16 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_ledger_frame_pixel{"claudeLedgerFrame"};
 	float m_bounce_uniform = 0.0f;
 	CachedPixelShaderSetting<float, 1, false> m_bounce_uniform_pixel{"claudeBounceUniform"};
+	// claude_count_cap (2026-10-10): the most samples a pixel's own count
+	// (the direct buffer's alpha) may record. At rest a pixel averages by
+	// max(the frame's 1/(2+N), its own 1/(n+1)) (claude_pixel_reset), so the
+	// old fixed cap of 4096 turned every parked average past 4096 frames into
+	// an exponential average with a 4096-frame window: unbiased, but its
+	// noise stopped falling (the cave control's "32768-frame" renders had the
+	// noise of ~8k frames; spec/measured.md 2026-10-10). Default 2^24, the
+	// largest count a float holds exactly; 4096 = the old behaviour.
+	float m_count_cap = 16777216.0f;
+	CachedPixelShaderSetting<float, 1, false> m_count_cap_pixel{"claudeCountCap"};
 	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
@@ -2698,6 +2708,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_bricks_far",
 		"claude_walk_exact",
 		"claude_bounce_uniform",
+		"claude_count_cap",
 		"claude_ledger",
 		"claude_white_balance",
 		"claude_leaf_transmit",
@@ -3647,6 +3658,8 @@ public:
 			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		if (name == "claude_count_cap")
+			m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
 		if (name == "claude_ledger")
 			m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		if (name == "claude_auto_exposure")
@@ -3773,6 +3786,7 @@ public:
 		m_bricks_far = readAir("claude_bricks_far", 1.0f, 1.0f);
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
 		m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
@@ -4159,6 +4173,7 @@ public:
 				m_bricks_far_pixel.set(&m_bricks_far, services);
 				m_walk_exact_pixel.set(&m_walk_exact, services);
 				m_bounce_uniform_pixel.set(&m_bounce_uniform, services);
+				m_count_cap_pixel.set(&m_count_cap, services);
 				m_ledger_pixel.set(&m_ledger, services);
 				{
 					float lf = (float)(g_claude_frame_no & 0xFFFFFF);
