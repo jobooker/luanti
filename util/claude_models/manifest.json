@@ -13,7 +13,9 @@
    "mcl_crafting_table:crafting_table"
   ],
   "torch_baked": [
-   "mcl_torches:torch",
+   "mcl_torches:torch"
+  ],
+  "torch_wall_baked": [
    "mcl_torches:torch_wall"
   ],
   "bookshelf_baked": [

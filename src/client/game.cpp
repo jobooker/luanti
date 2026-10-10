@@ -5269,6 +5269,46 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 			glow[r] = {0, 0, 0, 0, 0};
 		}
 		double glow_sq = 0.0; // rotation-invariant spread accumulator
+		// EXPLICIT ROTATIONS (2026-10-09, torch2): a model whose four
+		// param2 & 3 orientations are not yaw turns of one shape (the wall
+		// torch: the engine TIPS its mesh onto each wall with a 6d facedir)
+		// carries "rotations": four [z][y][x] grids, baked in
+		// claude_models.py from the engine's own mesh rotation. Rotation r
+		// then reads rotations[r] instead of turning "voxels" r x 90 deg;
+		// "voxels" == rotations[0] still feeds everything rotation-0 below
+		// (glow bound, flame K). Models without it take the old path.
+		const Json::Value &rotsrc = md["rotations"];
+		bool explicit_rots = rotsrc.isArray() && rotsrc.size() == 4;
+		for (int r = 0; r < 4 && explicit_rots; r++)
+			explicit_rots = rotsrc[r].isArray() && rotsrc[r].size() == 16;
+		if (explicit_rots) {
+			for (int r = 0; r < 4; r++) {
+				const Json::Value &rv = rotsrc[r];
+				for (int z = 0; z < 16; z++)
+				for (int y = 0; y < 16; y++)
+				for (int x = 0; x < 16; x++) {
+					int pi = rv[z][y][x].asInt();
+					if (pi == 0)
+						continue;
+					int emit = (pi < npal && !pal[pi].isNull())
+							? pal[pi]["emit"].asInt() : 0;
+					rots[r][(size_t)(z * 16 + y) * 2 + (x >> 3)]
+							|= (u8)(1 << (x & 7));
+					vrots[r][(size_t)(z * 16 + y) * 16 + x] =
+							(u8)std::min(pi, 255);
+					if (emit > 0) {
+						glow[r][0] += x + 0.5f;
+						glow[r][1] += y + 0.5f;
+						glow[r][2] += z + 0.5f;
+						glow[r][3] += 1.0f;
+						if (r == 0)
+							glow_sq += (x + 0.5) * (x + 0.5)
+									+ (y + 0.5) * (y + 0.5)
+									+ (z + 0.5) * (z + 0.5);
+					}
+				}
+			}
+		} else
 		for (int z = 0; z < 16; z++)
 		for (int y = 0; y < 16; y++)
 		for (int x = 0; x < 16; x++) {
@@ -5378,6 +5418,14 @@ static void claudeLoadModels(const NodeDefManager *ndef)
 					emit_f += ex;
 			}
 			float K = emit_f > 0 ? (float)all_f / (float)emit_f : 1.0f;
+			// flux_scale (2026-10-10): a model file may scale its flame's
+			// total output. The torches carry one: built from the game's mesh,
+			// the head shades the wall and a torch-lit room got 60 % of the
+			// old torch's light; John chose "the new torch with its flame
+			// turned up so rooms get today's light" (util/claude_models.py
+			// FLUX_SCALE, measured).
+			if (md.isMember("flux_scale"))
+				K *= std::max(0.0f, md["flux_scale"].asFloat());
 			u32 k16 = (u32)std::clamp(K * 256.0f + 0.5f, 0.0f, 65535.0f);
 			palrgba[0] = (u8)(k16 >> 8);
 			palrgba[1] = (u8)(k16 & 0xFF);
