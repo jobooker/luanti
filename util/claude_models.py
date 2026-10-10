@@ -847,7 +847,10 @@ PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          "flower_allium", "flower_tulip_red",
                          # the bark (2026-10-09): its bake is delit, so the
                          # carved texels are not darkened twice
-                         "log_oak_baked"}
+                         "log_oak_baked",
+                         # torches (2026-10-10): one flat cell colour made the
+                         # head black and it absorbed the flame light
+                         "torch_baked", "torch_wall_baked"}
 
 
 # ---- MESH VOXELIZER (2026-10-09, torch2) ----------------------------------
@@ -1024,10 +1027,23 @@ def voxelize_meshes(name, tex_rgba, bakes, emit_level=12):
                         emit=emit_level if _is_flame(r, g, b) else 0))
         pindex[t] = len(pal) - 1
     grids = []
+    emit_idx = np.array([i for i, p in enumerate(pal) if p and p["emit"] > 0], dtype=np.int64)
     for win_v, win_t in results:
         v = np.zeros((N, N, N), dtype=np.uint16)
         flat = v.reshape(-1)
         flat[win_v] = [pindex[int(t)] for t in win_t]
+        # THE MESH FINS HAVE NO THICKNESS (2026-10-10): in the game the
+        # flame shows past them from the side; as 1/16 voxels they boxed it
+        # in (exposed flame 4-6 texel faces against the mesh 15) and the
+        # torch lit nothing. A non-flame voxel touching a flame voxel at a
+        # side or above is cleared; the one directly below stays, so the
+        # flame still sits on its stick.
+        E = np.isin(v, emit_idx) & (v > 0)
+        clear = np.zeros_like(E)
+        for ax, sh in ((2, 1), (2, -1), (0, 1), (0, -1), (1, -1)):   # x, z sides; y: the voxel above a flame
+            clear |= np.roll(E, sh, axis=ax)
+        clear &= ~E & (v > 0)
+        v[clear] = 0
         grids.append(v)
     return name, pal, grids
 
