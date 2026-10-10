@@ -507,10 +507,26 @@ struct ClaudePathKey { float f, x, y, z, yaw, pitch; };
 static std::vector<ClaudePathKey> g_claude_path;
 static long g_claude_path_frame = -1;
 
+static u32 g_claude_frame_no = 0;
+static void claudeResetAccumulation();
+// REPLAY (claude_replay = 1, 2026-10-09, John: "some kind of seed ... like a
+// demo mode"). A test replays a camera path, and the same replay must give
+// the same frames: two runs of one arm differed 0.016-0.06 pixel RMS while
+// moving, as much as two different arms, because everything that varies
+// per frame in motion keyed off a global frame counter that never resets
+// (the random numbers once the camera moves, the ledger's write pattern,
+// guiding and light-picking epochs) and the eye adapted on wall-clock
+// seconds. With replay on, loading a path restarts the frame counter and
+// the picture, and the eye adapts on a fixed step (claude_replay_dt, the
+// path's own 1/fps) after one restart frame. The WORLD must hold still too
+// (the server's side: claude_freeze).
+static bool g_claude_replay_active = false;
+static bool g_claude_replay_eye_restart = false;
 static void claudeLoadPath(const std::string &file)
 {
 	g_claude_path.clear();
 	g_claude_path_frame = -1;
+	g_claude_replay_active = false;
 	if (file.empty() || file == "0") {
 		actionstream << "[claude_path] off" << std::endl;
 		return;
@@ -521,8 +537,16 @@ static void claudeLoadPath(const std::string &file)
 		g_claude_path.push_back(k);
 	if (!g_claude_path.empty())
 		g_claude_path_frame = 0;
+	if (!g_claude_path.empty() && g_settings->exists("claude_replay")
+			&& g_settings->getFloat("claude_replay", 0.0f, 1.0f) >= 0.5f) {
+		g_claude_frame_no = 0;
+		claudeResetAccumulation();
+		g_claude_replay_active = true;
+		g_claude_replay_eye_restart = true;
+	}
 	actionstream << "[claude_path] " << g_claude_path.size() << " keys from "
-			<< file << std::endl;
+			<< file << (g_claude_replay_active ? " (replay: frame counter, picture and eye restarted)" : "")
+			<< std::endl;
 }
 
 // pose at path frame fr (linear between keys, held past the last)
@@ -823,7 +847,6 @@ static void claudeDumpFrame(video::IVideoDriver *driver, LocalPlayer *player,
 // claude_stats.json so the harness reads the depth instead of guessing.
 static float g_claude_shutter_at = 0.0f;
 // every traced frame, for claudeRngFrame while the camera moves
-static u32 g_claude_frame_no = 0;
 
 // claude_guide's tallies (roadmap 3d-i): two R32UI tables, 32^3 blocks x 6
 // faces x 80 texels, laid out 51 tables per row. One is written this
@@ -4143,6 +4166,16 @@ public:
 									* 1e-6f, 0.25f);
 						dt_last_us = now;
 						dt_frame = g_claude_frame_no;
+						// replay: the eye restarts on the first frame (a huge
+						// step makes both adaptations take "now"), then adapts
+						// on the path's own fixed step, not the wall clock
+						if (g_claude_replay_active) {
+							m_frame_dt = g_claude_replay_eye_restart ? 1.0e6f
+									: (g_settings->exists("claude_replay_dt")
+										? g_settings->getFloat("claude_replay_dt", 1e-4f, 1.0f)
+										: 1.0f / 60.0f);
+							g_claude_replay_eye_restart = false;
+						}
 					}
 				}
 				m_frame_dt_pixel.set(&m_frame_dt, services);

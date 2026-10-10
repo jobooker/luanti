@@ -62,6 +62,7 @@ OUT = os.path.join(REPO, "screenshots", "playtest")
 import claude_truth_store as TS
 
 WALK = 4.0          # m/s (Luanti's walking speed)
+SETTLE_S = 5.0      # TUNED: standing still at the start of every replay, before the scenario's own moves | learn by: the start pose's error vs truth at the first move
 TURN = 90.0         # deg/s
 
 # name: start pose (x, y, z, yaw, pitch), then moves: ("hold", s) |
@@ -178,6 +179,7 @@ def capture(args):
         # these inputs at an fps within 10 % of it, THAT path (and its truth)
         # (the hold is not an input: a truth is held as long as its arms need)
         spec_base = {"scenario": name, "start": list(start), "moves": [list(m) for m in moves],
+                     "replay": 1, "settle_s": SETTLE_S,
                      "scale": 2, "all_run_dials": sorted(args.dial or []),
                      "truth_def": TS.TRUTH_DEF}
         man = None if args.fresh_truth else TS.find(spec_base, fps)
@@ -185,8 +187,11 @@ def capture(args):
             fps_path = man["spec"]["fps_path"]
             pk = [tuple(k) for k in man["spec"]["keys"]]
         else:
-            fps_path = round(fps, 3)
-            pk = path_frames(start, moves, fps_path)
+            fps_path = args.path_fps or round(fps, 3)
+            # REPLAY: the path starts with SETTLE_S of standing still, made
+            # inside the replay (the replay restarts the picture at path start,
+            # so the old 6 s park no longer carries over)
+            pk = path_frames(start, [("hold", SETTLE_S)] + list(moves), fps_path)
         pf = os.path.join(d, "path.txt")
         with open(pf, "w") as f:
             for k in pk:
@@ -212,7 +217,10 @@ def capture(args):
         # seed would persist on the seat into the next run)
         # ...and the denoiser at the GAME'S defaults: the truth runs turn it
         # off and dials persist on the seat into the next scenario
-        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0", "--dial", "claude_truth=0"] + \
+        # REPLAY (game.cpp claude_replay): loading the path restarts the frame
+        # counter, the picture and the eye; the eye adapts on the path's own step
+        fixed = ["--dial", "claude_auto_exposure=0", "--dial", "claude_rng_seed=0", "--dial", "claude_truth=0",
+                 "--dial", "claude_replay=1", "--dial", "claude_replay_dt=%r" % (1.0 / fps_path)] + \
             PLAY_DENOISE + \
             (["--dial", "claude_exposure=%r" % expo] if expo else []) + extra
         common = ["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pf, "--scale", "2"] + fixed
@@ -290,6 +298,7 @@ def capture(args):
             continue
 
         rt = {}
+        scene_ids = {}
         for ai, (arm, kvs) in enumerate(arms):
             arm_dials = sum([["--dial", kv] for kv in kvs], [])
             # every arm starts the same way: parked at the start pose with its
@@ -299,15 +308,33 @@ def capture(args):
             run(["python3", "util/claude_motion.py", "--play", "--skip-seat", "--path", pin,
                  "--nodump", "--frames", "120", "--name", name + "-park-" + arm] + extra + arm_dials)
             lab.goto({"pos": [x, y, z], "yaw": yaw, "pitch": pitch})
-            open(lab.PATCH, "w").write("claude_path = %s\nclaude_reset_accum = %s-%d\n"
-                                       % (pin, arm, time.time_ns()))
-            time.sleep(6)
+            # THE SCENE LOADED EXACTLY (2026-10-09): two identical arms in one
+            # session differed only through the doorway, where distant terrain
+            # was still streaming in. claude_lab.load_scene sends every block of
+            # the box and waits until the scene identity holds still; the
+            # identity is recorded, and an arm whose scene is not the truth's
+            # is not scored. (The replay restarts the picture at path start, so
+            # the old 6 s settle happens inside the path now.)
+            ls = lab.load_scene([x, y, z], yaw, pitch, pin)
+            scene_ids[arm] = ls.get("id")
+            if not ls.get("ok"):
+                print("%-12s arm %s: scene did not settle: %s" % (name, arm, ls.get("error")), flush=True)
             rt[arm] = run(common + arm_dials + ["--name", name + "-rt-" + arm])
         # THE TRUTH (2026-10-09): stored once, then checked instead of re-rendered;
         # three guards (claude_truth_store, TRUTH_DEF 4): every dial classified,
         # truth mode recorded in every frame, the dumb control agrees
         ref, fid = [], []
         truth = {"key": key, "build": BUILD}
+        lt = lab.load_scene([x, y, z], yaw, pitch, pin)
+        truth["scene_id"] = lt.get("id")
+        if args.no_truth:
+            # arms only (the replay repeatability test needs no truth)
+            meta["scenarios"][name] = {"fps_at_start": fps, "fps_path": fps_path, "frames": pk[-1][0] + 1,
+                                       "arms": {a: v[-1] for a, v in rt.items()}, "reference": "", "faces": "",
+                                       "scene_ids": scene_ids,
+                                       "truth": {"outcome": "skipped (--no-truth)"}}
+            print(name, json.dumps(meta["scenarios"][name]), flush=True)
+            continue
         if man and not man.get("admit") and BUILD in man.get("verified_builds", []) \
                 and not args.recheck_truth:
             # this build already passed the check against this truth: the same
@@ -386,6 +413,7 @@ def capture(args):
                 else:
                     man = TS.store(key, spec, expo, ref[-1], fid[-1], idxs, floor,
                                    {"fps_measured": fps, "control": cinfo, "hold": hold,
+                                    "scene_id": truth.get("scene_id"),
                                     "truth_frames": tframes, "truth_keys": [list(k) for k in tkeys],
                                     "engine": run(["git", "rev-parse", "--short", "HEAD"])[-1]})
                     TS.log({"event": "store", "key": key, "scenario": name, "floor": floor, "control": cinfo})
@@ -395,7 +423,7 @@ def capture(args):
         print("%-12s truth %s: %s" % (name, key, truth.get("outcome")), flush=True)
         meta["scenarios"][name] = {"fps_at_start": fps, "fps_path": fps_path, "exposure": expo,
                                    "exposure_measured": expo_measured, "frames": pk[-1][0] + 1,
-                                   "arms": {a: v[-1] for a, v in rt.items()},
+                                   "arms": {a: v[-1] for a, v in rt.items()}, "scene_ids": scene_ids,
                                    "reference": man["reference"], "faces": man["faces"], "truth": truth,
                                    "notes": [l for l in sum(rt.values(), []) + ref + fid if "REFUSED" in l]}
         print(name, json.dumps(meta["scenarios"][name]), flush=True)
@@ -403,6 +431,11 @@ def capture(args):
     lab.rpc("abm", on=True)
     json.dump(meta, open(os.path.join(run_dir, "meta.json"), "w"), indent=1)
     print(run_dir)
+
+
+def lab_scene_fields():
+    import claude_lab
+    return claude_lab.SCENE_ID
 
 
 def score(run_dir):
@@ -429,8 +462,27 @@ def score(run_dir):
         Rpose = [TS._pose(r) for r in Rrows]
         # every arm against the one truth (old runs: a single "realtime")
         arms = sc.get("arms") or {"rt": sc["realtime"]}
+        # the truth's scene: as stored with it (a reused truth was made in
+        # another session), else as loaded for it this run
+        tman_p = os.path.join(os.path.dirname(sc["reference"]), "manifest.json")
+        tid = (json.load(open(tman_p)).get("scene_id") if os.path.exists(tman_p) else None) \
+            or (sc.get("truth") or {}).get("scene_id")
         for arm, rt_dir in arms.items():
             key = name if len(arms) == 1 else name + "/" + arm
+            aid = (sc.get("scene_ids") or {}).get(arm)
+            if tid and aid:
+                diff = [f for f, u, v in zip(lab_scene_fields(), tid, aid) if u != v]
+                # grid_hash and far_db_blocks: WARN, do not refuse. Two arms
+                # whose frames matched to 0.0003 pixel RMS had different
+                # grid_hash (2026-10-09): it moves for something invisible,
+                # not yet known; the far loader keeps filling during a run.
+                # Which blocks and lights are loaded must match.
+                near = [f for f in diff if f not in ("far_db_blocks", "grid_hash")]
+                if near:
+                    print("%-20s NOT SCORED: its scene is not the truth's (%s)" % (key, ", ".join(near)))
+                    continue
+                if diff:
+                    print("%-20s warning: %s differ from the scene of the truth" % (key, ", ".join(diff)))
             T, rows = J.load_dump(rt_dir)
             n = min(len(T), len(Fc))
             pace = J.pacing(rows)
@@ -580,6 +632,9 @@ if __name__ == "__main__":
     ap.add_argument("--arm", action="append",
                     help="NAME:k=v,k=v -- one real-time run per arm, all on the same path "
                          "and scored against one truth (NAME: alone = the game as it is)")
+    ap.add_argument("--path-fps", type=float, default=0,
+                    help="lay the path out at this fps instead of the measured one (runs that must share a path)")
+    ap.add_argument("--no-truth", action="store_true", help="arms only; no truth, nothing to score against")
     ap.add_argument("--recheck-truth", action="store_true",
                     help="run the truth check even if this build already passed it")
     ap.add_argument("--fresh-truth", action="store_true",
