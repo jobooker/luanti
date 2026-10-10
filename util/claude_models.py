@@ -214,9 +214,119 @@ def _delight(img, carved, delight=1.0, target=None):
     return out
 
 
+# ---- HEIGHT MAPS FROM THE REAL OBJECT (2026-10-10, carve2; DECISIONS 0z) ----
+# John: depth should come from the real object the texture depicts (bark
+# furrows vertical and continuous, books recessed along their spines, mortar
+# below the bricks, plank seams as grooves), not from brightness rank alone.
+# Turning a picture into the object's shape is a vision model's job, so each
+# texture face has a 16x16 depth map in util/claude_heightmaps/<tile>.json,
+# proposed by Gemini from the texture (prompt, model, date and raw reply are
+# stored with it; util/claude_heightmap_ask.py asks). height[row][col], row 0
+# the top row of the image, value = depth in 1/16 m. Code only enforces the
+# hard rules: no carve deeper than SHELL, the bake floor (enforce_opaque),
+# the carve_faces gate. A face without a map keeps the brightness rule below.
+# CLAUDE_HEIGHTMAPS=0 = every face on the brightness rule (comparison arm).
+HEIGHTMAP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "claude_heightmaps")
+NORMALISE_REPORT = {}   # (model, face) -> what _normalise measured
+
+
+def tile_stem(path):
+    """the height-map key of a tile: its file name without '.png'"""
+    return os.path.basename(path).replace(".png", "")
+
+
+def load_heightmap(stem):
+    if os.environ.get("CLAUDE_HEIGHTMAPS", "1") == "0":
+        return None
+    p = os.path.join(HEIGHTMAP_DIR, stem + ".json")
+    if not os.path.exists(p):
+        return None
+    h = np.asarray(json.load(open(p))["height"], dtype=np.int32)
+    if h.shape != (N, N) or h.min() < 0:
+        raise SystemExit("bad height map %s: shape %s min %s"
+                         % (p, h.shape, h.min()))
+    return h
+
+
+def _normalise(img, depth, exclude=None):
+    """Take the painted depth-shadow out of a texture face, keep its colour.
+
+    John (DECISIONS 0z): "take the brightness ... put the original texture
+    with the brightness normalized back ... not a hard and fast rule because
+    some parts of the stone face are darker than others for different
+    colors. But I just don't want to double [darken]". So only the part of
+    the brightness that the DEPTH explains is removed, measured per face:
+    fit log(linear luminance) = a + b * depth over the face's texels (least
+    squares; a shadow multiplies the light, so the fit is in log linear
+    light), and where deeper texels are darker (b < 0) multiply each texel's
+    linear RGB by exp(-b * depth). Every texel at one depth moves by the same
+    factor, so the colour and brightness differences between texels at the
+    same depth (a darker stone, a knot, a red book beside a blue one) stay
+    exactly as painted. exclude = texels whose brightness is real (fire).
+    Returns (rgb float 0..255, report)."""
+    img = np.asarray(img, dtype=np.float32)
+    lin = (img / 255.0) ** 2.2
+    lum = lin @ LUMW
+    d = np.asarray(depth, dtype=np.float64)
+    m = lum > 1e-4
+    if exclude is not None:
+        m &= ~exclude
+    rep = dict(n=int(m.sum()), b=0.0, factor_per_level=1.0)
+    if m.sum() < 8 or np.ptp(d[m]) == 0:
+        return img.copy(), rep
+    A = np.stack([np.ones(int(m.sum())), d[m]], axis=1)
+    a, b = np.linalg.lstsq(A, np.log(lum[m]), rcond=None)[0]
+    rep.update(b=float(b), factor_per_level=float(np.exp(-b)))
+    if b >= 0.0:
+        return img.copy(), rep
+    k = np.exp(-b * d)[..., None]
+    out = (np.clip(lin * k, 0.0, 1.0) ** (1.0 / 2.2)) * 255.0
+    if exclude is not None:
+        out[exclude] = img[exclude]
+    # what is left of the depth trend, for the record (should be ~0)
+    lum2 = ((out / 255.0) ** 2.2) @ LUMW
+    a2, b2 = np.linalg.lstsq(A, np.log(np.maximum(lum2[m], 1e-6)),
+                             rcond=None)[0]
+    rep.update(b_after=float(b2))
+    return out.astype(np.float32), rep
+
+
+def rim_mask(depth, n=N):
+    """texel positions a face loses to the bake floor's rim when every face
+    of the cube is open: within `depth` of a tile edge"""
+    r = np.zeros((n, n), dtype=bool)
+    if depth > 0:
+        r[:depth] = r[-depth:] = True
+        r[:, :depth] = r[:, -depth:] = True
+    return r
+
+
+def best_roll(h, depth):
+    """The PHASE of a seamless texture that loses least carving to the rim.
+    A texture that tiles has no preferred origin -- where the block edge
+    cuts the pattern is a free choice -- and the bake floor flattens the
+    outer `depth` texels of every face (enforce_opaque). Measured, not
+    picked: for every (row, col) shift, the depth that lands in the rim;
+    the least wins (ties: the smallest shift). Returns (dv, du, lost0,
+    lost)."""
+    rim = rim_mask(depth)
+    lost0 = int((h * rim).sum())
+    best = (lost0, 0, 0, 0)
+    for dv in range(N):
+        for du in range(N):
+            lost = int((np.roll(h, (dv, du), axis=(0, 1)) * rim).sum())
+            if (lost, dv + du) < (best[0], best[1] + best[2]):
+                best = (lost, dv, du, lost)
+    return best[1], best[2], lost0, best[0]
+
+
+ROLL_REPORT = {}   # model -> (dv, du, depth lost to the rim before, after)
+
+
 def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
                     emit_level=13, delight=1.0, albedo=None,
-                    grain_depth=1, carve_faces=None):
+                    grain_depth=1, carve_faces=None, roll_faces=()):
     """tiles: {face: png path}. Returns (name, palette, voxels) in the
     same shape the authored models use. Palette grows per unique
     (rgb, emit) — texel-true colors, no quantization.
@@ -225,11 +335,31 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
     texture is not an albedo map. delight=0, albedo=None reproduces
     the original texel-verbatim bake."""
     imgs = {}
+    hmaps = {}
     for face, path in tiles.items():
         imgs[face] = np.asarray(
             Image.open(path).convert("RGB").resize((N, N),
                                                    Image.NEAREST),
             dtype=np.float32)
+        h = load_heightmap(tile_stem(path))
+        if h is not None:
+            hmaps[face] = np.minimum(h, SHELL)   # hard rule: no deeper
+    # ROLL (roll_faces: faces whose texture tiles seamlessly, so its phase
+    # is free): every such face takes the one shift that loses least depth
+    # to the rim of this model's own shell. The rim is as wide as the
+    # deepest carve (OWN_SHELL_MODELS), so that is measured first.
+    if roll_faces and os.environ.get("CLAUDE_ROLL", "1") != "0":
+        carving = [f for f in hmaps
+                   if carve_faces is None or f in carve_faces
+                   or (f == "side" and set(carve_faces) & {"left", "right", "back", "front"})]
+        rf = [f for f in roll_faces if f in hmaps]
+        if rf and carving:
+            dmax = max(int(hmaps[f].max()) for f in carving)
+            dv, du, lost0, lost = best_roll(hmaps[rf[0]], dmax)
+            for f in rf:
+                imgs[f] = np.roll(imgs[f], (dv, du), axis=(0, 1))
+                hmaps[f] = np.roll(hmaps[f], (dv, du), axis=(0, 1))
+            ROLL_REPORT[name] = (dv, du, lost0, lost)
     # interior filler: mean of the side-ish faces
     fillsrc = [f for f in ("side", "left", "right", "back")
                if f in tiles] or list(tiles)
@@ -254,6 +384,7 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
     plug_rgb = np.zeros((N, N, N, 3), dtype=np.float32)
     # 'side' shorthand expands to the four lateral faces
     faces = {}
+    hfaces = {}
     for face, img in imgs.items():
         if face == "side":
             for f in ("left", "right", "back"):
@@ -261,6 +392,13 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
             faces.setdefault("front", img)
         else:
             faces[face] = img
+    for face, h in hmaps.items():
+        if face == "side":
+            for f in ("left", "right", "back", "front"):
+                if f not in hmaps:
+                    hfaces[f] = h
+        else:
+            hfaces[face] = h
     # an edge voxel belongs to two faces and holds one colour: the last
     # face written wins. With carve_faces, the carving faces are written
     # last (a log's side wins its top and bottom edge from the end grain's
@@ -269,6 +407,38 @@ def bake_from_tiles(name, tiles, maxdepth=3, emissive_faces=(),
     if carve_faces is not None:
         order.sort(key=lambda fi: fi[0] in carve_faces)
     for face, img in order:
+        if face in hfaces:
+            h = hfaces[face].copy()
+            if carve_faces is not None and face not in carve_faces:
+                h[:] = 0
+            fire = np.zeros((N, N), dtype=bool)
+            if face in emissive_faces:
+                # the same fire texels glow as under the brightness rule (the
+                # furnace's light is not this change's business), but each
+                # sits at its map depth: the flames at the back of the mouth,
+                # the lit stones round it on the masonry, not sunk into pits
+                fire = ((img[:, :, 0] > 140.0)
+                        & (img[:, :, 0] > 1.5 * img[:, :, 2])
+                        & (img[:, :, 1] > 40.0))
+            alb, nrep = _normalise(img, np.where(fire, 0, h), exclude=fire)
+            nrep["depths"] = {int(k): int((h == k).sum())
+                              for k in np.unique(h)}
+            NORMALISE_REPORT[(name, face)] = nrep
+            for vv in range(N):
+                for u in range(N):
+                    r, g, b = alb[vv, u]
+                    is_fire = bool(fire[vv, u])
+                    d = int(h[vv, u])
+                    for dd in range(d):
+                        x, y, z = _face_map(face, u, vv, dd)
+                        v[z, y, x] = 0
+                        plug_on[z, y, x] = not is_fire
+                        plug_rgb[z, y, x] = img[vv, u]
+                    x, y, z = _face_map(face, u, vv, d)
+                    v[z, y, x] = pi((int(r), int(g), int(b)),
+                                    emit_level if is_fire else 0)
+                    plug_on[z, y, x] = False
+            continue
         lum = img @ np.array([0.2126, 0.7152, 0.0722])
         lo, hi = lum.min(), max(lum.max(), lum.min() + 1.0)
         med = float(np.median(lum))
@@ -387,7 +557,9 @@ def model_bookshelf_baked():
                               "default_wood.png"),
              bottom=os.path.join(mods, "mcl_core", "textures",
                                  "default_wood.png")),
-        maxdepth=1)  # book spines recess a single voxel
+        # depth from util/claude_heightmaps (spines 1, gaps between books
+        # 2, boards 0); maxdepth is the brightness rule's fallback only
+        maxdepth=1)
 
 
 def model_bed(part):
@@ -520,14 +692,16 @@ def model_planks_oak():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_wood.png")
     return bake_from_tiles("planks_oak_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=None)  # the texture's own mean
+                           albedo=None,  # the texture's own mean
+                           roll_faces=("side", "top", "bottom"))
 
 
 def model_planks_spruce():
     t = _mcl("ITEMS", "mcl_core", "textures", "mcl_core_planks_spruce.png")
     return bake_from_tiles("planks_spruce_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=None)  # the texture's own mean
+                           albedo=None,  # the texture's own mean
+                           roll_faces=("side", "top", "bottom"))
 
 
 def model_log_oak():
@@ -552,14 +726,26 @@ def model_log_oak():
         # the plain cube and the ground relief use: only the painted groove
         # shadow is removed (_delight)
         maxdepth=2 if var == "d2" else 1, albedo=None,
-        carve_faces=("left", "right", "back", "front"))
+        carve_faces=("left", "right", "back", "front"),
+        # the bark wraps round the trunk and stacks up it: its phase is free
+        roll_faces=("side",))
 
 
 def model_cobble():
     t = _mcl("ITEMS", "mcl_core", "textures", "default_cobble.png")
     return bake_from_tiles("cobble_baked",
                            dict(side=t, top=t, bottom=t), maxdepth=1,
-                           albedo=None)  # the texture's own mean
+                           albedo=None,  # the texture's own mean
+                           roll_faces=("side", "top", "bottom"))
+
+
+def model_stonebrick():
+    # stone bricks (2026-10-10, carve2): carved for the first time; mortar
+    # joints 2 deep, brick bevels 1 (util/claude_heightmaps)
+    t = _mcl("ITEMS", "mcl_core", "textures", "default_stone_brick.png")
+    return bake_from_tiles("stonebrick_baked",
+                           dict(side=t, top=t, bottom=t), maxdepth=1,
+                           albedo=None, roll_faces=("side", "top", "bottom"))
 
 
 # ---- the bake floor: no model may be see-through ---------------------
@@ -638,7 +824,7 @@ SOLID_NODE_MODELS = frozenset((
     # texture-derived cube bakes
     "furnace_baked", "crafting_baked", "bookshelf_baked",
     "planks_oak_baked", "planks_spruce_baked", "log_oak_baked",
-    "cobble_baked",
+    "cobble_baked", "stonebrick_baked",
     # hand-authored full-cube nodes
     "furnace_custom", "crafting_custom",
 ))
@@ -703,7 +889,8 @@ OWN_SHELL_MODELS = {"log_oak_baked",
                     # a wall read as a grid of framed glyph tiles. Furnace
                     # carves 3 deep: no change.
                     "planks_oak_baked", "planks_spruce_baked",
-                    "cobble_baked", "crafting_baked", "bookshelf_baked"}
+                    "cobble_baked", "crafting_baked", "bookshelf_baked",
+                    "stonebrick_baked"}
 
 # PLUG COLOUR = THE TEXEL'S PAINTED COLOUR (2026-10-09, blockcolour). A cell
 # the bake floor plugs was a carved texel: _delight had lifted its colour
@@ -717,7 +904,7 @@ OWN_SHELL_MODELS = {"log_oak_baked",
 # (and so the no-leak proof) is untouched, only the plug's palette entry.
 PAINTED_PLUG_MODELS = {"planks_oak_baked", "planks_spruce_baked",
                        "cobble_baked", "crafting_baked", "bookshelf_baked",
-                       "furnace_baked", "log_oak_baked"}
+                       "furnace_baked", "log_oak_baked", "stonebrick_baked"}
 PLUG_PAINT = {}     # name -> (mask, rgb), filled by bake_from_tiles
 
 
@@ -894,7 +1081,7 @@ PALETTE_COLOUR_MODELS = {"flower_poppy", "flower_dandelion",
                          # same reason; one flat colour per block looked fake
                          "planks_oak_baked", "planks_spruce_baked",
                          "cobble_baked", "furnace_baked", "crafting_baked",
-                         "bookshelf_baked"}
+                         "bookshelf_baked", "stonebrick_baked"}
 
 
 def model_torch_baked():
@@ -996,6 +1183,7 @@ MANIFEST = {
     "planks_spruce_baked": ["mcl_trees:wood_spruce"],
     "log_oak_baked": ["mcl_trees:tree_oak"],
     "cobble_baked": ["mcl_core:cobble"],
+    "stonebrick_baked": ["mcl_core:stonebrick"],
     # plantlike (2026-10-05): crossed 1/16 sheets, see crossed_cutout()
     "plant_tallgrass": ["mcl_flowers:tallgrass"],
     "plant_fern": ["mcl_flowers:fern"],
@@ -1038,7 +1226,7 @@ def main():
                lambda: model_bed("foot"), lambda: model_bed("head"),
                model_lantern, model_campfire, model_carpet,
                model_flowerpot, model_planks_oak, model_planks_spruce,
-               model_log_oak, model_cobble,
+               model_log_oak, model_cobble, model_stonebrick,
                lambda: _flower("plant_tallgrass", "mcl_flowers_tallgrass.png"),
                lambda: _flower("plant_fern", "mcl_flowers_fern.png"),
                lambda: _flower("flower_poppy", "mcl_flowers_poppy.png"),
@@ -1095,6 +1283,17 @@ def main():
                        if p and p["emit"] > 0))
         print("%-20s solid %4d/4096  emissive %3d%s"
               % (name, solid, emis, holes))
+        if name in ROLL_REPORT:
+            dv, du, l0, l1 = ROLL_REPORT[name]
+            print("    roll rows %d cols %d: carved depth in the rim %d -> %d"
+                  % (dv, du, l0, l1))
+        for (mn, face), r in sorted(NORMALISE_REPORT.items()):
+            if mn == name:
+                print("    %-6s depths %s  shadow per 1/16 deep x%.2f -> "
+                      "trend after %s" % (face, r.get("depths"),
+                                          1.0 / r["factor_per_level"],
+                                          "%.3f" % r["b_after"]
+                                          if "b_after" in r else "-"))
 
 
 if __name__ == "__main__":
