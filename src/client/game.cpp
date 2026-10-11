@@ -480,6 +480,13 @@ struct ClaudeTraceGrid
 	float dial_body_colour = 0.0f;
 	float dial_reproject = 0.0f;
 	float sun_airmass = 0.0f;   // for claude_stats.json: the sun's air mass
+	v3f sun_dir = v3f(0.0f, 1.0f, 0.0f);   // for claude_stats.json: the sun's direction
+	// for claude_stats.json (referees of sky-bound air, 2026-10-10): the clear
+	// baseline, the box a sky-bound segment's air ends at (farExitT: world
+	// lo corner + edge), the camera (world, as the shader builds rays)
+	float air_clear = 0.0f;
+	float far_box[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	float cam_ray[12] = {};
 	v3f sun_chroma = v3f(1.0f, 1.0f, 1.0f);
 	float dial_air_scatter = 0.0f;
 	float dial_flame = 0.0f;
@@ -2492,6 +2499,40 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	// largest count a float holds exactly; 4096 = the old behaviour.
 	float m_count_cap = 16777216.0f;
 	CachedPixelShaderSetting<float, 1, false> m_count_cap_pixel{"claudeCountCap"};
+	// claude_sky_ground (2026-10-10, a physics RULE): the sky's radiance --
+	// the sun's beam (IES: 127.5 klx exp(-0.21 m)) and the dome (IES clear-sky
+	// diffuse) -- is what an observer AT THE GROUND measures through a CLEAR
+	// atmosphere: that atmosphere's extinction and in-scatter are already in
+	// it. A segment that ends at the sky therefore skips the clear baseline
+	// (CLAUDE_AIR_CLEAR below) and keeps everything above it: fog, haze.
+	// Exact for every sun angle and receiver: each segment drops its own
+	// clear-air share. 1 (default) = that; 0 = the old double count (-3.7 %
+	// sun at noon, measured 2026-10-10). The FIRST version skipped ALL air
+	// on sky-bound segments, which removed fog in front of the sky (fixed
+	// the same night). Segments that end at a surface keep all the air.
+	float m_skyg = 1.0f;
+	CachedPixelShaderSetting<float, 1, false> m_skyg_pixel{"claudeSkyGround"};
+	// THE CLEAR ATMOSPHERE THE GROUND-MEASURED SKY ALREADY HOLDS (2026-10-10,
+	// the fog correction to claude_sky_ground). A sky-bound segment skips only
+	// THIS much extinction; fog, haze, smoke above it stay (fog in front of
+	// the sky, a fog-dimmed sun). DERIVED, not measured, from the IES clear
+	// sky the sky values come from (luanti-docs spec/photometric-sources.md
+	// sec. 2): luminous extinction c = 0.21 per air mass for the WHOLE
+	// column. Rayleigh part tau_R = 0.0979 (549 nm, Hansen & Travis 1974,
+	// the claude_sun_redden law's own number) over a density scale height
+	// of 8.0 km (US Standard Atmosphere 1976 near the ground): sigma_R =
+	// 1.22e-5 /m at the ground. Aerosol part tau_A = 0.21 - 0.0979 = 0.112
+	// over an aerosol scale height H_A: sigma_A = tau_A / H_A. H_A is the
+	// one number the IES model does not pin: 1.2 km is the usual
+	// exponential-aerosol value (Elterman 1968/1970); 1-2 km brackets it.
+	// sigma_clear = 1.22e-5 + 0.112 / 1200 = 1.06e-4 /m (Koschmieder
+	// visibility 3.912 / sigma = 37 km); H_A 1-2 km gives 6.8e-5 .. 1.24e-4
+	// (58 .. 32 km). The game's default visibility (50 km, 7.8e-5 /m) sits
+	// inside that band, below the central value: its excess is 0.
+	// DERIVED | pin by: a measured clear-day visibility on a day whose beam
+	// matched IES c = 0.21.
+	static constexpr float CLAUDE_AIR_CLEAR = 1.06e-4f;
+	CachedPixelShaderSetting<float, 1, false> m_air_clear_pixel{"claudeAirClear"};
 	float m_walk_exact = 1.0f;   // default ON since 2026-10-08 (geometry is a rule: DECISIONS 0x note)
 	CachedPixelShaderSetting<float, 1, false> m_walk_exact_pixel{"claudeWalkExact"};
 	CachedPixelShaderSetting<SamplerLayer_t, 1, false> m_modelids_sampler_pixel{"claudeModelIds"};
@@ -2619,6 +2660,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 	CachedPixelShaderSetting<float, 1, false> m_raw_frame_pixel{"claudeRawFrame"};
 	// claude_tree_plant (2026-10-07): the stage 2 gate's planted defect
 	float m_tree_plant = 0.0f;
+	// claude_plant_sun (2026-10-10): a PLANTED DEFECT for the truth guard's
+	// own test -- the sun's radiance times this (1 = none). Set on the
+	// control arm only, a 2 % error the guard must call a disagreement.
+	float m_plant_sun = 1.0f;
 	CachedPixelShaderSetting<float, 1, false> m_tree_plant_pixel{"claudeTreePlant"};
 	// claude_column_colour (seams 2026-10-10, default 1): a carved groove's
 	// side walls and a deep pocket's floor show the texel of the face they
@@ -2717,6 +2762,10 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_body_colour",
 		"claude_units",
 		"claude_air_scatter",
+		// the weather: its handler (onSettingsChange) existed but the key was
+		// never registered, so a live change did nothing until a restart, and
+		// guard 1 never saw the dial (found 2026-10-10, the fog referee)
+		"claude_visibility_km",
 		"claude_flame",
 		"claude_split",
 		"claude_exposure",
@@ -2738,6 +2787,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_truth",
 		"claude_tree_plant",
 		"claude_column_colour",
+		"claude_plant_sun",
 		"claude_tree_variant",
 		"claude_tree_dirs",
 		"claude_bricks",
@@ -2745,6 +2795,7 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 		"claude_walk_exact",
 		"claude_bounce_uniform",
 		"claude_count_cap",
+		"claude_sky_ground",
 		"claude_ledger",
 		"claude_white_balance",
 		"claude_leaf_transmit",
@@ -3457,6 +3508,8 @@ class GameGlobalShaderUniformSetter : public IShaderUniformSetter
 			g_claude_grid.moon_name = m_sky->getMoonTextureName();
 		}
 		m_sky_sun_dir_pixel.set(sun_dir, services);
+		g_claude_grid.sun_dir = sun_dir;
+		sun_col *= m_plant_sun;   // 1 unless the guard's test plants an error
 		m_sky_sun_col_pixel.set(sun_col, services);
 		m_sky_sun_cos_pixel.set(&sun_cos, services);
 		m_sky_moon_dir_pixel.set(moon_dir, services);
@@ -3682,6 +3735,8 @@ public:
 			m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		if (name == "claude_column_colour")
 			m_column_colour = readAir("claude_column_colour", 1.0f, 1.0f);
+		if (name == "claude_plant_sun")
+			m_plant_sun = readAir("claude_plant_sun", 1.0f, 4.0f);
 		if (name == "claude_tree_variant")
 			m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		if (name == "claude_tree_dirs")
@@ -3694,6 +3749,8 @@ public:
 			m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		if (name == "claude_bounce_uniform")
 			m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
+		if (name == "claude_sky_ground")
+			m_skyg = readAir("claude_sky_ground", 1.0f, 1.0f);
 		if (name == "claude_count_cap")
 			m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
 		if (name == "claude_ledger")
@@ -3816,6 +3873,7 @@ public:
 		m_truth = readAir("claude_truth", 0.0f, 1.0f);
 		m_tree_plant = readAir("claude_tree_plant", 0.0f, 1.0f);
 		m_column_colour = readAir("claude_column_colour", 1.0f, 1.0f);
+		m_plant_sun = readAir("claude_plant_sun", 1.0f, 4.0f);
 		m_tree_variant = readAir("claude_tree_variant", 0.0f, 8.0f);
 		m_tree_dirs = readAir("claude_tree_dirs", 0.0f, 1.0f);
 		m_bricks = readAir("claude_bricks", 1.0f, 1.0f);
@@ -3823,6 +3881,7 @@ public:
 		m_walk_exact = readAir("claude_walk_exact", 1.0f, 1.0f);
 		m_bounce_uniform = readAir("claude_bounce_uniform", 0.0f, 1.0f);
 		m_count_cap = std::max(1.0f, readAir("claude_count_cap", 16777216.0f, 16777216.0f));
+		m_skyg = readAir("claude_sky_ground", 1.0f, 1.0f);
 		m_ledger = readAir("claude_ledger", 0.0f, 5.0f);
 		m_white_balance = readAir("claude_white_balance", 1.0f, 1.0f);
 		m_leaf_transmit = readAir("claude_leaf_transmit", 1.0f, 1.0f);
@@ -4210,6 +4269,12 @@ public:
 				m_walk_exact_pixel.set(&m_walk_exact, services);
 				m_bounce_uniform_pixel.set(&m_bounce_uniform, services);
 				m_count_cap_pixel.set(&m_count_cap, services);
+				m_skyg_pixel.set(&m_skyg, services);
+				{
+					float ac = CLAUDE_AIR_CLEAR;
+					m_air_clear_pixel.set(&ac, services);
+					g_claude_grid.air_clear = ac;
+				}
 				m_ledger_pixel.set(&m_ledger, services);
 				{
 					float lf = (float)(g_claude_frame_no & 0xFFFFFF);
@@ -4348,6 +4413,19 @@ public:
 					for (int lv = 0; lv < 5 && g_claude_grid.casc[lv].valid; lv++)
 						nf += 1.0f;
 					m_far_levels_pixel.set(&nf, services);
+					{
+						// farExitT's box in WORLD coords (DDA p = world -
+						// origin + 0.5, so world = DDA + origin - 0.5)
+						int L = (int)(nf + 0.5f);
+						v3s16 o = L > 0 ? g_claude_grid.casc[L - 1].origin : v3s16(0, 0, 0);
+						v3f lo = L > 0 ? v3f(o.X, o.Y, o.Z)
+								: v3f(g_claude_grid.origin.X, g_claude_grid.origin.Y,
+									g_claude_grid.origin.Z);
+						g_claude_grid.far_box[0] = lo.X - 0.5f;
+						g_claude_grid.far_box[1] = lo.Y - 0.5f;
+						g_claude_grid.far_box[2] = lo.Z - 0.5f;
+						g_claude_grid.far_box[3] = L > 0 ? 128.0f * std::exp2((float)L) : 128.0f;
+					}
 					float fo = g_settings->exists("claude_far_only")
 							? g_settings->getFloat("claude_far_only", 0.0f, 1.0f)
 							: 0.0f;
@@ -4417,6 +4495,15 @@ public:
 				m_grid_cam_fwd_pixel.set(fwd, services);
 				m_grid_cam_right_pixel.set(right, services);
 				m_grid_cam_up_pixel.set(up, services);
+				{
+					v3f wpos = camera->getPosition() / BS;
+					const v3f vv[4] = {wpos, fwd, right, up};
+					for (int q = 0; q < 4; q++) {
+						g_claude_grid.cam_ray[q * 3 + 0] = vv[q].X;
+						g_claude_grid.cam_ray[q * 3 + 1] = vv[q].Y;
+						g_claude_grid.cam_ray[q * 3 + 2] = vv[q].Z;
+					}
+				}
 				// THE PREVIOUS FRAME'S CAMERA, for reprojection. Kept in
 				// WORLD node units and converted with the CURRENT origin, so
 				// a grid rebase between the frames changes nothing. Rolled
@@ -8562,6 +8649,17 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"nbox_starved\": " << g_claude_grid.nbox_starved
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
+			<< ", \"air_clear\": " << g_claude_grid.air_clear
+			<< ", \"far_box\": [" << g_claude_grid.far_box[0] << "," << g_claude_grid.far_box[1]
+					<< "," << g_claude_grid.far_box[2] << "," << g_claude_grid.far_box[3] << "]"
+			<< ", \"cam_ray\": [" << g_claude_grid.cam_ray[0] << "," << g_claude_grid.cam_ray[1]
+					<< "," << g_claude_grid.cam_ray[2] << "," << g_claude_grid.cam_ray[3]
+					<< "," << g_claude_grid.cam_ray[4] << "," << g_claude_grid.cam_ray[5]
+					<< "," << g_claude_grid.cam_ray[6] << "," << g_claude_grid.cam_ray[7]
+					<< "," << g_claude_grid.cam_ray[8] << "," << g_claude_grid.cam_ray[9]
+					<< "," << g_claude_grid.cam_ray[10] << "," << g_claude_grid.cam_ray[11] << "]"
+			<< ", \"sun_dir\": [" << g_claude_grid.sun_dir.X << "," << g_claude_grid.sun_dir.Y
+					<< "," << g_claude_grid.sun_dir.Z << "]"
 			<< ", \"sun_chroma\": [" << g_claude_grid.sun_chroma.X << ","
 			<< g_claude_grid.sun_chroma.Y << "," << g_claude_grid.sun_chroma.Z << "]"
 			<< ", \"claude_air_scatter\": " << g_claude_grid.dial_air_scatter
@@ -8587,6 +8685,7 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 					<< g_claude_grid.sky_zenith.Y << ","
 					<< g_claude_grid.sky_zenith.Z << "]"
 			<< ", \"still_frames\": " << g_claude_grid.still_frames
+			<< ", \"features\": " << g_claude_features
 			// zeroings, not clamps -- see ClaudeTraceGrid::accum_resets
 			<< ", \"accum_resets\": " << g_claude_grid.accum_resets
 			<< ", \"still_drift\": " << g_claude_grid.still_drift

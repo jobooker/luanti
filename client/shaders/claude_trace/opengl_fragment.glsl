@@ -3712,6 +3712,21 @@ uniform float claudePixelReset;     // 1 = a pixel whose surface changed drops i
 // Was a fixed 4096, which made every parked average past 4096 frames an
 // exponential one (claudePixelReset floors the weight at 1/(count+1)).
 uniform float claudeCountCap;
+// claude_sky_ground: 1 = the sky (sun beam and dome) is a ground-level
+// measurement, so a segment ending at the sky carries no tracer air
+// (game.cpp m_sky_ground). 0 = the old double count.
+uniform float claudeSkyGround;
+// the clear atmosphere the ground-measured sky values already hold (game.cpp
+// CLAUDE_AIR_CLEAR, derived from the IES clear sky; 1/m)
+uniform float claudeAirClear;
+// THE AIR ON A SKY-BOUND SEGMENT (claude_sky_ground): the tracer's air minus
+// the clear baseline, never below zero. Fog stays in front of the sky and
+// dims the sun; a day clearer than the baseline gets no air there at all,
+// never a negative one (a medium cannot add light along a path).
+float skySigT()
+{
+	return claudeSkyGround > 0.5 ? max(airSigT() - claudeAirClear, 0.0) : airSigT();
+}
 bool g_farMedium = false;           // the last far hit was a cloud's
 const int FAR_STEPS = 400;
 // set by marchAll(): did the last hit land on a far level?
@@ -4094,7 +4109,9 @@ vec3 neeSky(vec3 x, vec3 nx, vec3 rho, float curMed)
 	float pdfB = g_neeBScale * guideFactorDir(wi) * cosX / PI;  // p_b, sa
 	float w = pdfL / (pdfL + pdfB);          // balance heuristic
 	// AIR between here and the edge of the grid (1 with no medium)
-	vec3 tr = curMed < 0.5 ? vec3(airTr(farExitT(x, wi)))
+	// (claude_sky_ground: the beam's value is the ground's, after the whole
+	// atmosphere; the tracer's air would count that extinction twice)
+	vec3 tr = curMed < 0.5 ? vec3(exp(-skySigT() * farExitT(x, wi)))
 			: medTr(curMed, farExitT(x, wi));
 	return w * (rho / PI) * skyBody(wi) * (cosX / pdfL) * tr;
 }
@@ -4129,7 +4146,7 @@ vec3 neeSkyAir(vec3 x, vec3 dir)
 	float pdfL = 1.0 / (PI2 * (1.0 - bcos));
 	float ph = hgPhase(dot(dir, wi), claudeAirG);
 	float w = pdfL / (pdfL + ph);
-	return w * ph * skyBody(wi) * airTr(farExitT(x, wi)) / pdfL;
+	return w * ph * skyBody(wi) * exp(-skySigT() * farExitT(x, wi)) / pdfL;
 }
 
 // =====================================================================
@@ -4980,10 +4997,14 @@ void main(void)
 		// exactly 1). That is the whole estimator, and it is why no energy
 		// can be invented: a non-absorbing medium cannot move a sealed
 		// furnace (the furnace-050-air arm). Debug views see geometry only.
-		if (airSigT() > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)) {
+		// claude_sky_ground: a segment that reaches the sky carries only the
+		// air ABOVE the clear baseline the sky's radiance already holds
+		// (skySigT); its scattering share is the medium's own
+		float sigSeg = hitS ? airSigT() : skySigT();
+		if (sigSeg > 0.0 && curMed < 0.5 && !(view >= 1 && view <= 5)) {
 			float tSeg = hitS ? tHit : farExitT(p, dir);
 			float ua = rnd1();
-			float sAir = -log(max(1.0 - ua, 1e-12)) / airSigT();
+			float sAir = -log(max(1.0 - ua, 1e-12)) / sigSeg;
 			if (sAir < tSeg) {
 				vec3 xa = p + dir * sAir;
 				tp *= claudeAirScatter / airSigT();

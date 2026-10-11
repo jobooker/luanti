@@ -26,6 +26,9 @@ def main():
     ap.add_argument("--yaw", type=float, required=True)
     ap.add_argument("--pitch", type=float, required=True)
     ap.add_argument("--time", type=float, default=0.5)
+    # the truth guard shoots poses of a playtest, whose world time is the
+    # frozen snapshot's: setting --time would move the sun (2026-10-10)
+    ap.add_argument("--keep-time", action="store_true", help="do not set the time of day")
     ap.add_argument("--frames", type=int, default=1000)
     ap.add_argument("--dial", action="append", default=[],
                     help="name=value, repeatable")
@@ -80,6 +83,8 @@ def main():
         dials[k.strip()] = float(v)
     vant = {"pos": list(args.pos), "yaw": args.yaw, "pitch": args.pitch,
             "time": args.time}
+    if args.keep_time:
+        del vant["time"]
     vs = lab.load_vantages()
     if args.pin:
         # the capture resets by teleporting away and back, which a pinned

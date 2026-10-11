@@ -85,7 +85,7 @@ FORCED_BY_TRUTH = {"claude_denoise", "claude_denoise_learned", "claude_ledger", 
 FEATURE_OFF = ("denoise", "denoise_learned", "ledger", "boost", "split", "raw_frame", "reproject")
 CONTROL_DIALS = ["claude_nee=0", "claude_bounce_uniform=1", "claude_torch_nee=0", "claude_area_nee=0",
                  "claude_guide=0", "claude_area_pick=0", "claude_area_skip=0", "claude_boost=0"]
-CONTROL_HOLD = 32768   # TUNED: the scoreboard check's frame count | learn by: the control's own two-seed spread at this count
+CONTROL_HOLD = 32768   # the OLD fixed count (display-space guard); the linear guard sizes its own (control_frames)
 # DIAL CLASSES (filled from the shader, 2026-10-09). physics / geometry /
 # estimator / eye: the same in truth as in play; display: must be in
 # FORCED_BY_TRUTH; debug: instrument views and plants; dead: read, never used.
@@ -105,13 +105,15 @@ DIAL_CLASS = {
     # the per-pixel count cap: 4096 (old) makes a parked average past 4096
     # frames exponential, unbiased but no longer converging (2026-10-10)
     "claude_count_cap": "estimator",
+    # the sky is a ground-level measurement: no tracer air on sky-bound segments (2026-10-10)
+    "claude_sky_ground": "physics",
     # geometry: the world's shape walked differently, the same picture
     "claude_pyramid": "geometry", "claude_descend": "geometry", "claude_model_far": "geometry",
     "claude_bricks": "geometry", "claude_bricks_far": "geometry", "claude_walk_exact": "geometry",
     # physics: what the true picture is
     "claude_glass_flush": "physics", "claude_texel_colour": "physics", "claude_body_colour": "physics",
     "claude_sun_redden": "physics", "claude_air_scatter": "physics", "claude_air_absorb": "physics",
-    "claude_air_g": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
+    "claude_air_g": "physics", "claude_visibility_km": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
     "claude_flame": "physics", "claude_leaf_transmit": "physics",
     # the eye: applied identically to the truth and to play
     "claude_exposure": "eye", "claude_auto_exposure": "eye", "claude_present_guide": "eye", "claude_white_balance": "eye",
@@ -119,7 +121,7 @@ DIAL_CLASS = {
     "claude_adapt_darker": "eye",
     # debug: instrument views, planted defects, test skies
     "claude_grid_debug": "debug", "claude_view": "debug", "claude_sky_uniform": "debug",
-    "claude_tree_plant": "debug", "claude_tree_variant": "debug", "claude_tree_dirs": "debug",
+    "claude_tree_plant": "debug", "claude_plant_sun": "debug", "claude_tree_variant": "debug", "claude_tree_dirs": "debug",
     # dead: read and pushed, read by nothing (the five-pass chain and the raster
     # path; classification 2026-10-09). Clean-up candidates.
     "claude_water_reflections": "dead", "claude_gi": "dead", "claude_gi_split": "dead",
@@ -262,6 +264,109 @@ def control_verdict(ctrl_dirs, ref_dir, idx):
         ok_noise = mad <= CONTROL_K * noise_mad and abs(ratio - 1) <= max(0.01, CONTROL_KMEAN * sig_m)
     info["agree_by"] = "tolerance" if ok_fixed else ("control noise" if ok_noise else None)
     return (ok_fixed or ok_noise) and info["control_truth_mode"], info
+
+
+# GUARD 3 IN LINEAR RADIANCE (2026-10-10, cave-turn). The control used to be
+# compared with the stored truth in 8-bit DISPLAY values (exposure, ACES,
+# gamma). In a dark room lit through a 1x1 opening the control's per-pixel
+# noise is enormous and heavy tailed, and the display curve turns noise into
+# brightness: control/truth read 1.024 in display space and 1.0004 in linear
+# radiance, with both matching an analytic referee to 0.2 % (measured.md
+# 2026-10-10; util/claude_cave_referee.py). Now the control AND a fresh
+# truth-mode render at the same pose each write the tracer's linear
+# accumulation (two seeds each), and the same noise-aware verdict runs on
+# those; the stored truth is tied to the fresh render by the floor check
+# that already runs. The standard error comes from the two seeds' per-pixel
+# variance (pixels draw independent random numbers): se^2 = sum(var)/n^2.
+# The control's frame count follows from that error instead of a fixed
+# 32768: a pilot, then as many frames as the target needs.
+CONTROL_PILOT = 4096         # the pilot's frames per seed
+CONTROL_MAX = 65536          # seeds are 65536 frames apart in the RNG key (game.cpp claude_rng_seed)
+CONTROL_SE_TARGET = 0.0033   # TUNED: the mean ratio's standard error the control is run to (a third of the 1 % tolerance) | learn by: the planted-defect test at smaller plants
+TRUTH_LIN_FRAMES = 4096      # the fresh truth's frames per seed (NEE: its error is a few 0.01 %)
+LUMA = np.array([0.2126, 0.7152, 0.0722])
+
+
+def lin_load(prefix):
+    """the tracer's linear accumulation (claude_accum_dump): HxWx3, top row first"""
+    m = json.load(open(prefix + ".json"))
+    a = np.fromfile(prefix + ".f32", np.float32).reshape(m["h"], m["w"], 4)
+    return a[:, :, :3].astype(np.float64)
+
+
+def _seed_stats(ys, k=16):
+    """two seeds' luminance images -> (mean of the seed average, its standard
+    error, tile means, tile standard errors)"""
+    a = sum(ys) / len(ys)
+    v = (ys[0] - ys[1]) ** 2 / 2.0 / len(ys)        # per pixel: var of the seed average
+    h, w = a.shape
+    n = a.size
+    se = float(np.sqrt(v.sum()) / n)
+    tl = lambda x: x[:h // k * k, :w // k * k].reshape(h // k, k, w // k, k)
+    tm = tl(a).mean((1, 3))
+    tse = np.sqrt(tl(v).sum((1, 3))) / (k * k)
+    return float(a.mean()), se, tm, tse
+
+
+def ratio_se(ctrl, truth):
+    """control/truth mean ratio and its standard error, from linear images"""
+    mc, sc, _, _ = _seed_stats([x @ LUMA for x in ctrl])
+    mt, st, _, _ = _seed_stats([x @ LUMA for x in truth])
+    r = mc / max(mt, 1e-12)
+    return r, r * float(np.hypot(sc / max(mc, 1e-12), st / max(mt, 1e-12)))
+
+
+def control_frames(se, frames):
+    """frames per seed for the control to reach CONTROL_SE_TARGET, from an
+    error `se` measured at `frames` (error ~ 1/sqrt(N)); a power of two"""
+    need = frames * (se / CONTROL_SE_TARGET) ** 2
+    n = frames
+    while n < need and n < CONTROL_MAX:
+        n *= 2
+    return n
+
+
+def display_metric(lin, exposure):
+    """the OLD guard's number, for the record: claude_present's transform
+    (exposure, Narkowicz ACES, gamma 1/2.2, 8 bits) decoded as _frame()
+    decodes, luminance. Not the upsampled frame exactly (the dump is the
+    trace resolution); within ~0.6 % of the stored truths' dumps."""
+    x = np.maximum(lin, 0.0) * (exposure or 1.0)
+    a = np.clip(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0)
+    g = np.round(a ** (1 / 2.2) * 255.0) / 255.0
+    return np.where(g <= 0.04045, g / 12.92, ((g + 0.055) / 1.055) ** 2.4) @ LUMA
+
+
+def linear_control_verdict(ctrl, truth, exposure=None, ref_dir=None, idx=None, k=16):
+    """guard 3 in linear radiance. ctrl / truth: two seeds' linear images each
+    (lin_load). The verdict keeps the noise-aware structure of
+    control_verdict(): agree within the fixed tolerance (1 % mean, 5 % median
+    16x16 tile) OR within CONTROL_KMEAN / CONTROL_K times the measured noise,
+    the noise now being the standard error of the difference."""
+    yc = [x @ LUMA for x in ctrl]
+    yt = [x @ LUMA for x in truth]
+    mc, sc, tc, tsc = _seed_stats(yc, k)
+    mt, st, tt, tst = _seed_stats(yt, k)
+    ratio = mc / max(mt, 1e-12)
+    se = ratio * float(np.hypot(sc / max(mc, 1e-12), st / max(mt, 1e-12)))
+    tt_ = np.maximum(tt, 1e-9)
+    mad = float(np.median(np.abs(tc - tt) / tt_))
+    noise_tile = float(np.median(np.hypot(tsc, tst) / tt_))
+    info = {"space": "linear", "ratio": ratio, "se": se, "tile_mad": mad, "noise_tile": noise_tile,
+            "controls": len(ctrl), "truths": len(truth)}
+    ok_fixed = abs(ratio - 1) < 0.01 and mad < 0.05
+    ok_noise = mad <= CONTROL_K * noise_tile and abs(ratio - 1) <= max(0.01, CONTROL_KMEAN * se)
+    info["agree_by"] = "tolerance" if ok_fixed else ("control noise" if ok_noise else None)
+    # THE OLD NUMBER, recorded for one release so the two spaces can be seen
+    # to disagree (it is not judged)
+    dc = np.mean([display_metric(x, exposure).mean() for x in ctrl])
+    dt = np.mean([display_metric(x, exposure).mean() for x in truth])
+    info["display_ratio"] = float(dc / max(dt, 1e-12))
+    if ref_dir is not None and idx is not None:
+        stored = float((_frame(ref_dir, _rows(ref_dir)[idx]) @ LUMA).mean())
+        info["display_ratio_vs_stored"] = float(dc / max(stored, 1e-12))
+        info["fresh_truth_display_vs_stored"] = float(dt / max(stored, 1e-12))
+    return ok_fixed or ok_noise, info
 
 
 def find(spec_base, fps):

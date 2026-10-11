@@ -179,18 +179,102 @@ def cmd_referee(d, names):
     _report(d, names, rs, ref, regions, "camera %s; sun_lux %.0f" % (pos, st["sun_lux"]))
 
 
-def cmd_pad(d, names):
-    rs = runs(d)
-    st = rs[names[0]]["stats"]
+def box_distance(p, dirs, box):
+    """claude_trace farExitT in world coords: distance from p along unit
+    rays to the exit of the far-field box (world lo corner box[:3], edge
+    box[3]) -- where a sky-bound segment's air ends"""
+    lo = np.array(box[:3], float)
+    hi = lo + box[3]
+    room = np.where(dirs >= 0, hi - p, p - lo)
+    return np.maximum(np.min(room / np.maximum(np.abs(dirs), 1e-6), axis=-1), 0.0)
+
+
+def pad_irradiance(st, sigma_sky, x):
+    """horizontal irradiance (luminance, engine units) at pad point x from
+    the sun and the dome, each dimmed by exp(-sigma_sky D) along its own
+    sky-bound path (D = farExitT); sigma_sky = 0 gives the plain IES sums"""
     cos_a = 1.0 / np.sqrt(1.0 + TAN_A ** 2)
-    e = (st["sun_lux"] * (1 + cos_a) / 2 + st["sky_lux"]) / 1000.0
+    sd = np.array(st.get("sun_dir") or [0.0, 1.0, 0.0], float)
+    box = st.get("far_box")
+    # the disc by quadrature in its own frame (cone angle, azimuth): each
+    # direction its own cos to the pad and its own path through the air (a
+    # disc ray at angle theta travels D / cos theta, ~1.4 % more extinction
+    # than the centre ray in the 0.5 km fog)
+    l_sun = st["sun_lux"] / 1000.0 / (2 * np.pi * (1 - cos_a))
+    nr, na = 200, 96
+    ct = 1 - (np.arange(nr) + 0.5) / nr * (1 - cos_a)
+    az = (np.arange(na) + 0.5) / na * 2 * np.pi
+    CT, AZ = np.meshgrid(ct, az, indexing="ij")
+    st_ = np.sqrt(1 - CT * CT)
+    ta = np.array([1.0, 0.0, 0.0]) if abs(sd[1]) > 0.5 else np.array([0.0, 1.0, 0.0])
+    tx = np.cross(ta, sd); tx /= np.linalg.norm(tx)
+    ty = np.cross(sd, tx)
+    dirs = (tx * (st_ * np.cos(AZ))[..., None] + ty * (st_ * np.sin(AZ))[..., None]
+            + sd * CT[..., None]).reshape(-1, 3)
+    dw = (1 - cos_a) / nr * 2 * np.pi / na
+    cosn = np.maximum(dirs[:, 1], 0.0)
+    tr = np.exp(-sigma_sky * box_distance(x, dirs, box)) if sigma_sky > 0 else 1.0
+    e_sun = float((l_sun * cosn * tr).sum() * dw)
+    # the unoccluded, unattenuated disc for the record: sun_lux (1+cos a)/2 cos z
+    e_full = st["sun_lux"] / 1000.0 * (1 + cos_a) / 2 * sd[1]
+    t_sun = e_sun / e_full
+    hor = float(np.dot(st["sky_horizon"], LUM))
+    zen = float(np.dot(st["sky_zenith"], LUM))
+    # the dome by midpoint quadrature in (cos theta, phi): radiance
+    # mix(H, Z, sqrt(cos)) times cos, dw = dcos dphi
+    nc, nphi = 400, 360
+    c = (np.arange(nc) + 0.5) / nc
+    ph = (np.arange(nphi) + 0.5) / nphi * 2 * np.pi
+    C, P = np.meshgrid(c, ph, indexing="ij")
+    sn = np.sqrt(1 - C * C)
+    dirs = np.stack([sn * np.cos(P), C, sn * np.sin(P)], -1).reshape(-1, 3)
+    t = np.exp(-sigma_sky * box_distance(x, dirs, box)).reshape(C.shape) if sigma_sky > 0 else 1.0
+    e_dome = float(((hor + (zen - hor) * np.sqrt(C)) * C * t).sum() * (1.0 / nc) * (2 * np.pi / nphi))
+    return e_sun, e_dome, t_sun
+
+
+def full_stats(r):
+    """every stat at the shutter (the run log keeps a subset)"""
+    try:
+        return json.load(open(r["png"].replace(".png", ".capture.json")))["stats"]
+    except Exception:
+        return r["stats"]
+
+
+def cmd_pad(d, names):
+    """the open pad, direct light only (claude_bounces 1). With air: the sun
+    and the dome dimmed along their sky-bound paths by the air above the
+    clear baseline (claude_sky_ground 1) or by all of it (0), the camera
+    segment (it ends at the pad) by all of it. Not modelled: in-scatter on
+    the camera segment (sigma t_cam < 0.03 here; printed as a bound) and the
+    fence/surroundings (~0.2 %)."""
+    rs = runs(d)
+    cam = camera(d, names)
     h, w = load_y(d, names[0]).shape[:2]
-    pos, hits = floor_hits(camera(d, names), w, h, PAD, sub=1)
-    ok = hits[0][2]
-    ref = np.full((h, w), RHO / np.pi * e)
-    _report(d, names, rs, ref, [("open pad (3-node margin)", ok)],
-            "camera %s; sun_lux %.0f sky_lux %.0f; fence ignored (< 0.3 %%)"
-            % (pos, st["sun_lux"], st["sky_lux"]))
+    pos, hits = floor_hits(cam, w, h, PAD, sub=1)
+    x, z, ok = hits[0]
+    # the camera's own path length to each pad pixel
+    t_cam = np.hypot(np.hypot(x - pos[0], z - pos[2]), FLOOR_Y - pos[1])
+    xc = np.array([60.0, FLOOR_Y, 110.0])
+    by_arm = {}
+    for n in names:
+        by_arm.setdefault(rs[n]["arm"], []).append(n)
+    print("camera %s; fence ignored (~0.2 %%)" % pos)
+    print("%-14s %9s %9s %9s %8s %9s %9s %18s" % ("arm", "sigma_t", "sig_sky", "T_sun", "E_dome", "referee",
+                                               "camT", "measured/referee"))
+    for arm, ns in by_arm.items():
+        st = full_stats(rs[ns[0]])
+        sg = float(rs[ns[0]]["dials"].get("claude_sky_ground", 1))
+        sig = float(st.get("claude_air_scatter") or 0) + float(st.get("claude_air_absorb") or 0)
+        sig_sky = max(sig - float(st.get("air_clear") or 0.0), 0.0) if sg > 0.5 else sig
+        e_sun, e_dome, t_sun = pad_irradiance(st, sig_sky, xc)
+        ref = RHO / np.pi * (e_sun + e_dome) * np.exp(-sig * t_cam)
+        ys = [load_y(d, n) @ LUM for n in ns]
+        v = np.mean([y[ok].mean() for y in ys]) / ref[ok].mean()
+        se = _se(ys, ok) / ref[ok].mean()
+        print("%-14s %9.3g %9.3g %9.4f %8.4f %9.4f %9.4f %10.4f +- %.4f   (sun %s, sky_ground %g, sky_lux check %.4f)"
+              % (arm, sig, sig_sky, t_sun, e_dome, ref[ok].mean(), float(np.exp(-sig * t_cam[ok]).mean()),
+                 v, se, st.get("sun_dir"), sg, st["sky_lux"] / 1000.0))
 
 
 def _report(d, names, rs, ref, regions, head):
@@ -308,7 +392,7 @@ def cmd_run(spec_path, out):
                 cmd = [sys.executable, os.path.join(HERE, "claude_shoot.py"), "--skip-seat",
                        "--pin", "--play", "--pos"] + [str(v) for v in p[:3]] + [
                        "--yaw", str(p[3]), "--pitch", str(p[4]),
-                       "--time", str(spec.get("time", 0.5)),
+                       "--time", str(arm.get("time", spec.get("time", 0.5))),
                        "--frames", str(arm.get("frames", spec.get("frames", 4096))),
                        "--name", name, "--accum-dump", os.path.join(out, name)]
                 if arm.get("export"):
@@ -326,7 +410,8 @@ def cmd_run(spec_path, out):
                     rec["stats"] = {k: st.get(k) for k in (
                         "still_frames", "claude_nee", "claude_bounces", "claude_air_scatter",
                         "claude_air_absorb", "claude_sky_uniform", "sun_lux", "sky_lux",
-                        "sky_horizon", "sky_zenith", "grid_origin", "reset_why")}
+                        "sky_horizon", "sky_zenith", "grid_origin", "reset_why", "sun_dir",
+                        "features", "air_clear", "far_box", "cam_ray")}
                 except Exception as e:
                     rec["stats_err"] = str(e)
                 log.write(json.dumps(rec) + "\n")
