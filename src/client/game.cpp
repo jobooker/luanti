@@ -306,10 +306,43 @@ struct ClaudeTraceGrid
 	// already deduplicated above; the ring only copied them per cell), and
 	// a piece id per 1 m block over the WHOLE grid. Ids: 0 none, 1 solid,
 	// 2 empty, 2 + n node-box shape n, BRICK_MODEL0 + model*4 + rotation.
-	// Pool texture R8 128 x 16 x 1104: 64 shapes per 16-deep slab, shape
+	// Pool texture R8 128 x 16 x 2048: 64 shapes per 16-deep slab, shape
 	// id at x (id % 64) * 2, z (id / 64) * 16, the ring's byte layout.
+	//
+	// RELIEF HAS ITS OWN RANGE (seams, 2026-10-10): ids BRICK_RELIEF0 +
+	// slot, RELIEF_CAP slots, after the models. Relief shapes used to share
+	// the node-box range (nbox_masks, NBOX_CAP), and a relief shape is per
+	// (content, facedir, neighbour pattern): 1,833 of them after one test
+	// session, never freed, so a long roam would fill the pool and every
+	// door, fence, slab and stair met afterwards would render as a 1 m cube
+	// (and a door turned cube blocks light). Now node boxes keep all
+	// NBOX_CAP slots whatever the relief does, and relief slots that no cell
+	// of the grid references are reclaimed (claudeReliefSweep). The same
+	// texture (unit 23) and the same shader lookup serve both: no new
+	// binding or uniform, the texture only grows from 1104 to 2048 deep
+	// (128 slabs x 64 = 8192 ids, the last id BRICK_CAP - 1; 4 MB). 2048 is
+	// within GL_MAX_3D_TEXTURE_SIZE on every GL 3 class GPU we run (the RX
+	// 9070 reports 16384 through Vulkan).
 	static constexpr int BRICK_FULL = 1, BRICK_ZERO = 2, BRICK_NBOX0 = 2,
-			BRICK_MODEL0 = 4099, BRICK_CAP = 4355, BRICK_POOL_D = 1104;
+			BRICK_MODEL0 = 4099, BRICK_RELIEF0 = 4355, BRICK_CAP = 8192,
+			BRICK_POOL_D = 2048;
+	static constexpr int RELIEF_CAP = BRICK_CAP - BRICK_RELIEF0;   // 3837 slots
+	// a relief cell's nbox_all entry: RELIEF_TAG | slot (node boxes 1..4096)
+	static constexpr u16 RELIEF_TAG = 0x8000;
+	std::vector<std::array<u8, 512>> relief_masks;   // RELIEF_CAP slots
+	std::vector<u64> relief_slot_key;                // the shape key a slot holds
+	std::vector<u8> relief_slot_used;                // 1 = allocated
+	std::vector<u16> relief_free;                    // free slots, a stack
+	size_t relief_live = 0;                          // slots allocated
+	u32 relief_reclaimed = 0;                        // slots freed by sweeps, ever
+	u32 relief_starved = 0;                          // shapes refused: pool full after a sweep
+	u32 relief_sweeps = 0;                           // sweeps run, ever
+	// a sweep that freed nothing is not repeated until the next walk starts:
+	// with the pool full of shapes the grid really uses, every further new
+	// shape would otherwise scan the whole grid again
+	bool relief_sweep_futile = false;
+	int relief_cap = RELIEF_CAP;   // claude_relief_pool_cap (INSTRUMENT): slots handed out
+	int brick_pool_lo = -1, brick_pool_hi = -1;      // relief ids changed since the last upload
 	std::vector<u8> brick_ids;            // RG8 per cell (id lo, hi)
 	u32 brick_ids_tex = 0, brick_pool_tex = 0;
 	size_t brick_pool_nbox = (size_t)-1, brick_pool_models = (size_t)-1;
@@ -323,6 +356,9 @@ struct ClaudeTraceGrid
 	std::vector<u16> nbox_all;
 	std::vector<std::array<u8, 512>> nbox_masks; // 1-based via nbox_ids
 	std::unordered_map<u32, u16> nbox_of;        // shape cache
+	// node-box shapes refused because the pool was full: those nodes render
+	// as 1 m cubes (claude_frame_log reports it)
+	u32 nbox_starved = 0;
 	// SURFACE RELIEF (claude_relief, 2026-10-08; John: "the bark textures
 	// ... look fake. And the ground has no texture"). A log or a dirt/grass
 	// block gets grooves carved into its EXPOSED faces where its own face
@@ -5854,6 +5890,8 @@ static u16 claudeNodeBoxMaskId(const NodeDefManager *ndef, Map &map,
 				<< ClaudeTraceGrid::NBOX_CAP
 				<< "; further shapes render as 1 m cubes" << std::endl;
 	}
+	if (!id && V.nbox_masks.size() >= ClaudeTraceGrid::NBOX_CAP)
+		V.nbox_starved++;
 	V.nbox_of[key] = id;
 	return id;
 }
@@ -6244,6 +6282,108 @@ static ClaudeReliefNbr claudeReliefNeighbours(Map &map, const NodeDefManager *nd
 // The hole the old rule had: two blocks A, B = A+w, A open on +X, B open on
 // +Y, A's +Y and B's +X closed: A's +X groove and B's +Y groove met through
 // the seam, joining A+X and B+Y, two cells that touch only at a corner.
+static size_t claudeReliefLive()
+{
+	return g_claude_grid.relief_live;
+}
+
+// THE RELIEF POOL (seams, 2026-10-10; see BRICK_RELIEF0). Everything here is
+// CPU state; the pool texture follows in claudeBrickPoolUpload, uploading
+// only the slabs whose slots changed.
+static int claudeReliefCapWanted()
+{
+	const int N = ClaudeTraceGrid::RELIEF_CAP;
+	return g_settings->exists("claude_relief_pool_cap")
+			? std::clamp((int)g_settings->getFloat("claude_relief_pool_cap", 1.0f, (float)N), 1, N)
+			: N;
+}
+
+static void claudeReliefPoolReset()
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	const int N = ClaudeTraceGrid::RELIEF_CAP;
+	// claude_relief_pool_cap (an INSTRUMENT, default the whole range): hand
+	// out only this many slots, to drive the full-pool path (sweeps,
+	// refusals) on purpose; read when the pool is reset
+	V.relief_cap = claudeReliefCapWanted();
+	V.relief_masks.assign(N, std::array<u8, 512>{});
+	V.relief_slot_key.assign(N, 0);
+	V.relief_slot_used.assign(N, 0);
+	V.relief_free.clear();
+	for (int i = V.relief_cap - 1; i >= 0; i--)
+		V.relief_free.push_back((u16)i);
+	V.relief_sweep_futile = false;
+	V.relief_live = 0;
+	V.relief_shape_of.clear();
+	V.brick_pool_lo = ClaudeTraceGrid::BRICK_RELIEF0;
+	V.brick_pool_hi = ClaudeTraceGrid::BRICK_CAP - 1;
+}
+
+static void claudeReliefPoolDirty(int slot)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	int id = ClaudeTraceGrid::BRICK_RELIEF0 + slot;
+	V.brick_pool_lo = V.brick_pool_lo < 0 ? id : std::min(V.brick_pool_lo, id);
+	V.brick_pool_hi = std::max(V.brick_pool_hi, id);
+}
+
+// RECLAIM: free every relief slot no cell of the grid references
+// (nbox_all), and forget the shape keys that pointed at them, and the
+// cached "no room" answers (they may fit now). Safe at any moment: a cell
+// keeps its slot alive until its own entry changes, and a cell whose entry
+// changed lies in a block this walk re-bakes and re-uploads together with
+// the pool, so no piece id on the GPU outlives its slot's contents. Cost:
+// one pass over the grid's 2.1 M entries (~1-2 ms), at every full walk
+// (the grid recentres every 24 m) and when an allocation finds the pool
+// full.
+static void claudeReliefSweep()
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	if (V.relief_masks.empty())
+		return;
+	std::vector<u8> ref(ClaudeTraceGrid::RELIEF_CAP, 0);
+	for (u16 v : V.nbox_all)
+		if (v & ClaudeTraceGrid::RELIEF_TAG)
+			ref[v & 0x7FFF] = 1;
+	u32 freed = 0;
+	for (int i = 0; i < ClaudeTraceGrid::RELIEF_CAP; i++) {
+		if (!V.relief_slot_used[i] || ref[i])
+			continue;
+		V.relief_shape_of.erase(V.relief_slot_key[i]);
+		V.relief_slot_used[i] = 0;
+		V.relief_free.push_back((u16)i);
+		V.relief_live--;
+		freed++;
+	}
+	for (auto it = V.relief_shape_of.begin(); it != V.relief_shape_of.end();)
+		it = it->second ? std::next(it) : V.relief_shape_of.erase(it);
+	V.relief_reclaimed += freed;
+	V.relief_sweeps++;
+	V.relief_sweep_futile = freed == 0;
+}
+
+// a slot for a new relief shape, -1 when the pool is full even after a sweep
+static int claudeReliefAlloc(u64 key, const std::array<u8, 512> &mask)
+{
+	ClaudeTraceGrid &V = g_claude_grid;
+	if (V.relief_masks.empty())
+		claudeReliefPoolReset();
+	if (V.relief_free.empty() && !V.relief_sweep_futile)
+		claudeReliefSweep();
+	if (V.relief_free.empty()) {
+		V.relief_starved++;
+		return -1;
+	}
+	int slot = V.relief_free.back();
+	V.relief_free.pop_back();
+	V.relief_masks[slot] = mask;
+	V.relief_slot_key[slot] = key;
+	V.relief_slot_used[slot] = 1;
+	V.relief_live++;
+	claudeReliefPoolDirty(slot);
+	return slot;
+}
+
 static u16 claudeReliefShapeId(u16 mapid, const ClaudeReliefNbr &nb)
 {
 	ClaudeTraceGrid &V = g_claude_grid;
@@ -6255,7 +6395,7 @@ static u16 claudeReliefShapeId(u16 mapid, const ClaudeReliefNbr &nb)
 	if (it != V.relief_shape_of.end())
 		return it->second;
 	u16 id = 0;
-	if (V.nbox_masks.size() < ClaudeTraceGrid::NBOX_CAP) {
+	{
 		const ClaudeTraceGrid::ReliefMap &m = V.relief_maps[mapid - 1];
 		const int D = m.D;
 		// world tile of each face: +X 2, -X 3, +Y 0, -Y 1, +Z 4, -Z 5
@@ -6353,12 +6493,55 @@ static u16 claudeReliefShapeId(u16 mapid, const ClaudeReliefNbr &nb)
 			}
 		}
 		if (bits < 4096) {
-			V.nbox_masks.push_back(mask);
-			id = (u16)V.nbox_masks.size();
+			// no room (pool full of shapes the grid uses): the cell stays a
+			// plain cube, which is always leak-safe; the 0 is forgotten at
+			// the next sweep
+			int slot = claudeReliefAlloc(key, mask);
+			if (slot >= 0)
+				id = (u16)(ClaudeTraceGrid::RELIEF_TAG | slot);
 		}
 	}
 	V.relief_shape_of[key] = id;
 	return id;
+}
+
+// claude_frame_log = <file> (an INSTRUMENT, seams 2026-10-10; 0 = off): one
+// line per frame -- microseconds since the previous frame, the path frame,
+// the shapes in the node-box pool, the relief shapes alive, the node-box
+// shape keys, and the node-box shapes refused for want of room -- so a long
+// flight shows whether the pools plateau and whether reclaiming costs
+// frames. Re-read every 30 frames.
+static size_t claudeReliefLive();
+static void claudeFrameLog()
+{
+	static FILE *f = nullptr;
+	static std::string cur;
+	static u64 last = 0;
+	static u32 n = 0;
+	if (n++ % 30 == 0) {
+		std::string want = g_settings->exists("claude_frame_log")
+				? g_settings->get("claude_frame_log") : std::string();
+		if (want == "0")
+			want.clear();
+		if (want != cur) {
+			if (f)
+				fclose(f);
+			f = want.empty() ? nullptr : fopen(want.c_str(), "w");
+			cur = want;
+			last = 0;
+		}
+	}
+	if (!f)
+		return;
+	const ClaudeTraceGrid &V = g_claude_grid;
+	u64 now = porting::getTimeUs();
+	fprintf(f, "%llu %ld %zu %zu %zu %u %u %u %u %u %u\n", last ? (unsigned long long)(now - last) : 0ULL,
+			g_claude_path_frame, V.nbox_masks.size(), claudeReliefLive(),
+			V.nbox_of.size(), V.nbox_starved, V.relief_reclaimed, V.relief_starved,
+			V.relief_sweeps, V.solid_count, V.relief_cells);
+	last = now;
+	if (n % 120 == 0)
+		fflush(f);
 }
 
 static void claudeTraceGridWalkBlock(Client *client, const NodeDefManager *ndef,
@@ -7018,6 +7201,14 @@ static void claudeTraceGridBakeSubvox(int x0, int y0, int z0, int w, int h, int 
 }
 
 
+// an nbox_all entry as a piece id: a node-box shape n, or a relief slot
+static int claudePieceOfNboxAll(u16 v)
+{
+	if (v & ClaudeTraceGrid::RELIEF_TAG)
+		return ClaudeTraceGrid::BRICK_RELIEF0 + (v & 0x7FFF);
+	return ClaudeTraceGrid::BRICK_NBOX0 + v;
+}
+
 // THE PIECE IDS (ladder B1). The same decision claudeTraceGridBakeSubvox
 // makes, in the same order, for every cell rather than only the ring:
 // inside the ring a model, else a node-box shape, else solid or empty
@@ -7046,14 +7237,15 @@ static void claudeTraceGridBakeBricks(int x0, int y0, int z0, int w, int h, int 
 			else if (bakes && !V.nbox_all.empty() && V.nbox_all[vi])
 				// only a relief cell gets here: a node-box cell in the
 				// ring has the same id in nbox_ids, caught above
-				id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_all[vi];
+				id = claudePieceOfNboxAll(V.nbox_all[vi]);
 			else
 				id = bakes ? ClaudeTraceGrid::BRICK_FULL : ClaudeTraceGrid::BRICK_ZERO;
 		} else if (tag >> 2) {
 			id = ClaudeTraceGrid::BRICK_MODEL0 + ((tag >> 2) - 1) * 4 + (tag & 3);
 		} else if (!V.nbox_all.empty() && V.nbox_all[vi]) {
-			// B3: a node-box shape past the ring (stairs, slabs, panes)
-			id = ClaudeTraceGrid::BRICK_NBOX0 + V.nbox_all[vi];
+			// B3: a node-box shape past the ring (stairs, slabs, panes),
+			// or a relief shape
+			id = claudePieceOfNboxAll(V.nbox_all[vi]);
 		}
 		if (id >= ClaudeTraceGrid::BRICK_CAP)
 			id = 0;
@@ -7066,6 +7258,12 @@ static void claudeTraceGridBakeBricks(int x0, int y0, int z0, int w, int h, int 
 static const u8 *claudeBrickMask(int id)
 {
 	ClaudeTraceGrid &V = g_claude_grid;
+	if (id >= ClaudeTraceGrid::BRICK_RELIEF0) {
+		int slot = id - ClaudeTraceGrid::BRICK_RELIEF0;
+		if (slot < (int)V.relief_masks.size() && V.relief_slot_used[slot])
+			return V.relief_masks[slot].data();
+		return nullptr;
+	}
 	if (id >= ClaudeTraceGrid::BRICK_MODEL0) {
 		int m = (id - ClaudeTraceGrid::BRICK_MODEL0) / 4, r = (id - ClaudeTraceGrid::BRICK_MODEL0) % 4;
 		if (m < (int)V.models.size() && V.models[m][r].size() == 512)
@@ -7091,11 +7289,36 @@ static void claudeTraceGridTexParams3D();
 static void claudeBrickPoolUpload()
 {
 	ClaudeTraceGrid &V = g_claude_grid;
-	if (V.brick_pool_tex && V.brick_pool_nbox == V.nbox_masks.size()
-			&& V.brick_pool_models == V.models.size())
+	const bool same = V.brick_pool_tex && V.brick_pool_nbox == V.nbox_masks.size()
+			&& V.brick_pool_models == V.models.size();
+	if (same && V.brick_pool_lo < 0)
 		return;
+	if (same) {
+		// only relief slots changed: re-upload just their slabs (a new
+		// shape while roaming costs one 32 KB slab, not the 4 MB pool)
+		const int z0 = (V.brick_pool_lo / 64) * 16, z1 = (V.brick_pool_hi / 64 + 1) * 16;
+		std::vector<u8> part((size_t)128 * 16 * (z1 - z0), 0);
+		for (int id = (z0 / 16) * 64; id < (z1 / 16) * 64 && id < ClaudeTraceGrid::BRICK_CAP; id++) {
+			const u8 *mm = claudeBrickMask(id);
+			if (id != ClaudeTraceGrid::BRICK_FULL && !mm)
+				continue;
+			int x0 = (id % 64) * 2, zz = (id / 64) * 16 - z0;
+			for (int sz = 0; sz < 16; sz++)
+			for (int sy = 0; sy < 16; sy++)
+			for (int b = 0; b < 2; b++)
+				part[((size_t)(zz + sz) * 16 + sy) * 128 + x0 + b] =
+						mm ? mm[(sz * 16 + sy) * 2 + b] : 0xFF;
+		}
+		GL.ActiveTexture(GL.TEXTURE0 + 23);
+		GL.BindTexture(GL.TEXTURE_3D, V.brick_pool_tex);
+		GL.TexSubImage3D(GL.TEXTURE_3D, 0, 0, 0, z0, 128, 16, z1 - z0, GL.RED,
+				GL.UNSIGNED_BYTE, part.data());
+		V.brick_pool_lo = V.brick_pool_hi = -1;
+		return;
+	}
 	V.brick_pool_nbox = V.nbox_masks.size();
 	V.brick_pool_models = V.models.size();
+	V.brick_pool_lo = V.brick_pool_hi = -1;
 	const int D = ClaudeTraceGrid::BRICK_POOL_D;
 	std::vector<u8> pool((size_t)128 * 16 * D, 0);
 	for (int id = 1; id < ClaudeTraceGrid::BRICK_CAP; id++) {
@@ -7705,7 +7928,7 @@ static void claudeTraceGridSnapshot(Client *client)
 			// session ends; at most a few dozen per dial move)
 			V.relief_maps.clear();
 			V.relief_base_of.clear();
-			V.relief_shape_of.clear();
+			claudeReliefPoolReset();
 		}
 		V.relief_depth = rd;
 		V.relief_frac = rf;
@@ -7714,8 +7937,11 @@ static void claudeTraceGridSnapshot(Client *client)
 			const bool po = g_settings->exists("claude_relief_partial_open")
 					&& g_settings->getFloat("claude_relief_partial_open", 0.0f, 1.0f) >= 0.5f;
 			if (po != V.relief_partial_open)
-				V.relief_shape_of.clear();   // the neighbour classes changed
+				claudeReliefPoolReset();   // the neighbour classes changed
 			V.relief_partial_open = po;
+			// the instrument cap moved: a full walk follows, so a reset is safe
+			if (!V.relief_masks.empty() && claudeReliefCapWanted() != V.relief_cap)
+				claudeReliefPoolReset();
 		}
 		V.relief_flat = claudeReliefFlat();
 		V.oak_model = claudeOakModel();
@@ -7740,8 +7966,23 @@ static void claudeTraceGridSnapshot(Client *client)
 	// A full walk owns every cell, so nothing survives it: drop the whole
 	// point-emitter list rather than let 512 per-block erases do it.
 	V.emit_all.clear();
+	V.relief_sweep_futile = false;
 	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++)
 		claudeTraceGridWalkBlock(client, ndef, map, origin, b);
+	// every cell was just re-walked: the relief slots the old grid alone
+	// used go back to the pool -- once the pool is half full. Sweeping at
+	// every recentre (first version) freed shapes the next slab of terrain
+	// needed again: 49,970 shapes rebuilt in an 11-minute roam where 1,746
+	// distinct ones were ever needed. Half the pool is a cache of recently
+	// used shapes; the other half guarantees room for a full grid's worth
+	// of new ones (a grid needs at most ~1,000 in the roam) before the
+	// allocator has to sweep mid-walk.
+	// TUNED: sweep above half the pool | learn by: the roam's rebuilt-shape
+	// count and frame-time p99 against the threshold
+	u64 tsweep = porting::getTimeUs();
+	if (V.relief_live * 2 > (size_t)V.relief_cap)
+		claudeReliefSweep();
+	const u64 sweep_us = porting::getTimeUs() - tsweep;
 	u32 solid = 0;
 	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++)
 		solid += V.block_solid[b];
@@ -7806,7 +8047,11 @@ static void claudeTraceGridSnapshot(Client *client)
 			<< " relief=" << V.relief_depth
 			<< " relief_blocks=" << (V.relief_blocks ? 1 : 0)
 			<< " relief_cells=" << V.relief_cells
-			<< " relief_shapes=" << V.relief_shape_of.size()
+			<< " relief_shapes=" << V.relief_live << "/" << ClaudeTraceGrid::RELIEF_CAP
+			<< " (reclaimed " << V.relief_reclaimed << " in " << V.relief_sweeps
+			<< " sweeps, refused " << V.relief_starved
+			<< ", sweep " << sweep_us << "us)"
+			<< " nbox_starved=" << V.nbox_starved
 			<< std::endl;
 }
 
@@ -7885,6 +8130,7 @@ static bool claudeTraceGridIncremental(Client *client)
 	const NodeDefManager *ndef = client->getNodeDefManager();
 	claudeLoadModels(ndef);
 	V.nodebox_on = claudeNodeBoxEnabled();
+	V.relief_sweep_futile = false;
 	int cx0 = S, cy0 = S, cz0 = S, cx1 = 0, cy1 = 0, cz1 = 0;
 	int changed = 0;
 	for (int b = 0; b < ClaudeTraceGrid::NBLOCKS; b++) {
@@ -8309,7 +8555,11 @@ static void claudeWriteStats(f32 dtime, f32 busy_us, f32 draw_us)
 			<< ", \"claude_relief_blocks\": " << (g_claude_grid.relief_blocks ? 1 : 0)
 			<< ", \"claude_relief_frac\": " << g_claude_grid.relief_frac
 			<< ", \"relief_cells\": " << g_claude_grid.relief_cells
-			<< ", \"relief_shapes\": " << g_claude_grid.relief_shape_of.size()
+			<< ", \"relief_shapes\": " << g_claude_grid.relief_live
+			<< ", \"relief_reclaimed\": " << g_claude_grid.relief_reclaimed
+			<< ", \"relief_refused\": " << g_claude_grid.relief_starved
+			<< ", \"nbox_shapes\": " << g_claude_grid.nbox_masks.size()
+			<< ", \"nbox_starved\": " << g_claude_grid.nbox_starved
 			<< ", \"claude_body_colour\": " << g_claude_grid.dial_body_colour
 			<< ", \"sun_airmass\": " << g_claude_grid.sun_airmass
 			<< ", \"sun_chroma\": [" << g_claude_grid.sun_chroma.X << ","
@@ -8965,6 +9215,8 @@ static void pollSettingsPatch(f32 dtime, Client *client, GameUI *game_ui)
 					|| claudeReliefDepth() != g_claude_grid.relief_depth
 					|| claudeReliefFlat() != g_claude_grid.relief_flat
 					|| claudeReliefBlocksOn() != g_claude_grid.relief_blocks
+					|| (!g_claude_grid.relief_masks.empty()
+						&& claudeReliefCapWanted() != g_claude_grid.relief_cap)
 					|| (g_settings->exists("claude_relief_partial_open")
 						&& g_settings->getFloat("claude_relief_partial_open", 0.0f, 1.0f) >= 0.5f)
 						!= g_claude_grid.relief_partial_open
@@ -9181,6 +9433,7 @@ void Game::run()
 					cam_damp_lambda
 			);
 		}
+		claudeFrameLog();
 		if (g_claude_path_frame >= 0 && !g_claude_path.empty()) {
 			ClaudePathKey k = claudePathPose(g_claude_path_frame);
 			cam_view.camera_yaw = cam_view_target.camera_yaw = k.yaw;

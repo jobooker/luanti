@@ -1655,7 +1655,7 @@ bool brickSolid(float id, vec3 sv)
 	vec3 texel = vec3(mod(id, 64.0) * 2.0 + floor(sv.x / 8.0), sv.y,
 			floor(id / 64.0) * 16.0 + sv.z);
 	float raw = texture3D(claudeBrickPool,
-			(texel + 0.5) / vec3(128.0, 16.0, 1104.0)).r;
+			(texel + 0.5) / vec3(128.0, 16.0, 2048.0)).r;   // BRICK_POOL_D
 	float byte = floor(raw * 255.0 + 0.5);
 	return mod(floor(byte / exp2(mod(sv.x, 8.0))), 2.0) >= 0.5;
 }
