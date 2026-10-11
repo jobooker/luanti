@@ -524,6 +524,15 @@ CI_TAG = "ci"              # the key that marks a vantage as part of this set
 # saturated patch makes a referee a truncation detector, not a precision
 # one).
 SKY_UNIFORM_L = 1.0
+# skyfog-up's absorbing air, 1/m: about one optical depth across CI's
+# 128-node grid (CI runs without the far field), so the referee's answer
+# sits mid-range and dropping the fog moves it by x2.24.
+SKYFOG_ABSORB = 0.01
+# skyfog-up's tolerance on measured/analytic: the transmittance is
+# deterministic and the frame is all sky, so only Monte Carlo noise and the
+# geometry's float precision are left. TUNED: 1 % | learn by: the arm's
+# run-to-run spread over the first runs (record in measured.md)
+SKYFOG_TOL = 0.01
 
 # THE DEPTH A RARE-EVENT GATE RUNS AT, and it is not SETTLE_FRAMES.
 # environment-laws: on the SAME broken build the origin-cell leak read 0
@@ -548,7 +557,7 @@ FURNACE_EXPOSURE = 0.1
 # into <rundir>/<arm>.f32 + .json, and these referees judge it. The PNG
 # reading of the same box is still made and recorded beside it
 # (ratio_png / region_ratios_png), never judged.
-LINEAR_REFEREES = ("furnace", "skyfurnace", "cornell")
+LINEAR_REFEREES = ("furnace", "skyfurnace", "cornell", "skyfog")
 ACCUM_DUMP_TIMEOUT = 15.0
 # A CAMERA EXPOSURE PER ARM THAT SEES SKY OR FLAMES (2026-10-05, real light
 # units). MEASURED, not chosen: each is the factor claude_exposure (the
@@ -619,6 +628,18 @@ CI_SHOTS = [
     {"name": "skyfurnace-050-nee1", "vantage": "skyfurnace-050",
      "referee": ("skyfurnace", "050"),
      "dials": {"claude_sky_uniform": SKY_UNIFORM_L, "claude_nee": 1}},
+    # FOG IN FRONT OF THE SKY (2026-10-10). claude_sky_ground's first
+    # version skipped ALL air on segments that end at the sky, so fog
+    # vanished in front of it, and no arm could see that: the only air arm
+    # (furnace-050-air) is sealed. Here the camera looks UP at the constant
+    # test sky through a purely absorbing medium, where the answer is
+    # L exp(-max(sigma_a - sigma_clear, 0) D) per pixel, computed
+    # (claude_skyfog_check). The first version reads x2.24 too bright
+    # (measured: 1.00000 +- 0.00016 of the analytic answer, 2026-10-10).
+    {"name": "skyfog-up", "vantage": "skyfog-up",
+     "referee": ("skyfog", None),
+     "dials": {"claude_sky_uniform": SKY_UNIFORM_L, "claude_air_scatter": 0,
+               "claude_air_absorb": SKYFOG_ABSORB}},
     {"name": "cave-skylight-noon", "vantage": "cave-skylight-noon",
      "referee": None},
     {"name": "cave-skylight-night", "vantage": "cave-skylight-night",
@@ -788,6 +809,7 @@ VANTAGE_ROOM = {
     "cave-glass": "cave-glass",
     "skyfurnace-050": "sky-furnace-050",
     "skyfurnace-050-nee1": "sky-furnace-050",
+    "skyfog-up": "sky-furnace-050",
     "exterior-ci": "exterior-ci",
     "glass-dark": "glasspair", "glass-lit": "glasspair",
     "glassfurnace": "glassfurnace",
@@ -2399,6 +2421,8 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
         cmd += ["--patch"] + [str(v) for v in FURNACE_PATCH]
     if kind == "furnace":
         cmd += ["--exposure", str(FURNACE_EXPOSURE)]
+    if kind == "skyfog":
+        cmd += ["--lsky", str(SKY_UNIFORM_L)]
     if kind == "skyfurnace":
         # the test sky's radiance comes from THE SAME constant the arm's
         # dial is pushed from, so the referee cannot be judging a
@@ -2435,6 +2459,8 @@ def run_referee(kind, arg, png, rundir, name, golden_png=None,
         out.update(parse_skyfurnace(text))
     elif kind == "sealed":
         out.update(parse_sealed(text))
+    elif kind == "skyfog":
+        out.update(parse_skyfog(text))
     else:
         out.update(parse_cornell(text))
     return out
@@ -2465,6 +2491,29 @@ def parse_furnace(t):
     if m:
         out["clipped_pct"] = float(m.group(1))
     return _parse_linear_extras(t, out)
+
+
+def parse_skyfog(t):
+    """Headline: measured / analytic for the rule (claude_sky_ground 1)."""
+    import re as _re
+    m = _re.search(r"^ratio ([-\d.]+) \+/- ([-\d.]+)", t, _re.M)
+    return {"ratio": float(m.group(1)), "ratio_se": float(m.group(2))} if m else {}
+
+
+def skyfog_verdict(ref):
+    """PASS iff measured / analytic is within SKYFOG_TOL of 1 (the analytic
+    answer is exact: no pin, unlike the pad)."""
+    if not ref or ref.get("returncode") != 0:
+        return "-", "referee could not speak"
+    if not ref.get("linear"):
+        return "-", "no linear dump for this capture"
+    r = ref.get("ratio")
+    if r is None:
+        return "-", "unparsed"
+    ok = abs(r - 1.0) <= SKYFOG_TOL
+    return ("PASS" if ok else "FAIL"), "measured/analytic %.5f +/- %.5f (tol %.3f)%s" % (
+        r, ref.get("ratio_se", float("nan")), SKYFOG_TOL,
+        "" if ok else " -- FOG IN FRONT OF THE SKY IS WRONG")
 
 
 def parse_skyfurnace(t):
@@ -2650,6 +2699,8 @@ def verdict(shot_def, ref):
         return skyfurnace_verdict(ref, arg)
     if kind == "sealed":
         return sealed_verdict(ref)
+    if kind == "skyfog":
+        return skyfog_verdict(ref)
     return cornell_verdict(ref)
 
 
@@ -3522,6 +3573,8 @@ def cmd_calibrate(args):
                     # golden pinned" as BLIND, every run. Their own
                     # calibration is the uniform-sky analytic answer.
                     continue
+                if shot_def["referee"][0] == "skyfog":
+                    continue      # its own analytic answer; the planted defects are about rooms
                 if shot_def["referee"][0] == "sealed":
                     # THE SEALED-PLANK ARMS ARE CALIBRATED ALREADY, AND
                     # NOT BY A PLANTED DIAL. Their claim is "no light

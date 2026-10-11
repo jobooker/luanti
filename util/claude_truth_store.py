@@ -113,7 +113,7 @@ DIAL_CLASS = {
     # physics: what the true picture is
     "claude_glass_flush": "physics", "claude_texel_colour": "physics", "claude_body_colour": "physics",
     "claude_sun_redden": "physics", "claude_air_scatter": "physics", "claude_air_absorb": "physics",
-    "claude_air_g": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
+    "claude_air_g": "physics", "claude_visibility_km": "physics", "claude_water_absorb": "physics", "claude_units": "physics",
     "claude_flame": "physics", "claude_leaf_transmit": "physics",
     # the eye: applied identically to the truth and to play
     "claude_exposure": "eye", "claude_auto_exposure": "eye", "claude_present_guide": "eye", "claude_white_balance": "eye",

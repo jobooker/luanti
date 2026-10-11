@@ -281,6 +281,21 @@
 		"time" : 0.5,
 		"yaw" : 265.71998558326192
 	},
+	"skyfog-up" : 
+	{
+		"ci" : true,
+		"notes" : "2026-10-10: the sky-furnace pad stand point looking UP, all sky. Under the constant test sky through purely absorbing air the analytic answer is L exp(-max(sigma_a - sigma_clear, 0) D) per pixel (claude_skyfog_check): fog must stay in front of the sky (claude_sky_ground).",
+		"pitch" : 60,
+		"pos" : 
+		[
+			60,
+			9,
+			104
+		],
+		"set" : "gallery",
+		"time" : 0.5,
+		"yaw" : 0
+	},
 	"skyfurnace-050" : 
 	{
 		"ci" : true,
